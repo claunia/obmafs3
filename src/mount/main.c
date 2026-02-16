@@ -11,6 +11,7 @@
 
 struct obmafs3_options {
     const char *device;
+    const char *disk_images;
     int show_help;
     int compression;        /* -1 = not set (use default) */
     int zstd_level;         /* -1 = not set (use default) */
@@ -20,6 +21,7 @@ struct obmafs3_options {
 
 static const struct fuse_opt option_spec[] = {
     OPTION("--device=%s",       device),
+    OPTION("--disk-images=%s",  disk_images),
     OPTION("-h",                show_help),
     OPTION("--help",            show_help),
     {"--compression=%d",        offsetof(struct obmafs3_options, compression), 0},
@@ -34,6 +36,8 @@ static void show_help(const char *progname)
            "    --device=<path>        Path to the OBMAFS3 filesystem image\n"
            "    --compression=<0|1>    Enable (1) or disable (0) compression (default: 1)\n"
            "    --zstd-level=<1-15>    ZSTD compression level (default: 15)\n"
+           "    --disk-images=<spec>   Semicolon-separated ext=sector_size pairs\n"
+           "                           (default: dsk=512;iso=2048)\n"
            "\n", progname);
 }
 
@@ -82,6 +86,20 @@ int main(int argc, char *argv[])
                 return 1;
             }
             g_ctx->zstd_level = opts.zstd_level;
+        }
+    }
+
+    /* Parse disk image extension mappings */
+    {
+        const char *spec = opts.disk_images ? opts.disk_images
+                                            : "dsk=512;iso=2048";
+        if (parse_disk_image_maps(spec) != 0) {
+            fprintf(stderr, "Error: invalid --disk-images specification\n");
+            if (g_ctx) {
+                obmafs3_close(g_ctx);
+                g_ctx = NULL;
+            }
+            return 1;
         }
     }
 

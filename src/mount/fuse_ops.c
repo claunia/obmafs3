@@ -14,8 +14,83 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdio.h>
 
 struct obmafs3_ctx *g_ctx = NULL;
+
+/* Disk image extension-to-sector-size mappings */
+struct disk_image_mapping g_disk_image_maps[OBMAFS3_MAX_DISK_IMAGE_MAPS];
+int g_disk_image_map_count = 0;
+
+int parse_disk_image_maps(const char *spec)
+{
+    if (!spec || !*spec) {
+        g_disk_image_map_count = 0;
+        return 0;
+    }
+
+    /* Work on a copy so we can tokenise */
+    char *buf = strdup(spec);
+    if (!buf)
+        return -1;
+
+    int count = 0;
+    char *saveptr = NULL;
+    char *pair = strtok_r(buf, ";", &saveptr);
+
+    while (pair && count < OBMAFS3_MAX_DISK_IMAGE_MAPS) {
+        char *eq = strchr(pair, '=');
+        if (!eq || eq == pair || !*(eq + 1)) {
+            fprintf(stderr, "Error: bad disk_images pair: '%s'\n", pair);
+            free(buf);
+            return -1;
+        }
+        *eq = '\0';
+        const char *ext  = pair;
+        const char *sval = eq + 1;
+
+        char *endptr;
+        long val = strtol(sval, &endptr, 10);
+        if (*endptr != '\0' || val <= 0 || val > 65535) {
+            fprintf(stderr,
+                "Error: invalid sector size '%s' for extension '%s'\n",
+                sval, ext);
+            free(buf);
+            return -1;
+        }
+
+        strncpy(g_disk_image_maps[count].extension, ext,
+                sizeof(g_disk_image_maps[count].extension) - 1);
+        g_disk_image_maps[count].extension[
+            sizeof(g_disk_image_maps[count].extension) - 1] = '\0';
+        g_disk_image_maps[count].sector_size = (uint16_t)val;
+        count++;
+
+        pair = strtok_r(NULL, ";", &saveptr);
+    }
+
+    g_disk_image_map_count = count;
+    free(buf);
+    return 0;
+}
+
+/**
+ * Look up a filename against the disk image extension map.
+ * Returns the sector size if the extension matches, or 0 if no match.
+ */
+static uint16_t lookup_disk_image_sector_size(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name)
+        return 0;
+    const char *ext = dot + 1;
+
+    for (int i = 0; i < g_disk_image_map_count; i++) {
+        if (strcasecmp(ext, g_disk_image_maps[i].extension) == 0)
+            return g_disk_image_maps[i].sector_size;
+    }
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Path resolution                                                    */
@@ -328,6 +403,11 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     new_inode.access_time       = now;
     new_inode.file_size         = 0;
     new_inode.file_type         = kFileTypeRegular;
+
+    /* Check if this file should be treated as a media/disk image */
+    uint16_t img_sector_size = lookup_disk_image_sector_size(name);
+    if (img_sector_size > 0)
+        new_inode.file_type = kFileTypeMediaImage;
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
     if (rc != OBMAFS3_OK)
