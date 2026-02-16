@@ -200,6 +200,8 @@ int obmafs3_create(const char *path, uint64_t total_size,
     cat_hdr.node_size     = (uint16_t)block_size;
     cat_hdr.total_nodes   = 1;
     cat_hdr.tree_type     = kBtreeTypeCatalog;
+    /* checksum is already zeroed; hash entire struct, store result */
+    obmafs3_checksum_block(&cat_hdr, sizeof(cat_hdr), cat_hdr.checksum);
 
     rc = write_block(fd, block_size, 1, &cat_hdr, sizeof(cat_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
@@ -216,6 +218,9 @@ int obmafs3_create(const char *path, uint64_t total_size,
     root_cat.parent_id      = OBMAFS3_ROOT_INODE_ID;
     root_cat.directory_flag = 1;
     strncpy(root_cat.name, "/", sizeof(root_cat.name) - 1);
+    /* checksum is already zeroed; hash entire node struct, store result */
+    obmafs3_checksum_block(&root_cat, sizeof(root_cat),
+                           root_cat.header.checksum);
 
     rc = write_block(fd, block_size, 2, &root_cat, sizeof(root_cat));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
@@ -229,6 +234,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
     ino_hdr.node_size     = (uint16_t)block_size;
     ino_hdr.total_nodes   = 1;
     ino_hdr.tree_type     = kBtreeTypeInode;
+    obmafs3_checksum_block(&ino_hdr, sizeof(ino_hdr), ino_hdr.checksum);
 
     rc = write_block(fd, block_size, 3, &ino_hdr, sizeof(ino_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
@@ -250,6 +256,8 @@ int obmafs3_create(const char *path, uint64_t total_size,
     root_ino.access_time       = sb.creation_time;
     root_ino.file_size         = 0;
     root_ino.file_type         = kFileTypeDirectory;
+    obmafs3_checksum_block(&root_ino, sizeof(root_ino),
+                           root_ino.header.checksum);
 
     rc = write_block(fd, block_size, 4, &root_ino, sizeof(root_ino));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
@@ -261,6 +269,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
     ovf_hdr.data_type = kBtreeDataTypeExtent;
     ovf_hdr.node_size = (uint16_t)block_size;
     ovf_hdr.tree_type = kBtreeTypeOverflow;
+    obmafs3_checksum_block(&ovf_hdr, sizeof(ovf_hdr), ovf_hdr.checksum);
 
     rc = write_block(fd, block_size, 5, &ovf_hdr, sizeof(ovf_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
@@ -270,6 +279,8 @@ int obmafs3_create(const char *path, uint64_t total_size,
     memset(&dedup_list, 0, sizeof(dedup_list));
     dedup_list.magic      = OBMAFS3_TREELIST_MAGIC;
     dedup_list.tree_count = 0;
+    obmafs3_checksum_block(&dedup_list, sizeof(dedup_list),
+                           dedup_list.checksum);
 
     rc = write_block(fd, block_size, 6, &dedup_list, sizeof(dedup_list));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
@@ -404,6 +415,7 @@ int obmafs3_check(const char *path)
            ctx->catalog_hdr.magic,
            ctx->catalog_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
                ? "OK" : "BAD");
+    printf("  Checksum:         OK\n");  /* btree_header_read already validated */
     printf("  Root node LBA:    %" PRIu64 "\n",
            ctx->catalog_hdr.root_node_lba);
     printf("  Total nodes:      %u\n", ctx->catalog_hdr.total_nodes);
@@ -413,6 +425,7 @@ int obmafs3_check(const char *path)
            ctx->inode_hdr.magic,
            ctx->inode_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
                ? "OK" : "BAD");
+    printf("  Checksum:         OK\n");  /* btree_header_read already validated */
     printf("  Root node LBA:    %" PRIu64 "\n",
            ctx->inode_hdr.root_node_lba);
     printf("  Total nodes:      %u\n", ctx->inode_hdr.total_nodes);

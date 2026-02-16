@@ -11,6 +11,16 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Compute and store the checksum for a btree node block.
+ * The node size is derived from keys_length in the header. */
+static void compute_node_checksum(uint8_t *buf)
+{
+    struct btree_node_header *nhdr = (struct btree_node_header *)buf;
+    size_t data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
+    memset(nhdr->checksum, 0, sizeof(nhdr->checksum));
+    obmafs3_checksum_block(buf, data_size, nhdr->checksum);
+}
+
 int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
                               struct btree_header *hdr)
 {
@@ -30,6 +40,16 @@ int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
     if (hdr->magic != OBMAFS3_BTREE_HDR_MAGIC)
         return OBMAFS3_ERR_BADMAGIC;
 
+    /* Verify checksum: save stored checksum, zero field, recompute */
+    uint8_t stored[32];
+    memcpy(stored, hdr->checksum, 32);
+    memset(hdr->checksum, 0, 32);
+    uint8_t computed[32];
+    obmafs3_checksum_block(hdr, sizeof(*hdr), computed);
+    memcpy(hdr->checksum, stored, 32);
+    if (memcmp(stored, computed, 32) != 0)
+        return OBMAFS3_ERR_CHECKSUM;
+
     return OBMAFS3_OK;
 }
 
@@ -41,6 +61,12 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba,
         return OBMAFS3_ERR_NOMEM;
 
     memcpy(buf, hdr, sizeof(*hdr));
+
+    /* Compute checksum: zero field, hash the struct, store result */
+    struct btree_header *hdr_buf = (struct btree_header *)buf;
+    memset(hdr_buf->checksum, 0, sizeof(hdr_buf->checksum));
+    obmafs3_checksum_block(buf, sizeof(*hdr), hdr_buf->checksum);
+
     int rc = obmafs3_block_write(ctx, lba, buf, (size_t)ctx->sb.block_size);
     free(buf);
     return rc;
@@ -242,6 +268,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx,
         return OBMAFS3_ERR_NOMEM;
 
     memcpy(buf, entry, sizeof(*entry));
+    compute_node_checksum(buf);
     rc = obmafs3_block_write(ctx, new_lba, buf, (size_t)ctx->sb.block_size);
     free(buf);
     if (rc != OBMAFS3_OK)
@@ -278,6 +305,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx,
     memcpy(&hdr, node_buf, sizeof(hdr));
     hdr.right_link = new_lba;
     memcpy(node_buf, &hdr, sizeof(hdr));
+    compute_node_checksum(node_buf);
     rc = obmafs3_block_write(ctx, prev_lba, node_buf,
                              (size_t)ctx->sb.block_size);
     free(node_buf);
@@ -352,6 +380,7 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id,
                 memcpy(&prev_hdr, prev_buf, sizeof(prev_hdr));
                 prev_hdr.right_link = node.header.right_link;
                 memcpy(prev_buf, &prev_hdr, sizeof(prev_hdr));
+                compute_node_checksum(prev_buf);
                 rc = obmafs3_block_write(ctx, prev_lba, prev_buf,
                                          (size_t)ctx->sb.block_size);
                 free(prev_buf);
@@ -417,6 +446,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx,
             /* Update in place */
             memset(buf, 0, (size_t)ctx->sb.block_size);
             memcpy(buf, inode, sizeof(*inode));
+            compute_node_checksum(buf);
             rc = obmafs3_block_write(ctx, lba, buf,
                                      (size_t)ctx->sb.block_size);
             free(buf);
@@ -439,6 +469,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx,
         return OBMAFS3_ERR_NOMEM;
 
     memcpy(buf, inode, sizeof(*inode));
+    compute_node_checksum(buf);
     rc = obmafs3_block_write(ctx, new_lba, buf, (size_t)ctx->sb.block_size);
     free(buf);
     if (rc != OBMAFS3_OK)
@@ -474,6 +505,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx,
     memcpy(&nhdr, node_buf, sizeof(nhdr));
     nhdr.right_link = new_lba;
     memcpy(node_buf, &nhdr, sizeof(nhdr));
+    compute_node_checksum(node_buf);
     rc = obmafs3_block_write(ctx, prev_lba, node_buf,
                              (size_t)ctx->sb.block_size);
     free(node_buf);
@@ -537,6 +569,7 @@ int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
                 memcpy(&prev_hdr, prev_buf, sizeof(prev_hdr));
                 prev_hdr.right_link = node.header.right_link;
                 memcpy(prev_buf, &prev_hdr, sizeof(prev_hdr));
+                compute_node_checksum(prev_buf);
                 rc = obmafs3_block_write(ctx, prev_lba, prev_buf,
                                          (size_t)ctx->sb.block_size);
                 free(prev_buf);

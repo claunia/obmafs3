@@ -177,6 +177,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
         empty_hdr.flags = 0;
         empty_hdr.original_size = 0;
         empty_hdr.compressed_size = 0;
+        /* Checksum of zero-length data */
+        obmafs3_checksum_block(zero_block + sizeof(empty_hdr), 0,
+                               empty_hdr.checksum);
         memcpy(zero_block, &empty_hdr, sizeof(empty_hdr));
         for (uint64_t b = 0; b < new_blocks; b++) {
             rc = obmafs3_block_write(ctx, new_start + b, zero_block,
