@@ -34,8 +34,12 @@ struct obmafs3_ctx {
     int zstd_level;                  /**< ZSTD compression level (1-15) */
 };
 
+/* Open flags */
+#define OBMAFS3_OPEN_SKIP_BITMAP  0x01  /**< Do not load/validate bitmap */
+
 /* --- Context management --- */
 int  obmafs3_open(const char *path, struct obmafs3_ctx **ctx);
+int  obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx);
 void obmafs3_close(struct obmafs3_ctx *ctx);
 
 /* --- Superblock operations --- */

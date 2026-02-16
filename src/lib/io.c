@@ -61,6 +61,11 @@ int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba,
 
 int obmafs3_open(const char *path, struct obmafs3_ctx **ctx)
 {
+    return obmafs3_open_flags(path, 0, ctx);
+}
+
+int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
+{
     int fd = open(path, O_RDWR);
     if (fd < 0)
         return OBMAFS3_ERR_IO;
@@ -93,8 +98,9 @@ int obmafs3_open(const char *path, struct obmafs3_ctx **ctx)
         if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
     }
 
-    /* Load allocation bitmap */
-    if (c->sb.bitmap_lba != 0 && c->sb.bitmap_blocks != 0) {
+    /* Load allocation bitmap (skip when asked, e.g. for fsck) */
+    if (!(flags & OBMAFS3_OPEN_SKIP_BITMAP) &&
+        c->sb.bitmap_lba != 0 && c->sb.bitmap_blocks != 0) {
         rc = obmafs3_bitmap_read(c);
         if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
     }
