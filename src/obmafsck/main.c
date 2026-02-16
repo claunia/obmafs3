@@ -721,6 +721,201 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
     return bad;
 }
 
+/**
+ * Scrub dedup data blocks.
+ * Each dedup data block is a contiguous 4 MiB region (dedup_block_size)
+ * with a single block_header at the start covering all the sector data.
+ */
+static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
+{
+    if (ctx->sb.dedup_lba == 0) {
+        printf("\nDedup data block scrub:\n");
+        printf("  No dedup data blocks to scrub.\n");
+        return 0;
+    }
+
+    /* Read the tree list header */
+    uint8_t *list_buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!list_buf) {
+        fprintf(stderr, "\nError: out of memory\n");
+        return 0;
+    }
+
+    int rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, list_buf,
+                                (size_t)ctx->sb.block_size);
+    if (rc != OBMAFS3_OK) {
+        fprintf(stderr, "\nError: could not read dedup tree list: %d\n", rc);
+        free(list_buf);
+        return 0;
+    }
+
+    struct tree_list_header list_hdr;
+    memcpy(&list_hdr, list_buf, sizeof(list_hdr));
+    if (list_hdr.magic != OBMAFS3_TREELIST_MAGIC ||
+        list_hdr.tree_count == 0) {
+        free(list_buf);
+        printf("\nDedup data block scrub:\n");
+        printf("  No dedup data blocks to scrub.\n");
+        return 0;
+    }
+
+    uint64_t tree_count = list_hdr.tree_count;
+    struct tree_list_entry *entries =
+        malloc((size_t)(tree_count * sizeof(struct tree_list_entry)));
+    if (!entries) {
+        free(list_buf);
+        return 0;
+    }
+    memcpy(entries, list_buf + sizeof(struct tree_list_header),
+           (size_t)(tree_count * sizeof(struct tree_list_entry)));
+    free(list_buf);
+
+    /* Collect unique dedup data block base LBAs */
+    uint64_t *bases = NULL;
+    uint64_t base_count = 0;
+    uint64_t base_cap = 0;
+
+    uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!node_buf) {
+        free(entries);
+        return 0;
+    }
+
+    for (uint64_t t = 0; t < tree_count; t++) {
+        struct btree_header thdr;
+        rc = obmafs3_btree_header_read(ctx, entries[t].tree_lba, &thdr);
+        if (rc != OBMAFS3_OK)
+            continue;
+
+        uint64_t lba = thdr.root_node_lba;
+        while (lba != 0) {
+            rc = obmafs3_block_read(ctx, lba, node_buf,
+                                    (size_t)ctx->sb.block_size);
+            if (rc != OBMAFS3_OK)
+                break;
+
+            struct btree_node_header nhdr;
+            memcpy(&nhdr, node_buf, sizeof(nhdr));
+            if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+                break;
+
+            const uint8_t *ep = node_buf +
+                                sizeof(struct btree_node_header);
+            for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+                struct dedup_entry de;
+                memcpy(&de, ep + i * sizeof(struct dedup_entry),
+                       sizeof(de));
+                if (de.block_lba == 0)
+                    continue;
+
+                /* Check uniqueness */
+                int found = 0;
+                for (uint64_t j = 0; j < base_count; j++) {
+                    if (bases[j] == de.block_lba) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    if (base_count >= base_cap) {
+                        base_cap = (base_cap == 0) ? 256
+                                                   : base_cap * 2;
+                        uint64_t *bt = realloc(bases,
+                                               base_cap * sizeof(*bt));
+                        if (!bt) {
+                            free(node_buf); free(entries); free(bases);
+                            return 0;
+                        }
+                        bases = bt;
+                    }
+                    bases[base_count++] = de.block_lba;
+                }
+            }
+
+            lba = nhdr.right_link;
+        }
+    }
+
+    free(node_buf);
+    free(entries);
+
+    if (base_count == 0) {
+        printf("\nDedup data block scrub:\n");
+        printf("  No dedup data blocks to scrub.\n");
+        free(bases);
+        return 0;
+    }
+
+    printf("\nDedup data block scrub:\n");
+    printf("  Blocks to verify: %" PRIu64 "\n", base_count);
+
+    size_t dedup_size = (size_t)ctx->sb.dedup_block_size;
+    uint8_t *buf = calloc(1, dedup_size);
+    if (!buf) {
+        fprintf(stderr, "  Error: out of memory\n");
+        free(bases);
+        return 0;
+    }
+
+    uint64_t bad = 0;
+    uint64_t bad_magic = 0;
+    uint64_t bad_checksum = 0;
+    uint64_t read_errors = 0;
+
+    for (uint64_t i = 0; i < base_count; i++) {
+        if (i % 4 == 0 || i == base_count - 1)
+            print_progress(i + 1, base_count, bad);
+
+        rc = obmafs3_block_read(ctx, bases[i], buf, dedup_size);
+        if (rc != OBMAFS3_OK) {
+            read_errors++;
+            bad++;
+            continue;
+        }
+
+        struct block_header bhdr;
+        memcpy(&bhdr, buf, sizeof(bhdr));
+
+        if (bhdr.magic != OBMAFS3_BLOCK_MAGIC) {
+            bad_magic++;
+            bad++;
+            continue;
+        }
+
+        /* Checksum covers original_size bytes after the header */
+        size_t check_size = (size_t)bhdr.original_size;
+        if (check_size > dedup_size - sizeof(bhdr))
+            check_size = dedup_size - sizeof(bhdr);
+
+        uint8_t computed[32];
+        obmafs3_checksum_block(buf + sizeof(bhdr), check_size, computed);
+
+        if (memcmp(computed, bhdr.checksum, 32) != 0) {
+            bad_checksum++;
+            bad++;
+        }
+    }
+
+    print_progress(base_count, base_count, bad);
+    fprintf(stderr, "\n");
+
+    if (bad == 0) {
+        printf("  Result:           OK\n");
+    } else {
+        printf("  Result:           %" PRIu64 " error(s)\n", bad);
+        if (read_errors > 0)
+            printf("    Read errors:    %" PRIu64 "\n", read_errors);
+        if (bad_magic > 0)
+            printf("    Bad magic:      %" PRIu64 "\n", bad_magic);
+        if (bad_checksum > 0)
+            printf("    Bad checksum:   %" PRIu64 "\n", bad_checksum);
+    }
+
+    free(buf);
+    free(bases);
+    return bad;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
@@ -1177,6 +1372,10 @@ int main(int argc, char *argv[])
         uint64_t scrub_bad = scrub_data_blocks(ctx);
         if (scrub_bad > 0)
             errors += (int)scrub_bad;
+
+        uint64_t dedup_bad = scrub_dedup_data_blocks(ctx);
+        if (dedup_bad > 0)
+            errors += (int)dedup_bad;
     }
 
     /* ---- Summary ---- */
