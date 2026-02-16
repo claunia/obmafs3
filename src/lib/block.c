@@ -26,6 +26,275 @@ int obmafs3_decompress(const void *src, size_t src_size,
     return OBMAFS3_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Overflow extent tree helpers                                       */
+/* ------------------------------------------------------------------ */
+
+/** Compute and store the checksum for a btree node block. */
+static void compute_node_checksum(uint8_t *buf)
+{
+    struct btree_node_header *nhdr = (struct btree_node_header *)buf;
+    size_t data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
+    memset(nhdr->checksum, 0, sizeof(nhdr->checksum));
+    obmafs3_checksum_block(buf, data_size, nhdr->checksum);
+}
+
+/** Maximum number of overflow_extent records that fit in one node. */
+static uint16_t overflow_max_keys(const struct obmafs3_ctx *ctx)
+{
+    return (uint16_t)((ctx->sb.block_size - sizeof(struct btree_node_header))
+                      / sizeof(struct overflow_extent));
+}
+
+/**
+ * Insert an extent into the overflow tree for a given inode.
+ * Uses multi-key nodes linked via right_link, same pattern as dedup nodes.
+ */
+static int overflow_insert(struct obmafs3_ctx *ctx,
+                           const struct overflow_extent *entry)
+{
+    struct btree_header *hdr = &ctx->overflow_hdr;
+    uint64_t hdr_lba = ctx->sb.overflow_lba;
+    uint16_t max_keys = overflow_max_keys(ctx);
+    int rc;
+
+    /* If the tree has no root node yet, allocate one */
+    if (hdr->root_node_lba == 0) {
+        uint64_t root_lba;
+        rc = obmafs3_alloc_block(ctx, &root_lba);
+        if (rc != OBMAFS3_OK)
+            return rc;
+
+        uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
+        if (!node_buf)
+            return OBMAFS3_ERR_NOMEM;
+
+        struct btree_node_header nhdr;
+        memset(&nhdr, 0, sizeof(nhdr));
+        nhdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+        nhdr.record_type = kBtreeDataTypeExtent;
+        nhdr.node_keys   = 1;
+        nhdr.keys_length = (uint16_t)sizeof(struct overflow_extent);
+        memcpy(node_buf, &nhdr, sizeof(nhdr));
+        memcpy(node_buf + sizeof(nhdr), entry, sizeof(*entry));
+        compute_node_checksum(node_buf);
+
+        rc = obmafs3_block_write(ctx, root_lba, node_buf,
+                                 (size_t)ctx->sb.block_size);
+        free(node_buf);
+        if (rc != OBMAFS3_OK)
+            return rc;
+
+        hdr->root_node_lba = root_lba;
+        hdr->total_nodes   = 1;
+        return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+    }
+
+    /* Walk to the last node in the linked list */
+    uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!node_buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t lba = hdr->root_node_lba;
+    uint64_t last_lba = lba;
+
+    while (lba != 0) {
+        rc = obmafs3_block_read(ctx, lba, node_buf,
+                                (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            free(node_buf);
+            return rc;
+        }
+        last_lba = lba;
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, node_buf, sizeof(nhdr));
+        if (nhdr.right_link == 0)
+            break;
+        lba = nhdr.right_link;
+    }
+
+    /* Check if the last node has room */
+    struct btree_node_header nhdr;
+    memcpy(&nhdr, node_buf, sizeof(nhdr));
+
+    if (nhdr.node_keys < max_keys) {
+        /* Append in place */
+        size_t offset = sizeof(struct btree_node_header)
+                        + nhdr.node_keys * sizeof(struct overflow_extent);
+        memcpy(node_buf + offset, entry, sizeof(*entry));
+        nhdr.node_keys++;
+        nhdr.keys_length = (uint16_t)(nhdr.node_keys *
+                                      sizeof(struct overflow_extent));
+        memcpy(node_buf, &nhdr, sizeof(nhdr));
+        compute_node_checksum(node_buf);
+        rc = obmafs3_block_write(ctx, last_lba, node_buf,
+                                 (size_t)ctx->sb.block_size);
+        free(node_buf);
+        return rc;
+    }
+
+    /* Last node full — allocate a new one */
+    uint64_t new_lba;
+    rc = obmafs3_alloc_block(ctx, &new_lba);
+    if (rc != OBMAFS3_OK) {
+        free(node_buf);
+        return rc;
+    }
+
+    uint8_t *new_buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!new_buf) {
+        free(node_buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    struct btree_node_header new_hdr;
+    memset(&new_hdr, 0, sizeof(new_hdr));
+    new_hdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    new_hdr.record_type = kBtreeDataTypeExtent;
+    new_hdr.node_keys   = 1;
+    new_hdr.keys_length = (uint16_t)sizeof(struct overflow_extent);
+    memcpy(new_buf, &new_hdr, sizeof(new_hdr));
+    memcpy(new_buf + sizeof(new_hdr), entry, sizeof(*entry));
+    compute_node_checksum(new_buf);
+
+    rc = obmafs3_block_write(ctx, new_lba, new_buf,
+                             (size_t)ctx->sb.block_size);
+    free(new_buf);
+    if (rc != OBMAFS3_OK) {
+        free(node_buf);
+        return rc;
+    }
+
+    /* Link the previous last node to the new one */
+    nhdr.right_link = new_lba;
+    memcpy(node_buf, &nhdr, sizeof(nhdr));
+    compute_node_checksum(node_buf);
+    rc = obmafs3_block_write(ctx, last_lba, node_buf,
+                             (size_t)ctx->sb.block_size);
+    free(node_buf);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    hdr->total_nodes++;
+    return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+}
+
+/**
+ * Search the overflow tree for extents belonging to the given inode
+ * and map a logical block number to a physical LBA.
+ *
+ * Inline extents cover logical blocks 0..inline_block_count-1.
+ * Overflow extents continue from there: the first overflow extent
+ * covers logical blocks starting at inline_block_count.
+ *
+ * Returns 1 if found (phys_lba set), 0 if not found.
+ */
+static int overflow_find_phys(struct obmafs3_ctx *ctx,
+                              uint64_t inode_id,
+                              uint64_t logical_block,
+                              uint64_t inline_block_count,
+                              uint64_t *phys_lba)
+{
+    struct btree_header *hdr = &ctx->overflow_hdr;
+    if (hdr->root_node_lba == 0)
+        return 0;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return 0;
+
+    uint64_t lba = hdr->root_node_lba;
+    uint64_t ovf_block_count = inline_block_count;
+
+    while (lba != 0) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            free(buf);
+            return 0;
+        }
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf);
+            return 0;
+        }
+
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+            struct overflow_extent oe;
+            memcpy(&oe, entries + i * sizeof(struct overflow_extent),
+                   sizeof(oe));
+            if (oe.inode_id != inode_id)
+                continue;
+
+            if (logical_block >= ovf_block_count &&
+                logical_block < ovf_block_count + oe.block_count) {
+                *phys_lba = oe.start_block +
+                            (logical_block - ovf_block_count);
+                free(buf);
+                return 1;
+            }
+            ovf_block_count += oe.block_count;
+        }
+
+        lba = nhdr.right_link;
+    }
+
+    free(buf);
+    return 0;
+}
+
+/**
+ * Count the total number of blocks stored in overflow extents for an inode.
+ */
+static uint64_t overflow_count_blocks(struct obmafs3_ctx *ctx,
+                                      uint64_t inode_id)
+{
+    struct btree_header *hdr = &ctx->overflow_hdr;
+    if (hdr->root_node_lba == 0)
+        return 0;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return 0;
+
+    uint64_t total = 0;
+    uint64_t lba = hdr->root_node_lba;
+
+    while (lba != 0) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK)
+            break;
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+            break;
+
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+            struct overflow_extent oe;
+            memcpy(&oe, entries + i * sizeof(struct overflow_extent),
+                   sizeof(oe));
+            if (oe.inode_id == inode_id)
+                total += oe.block_count;
+        }
+
+        lba = nhdr.right_link;
+    }
+
+    free(buf);
+    return total;
+}
+
+/* ------------------------------------------------------------------ */
+/*  File data reading                                                  */
+/* ------------------------------------------------------------------ */
+
 int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
                            const struct btree_node_inode *inode,
                            uint64_t offset, void *buf, size_t size)
@@ -71,6 +340,13 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
                 break;
             }
             block_count_so_far += inode->extents[i].block_count;
+        }
+
+        /* If not found in inline extents, check overflow tree */
+        if (!found) {
+            found = overflow_find_phys(ctx, inode->inode_id,
+                                       logical_block, block_count_so_far,
+                                       &phys_lba);
         }
 
         if (!found) {
@@ -171,11 +447,12 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
     uint64_t total_blocks_needed =
         (inode->file_size + data_capacity - 1) / data_capacity;
 
-    /* Count existing allocated blocks */
+    /* Count existing allocated blocks (inline + overflow) */
     uint64_t existing_blocks = 0;
     int i;
     for (i = 0; i < 8; i++)
         existing_blocks += inode->extents[i].block_count;
+    existing_blocks += overflow_count_blocks(ctx, inode->inode_id);
 
     /* Allocate additional blocks if needed */
     if (total_blocks_needed > existing_blocks) {
@@ -226,8 +503,16 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
                 break;
             }
         }
-        if (!added)
-            return OBMAFS3_ERR_NOSPC; /* No room in inode extents */
+        if (!added) {
+            /* Inline extents full — store in overflow tree */
+            struct overflow_extent oe;
+            oe.inode_id    = inode->inode_id;
+            oe.start_block = new_start;
+            oe.block_count = new_blocks;
+            rc = overflow_insert(ctx, &oe);
+            if (rc != OBMAFS3_OK)
+                return rc;
+        }
     }
 
     /* Now write the data into the appropriate blocks */
@@ -256,6 +541,13 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
                 break;
             }
             block_count_so_far += inode->extents[i].block_count;
+        }
+
+        /* If not found in inline extents, check overflow tree */
+        if (!found) {
+            found = overflow_find_phys(ctx, inode->inode_id,
+                                       logical_block, block_count_so_far,
+                                       &phys_lba);
         }
 
         if (!found) {
