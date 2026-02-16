@@ -86,16 +86,41 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     rc = obmafs3_sb_validate(&c->sb);
     if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
 
-    rc = obmafs3_btree_header_read(c, c->sb.catalog_lba, &c->catalog_hdr);
-    if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+    if (flags & OBMAFS3_OPEN_LENIENT) {
+        int cs_ok;
+        rc = obmafs3_btree_header_read_lenient(c, c->sb.catalog_lba,
+                                               &c->catalog_hdr, &cs_ok);
+        if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+            close(fd); free(c); return rc;
+        }
 
-    rc = obmafs3_btree_header_read(c, c->sb.inode_lba, &c->inode_hdr);
-    if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        rc = obmafs3_btree_header_read_lenient(c, c->sb.inode_lba,
+                                               &c->inode_hdr, &cs_ok);
+        if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+            close(fd); free(c); return rc;
+        }
 
-    if (c->sb.overflow_lba != 0) {
-        rc = obmafs3_btree_header_read(c, c->sb.overflow_lba,
-                                       &c->overflow_hdr);
+        if (c->sb.overflow_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.overflow_lba,
+                                                   &c->overflow_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
+    } else {
+        rc = obmafs3_btree_header_read(c, c->sb.catalog_lba,
+                                       &c->catalog_hdr);
         if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+
+        rc = obmafs3_btree_header_read(c, c->sb.inode_lba, &c->inode_hdr);
+        if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+
+        if (c->sb.overflow_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.overflow_lba,
+                                           &c->overflow_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
     }
 
     /* Load allocation bitmap (skip when asked, e.g. for fsck) */

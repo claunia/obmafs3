@@ -24,6 +24,17 @@ static void compute_node_checksum(uint8_t *buf)
 int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
                               struct btree_header *hdr)
 {
+    int cs_ok = 0;
+    int rc = obmafs3_btree_header_read_lenient(ctx, lba, hdr, &cs_ok);
+    if (rc != OBMAFS3_OK)
+        return rc;
+    return cs_ok ? OBMAFS3_OK : OBMAFS3_ERR_CHECKSUM;
+}
+
+int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba,
+                                      struct btree_header *hdr,
+                                      int *checksum_ok)
+{
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if (!buf)
         return OBMAFS3_ERR_NOMEM;
@@ -47,8 +58,7 @@ int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
     uint8_t computed[32];
     obmafs3_checksum_block(hdr, sizeof(*hdr), computed);
     memcpy(hdr->checksum, stored, 32);
-    if (memcmp(stored, computed, 32) != 0)
-        return OBMAFS3_ERR_CHECKSUM;
+    *checksum_ok = (memcmp(stored, computed, 32) == 0);
 
     return OBMAFS3_OK;
 }

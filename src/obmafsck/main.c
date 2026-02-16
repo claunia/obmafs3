@@ -356,9 +356,12 @@ int main(int argc, char *argv[])
 
     const char *path = argv[optind];
 
-    /* ---- Open the filesystem (skip bitmap so we can check it ourselves) ---- */
+    /* ---- Open the filesystem (skip bitmap, tolerate checksum errors) ---- */
     struct obmafs3_ctx *ctx;
-    int rc = obmafs3_open_flags(path, OBMAFS3_OPEN_SKIP_BITMAP, &ctx);
+    int rc = obmafs3_open_flags(path,
+                                OBMAFS3_OPEN_SKIP_BITMAP |
+                                OBMAFS3_OPEN_LENIENT,
+                                &ctx);
     if (rc != OBMAFS3_OK) {
         fprintf(stderr, "Error: failed to open filesystem: %d\n", rc);
         return 1;
@@ -384,7 +387,14 @@ int main(int argc, char *argv[])
            ctx->catalog_hdr.magic,
            ctx->catalog_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
                ? "OK" : "BAD");
-    printf("  Header checksum:  OK\n");
+    {
+        int cat_hdr_cs_ok = 0;
+        obmafs3_btree_header_read_lenient(ctx, ctx->sb.catalog_lba,
+                                          &ctx->catalog_hdr,
+                                          &cat_hdr_cs_ok);
+        printf("  Header checksum:  %s\n", cat_hdr_cs_ok ? "OK" : "BAD");
+        if (!cat_hdr_cs_ok) errors++;
+    }
     printf("  Root node LBA:    %" PRIu64 "\n",
            ctx->catalog_hdr.root_node_lba);
     printf("  Total nodes:      %u\n", ctx->catalog_hdr.total_nodes);
@@ -407,7 +417,14 @@ int main(int argc, char *argv[])
            ctx->inode_hdr.magic,
            ctx->inode_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
                ? "OK" : "BAD");
-    printf("  Header checksum:  OK\n");
+    {
+        int ino_hdr_cs_ok = 0;
+        obmafs3_btree_header_read_lenient(ctx, ctx->sb.inode_lba,
+                                          &ctx->inode_hdr,
+                                          &ino_hdr_cs_ok);
+        printf("  Header checksum:  %s\n", ino_hdr_cs_ok ? "OK" : "BAD");
+        if (!ino_hdr_cs_ok) errors++;
+    }
     printf("  Root node LBA:    %" PRIu64 "\n",
            ctx->inode_hdr.root_node_lba);
     printf("  Total nodes:      %u\n", ctx->inode_hdr.total_nodes);
@@ -431,7 +448,15 @@ int main(int argc, char *argv[])
                ctx->overflow_hdr.magic,
                ctx->overflow_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
                    ? "OK" : "BAD");
-        printf("  Header checksum:  OK\n");
+        {
+            int ovf_hdr_cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.overflow_lba,
+                                              &ctx->overflow_hdr,
+                                              &ovf_hdr_cs_ok);
+            printf("  Header checksum:  %s\n",
+                   ovf_hdr_cs_ok ? "OK" : "BAD");
+            if (!ovf_hdr_cs_ok) errors++;
+        }
 
         if (ctx->overflow_hdr.root_node_lba != 0) {
             uint64_t ovf_bad = 0;
