@@ -156,6 +156,75 @@ static int collect_inode_data_blocks(struct obmafs3_ctx *ctx,
     return OBMAFS3_OK;
 }
 
+/**
+ * Walk the overflow tree and collect all data blocks referenced by
+ * overflow_extent entries.
+ */
+static int collect_overflow_data_blocks(struct obmafs3_ctx *ctx,
+                                        uint64_t **out_lbas,
+                                        uint64_t *out_count)
+{
+    *out_lbas = NULL;
+    *out_count = 0;
+
+    if (ctx->overflow_hdr.root_node_lba == 0)
+        return OBMAFS3_OK;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t *lbas = NULL;
+    uint64_t count = 0;
+    uint64_t cap = 0;
+    uint64_t lba = ctx->overflow_hdr.root_node_lba;
+
+    while (lba != 0) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            free(buf); free(lbas); return rc;
+        }
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); free(lbas); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+            struct overflow_extent oe;
+            memcpy(&oe, entries + i * sizeof(struct overflow_extent),
+                   sizeof(oe));
+            for (uint64_t b = 0; b < oe.block_count; b++) {
+                if (count >= cap) {
+                    cap = (cap == 0) ? 128 : cap * 2;
+                    uint64_t *tmp = realloc(lbas, cap * sizeof(*tmp));
+                    if (!tmp) {
+                        free(buf); free(lbas);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                    lbas = tmp;
+                }
+                lbas[count++] = oe.start_block + b;
+            }
+        }
+
+        lba = nhdr.right_link;
+    }
+
+    free(buf);
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Build expected bitmap                                              */
 /* ------------------------------------------------------------------ */
@@ -248,6 +317,37 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
         } else {
             fprintf(stderr,
                     "Warning: could not collect inode data blocks\n");
+        }
+    }
+
+    /* File data blocks from overflow extents */
+    {
+        uint64_t *ovf_data_lbas = NULL;
+        uint64_t ovf_data_count = 0;
+        int rc = collect_overflow_data_blocks(ctx, &ovf_data_lbas,
+                                              &ovf_data_count);
+        if (rc == OBMAFS3_OK) {
+            for (uint64_t i = 0; i < ovf_data_count; i++)
+                MARK(ovf_data_lbas[i]);
+            free(ovf_data_lbas);
+        } else {
+            fprintf(stderr,
+                    "Warning: could not collect overflow data blocks\n");
+        }
+    }
+
+    /* Dedup tree blocks: headers, nodes, and data blocks */
+    {
+        uint64_t *dedup_lbas = NULL;
+        uint64_t dedup_count = 0;
+        int rc = collect_dedup_blocks(ctx, &dedup_lbas, &dedup_count);
+        if (rc == OBMAFS3_OK) {
+            for (uint64_t i = 0; i < dedup_count; i++)
+                MARK(dedup_lbas[i]);
+            free(dedup_lbas);
+        } else {
+            fprintf(stderr,
+                    "Warning: could not collect dedup tree blocks\n");
         }
     }
 
@@ -354,6 +454,24 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
     if (rc != OBMAFS3_OK) {
         fprintf(stderr, "\nError: could not collect data block LBAs: %d\n", rc);
         return 0;
+    }
+
+    /* Also collect overflow data blocks */
+    uint64_t *ovf_lbas = NULL;
+    uint64_t ovf_count = 0;
+    rc = collect_overflow_data_blocks(ctx, &ovf_lbas, &ovf_count);
+    if (rc == OBMAFS3_OK && ovf_count > 0) {
+        uint64_t *tmp = realloc(data_lbas,
+                                (data_count + ovf_count) * sizeof(*tmp));
+        if (tmp) {
+            data_lbas = tmp;
+            memcpy(data_lbas + data_count, ovf_lbas,
+                   ovf_count * sizeof(*ovf_lbas));
+            data_count += ovf_count;
+        }
+        free(ovf_lbas);
+    } else {
+        free(ovf_lbas);
     }
 
     if (data_count == 0) {
