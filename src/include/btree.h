@@ -54,6 +54,9 @@ struct __attribute__((packed)) btree_node_inode {
     uint64_t file_size;          /**< File size in bytes */
     struct extent_run extents[8];/**< Array of extent runs for file data */
     uint8_t  file_type;          /**< Type of file (regular, media image, etc.) */
+    uint64_t sector_count;       /**< Total number of sectors in the media image */
+    uint64_t sector_map_size;    /**< Number of sector_map_entries written so far */
+};
 };
 
 #endif /* OBMAFS3_BTREE_H */
