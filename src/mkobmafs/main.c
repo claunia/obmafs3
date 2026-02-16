@@ -58,7 +58,7 @@ static void usage(const char *prog)
         "Options:\n"
         "  -s, --size <bytes>         Total filesystem size (default: file size, or 1 GiB)\n"
         "  -b, --block-size <bytes>   Block size (default: 4096)\n"
-        "  -d, --dedup-size <bytes>   Dedup block size (default: 4096)\n"
+        "  -d, --dedup-size <bytes>   Dedup block size (default: 4194304)\n"
         "  -l, --label <name>         Volume label (default: OBMAFS3)\n"
         "  -g, --guid <uuid>          Filesystem GUID (default: random)\n"
         "  -h, --help                 Show this help\n",
