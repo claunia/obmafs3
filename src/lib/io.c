@@ -138,7 +138,7 @@ static int write_block(int fd, uint64_t block_size, uint64_t lba,
 
 int obmafs3_create(const char *path, uint64_t total_size,
                    uint64_t block_size, uint64_t dedup_block_size,
-                   const char *label)
+                   const char *label, const uint8_t *guid)
 {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
@@ -155,7 +155,10 @@ int obmafs3_create(const char *path, uint64_t total_size,
     struct obmafs3_sb sb;
     memset(&sb, 0, sizeof(sb));
     sb.magic           = OBMAFS3_SB_MAGIC;
-    generate_guid(sb.guid);
+    if (guid)
+        memcpy(sb.guid, guid, 16);
+    else
+        generate_guid(sb.guid);
     sb.block_size      = block_size;
     sb.dedup_block_size = dedup_block_size;
     sb.total_bytes     = total_size;

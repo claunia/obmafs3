@@ -11,6 +11,39 @@
 #include <string.h>
 #include <unistd.h>
 
+static int parse_guid(const char *str, uint8_t *out)
+{
+    /* Accept xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or 32 hex chars */
+    uint8_t tmp[16];
+    int idx = 0;
+    const char *p = str;
+
+    while (*p && idx < 16) {
+        if (*p == '-') { p++; continue; }
+        if (!((p[0] >= '0' && p[0] <= '9') ||
+              (p[0] >= 'a' && p[0] <= 'f') ||
+              (p[0] >= 'A' && p[0] <= 'F')) ||
+            !p[1] ||
+            !((p[1] >= '0' && p[1] <= '9') ||
+              (p[1] >= 'a' && p[1] <= 'f') ||
+              (p[1] >= 'A' && p[1] <= 'F')))
+            return -1;
+        unsigned int byte;
+        if (sscanf(p, "%2x", &byte) != 1)
+            return -1;
+        tmp[idx++] = (uint8_t)byte;
+        p += 2;
+    }
+    if (idx != 16)
+        return -1;
+    /* Skip trailing dashes */
+    while (*p == '-') p++;
+    if (*p != '\0')
+        return -1;
+    memcpy(out, tmp, 16);
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -21,6 +54,7 @@ static void usage(const char *prog)
         "  -b, --block-size <bytes>   Block size (default: 4096)\n"
         "  -d, --dedup-size <bytes>   Dedup block size (default: 4096)\n"
         "  -l, --label <name>         Volume label (default: OBMAFS3)\n"
+        "  -g, --guid <uuid>          Filesystem GUID (default: random)\n"
         "  -h, --help                 Show this help\n",
         prog);
 }
@@ -32,6 +66,7 @@ int main(int argc, char *argv[])
         {"block-size", required_argument, NULL, 'b'},
         {"dedup-size", required_argument, NULL, 'd'},
         {"label",      required_argument, NULL, 'l'},
+        {"guid",       required_argument, NULL, 'g'},
         {"help",       no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -40,16 +75,26 @@ int main(int argc, char *argv[])
     uint64_t block_size      = OBMAFS3_DEFAULT_BLOCK_SIZE;
     uint64_t dedup_block_size = OBMAFS3_DEFAULT_DEDUP_BLOCK_SIZE;
     const char *label        = "OBMAFS3";
+    uint8_t guid[16];
+    int have_guid            = 0;
     const char *path;
     int opt;
 
-    while ((opt = getopt_long(argc, argv, "s:b:d:l:h",
+    while ((opt = getopt_long(argc, argv, "s:b:d:l:g:h",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': total_size      = strtoull(optarg, NULL, 0); break;
         case 'b': block_size      = strtoull(optarg, NULL, 0); break;
         case 'd': dedup_block_size = strtoull(optarg, NULL, 0); break;
         case 'l': label           = optarg;                    break;
+        case 'g':
+            if (parse_guid(optarg, guid) != 0) {
+                fprintf(stderr, "Error: invalid GUID format: %s\n", optarg);
+                fprintf(stderr, "Expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n");
+                return 1;
+            }
+            have_guid = 1;
+            break;
         case 'h':
         default:
             usage(argv[0]);
@@ -79,7 +124,8 @@ int main(int argc, char *argv[])
     }
 
     int rc = obmafs3_create(path, total_size, block_size,
-                            dedup_block_size, label);
+                            dedup_block_size, label,
+                            have_guid ? guid : NULL);
     if (rc != OBMAFS3_OK) {
         fprintf(stderr, "Error: failed to create filesystem (rc=%d)\n", rc);
         return 1;

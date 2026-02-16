@@ -116,7 +116,7 @@ int obmafs3_decompress(const void *src, size_t src_size,
 /* --- Filesystem creation --- */
 int obmafs3_create(const char *path, uint64_t total_size,
                    uint64_t block_size, uint64_t dedup_block_size,
-                   const char *label);
+                   const char *label, const uint8_t *guid);
 
 /* --- Filesystem checking --- */
 int obmafs3_check(const char *path);
