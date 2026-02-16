@@ -331,7 +331,18 @@ static int obmafs3_fuse_read(const char *path, char *buf, size_t size,
     if ((uint64_t)offset + size > inode.file_size)
         size = (size_t)(inode.file_size - (uint64_t)offset);
 
-    rc = obmafs3_read_file_data(g_ctx, &inode, (uint64_t)offset, buf, size);
+    if (inode.file_type == kFileTypeMediaImage) {
+        uint16_t ss = lookup_disk_image_sector_size(name);
+        if (ss == 0)
+            return -EINVAL;
+        rc = obmafs3_read_media_image_data(g_ctx, &inode,
+                                           (uint64_t)offset, buf,
+                                           size, ss);
+    } else {
+        rc = obmafs3_read_file_data(g_ctx, &inode, (uint64_t)offset,
+                                    buf, size);
+    }
+
     if (rc != OBMAFS3_OK)
         return -EIO;
 
@@ -403,10 +414,11 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     new_inode.access_time       = now;
     new_inode.file_size         = 0;
     new_inode.file_type         = kFileTypeRegular;
+    new_inode.sector_count      = 0;
+    new_inode.sector_map_size   = 0;
 
     /* Check if this file should be treated as a media/disk image */
-    uint16_t img_sector_size = lookup_disk_image_sector_size(name);
-    if (img_sector_size > 0)
+    if (lookup_disk_image_sector_size(name) > 0)
         new_inode.file_type = kFileTypeMediaImage;
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
@@ -440,15 +452,23 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    rc = obmafs3_write_file_data(g_ctx, &inode,
-                                 (uint64_t)offset, buf, size);
+    if (inode.file_type == kFileTypeMediaImage) {
+        uint16_t ss = lookup_disk_image_sector_size(name);
+        if (ss == 0)
+            return -EINVAL;
+        rc = obmafs3_write_media_image_data(g_ctx, &inode,
+                                            (uint64_t)offset, buf,
+                                            size, ss);
+    } else {
+        rc = obmafs3_write_file_data(g_ctx, &inode,
+                                     (uint64_t)offset, buf, size);
+    }
+
     if (rc == OBMAFS3_ERR_NOSPC)
         return -ENOSPC;
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    /* Update inode timestamps and size */
-    inode.modification_time = (uint64_t)time(NULL);
     rc = obmafs3_inode_put(g_ctx, &inode);
     if (rc != OBMAFS3_OK)
         return -EIO;

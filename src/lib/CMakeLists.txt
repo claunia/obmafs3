@@ -4,6 +4,7 @@ add_library(obmafs STATIC
     bitmap.c
     block.c
     checksum.c
+    dedup.c
     io.c
 )
 
