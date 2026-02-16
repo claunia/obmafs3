@@ -9,7 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <linux/fs.h>   /* BLKGETSIZE64 */
+#endif
 
 static int parse_guid(const char *str, uint8_t *out)
 {
@@ -110,14 +116,30 @@ int main(int argc, char *argv[])
 
     path = argv[optind];
 
-    /* Determine size from existing file if not specified */
+    /* Determine size from existing file or device if not specified */
     if (total_size == 0) {
-        int fd = open(path, O_RDONLY);
-        if (fd >= 0) {
-            off_t end = lseek(fd, 0, SEEK_END);
-            if (end > 0)
-                total_size = (uint64_t)end;
-            close(fd);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            if (S_ISREG(st.st_mode) && st.st_size > 0) {
+                total_size = (uint64_t)st.st_size;
+            } else if (S_ISBLK(st.st_mode)) {
+#ifdef BLKGETSIZE64
+                int fd = open(path, O_RDONLY);
+                if (fd >= 0) {
+                    uint64_t dev_size = 0;
+                    if (ioctl(fd, BLKGETSIZE64, &dev_size) == 0 &&
+                        dev_size > 0)
+                        total_size = dev_size;
+                    close(fd);
+                }
+#endif
+                if (total_size == 0) {
+                    fprintf(stderr,
+                        "Error: cannot determine size of block device %s\n",
+                        path);
+                    return 1;
+                }
+            }
         }
         if (total_size == 0)
             total_size = 1ULL * 1024 * 1024 * 1024;  /* 1 GiB */

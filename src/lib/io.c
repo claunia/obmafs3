@@ -140,11 +140,20 @@ int obmafs3_create(const char *path, uint64_t total_size,
                    uint64_t block_size, uint64_t dedup_block_size,
                    const char *label, const uint8_t *guid)
 {
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    struct stat st;
+    int is_blkdev = 0;
+    int fd;
+
+    if (stat(path, &st) == 0 && S_ISBLK(st.st_mode)) {
+        is_blkdev = 1;
+        fd = open(path, O_RDWR);
+    } else {
+        fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    }
     if (fd < 0)
         return OBMAFS3_ERR_IO;
 
-    if (ftruncate(fd, (off_t)total_size) < 0) {
+    if (!is_blkdev && ftruncate(fd, (off_t)total_size) < 0) {
         close(fd);
         return OBMAFS3_ERR_IO;
     }
