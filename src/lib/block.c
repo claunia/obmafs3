@@ -98,22 +98,37 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
              * the current write path but handle gracefully */
             data_ptr = block_buf;
             data_len = (size_t)block_size;
-        } else if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) {
-            rc = obmafs3_decompress(
-                block_buf + sizeof(bhdr),
-                (size_t)bhdr.compressed_size,
-                decomp_buf,
-                (size_t)bhdr.original_size);
-            if (rc != OBMAFS3_OK) {
+        } else {
+            /* Verify checksum over on-disk data after header */
+            size_t check_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                    ? (size_t)bhdr.compressed_size
+                                    : (size_t)bhdr.original_size;
+            uint8_t computed[32];
+            obmafs3_checksum_block(block_buf + sizeof(bhdr),
+                                   check_size, computed);
+            if (memcmp(computed, bhdr.checksum, 32) != 0) {
                 free(block_buf);
                 free(decomp_buf);
-                return rc;
+                return OBMAFS3_ERR_CHECKSUM;
             }
-            data_ptr = decomp_buf;
-            data_len = (size_t)bhdr.original_size;
-        } else {
-            data_ptr = block_buf + sizeof(bhdr);
-            data_len = (size_t)bhdr.original_size;
+
+            if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) {
+                rc = obmafs3_decompress(
+                    block_buf + sizeof(bhdr),
+                    (size_t)bhdr.compressed_size,
+                    decomp_buf,
+                    (size_t)bhdr.original_size);
+                if (rc != OBMAFS3_OK) {
+                    free(block_buf);
+                    free(decomp_buf);
+                    return rc;
+                }
+                data_ptr = decomp_buf;
+                data_len = (size_t)bhdr.original_size;
+            } else {
+                data_ptr = block_buf + sizeof(bhdr);
+                data_len = (size_t)bhdr.original_size;
+            }
         }
 
         /* Copy data from the block at the correct offset */
@@ -301,8 +316,8 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
                     bhdr.compression_type = kCompressionZstd;
                     bhdr.compressed_size = comp_size;
                     obmafs3_checksum_block(
-                        block_buf + sizeof(struct block_header),
-                        (size_t)block_data_end, bhdr.checksum);
+                        comp_block + sizeof(struct block_header),
+                        comp_size, bhdr.checksum);
                     memcpy(comp_block, &bhdr, sizeof(bhdr));
                     /* Zero-fill remainder of the block */
                     size_t used = sizeof(struct block_header) + comp_size;
