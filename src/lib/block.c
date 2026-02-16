@@ -8,9 +8,9 @@
 #include <string.h>
 
 int obmafs3_compress(const void *src, size_t src_size,
-                     void *dst, size_t *dst_size)
+                     void *dst, size_t *dst_size, int level)
 {
-    size_t result = ZSTD_compress(dst, *dst_size, src, src_size, 3);
+    size_t result = ZSTD_compress(dst, *dst_size, src, src_size, level);
     if (ZSTD_isError(result))
         return OBMAFS3_ERR_IO;
     *dst_size = result;
@@ -31,10 +31,10 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
                            uint64_t offset, void *buf, size_t size)
 {
     uint64_t block_size = ctx->sb.block_size;
+    size_t data_capacity = (size_t)block_size - sizeof(struct block_header);
     size_t bytes_read = 0;
     uint8_t *block_buf;
     uint8_t *decomp_buf;
-    int i;
 
     if (offset >= inode->file_size)
         return OBMAFS3_OK;
@@ -50,80 +50,83 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
         return OBMAFS3_ERR_NOMEM;
     }
 
-    for (i = 0; i < 8 && bytes_read < size; i++) {
-        const struct extent_run *ext = &inode->extents[i];
-        uint64_t b;
+    while (bytes_read < size) {
+        uint64_t read_pos = offset + bytes_read;
+        uint64_t logical_block = read_pos / data_capacity;
+        size_t offset_in_block = (size_t)(read_pos % data_capacity);
 
-        if (ext->block_count == 0)
-            continue;
-
-        for (b = 0; b < ext->block_count && bytes_read < size; b++) {
-            uint64_t block_lba = ext->start_block + b;
-            uint64_t block_byte_start = block_lba * block_size;
-            struct block_header bhdr;
-            size_t copy_offset = 0;
-            size_t copy_size;
-            int rc;
-
-            if (block_byte_start + block_size <= offset)
+        /* Map logical block to physical LBA via extents */
+        uint64_t phys_lba = 0;
+        uint64_t block_count_so_far = 0;
+        int found = 0;
+        int i;
+        for (i = 0; i < 8; i++) {
+            if (inode->extents[i].block_count == 0)
                 continue;
+            if (logical_block < block_count_so_far +
+                                    inode->extents[i].block_count) {
+                phys_lba = inode->extents[i].start_block +
+                           (logical_block - block_count_so_far);
+                found = 1;
+                break;
+            }
+            block_count_so_far += inode->extents[i].block_count;
+        }
 
-            rc = obmafs3_block_read(ctx, block_lba, block_buf,
+        if (!found) {
+            free(block_buf);
+            free(decomp_buf);
+            return OBMAFS3_ERR_IO;
+        }
+
+        int rc = obmafs3_block_read(ctx, phys_lba, block_buf,
                                     (size_t)block_size);
+        if (rc != OBMAFS3_OK) {
+            free(block_buf);
+            free(decomp_buf);
+            return rc;
+        }
+
+        struct block_header bhdr;
+        memcpy(&bhdr, block_buf, sizeof(bhdr));
+
+        uint8_t *data_ptr;
+        size_t data_len;
+
+        if (bhdr.magic != OBMAFS3_BLOCK_MAGIC) {
+            /* Raw data block (no header) — shouldn't happen with
+             * the current write path but handle gracefully */
+            data_ptr = block_buf;
+            data_len = (size_t)block_size;
+        } else if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) {
+            rc = obmafs3_decompress(
+                block_buf + sizeof(bhdr),
+                (size_t)bhdr.compressed_size,
+                decomp_buf,
+                (size_t)bhdr.original_size);
             if (rc != OBMAFS3_OK) {
                 free(block_buf);
                 free(decomp_buf);
                 return rc;
             }
-
-            memcpy(&bhdr, block_buf, sizeof(bhdr));
-
-            if (bhdr.magic != OBMAFS3_BLOCK_MAGIC) {
-                /* Raw data block (no header) */
-                if (offset > block_byte_start)
-                    copy_offset = (size_t)(offset - block_byte_start);
-                copy_size = (size_t)block_size - copy_offset;
-                if (copy_size > size - bytes_read)
-                    copy_size = size - bytes_read;
-                memcpy((uint8_t *)buf + bytes_read,
-                       block_buf + copy_offset, copy_size);
-                bytes_read += copy_size;
-                continue;
-            }
-
-            /* Data block with header */
-            if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) {
-                rc = obmafs3_decompress(
-                    block_buf + sizeof(bhdr),
-                    (size_t)bhdr.compressed_size,
-                    decomp_buf,
-                    (size_t)bhdr.original_size);
-                if (rc != OBMAFS3_OK) {
-                    free(block_buf);
-                    free(decomp_buf);
-                    return rc;
-                }
-
-                if (offset > block_byte_start)
-                    copy_offset = (size_t)(offset - block_byte_start);
-                copy_size = (size_t)bhdr.original_size - copy_offset;
-                if (copy_size > size - bytes_read)
-                    copy_size = size - bytes_read;
-                memcpy((uint8_t *)buf + bytes_read,
-                       decomp_buf + copy_offset, copy_size);
-            } else {
-                if (offset > block_byte_start)
-                    copy_offset = (size_t)(offset - block_byte_start);
-                copy_size = (size_t)bhdr.original_size - copy_offset;
-                if (copy_size > size - bytes_read)
-                    copy_size = size - bytes_read;
-                memcpy((uint8_t *)buf + bytes_read,
-                       block_buf + sizeof(bhdr) + copy_offset,
-                       copy_size);
-            }
-
-            bytes_read += copy_size;
+            data_ptr = decomp_buf;
+            data_len = (size_t)bhdr.original_size;
+        } else {
+            data_ptr = block_buf + sizeof(bhdr);
+            data_len = (size_t)bhdr.original_size;
         }
+
+        /* Copy data from the block at the correct offset */
+        size_t avail = data_len > offset_in_block
+                           ? data_len - offset_in_block : 0;
+        size_t to_copy = (size - bytes_read < avail)
+                             ? size - bytes_read : avail;
+        if (to_copy == 0)
+            break;
+
+        memcpy((uint8_t *)buf + bytes_read,
+               data_ptr + offset_in_block, to_copy);
+        bytes_read += to_copy;
     }
 
     free(block_buf);
@@ -267,7 +270,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
         struct block_header bhdr;
         memset(&bhdr, 0, sizeof(bhdr));
         bhdr.magic = OBMAFS3_BLOCK_MAGIC;
-        bhdr.flags = 0; /* no compression on write */
         uint64_t block_data_end = offset_in_block + to_write;
         /* Track the maximum data in this block */
         struct block_header existing_hdr;
@@ -275,16 +277,59 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
         if (existing_hdr.original_size > block_data_end)
             block_data_end = existing_hdr.original_size;
         bhdr.original_size = block_data_end;
-        bhdr.compressed_size = block_data_end;
 
-        /* Compute checksum of the data */
-        obmafs3_checksum_block(
-            block_buf + sizeof(struct block_header),
-            (size_t)block_data_end, bhdr.checksum);
-        memcpy(block_buf, &bhdr, sizeof(bhdr));
+        /* Try to compress if enabled */
+        uint8_t *write_buf = block_buf;
+        uint8_t *comp_block = NULL;
+        if (ctx->compression && block_data_end > 0) {
+            size_t comp_bound = ZSTD_compressBound((size_t)block_data_end);
+            size_t comp_buf_size = sizeof(struct block_header) + comp_bound;
+            if (comp_buf_size < (size_t)block_size)
+                comp_buf_size = (size_t)block_size;
+            comp_block = calloc(1, comp_buf_size);
+            if (comp_block) {
+                size_t comp_size = comp_bound;
+                int crc = obmafs3_compress(
+                    block_buf + sizeof(struct block_header),
+                    (size_t)block_data_end,
+                    comp_block + sizeof(struct block_header),
+                    &comp_size, ctx->zstd_level);
+                if (crc == OBMAFS3_OK &&
+                    comp_size < block_data_end) {
+                    /* Compression saved space — use compressed block */
+                    bhdr.flags = OBMAFS3_BLOCK_FLAG_COMPRESSED;
+                    bhdr.compression_type = kCompressionZstd;
+                    bhdr.compressed_size = comp_size;
+                    obmafs3_checksum_block(
+                        block_buf + sizeof(struct block_header),
+                        (size_t)block_data_end, bhdr.checksum);
+                    memcpy(comp_block, &bhdr, sizeof(bhdr));
+                    /* Zero-fill remainder of the block */
+                    size_t used = sizeof(struct block_header) + comp_size;
+                    if (used < (size_t)block_size)
+                        memset(comp_block + used, 0,
+                               (size_t)block_size - used);
+                    write_buf = comp_block;
+                } else {
+                    free(comp_block);
+                    comp_block = NULL;
+                }
+            }
+        }
 
-        rc = obmafs3_block_write(ctx, phys_lba, block_buf,
+        if (!comp_block) {
+            /* Store uncompressed */
+            bhdr.flags = 0;
+            bhdr.compressed_size = block_data_end;
+            obmafs3_checksum_block(
+                block_buf + sizeof(struct block_header),
+                (size_t)block_data_end, bhdr.checksum);
+            memcpy(block_buf, &bhdr, sizeof(bhdr));
+        }
+
+        rc = obmafs3_block_write(ctx, phys_lba, write_buf,
                                  (size_t)block_size);
+        free(comp_block);
         if (rc != OBMAFS3_OK) {
             free(block_buf);
             return rc;

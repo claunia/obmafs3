@@ -12,14 +12,18 @@
 struct obmafs3_options {
     const char *device;
     int show_help;
+    int compression;        /* -1 = not set (use default) */
+    int zstd_level;         /* -1 = not set (use default) */
 };
 
 #define OPTION(t, p) { t, offsetof(struct obmafs3_options, p), 1 }
 
 static const struct fuse_opt option_spec[] = {
-    OPTION("--device=%s", device),
-    OPTION("-h",          show_help),
-    OPTION("--help",      show_help),
+    OPTION("--device=%s",       device),
+    OPTION("-h",                show_help),
+    OPTION("--help",            show_help),
+    {"--compression=%d",        offsetof(struct obmafs3_options, compression), 0},
+    {"--zstd-level=%d",         offsetof(struct obmafs3_options, zstd_level),  0},
     FUSE_OPT_END
 };
 
@@ -27,7 +31,9 @@ static void show_help(const char *progname)
 {
     printf("Usage: %s --device=<path> <mountpoint> [FUSE options]\n\n"
            "OBMAFS3 options:\n"
-           "    --device=<path>    Path to the OBMAFS3 filesystem image\n"
+           "    --device=<path>        Path to the OBMAFS3 filesystem image\n"
+           "    --compression=<0|1>    Enable (1) or disable (0) compression (default: 1)\n"
+           "    --zstd-level=<1-15>    ZSTD compression level (default: 15)\n"
            "\n", progname);
 }
 
@@ -38,6 +44,8 @@ int main(int argc, char *argv[])
     int rc;
 
     memset(&opts, 0, sizeof(opts));
+    opts.compression = -1;  /* sentinel: use default */
+    opts.zstd_level  = -1;  /* sentinel: use default */
 
     if (fuse_opt_parse(&args, &opts, option_spec, NULL) == -1)
         return 1;
@@ -60,6 +68,20 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Error: failed to open %s (rc=%d)\n",
                     opts.device, rc);
             return 1;
+        }
+
+        /* Apply mount options */
+        if (opts.compression != -1)
+            g_ctx->compression = (opts.compression != 0);
+        if (opts.zstd_level != -1) {
+            if (opts.zstd_level < 1 || opts.zstd_level > 15) {
+                fprintf(stderr,
+                    "Error: --zstd-level must be between 1 and 15\n");
+                obmafs3_close(g_ctx);
+                g_ctx = NULL;
+                return 1;
+            }
+            g_ctx->zstd_level = opts.zstd_level;
         }
     }
 

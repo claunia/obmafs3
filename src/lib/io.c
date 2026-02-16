@@ -72,6 +72,8 @@ int obmafs3_open(const char *path, struct obmafs3_ctx **ctx)
     }
 
     c->fd = fd;
+    c->compression = 1;     /* compression on by default */
+    c->zstd_level  = 15;    /* ZSTD level 15 by default */
 
     int rc = obmafs3_sb_read(fd, &c->sb);
     if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }

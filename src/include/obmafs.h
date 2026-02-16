@@ -30,6 +30,8 @@ struct obmafs3_ctx {
     struct btree_header overflow_hdr;/**< Cached overflow tree header */
     uint8_t *bitmap;                 /**< In-memory allocation bitmap */
     uint64_t bitmap_size;            /**< Size of allocation bitmap in bytes */
+    int compression;                 /**< Non-zero to compress data blocks on write */
+    int zstd_level;                  /**< ZSTD compression level (1-15) */
 };
 
 /* --- Context management --- */
@@ -109,7 +111,7 @@ void     obmafs3_checksum_block(const void *data, size_t size, uint8_t *out);
 
 /* --- Compression operations --- */
 int obmafs3_compress(const void *src, size_t src_size,
-                     void *dst, size_t *dst_size);
+                     void *dst, size_t *dst_size, int level);
 int obmafs3_decompress(const void *src, size_t src_size,
                        void *dst, size_t dst_size);
 
