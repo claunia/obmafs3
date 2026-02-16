@@ -19,9 +19,10 @@ static void usage(const char *prog)
             "Usage: %s [options] <device-or-file>\n"
             "\n"
             "Options:\n"
-            "  -y            Assume 'yes' to all repair questions\n"
-            "  -n            Assume 'no' to all repair questions\n"
-            "  -h, --help    Show this help message\n",
+            "  -y              Assume 'yes' to all repair questions\n"
+            "  -n              Assume 'no' to all repair questions\n"
+            "  -s, --scrub     Verify checksums of all data blocks\n"
+            "  -h, --help      Show this help message\n",
             prog);
 }
 
@@ -317,6 +318,122 @@ static int verify_tree_node_checksums(struct obmafs3_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Scrub: verify checksums of all data blocks                         */
+/* ------------------------------------------------------------------ */
+
+static void print_progress(uint64_t done, uint64_t total, uint64_t bad)
+{
+    int bar_width = 40;
+    double frac = total > 0 ? (double)done / (double)total : 1.0;
+    int filled = (int)(frac * bar_width);
+
+    fprintf(stderr, "\r  [" );
+    for (int i = 0; i < bar_width; i++) {
+        if (i < filled)      fputc('=', stderr);
+        else if (i == filled) fputc('>', stderr);
+        else                 fputc(' ', stderr);
+    }
+    fprintf(stderr, "] %3d%% | %" PRIu64 "/" "%" PRIu64 " blocks | %" PRIu64 " error%s",
+            (int)(frac * 100), done, total, bad, bad == 1 ? "" : "s");
+    fflush(stderr);
+}
+
+static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
+{
+    /* Collect all data block LBAs from inode extents */
+    if (ctx->inode_hdr.root_node_lba == 0) {
+        printf("\nData block scrub:\n");
+        printf("  No data blocks to scrub.\n");
+        return 0;
+    }
+
+    uint64_t *data_lbas = NULL;
+    uint64_t data_count = 0;
+    int rc = collect_inode_data_blocks(ctx, ctx->inode_hdr.root_node_lba,
+                                       &data_lbas, &data_count);
+    if (rc != OBMAFS3_OK) {
+        fprintf(stderr, "\nError: could not collect data block LBAs: %d\n", rc);
+        return 0;
+    }
+
+    if (data_count == 0) {
+        printf("\nData block scrub:\n");
+        printf("  No data blocks to scrub.\n");
+        free(data_lbas);
+        return 0;
+    }
+
+    printf("\nData block scrub:\n");
+    printf("  Blocks to verify: %" PRIu64 "\n", data_count);
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf) {
+        fprintf(stderr, "  Error: out of memory\n");
+        free(data_lbas);
+        return 0;
+    }
+
+    uint64_t bad = 0;
+    uint64_t bad_magic = 0;
+    uint64_t bad_checksum = 0;
+    uint64_t read_errors = 0;
+
+    for (uint64_t i = 0; i < data_count; i++) {
+        if (i % 64 == 0 || i == data_count - 1)
+            print_progress(i + 1, data_count, bad);
+
+        rc = obmafs3_block_read(ctx, data_lbas[i], buf,
+                                (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            read_errors++;
+            bad++;
+            continue;
+        }
+
+        struct block_header bhdr;
+        memcpy(&bhdr, buf, sizeof(bhdr));
+
+        if (bhdr.magic != OBMAFS3_BLOCK_MAGIC) {
+            bad_magic++;
+            bad++;
+            continue;
+        }
+
+        /* Checksum is over on-disk data after header:
+         * compressed_size for compressed blocks, original_size for raw */
+        size_t check_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                ? (size_t)bhdr.compressed_size
+                                : (size_t)bhdr.original_size;
+        uint8_t computed[32];
+        obmafs3_checksum_block(buf + sizeof(bhdr), check_size, computed);
+
+        if (memcmp(computed, bhdr.checksum, 32) != 0) {
+            bad_checksum++;
+            bad++;
+        }
+    }
+
+    print_progress(data_count, data_count, bad);
+    fprintf(stderr, "\n");
+
+    if (bad == 0) {
+        printf("  Result:           OK\n");
+    } else {
+        printf("  Result:           %" PRIu64 " error(s)\n", bad);
+        if (read_errors > 0)
+            printf("    Read errors:    %" PRIu64 "\n", read_errors);
+        if (bad_magic > 0)
+            printf("    Bad magic:      %" PRIu64 "\n", bad_magic);
+        if (bad_checksum > 0)
+            printf("    Bad checksum:   %" PRIu64 "\n", bad_checksum);
+    }
+
+    free(buf);
+    free(data_lbas);
+    return bad;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -324,17 +441,20 @@ int main(int argc, char *argv[])
 {
     int auto_yes = 0;
     int auto_no  = 0;
+    int do_scrub = 0;
 
     static struct option long_opts[] = {
-        { "help", no_argument, NULL, 'h' },
-        { NULL,   0,           NULL,  0  }
+        { "help",  no_argument, NULL, 'h' },
+        { "scrub", no_argument, NULL, 's' },
+        { NULL,    0,           NULL,  0  }
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "ynh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "ynsh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'y': auto_yes = 1; break;
         case 'n': auto_no  = 1; break;
+        case 's': do_scrub = 1; break;
         case 'h':
             usage(argv[0]);
             return 0;
@@ -651,6 +771,13 @@ int main(int argc, char *argv[])
             free(disk_bitmap);
             ctx->bitmap = NULL;
         }
+    }
+
+    /* ---- Data block scrub ---- */
+    if (do_scrub) {
+        uint64_t scrub_bad = scrub_data_blocks(ctx);
+        if (scrub_bad > 0)
+            errors += (int)scrub_bad;
     }
 
     /* ---- Summary ---- */
