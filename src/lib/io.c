@@ -1,0 +1,304 @@
+/*
+ * io.c - OBMAFS3 context management, block I/O, creation, and checking
+ */
+#include "obmafs.h"
+
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+static void generate_guid(uint8_t *guid)
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        if (read(fd, guid, 16) != 16)
+            memset(guid, 0, 16);
+        close(fd);
+    } else {
+        memset(guid, 0, 16);
+    }
+    /* RFC 4122 version 4 */
+    guid[6] = (guid[6] & 0x0F) | 0x40;
+    guid[8] = (guid[8] & 0x3F) | 0x80;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Block I/O                                                          */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba,
+                       void *buf, size_t size)
+{
+    off_t offset = (off_t)(lba * ctx->sb.block_size);
+    ssize_t n = pread(ctx->fd, buf, size, offset);
+    if (n < 0 || (size_t)n != size)
+        return OBMAFS3_ERR_IO;
+    return OBMAFS3_OK;
+}
+
+int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba,
+                        const void *buf, size_t size)
+{
+    off_t offset = (off_t)(lba * ctx->sb.block_size);
+    ssize_t n = pwrite(ctx->fd, buf, size, offset);
+    if (n < 0 || (size_t)n != size)
+        return OBMAFS3_ERR_IO;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Context open / close                                               */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_open(const char *path, struct obmafs3_ctx **ctx)
+{
+    int fd = open(path, O_RDWR);
+    if (fd < 0)
+        return OBMAFS3_ERR_IO;
+
+    struct obmafs3_ctx *c = calloc(1, sizeof(*c));
+    if (!c) {
+        close(fd);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    c->fd = fd;
+
+    int rc = obmafs3_sb_read(fd, &c->sb);
+    if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+
+    rc = obmafs3_sb_validate(&c->sb);
+    if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+
+    rc = obmafs3_btree_header_read(c, c->sb.catalog_lba, &c->catalog_hdr);
+    if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+
+    rc = obmafs3_btree_header_read(c, c->sb.inode_lba, &c->inode_hdr);
+    if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+
+    if (c->sb.overflow_lba != 0) {
+        rc = obmafs3_btree_header_read(c, c->sb.overflow_lba,
+                                       &c->overflow_hdr);
+        if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+    }
+
+    *ctx = c;
+    return OBMAFS3_OK;
+}
+
+void obmafs3_close(struct obmafs3_ctx *ctx)
+{
+    if (!ctx)
+        return;
+    if (ctx->fd >= 0)
+        close(ctx->fd);
+    free(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Filesystem creation (mkobmafs)                                     */
+/* ------------------------------------------------------------------ */
+
+static int write_block(int fd, uint64_t block_size, uint64_t lba,
+                       const void *data, size_t data_size)
+{
+    uint8_t *block = calloc(1, (size_t)block_size);
+    if (!block)
+        return OBMAFS3_ERR_NOMEM;
+
+    if (data_size > (size_t)block_size)
+        data_size = (size_t)block_size;
+    memcpy(block, data, data_size);
+
+    off_t offset = (off_t)(lba * block_size);
+    ssize_t n = pwrite(fd, block, (size_t)block_size, offset);
+    free(block);
+
+    if (n < 0 || (size_t)n != (size_t)block_size)
+        return OBMAFS3_ERR_IO;
+    return OBMAFS3_OK;
+}
+
+int obmafs3_create(const char *path, uint64_t total_size,
+                   uint64_t block_size, uint64_t dedup_block_size,
+                   const char *label)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return OBMAFS3_ERR_IO;
+
+    if (ftruncate(fd, (off_t)total_size) < 0) {
+        close(fd);
+        return OBMAFS3_ERR_IO;
+    }
+
+    int rc;
+
+    /* --- Block 0: Superblock --- */
+    struct obmafs3_sb sb;
+    memset(&sb, 0, sizeof(sb));
+    sb.magic           = OBMAFS3_SB_MAGIC;
+    generate_guid(sb.guid);
+    sb.block_size      = block_size;
+    sb.dedup_block_size = dedup_block_size;
+    sb.total_bytes     = total_size;
+    sb.catalog_lba     = 1;   /* block 1 */
+    sb.inode_lba       = 3;   /* block 3 */
+    sb.overflow_lba    = 5;   /* block 5 */
+    sb.dedup_lba       = 6;   /* block 6 */
+    sb.metadata_lba    = 0;   /* reserved */
+    sb.media_tag_lba   = 0;   /* reserved */
+    sb.checksum_type   = kChecksumTypeXXH64;
+    sb.creation_time   = (uint64_t)time(NULL);
+    strncpy((char *)sb.volume_label, label,
+            sizeof(sb.volume_label) - 1);
+
+    rc = write_block(fd, block_size, 0, &sb, sizeof(sb));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 1: Catalog tree header --- */
+    struct btree_header cat_hdr;
+    memset(&cat_hdr, 0, sizeof(cat_hdr));
+    cat_hdr.magic         = OBMAFS3_BTREE_HDR_MAGIC;
+    cat_hdr.data_type     = kBtreeDataTypeFilename;
+    cat_hdr.root_node_lba = 2;
+    cat_hdr.node_size     = (uint16_t)block_size;
+    cat_hdr.total_nodes   = 1;
+    cat_hdr.tree_type     = kBtreeTypeCatalog;
+
+    rc = write_block(fd, block_size, 1, &cat_hdr, sizeof(cat_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 2: Catalog root node (root directory entry) --- */
+    struct btree_node_filename root_cat;
+    memset(&root_cat, 0, sizeof(root_cat));
+    root_cat.header.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    root_cat.header.record_type = kBtreeDataTypeFilename;
+    root_cat.header.node_keys   = 1;
+    root_cat.header.keys_length = (uint16_t)(sizeof(root_cat) -
+                                             sizeof(root_cat.header));
+    root_cat.inode_id       = OBMAFS3_ROOT_INODE_ID;
+    root_cat.parent_id      = OBMAFS3_ROOT_INODE_ID;
+    root_cat.directory_flag = 1;
+    strncpy(root_cat.name, "/", sizeof(root_cat.name) - 1);
+
+    rc = write_block(fd, block_size, 2, &root_cat, sizeof(root_cat));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 3: Inode tree header --- */
+    struct btree_header ino_hdr;
+    memset(&ino_hdr, 0, sizeof(ino_hdr));
+    ino_hdr.magic         = OBMAFS3_BTREE_HDR_MAGIC;
+    ino_hdr.data_type     = kBtreeDataTypeInode;
+    ino_hdr.root_node_lba = 4;
+    ino_hdr.node_size     = (uint16_t)block_size;
+    ino_hdr.total_nodes   = 1;
+    ino_hdr.tree_type     = kBtreeTypeInode;
+
+    rc = write_block(fd, block_size, 3, &ino_hdr, sizeof(ino_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 4: Root directory inode --- */
+    struct btree_node_inode root_ino;
+    memset(&root_ino, 0, sizeof(root_ino));
+    root_ino.header.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    root_ino.header.record_type = kBtreeDataTypeInode;
+    root_ino.header.node_keys   = 1;
+    root_ino.header.keys_length = (uint16_t)(sizeof(root_ino) -
+                                             sizeof(root_ino.header));
+    root_ino.inode_id          = OBMAFS3_ROOT_INODE_ID;
+    root_ino.uid               = 0;
+    root_ino.gid               = 0;
+    root_ino.mode              = 0755;
+    root_ino.creation_time     = sb.creation_time;
+    root_ino.modification_time = sb.creation_time;
+    root_ino.access_time       = sb.creation_time;
+    root_ino.file_size         = 0;
+    root_ino.file_type         = kFileTypeDirectory;
+
+    rc = write_block(fd, block_size, 4, &root_ino, sizeof(root_ino));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 5: Overflow tree header (empty) --- */
+    struct btree_header ovf_hdr;
+    memset(&ovf_hdr, 0, sizeof(ovf_hdr));
+    ovf_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    ovf_hdr.data_type = kBtreeDataTypeExtent;
+    ovf_hdr.node_size = (uint16_t)block_size;
+    ovf_hdr.tree_type = kBtreeTypeOverflow;
+
+    rc = write_block(fd, block_size, 5, &ovf_hdr, sizeof(ovf_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 6: Dedup tree list header (empty) --- */
+    struct tree_list_header dedup_list;
+    memset(&dedup_list, 0, sizeof(dedup_list));
+    dedup_list.magic      = OBMAFS3_TREELIST_MAGIC;
+    dedup_list.tree_count = 0;
+
+    rc = write_block(fd, block_size, 6, &dedup_list, sizeof(dedup_list));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* Flush and close */
+    if (fsync(fd) < 0) {
+        close(fd);
+        return OBMAFS3_ERR_IO;
+    }
+
+    close(fd);
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Filesystem checking (obmafsck)                                     */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_check(const char *path)
+{
+    struct obmafs3_ctx *ctx;
+    int rc = obmafs3_open(path, &ctx);
+    if (rc != OBMAFS3_OK) {
+        fprintf(stderr, "Error: failed to open filesystem: %d\n", rc);
+        return rc;
+    }
+
+    printf("Superblock:\n");
+    printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+           ctx->sb.magic,
+           ctx->sb.magic == OBMAFS3_SB_MAGIC ? "OK" : "BAD");
+    printf("  Block size:       %" PRIu64 "\n", ctx->sb.block_size);
+    printf("  Dedup block size: %" PRIu64 "\n", ctx->sb.dedup_block_size);
+    printf("  Total bytes:      %" PRIu64 "\n", ctx->sb.total_bytes);
+    printf("  Volume label:     %s\n", ctx->sb.volume_label);
+
+    printf("\nCatalog tree:\n");
+    printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+           ctx->catalog_hdr.magic,
+           ctx->catalog_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+               ? "OK" : "BAD");
+    printf("  Root node LBA:    %" PRIu64 "\n",
+           ctx->catalog_hdr.root_node_lba);
+    printf("  Total nodes:      %u\n", ctx->catalog_hdr.total_nodes);
+
+    printf("\nInode tree:\n");
+    printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+           ctx->inode_hdr.magic,
+           ctx->inode_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+               ? "OK" : "BAD");
+    printf("  Root node LBA:    %" PRIu64 "\n",
+           ctx->inode_hdr.root_node_lba);
+    printf("  Total nodes:      %u\n", ctx->inode_hdr.total_nodes);
+
+    obmafs3_close(ctx);
+    printf("\nFilesystem check passed.\n");
+    return OBMAFS3_OK;
+}

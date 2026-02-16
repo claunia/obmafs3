@@ -1,0 +1,4 @@
+add_subdirectory(lib)
+add_subdirectory(mkobmafs)
+add_subdirectory(mount)
+add_subdirectory(obmafsck)
