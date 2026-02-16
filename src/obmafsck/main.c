@@ -220,6 +220,176 @@ static int collect_overflow_data_blocks(struct obmafs3_ctx *ctx,
     return OBMAFS3_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Collect all blocks used by dedup trees (headers, nodes, data)      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Walk the dedup tree list and collect every block LBA that belongs to
+ * dedup structures: the tree list block itself, each per-sector-size
+ * tree header, every tree node, and every dedup data block.
+ *
+ * Dedup data blocks span dedup_block_size / block_size standard blocks.
+ * Multiple dedup_entry records may share the same data block (different
+ * offsets), so we deduplicate the data block LBAs.
+ */
+static int collect_dedup_blocks(struct obmafs3_ctx *ctx,
+                                uint64_t **out_lbas,
+                                uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if (ctx->sb.dedup_lba == 0)
+        return OBMAFS3_OK;
+
+    uint64_t *lbas = NULL;
+    uint64_t count = 0;
+    uint64_t cap = 0;
+
+    /* Separate small array to track unique dedup data block base LBAs
+     * for fast deduplication (one entry per dedup data block). */
+    uint64_t *unique_bases = NULL;
+    uint64_t unique_count = 0;
+    uint64_t unique_cap = 0;
+
+    #define PUSH_LBA(blk) do { \
+        if (count >= cap) { \
+            cap = (cap == 0) ? 256 : cap * 2; \
+            uint64_t *_t = realloc(lbas, cap * sizeof(*_t)); \
+            if (!_t) { free(lbas); return OBMAFS3_ERR_NOMEM; } \
+            lbas = _t; \
+        } \
+        lbas[count++] = (blk); \
+    } while (0)
+
+    /* The tree list block itself is already marked in build_expected_bitmap */
+
+    /* Read the tree list */
+    uint8_t *list_buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!list_buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    int rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, list_buf,
+                                (size_t)ctx->sb.block_size);
+    if (rc != OBMAFS3_OK) {
+        free(list_buf);
+        return rc;
+    }
+
+    struct tree_list_header list_hdr;
+    memcpy(&list_hdr, list_buf, sizeof(list_hdr));
+    if (list_hdr.magic != OBMAFS3_TREELIST_MAGIC) {
+        free(list_buf);
+        return OBMAFS3_ERR_BADMAGIC;
+    }
+
+    uint64_t tree_count = list_hdr.tree_count;
+    if (tree_count == 0) {
+        free(list_buf);
+        *out_lbas  = lbas;
+        *out_count = count;
+        return OBMAFS3_OK;
+    }
+
+    struct tree_list_entry *entries =
+        malloc((size_t)(tree_count * sizeof(struct tree_list_entry)));
+    if (!entries) {
+        free(list_buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
+    memcpy(entries, list_buf + sizeof(struct tree_list_header),
+           (size_t)(tree_count * sizeof(struct tree_list_entry)));
+    free(list_buf);
+
+    uint64_t std_per_dedup = ctx->sb.dedup_block_size / ctx->sb.block_size;
+
+    /* For each dedup tree */
+    for (uint64_t t = 0; t < tree_count; t++) {
+        /* Mark the tree header block */
+        PUSH_LBA(entries[t].tree_lba);
+
+        /* Read tree header to get root node */
+        struct btree_header thdr;
+        rc = obmafs3_btree_header_read(ctx, entries[t].tree_lba, &thdr);
+        if (rc != OBMAFS3_OK)
+            continue;
+
+        /* Walk tree nodes */
+        uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
+        if (!node_buf) {
+            free(entries); free(lbas);
+            return OBMAFS3_ERR_NOMEM;
+        }
+
+        uint64_t lba = thdr.root_node_lba;
+        while (lba != 0) {
+            /* Mark the node block */
+            PUSH_LBA(lba);
+
+            rc = obmafs3_block_read(ctx, lba, node_buf,
+                                    (size_t)ctx->sb.block_size);
+            if (rc != OBMAFS3_OK)
+                break;
+
+            struct btree_node_header nhdr;
+            memcpy(&nhdr, node_buf, sizeof(nhdr));
+            if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+                break;
+
+            /* Collect data block LBAs from dedup entries */
+            const uint8_t *ep = node_buf +
+                                sizeof(struct btree_node_header);
+            for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+                struct dedup_entry de;
+                memcpy(&de, ep + i * sizeof(struct dedup_entry),
+                       sizeof(de));
+                if (de.block_lba == 0)
+                    continue;
+
+                /* Check if we already recorded this data block base LBA.
+                 * Multiple entries can share the same dedup data block
+                 * at different offsets. Use the small unique_bases array
+                 * for fast lookup instead of scanning the full output. */
+                int found = 0;
+                for (uint64_t j = 0; j < unique_count; j++) {
+                    if (unique_bases[j] == de.block_lba) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    /* Record this base LBA */
+                    if (unique_count >= unique_cap) {
+                        unique_cap = (unique_cap == 0) ? 256
+                                                       : unique_cap * 2;
+                        uint64_t *ut = realloc(unique_bases,
+                                               unique_cap * sizeof(*ut));
+                        if (!ut) {
+                            free(node_buf); free(entries);
+                            free(lbas); free(unique_bases);
+                            return OBMAFS3_ERR_NOMEM;
+                        }
+                        unique_bases = ut;
+                    }
+                    unique_bases[unique_count++] = de.block_lba;
+
+                    /* Mark all standard blocks in this dedup data block */
+                    for (uint64_t s = 0; s < std_per_dedup; s++)
+                        PUSH_LBA(de.block_lba + s);
+                }
+            }
+
+            lba = nhdr.right_link;
+        }
+
+        free(node_buf);
+    }
+
+    free(entries);
+    free(unique_bases);
+    #undef PUSH_LBA
+
     *out_lbas  = lbas;
     *out_count = count;
     return OBMAFS3_OK;
@@ -708,6 +878,117 @@ int main(int argc, char *argv[])
             } else {
                 printf("  Node checksums:   OK\n");
             }
+        }
+    }
+
+    /* ---- Dedup tree list ---- */
+    if (ctx->sb.dedup_lba != 0) {
+        printf("\nDedup tree list:\n");
+
+        uint8_t *list_buf = calloc(1, (size_t)ctx->sb.block_size);
+        if (list_buf) {
+            rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, list_buf,
+                                    (size_t)ctx->sb.block_size);
+            if (rc == OBMAFS3_OK) {
+                struct tree_list_header list_hdr;
+                memcpy(&list_hdr, list_buf, sizeof(list_hdr));
+                printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+                       list_hdr.magic,
+                       list_hdr.magic == OBMAFS3_TREELIST_MAGIC
+                           ? "OK" : "BAD");
+                if (list_hdr.magic != OBMAFS3_TREELIST_MAGIC)
+                    errors++;
+
+                /* Verify list header checksum */
+                if (list_hdr.magic == OBMAFS3_TREELIST_MAGIC) {
+                    uint8_t stored_cs[32];
+                    memcpy(stored_cs, list_hdr.checksum, 32);
+                    memset(list_buf +
+                           __builtin_offsetof(struct tree_list_header,
+                                              checksum),
+                           0, 32);
+                    uint8_t computed_cs[32];
+                    size_t cs_len = sizeof(struct tree_list_header) +
+                                   (size_t)(list_hdr.tree_count *
+                                            sizeof(struct tree_list_entry));
+                    obmafs3_checksum_block(list_buf, cs_len, computed_cs);
+                    int cs_ok = (memcmp(stored_cs, computed_cs, 32) == 0);
+                    printf("  Header checksum:  %s\n",
+                           cs_ok ? "OK" : "BAD");
+                    if (!cs_ok) errors++;
+
+                    printf("  Trees:            %" PRIu64 "\n",
+                           list_hdr.tree_count);
+
+                    /* Verify each per-sector-size tree */
+                    struct tree_list_entry *tl_entries = NULL;
+                    if (list_hdr.tree_count > 0) {
+                        tl_entries = malloc(
+                            (size_t)(list_hdr.tree_count *
+                                     sizeof(struct tree_list_entry)));
+                        if (tl_entries)
+                            memcpy(tl_entries,
+                                   list_buf +
+                                       sizeof(struct tree_list_header),
+                                   (size_t)(list_hdr.tree_count *
+                                            sizeof(struct tree_list_entry)));
+                    }
+
+                    for (uint64_t t = 0;
+                         t < list_hdr.tree_count && tl_entries; t++) {
+                        printf("  Tree %" PRIu64
+                               " (sector_size=%" PRIu16 "):\n",
+                               t, tl_entries[t].sector_size);
+
+                        struct btree_header thdr;
+                        rc = obmafs3_btree_header_read(
+                            ctx, tl_entries[t].tree_lba, &thdr);
+                        if (rc == OBMAFS3_OK) {
+                            printf("    Magic:          0x%016" PRIx64
+                                   " (%s)\n",
+                                   thdr.magic,
+                                   thdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+                                       ? "OK" : "BAD");
+                            if (thdr.magic != OBMAFS3_BTREE_HDR_MAGIC)
+                                errors++;
+
+                            int thdr_cs_ok = 0;
+                            obmafs3_btree_header_read_lenient(
+                                ctx, tl_entries[t].tree_lba, &thdr,
+                                &thdr_cs_ok);
+                            printf("    Header checksum:%s\n",
+                                   thdr_cs_ok ? " OK" : " BAD");
+                            if (!thdr_cs_ok) errors++;
+
+                            printf("    Total nodes:    %u\n",
+                                   thdr.total_nodes);
+
+                            if (thdr.root_node_lba != 0) {
+                                uint64_t dbad = 0;
+                                verify_tree_node_checksums(
+                                    ctx, thdr.root_node_lba,
+                                    "Dedup", &dbad);
+                                if (dbad > 0) {
+                                    printf("    Node checksums: "
+                                           "%" PRIu64 " BAD\n", dbad);
+                                    errors++;
+                                } else {
+                                    printf("    Node checksums: OK\n");
+                                }
+                            }
+                        } else {
+                            printf("    Error reading header: %d\n", rc);
+                            errors++;
+                        }
+                    }
+
+                    free(tl_entries);
+                }
+            } else {
+                printf("  Error reading tree list block: %d\n", rc);
+                errors++;
+            }
+            free(list_buf);
         }
     }
 
