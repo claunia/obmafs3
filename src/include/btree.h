@@ -18,6 +18,8 @@ struct __attribute__((packed)) btree_header {
     uint32_t total_nodes;    /**< Total number of nodes */
     uint32_t free_nodes;     /**< Number of free nodes */
     uint32_t tree_type;      /**< Type of btree (catalog, dedup, metadata, etc.) */
+    uint64_t last_block_lba; /**< LBA of the last partially written data block (dedup trees) */
+    uint64_t last_block_offset; /**< Byte offset within last_block_lba where next write starts */
     uint8_t  checksum[32];   /**< Checksum of the btree header block */
 };
 

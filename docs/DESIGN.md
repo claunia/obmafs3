@@ -82,7 +82,27 @@ When blocks are allocated (for new files, directory entries, inodes, or data), t
 
 ## The B+Tree Structures
 
-All the B+Tree structures in OBMAFS v3 (Catalog Tree, Inode Tree, Overflow Tree, Deduplication Tree, Metadata Tree, Media Tag Tree) share a common header structure:
+All the B+Tree structures in OBMAFS v3 (Catalog Tree, Inode Tree, Overflow Tree, Deduplication Tree, Metadata Tree, Media Tag Tree) share a common tree header structure stored at the LBA referenced by the superblock:
+
+```c
+struct btree_header {
+    uint64_t magic; //< "BTREEHDR"
+    uint32_t data_type;
+    uint64_t root_node_lba;
+    uint64_t free_node_lba;
+    uint16_t node_size;
+    uint32_t total_nodes;
+    uint32_t free_nodes;
+    uint32_t tree_type;
+    uint64_t last_block_lba;
+    uint64_t last_block_offset;
+    uint8_t checksum[32]; //< Checksum of the btree header block for integrity verification
+};
+```
+
+The `magic` field is used to identify the block as a B+Tree header. The `data_type` field indicates the type of data stored in the tree (e.g., filenames, inodes, deduplication entries). The `root_node_lba` field points to the LBA of the root node of the tree. The `free_node_lba` field points to the first free node available for reuse. The `node_size` field indicates the size of each node in bytes. The `total_nodes` and `free_nodes` fields track the total and free node counts respectively. The `tree_type` field identifies the purpose of the tree (catalog, inode, overflow, deduplication, metadata, or media tag). The `last_block_lba` and `last_block_offset` fields are used by deduplication trees to track the last partially written data block and the byte offset within that block where the next write should start; for non-deduplication trees these fields are zero. The `checksum` field contains a checksum of the entire B+Tree header block for integrity verification (with that field zeroed).
+
+All the B+Tree structures also share a common node header structure:
 
 ```c
 struct btree_node_header {
@@ -188,7 +208,9 @@ Where `sector_size` indicates the size of each sector in bytes (e.g., 512, 4096)
 
 When a file is copied to the filesystem it is first analyzed to identify if it is a disk image file or not. If it is not a disk image file, it is stored as a regular file with its data blocks stored in the filesystem without deduplication. If it is identified as a disk image file, it is processed to identify the sector size, and then, if the corresponding B+Tree structure for that sector size does not exist in the Deduplication Tree List, a new B+Tree structure is created for that sector size and added to the list.
 
-Then the disk image is processed sector by sector, where for each sector, a hash value is computed from the data in the sector. The deduplication tree corresponding to the sector size is then searched for an entry with a matching hash value. If a matching entry is found, it means that an identical sector has already been stored in the filesystem, and its contents are discarded. If no match is found, the sector data is stored in memory, until a full deduplicated block is formed (e.g., 4KB), at which point the block is written to the filesystem, and an entry is added to the corresponding deduplication tree with the hash value of the block and its location in the filesystem. This process allows for efficient storage of disk image files by eliminating duplicate sectors across different images, while still allowing for efficient random access to the data through the use of the B+Tree structures. In both cases the sector number, size, and hash value are stored in the `sector_map_entry` structures in the inodes for the disk image files, allowing for efficient mapping of the logical sectors of the disk images to their corresponding deduplicated data blocks in the filesystem.
+Then the disk image is processed sector by sector, where for each sector, a hash value is computed from the data in the sector. The deduplication tree corresponding to the sector size is then searched for an entry with a matching hash value. If a matching entry is found, it means that an identical sector has already been stored in the filesystem, and its contents are discarded. If no match is found, the sector data is appended to the current partially filled dedup data block. The deduplication tree header tracks this partial block via the `last_block_lba` field (the LBA of the block being filled) and the `last_block_offset` field (the byte offset within that block where the next sector should be written). When the accumulated data fills the block, it is finalized (its block header checksum is computed and written), and a new block is allocated for subsequent sectors. If the disk image processing finishes with a partially filled block, the `last_block_lba` and `last_block_offset` values remain in the tree header so that future imports with the same sector size can continue appending to the same block, avoiding wasted space.
+
+This process allows for efficient storage of disk image files by eliminating duplicate sectors across different images, while still allowing for efficient random access to the data through the use of the B+Tree structures. In both cases the sector number, size, and hash value are stored in the `sector_map_entry` structures in the inodes for the disk image files, allowing for efficient mapping of the logical sectors of the disk images to their corresponding deduplicated data blocks in the filesystem.
 
 In both types of files (regular and disk image files), the metadata about the file (e.g., size, timestamps, permissions) is stored in the Inode Tree, and the directory structure and file names are stored in the Catalog Tree, allowing for efficient organization and retrieval of files in the filesystem.
 
