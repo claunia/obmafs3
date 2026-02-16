@@ -6,6 +6,9 @@
 /* "TREELIST" as little-endian uint64 */
 #define OBMAFS3_TREELIST_MAGIC 0x5453494C45455254ULL
 
+/* "OBMABMAP" as little-endian uint64 */
+#define OBMAFS3_BITMAP_MAGIC 0x50414D42414D424FULL
+
 #define OBMAFS3_DEFAULT_BLOCK_SIZE       4096
 #define OBMAFS3_DEFAULT_DEDUP_BLOCK_SIZE 4096
 
@@ -38,6 +41,12 @@ struct __attribute__((packed)) sector_map_entry {
 struct __attribute__((packed)) extent_run {
     uint64_t start_block;  /**< Starting block of the extent run */
     uint64_t block_count;  /**< Number of blocks in the extent run */
+};
+
+struct __attribute__((packed)) bitmap_header {
+    uint64_t magic;          /**< "OBMABMAP" */
+    uint64_t total_blocks;   /**< Total number of blocks tracked by bitmap */
+    uint8_t  checksum[32];   /**< Checksum of the bitmap data */
 };
 
 #endif /* OBMAFS3_DEFS_H */

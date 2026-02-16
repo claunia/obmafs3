@@ -91,6 +91,12 @@ int obmafs3_open(const char *path, struct obmafs3_ctx **ctx)
         if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
     }
 
+    /* Load allocation bitmap */
+    if (c->sb.bitmap_lba != 0 && c->sb.bitmap_blocks != 0) {
+        rc = obmafs3_bitmap_read(c);
+        if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+    }
+
     *ctx = c;
     return OBMAFS3_OK;
 }
@@ -99,6 +105,8 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
 {
     if (!ctx)
         return;
+    if (ctx->bitmap)
+        free(ctx->bitmap);
     if (ctx->fd >= 0)
         close(ctx->fd);
     free(ctx);
@@ -159,8 +167,24 @@ int obmafs3_create(const char *path, uint64_t total_size,
     sb.media_tag_lba   = 0;   /* reserved */
     sb.checksum_type   = kChecksumTypeXXH64;
     sb.creation_time   = (uint64_t)time(NULL);
-    sb.next_free_lba   = 7;   /* first block after initial structures */
-    sb.next_inode_id   = 3;   /* root inode is 2, next is 3 */
+
+    /* Calculate allocation bitmap size */
+    uint64_t total_blocks = total_size / block_size;
+    uint64_t bitmap_bytes = (total_blocks + 7) / 8;
+    size_t   hdr_size = sizeof(struct bitmap_header);
+    /* First block holds header + data, subsequent blocks are pure data */
+    uint64_t first_block_capacity = block_size - hdr_size;
+    uint64_t bitmap_blks;
+    if (bitmap_bytes <= first_block_capacity)
+        bitmap_blks = 1;
+    else
+        bitmap_blks = 1 + (bitmap_bytes - first_block_capacity +
+                           block_size - 1) / block_size;
+
+    sb.bitmap_lba      = 7;                   /* bitmap starts at block 7 */
+    sb.bitmap_blocks   = bitmap_blks;
+    sb.next_free_lba   = 7 + bitmap_blks;     /* first block after bitmap */
+    sb.next_inode_id   = 3;                    /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label,
             sizeof(sb.volume_label) - 1);
 
@@ -250,6 +274,65 @@ int obmafs3_create(const char *path, uint64_t total_size,
     rc = write_block(fd, block_size, 6, &dedup_list, sizeof(dedup_list));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
+    /* --- Blocks 7..7+N-1: Allocation bitmap --- */
+    {
+        /* Build the flat bitmap data */
+        uint8_t *bitmap = calloc(1, (size_t)bitmap_bytes);
+        if (!bitmap) { close(fd); return OBMAFS3_ERR_NOMEM; }
+
+        /* Mark blocks 0 through (7 + bitmap_blks - 1) as allocated */
+        uint64_t reserved = 7 + bitmap_blks;
+        for (uint64_t b = 0; b < reserved; b++)
+            bitmap[b / 8] |= (1u << (b % 8));
+
+        /* Build the bitmap header with checksum over bitmap data */
+        struct bitmap_header bhdr;
+        memset(&bhdr, 0, sizeof(bhdr));
+        bhdr.magic = OBMAFS3_BITMAP_MAGIC;
+        bhdr.total_blocks = total_blocks;
+        obmafs3_checksum_block(bitmap, (size_t)bitmap_bytes,
+                               bhdr.checksum);
+
+        /* Write bitmap blocks: first block = header + data */
+        uint8_t *blk = calloc(1, (size_t)block_size);
+        if (!blk) { free(bitmap); close(fd); return OBMAFS3_ERR_NOMEM; }
+
+        uint64_t data_offset = 0;
+        uint64_t data_remaining = bitmap_bytes;
+
+        for (uint64_t i = 0; i < bitmap_blks; i++) {
+            memset(blk, 0, (size_t)block_size);
+
+            if (i == 0) {
+                memcpy(blk, &bhdr, hdr_size);
+                size_t avail = (size_t)(block_size - hdr_size);
+                size_t copy = (data_remaining < avail)
+                                  ? (size_t)data_remaining : avail;
+                memcpy(blk + hdr_size, bitmap + data_offset, copy);
+                data_offset += copy;
+                data_remaining -= copy;
+            } else {
+                size_t copy = (data_remaining < block_size)
+                                  ? (size_t)data_remaining
+                                  : (size_t)block_size;
+                memcpy(blk, bitmap + data_offset, copy);
+                data_offset += copy;
+                data_remaining -= copy;
+            }
+
+            rc = write_block(fd, block_size, 7 + i, blk,
+                             (size_t)block_size);
+            if (rc != OBMAFS3_OK) {
+                free(blk);
+                free(bitmap);
+                close(fd);
+                return rc;
+            }
+        }
+        free(blk);
+        free(bitmap);
+    }
+
     /* Flush and close */
     if (fsync(fd) < 0) {
         close(fd);
@@ -281,6 +364,40 @@ int obmafs3_check(const char *path)
     printf("  Dedup block size: %" PRIu64 "\n", ctx->sb.dedup_block_size);
     printf("  Total bytes:      %" PRIu64 "\n", ctx->sb.total_bytes);
     printf("  Volume label:     %s\n", ctx->sb.volume_label);
+
+    /* Bitmap statistics */
+    if (ctx->sb.bitmap_lba != 0 && ctx->bitmap) {
+        /* Read the header for display */
+        uint8_t *bhdr_buf = malloc((size_t)ctx->sb.block_size);
+        struct bitmap_header bhdr;
+        memset(&bhdr, 0, sizeof(bhdr));
+        if (bhdr_buf) {
+            if (obmafs3_block_read(ctx, ctx->sb.bitmap_lba, bhdr_buf,
+                                   (size_t)ctx->sb.block_size) == OBMAFS3_OK)
+                memcpy(&bhdr, bhdr_buf, sizeof(bhdr));
+            free(bhdr_buf);
+        }
+
+        uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
+        uint64_t allocated = 0;
+        for (uint64_t b = 0; b < total_blocks; b++) {
+            if (obmafs3_bitmap_is_set(ctx, b))
+                allocated++;
+        }
+
+        printf("\nAllocation bitmap:\n");
+        printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+               bhdr.magic,
+               bhdr.magic == OBMAFS3_BITMAP_MAGIC ? "OK" : "BAD");
+        printf("  Checksum:         %s\n",
+               ctx->bitmap ? "OK" : "BAD");  /* bitmap_read would have failed */
+        printf("  Bitmap LBA:       %" PRIu64 "\n", ctx->sb.bitmap_lba);
+        printf("  Bitmap blocks:    %" PRIu64 "\n", ctx->sb.bitmap_blocks);
+        printf("  Total blocks:     %" PRIu64 "\n", total_blocks);
+        printf("  Allocated blocks: %" PRIu64 "\n", allocated);
+        printf("  Free blocks:      %" PRIu64 "\n",
+               total_blocks - allocated);
+    }
 
     printf("\nCatalog tree:\n");
     printf("  Magic:            0x%016" PRIx64 " (%s)\n",

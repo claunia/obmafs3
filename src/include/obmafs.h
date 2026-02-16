@@ -28,6 +28,8 @@ struct obmafs3_ctx {
     struct btree_header catalog_hdr; /**< Cached catalog tree header */
     struct btree_header inode_hdr;   /**< Cached inode tree header */
     struct btree_header overflow_hdr;/**< Cached overflow tree header */
+    uint8_t *bitmap;                 /**< In-memory allocation bitmap */
+    uint64_t bitmap_size;            /**< Size of allocation bitmap in bytes */
 };
 
 /* --- Context management --- */
@@ -67,10 +69,24 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx,
                       const struct btree_node_inode *inode);
 int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id);
 
+/* --- Allocation bitmap --- */
+int  obmafs3_bitmap_read(struct obmafs3_ctx *ctx);
+int  obmafs3_bitmap_write(struct obmafs3_ctx *ctx);
+void obmafs3_bitmap_set(struct obmafs3_ctx *ctx, uint64_t lba,
+                        uint64_t count);
+void obmafs3_bitmap_clear(struct obmafs3_ctx *ctx, uint64_t lba,
+                          uint64_t count);
+int  obmafs3_bitmap_is_set(struct obmafs3_ctx *ctx, uint64_t lba);
+int  obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count,
+                              uint64_t *start_lba);
+
 /* --- Block allocation --- */
 int      obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba);
 int      obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count,
                               uint64_t *start_lba);
+int      obmafs3_free_block(struct obmafs3_ctx *ctx, uint64_t lba);
+int      obmafs3_free_blocks(struct obmafs3_ctx *ctx, uint64_t lba,
+                             uint64_t count);
 uint64_t obmafs3_alloc_inode_id(struct obmafs3_ctx *ctx);
 
 /* --- Catalog mutations --- */

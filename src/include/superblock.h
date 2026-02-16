@@ -22,6 +22,8 @@ struct __attribute__((packed)) obmafs3_sb {
     uint64_t creation_time;      /**< Creation time of the filesystem */
     uint64_t next_free_lba;      /**< Next free logical block address for allocation */
     uint64_t next_inode_id;      /**< Next available inode ID */
+    uint64_t bitmap_lba;         /**< LBA of the first allocation bitmap block */
+    uint64_t bitmap_blocks;      /**< Number of blocks used by the allocation bitmap */
     uint8_t  volume_label[256];  /**< Volume label of the filesystem */
 };
 

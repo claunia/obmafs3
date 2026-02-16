@@ -411,8 +411,51 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
         if (rc != OBMAFS3_OK)
             return -EIO;
     } else {
-        /* Shrinking: just update file_size.
-         * Blocks remain allocated but data beyond newsize is ignored. */
+        /* Shrinking: free blocks that are no longer needed */
+        uint64_t block_size = g_ctx->sb.block_size;
+        size_t data_capacity = (size_t)block_size -
+                               sizeof(struct block_header);
+        uint64_t old_blocks =
+            (inode.file_size + data_capacity - 1) / data_capacity;
+        uint64_t new_blocks_needed = (newsize > 0)
+            ? ((uint64_t)newsize + data_capacity - 1) / data_capacity
+            : 0;
+
+        if (new_blocks_needed < old_blocks) {
+            /* Walk extents and free trailing blocks */
+            uint64_t block_idx = 0;
+            for (int ei = 0; ei < 8; ei++) {
+                if (inode.extents[ei].block_count == 0)
+                    continue;
+                uint64_t ext_end = block_idx +
+                                   inode.extents[ei].block_count;
+                if (ext_end <= new_blocks_needed) {
+                    block_idx = ext_end;
+                    continue;
+                }
+                if (block_idx >= new_blocks_needed) {
+                    /* Free entire extent */
+                    obmafs3_free_blocks(
+                        g_ctx,
+                        inode.extents[ei].start_block,
+                        inode.extents[ei].block_count);
+                    inode.extents[ei].start_block = 0;
+                    inode.extents[ei].block_count = 0;
+                } else {
+                    /* Partially free this extent */
+                    uint64_t keep = new_blocks_needed - block_idx;
+                    uint64_t free_count =
+                        inode.extents[ei].block_count - keep;
+                    obmafs3_free_blocks(
+                        g_ctx,
+                        inode.extents[ei].start_block + keep,
+                        free_count);
+                    inode.extents[ei].block_count = keep;
+                }
+                block_idx = ext_end;
+            }
+        }
+
         inode.file_size = (uint64_t)newsize;
     }
 

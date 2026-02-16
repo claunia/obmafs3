@@ -190,26 +190,28 @@ int obmafs3_inode_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
 
 int obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba)
 {
-    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
-    if (ctx->sb.next_free_lba >= max_lba)
-        return OBMAFS3_ERR_NOSPC;
-
-    *lba = ctx->sb.next_free_lba;
-    ctx->sb.next_free_lba++;
-
-    /* Persist updated superblock */
-    return obmafs3_sb_write(ctx->fd, &ctx->sb);
+    return obmafs3_alloc_blocks(ctx, 1, lba);
 }
 
 int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count,
                          uint64_t *start_lba)
 {
-    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
-    if (ctx->sb.next_free_lba + count > max_lba)
-        return OBMAFS3_ERR_NOSPC;
+    /* Find contiguous free blocks via the bitmap */
+    int rc = obmafs3_bitmap_find_free(ctx, count, start_lba);
+    if (rc != OBMAFS3_OK)
+        return rc;
 
-    *start_lba = ctx->sb.next_free_lba;
-    ctx->sb.next_free_lba += count;
+    /* Mark them as allocated */
+    obmafs3_bitmap_set(ctx, *start_lba, count);
+
+    /* Persist the bitmap */
+    rc = obmafs3_bitmap_write(ctx);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    /* Keep next_free_lba as a hint for future allocations */
+    if (*start_lba + count > ctx->sb.next_free_lba)
+        ctx->sb.next_free_lba = *start_lba + count;
 
     return obmafs3_sb_write(ctx->fd, &ctx->sb);
 }
@@ -362,8 +364,16 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id,
             ctx->catalog_hdr.total_nodes--;
             rc = obmafs3_btree_header_write(ctx, ctx->sb.catalog_lba,
                                             &ctx->catalog_hdr);
+            if (rc != OBMAFS3_OK) {
+                free(buf);
+                return rc;
+            }
+
+            /* Free the catalog node block */
+            obmafs3_free_block(ctx, lba);
+
             free(buf);
-            return rc;
+            return OBMAFS3_OK;
         }
 
         prev_lba = lba;
@@ -536,11 +546,26 @@ int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
                 }
             }
 
+            /* Free file data blocks from extents */
+            for (int ei = 0; ei < 8; ei++) {
+                if (node.extents[ei].block_count > 0)
+                    obmafs3_free_blocks(ctx, node.extents[ei].start_block,
+                                        node.extents[ei].block_count);
+            }
+
             ctx->inode_hdr.total_nodes--;
             rc = obmafs3_btree_header_write(ctx, ctx->sb.inode_lba,
                                             &ctx->inode_hdr);
+            if (rc != OBMAFS3_OK) {
+                free(buf);
+                return rc;
+            }
+
+            /* Free the inode node block */
+            obmafs3_free_block(ctx, lba);
+
             free(buf);
-            return rc;
+            return OBMAFS3_OK;
         }
 
         prev_lba = lba;

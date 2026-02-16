@@ -1,6 +1,7 @@
 add_library(obmafs STATIC
     superblock.c
     btree.c
+    bitmap.c
     block.c
     checksum.c
     io.c

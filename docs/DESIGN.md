@@ -17,10 +17,14 @@ struct obmafs3_sb {
     uint64_t inode_lba; //< Logical block address of the inode (btree) structure
     uint64_t overflow_lba; //< Logical block address of the overflow tree for large files
     uint64_t dedup_lba; //< Logical block address of the deduplication tree list header
-    uint64_t metadata_lba; //< Logical block address of the metadata (btree)structure
+    uint64_t metadata_lba; //< Logical block address of the metadata (btree) structure
     uint64_t media_tag_lba; //< Logical block address of the media tag (btree) structure
     uint16_t checksum_type; //< Type of checksum used for the filesystem
     uint64_t creation_time; //< Creation time of the filesystem
+    uint64_t next_free_lba; //< Next free logical block address hint for allocation
+    uint64_t next_inode_id; //< Next available inode ID for new files
+    uint64_t bitmap_lba; //< Logical block address of the first allocation bitmap block
+    uint64_t bitmap_blocks; //< Number of blocks used by the allocation bitmap
     uint8_t volume_label[256]; //< Volume label of the filesystem
 };
 ```
@@ -40,6 +44,41 @@ The `metadata_lba` points to the logical block address containing the header of 
 The `media_tag_lba` points to the logical block address containing the header of the Media Tag Tree, which is a B+Tree structure that stores media tags for the disk images. Each node in the Media Tag Tree contains a list of entries, where each entry represents a media tag. The entries contain the name of the media tag and its value or a pointer to a block in the filesystem storing its value.
 
 The `checksum_type` field in the superblock indicates the type of checksum used for the filesystem, which can be used to verify the integrity of the data stored in the filesystem. The `creation_time` field stores the time when the filesystem was created, and the `volume_label` field allows for a human-readable label to be assigned to the filesystem.
+
+The `next_free_lba` field serves as a hint for the block allocator, tracking the highest allocated logical block address to speed up sequential allocations. The `next_inode_id` field tracks the next available inode identifier and is incremented each time a new file or directory is created.
+
+The `bitmap_lba` field points to the logical block address of the first block of the allocation bitmap, and `bitmap_blocks` indicates how many blocks the bitmap occupies on disk. Together they allow the filesystem to locate and load the allocation bitmap at mount time.
+
+## The Allocation Bitmap
+
+OBMAFS v3 uses an allocation bitmap to track which blocks in the filesystem are in use and which are free. Each bit in the bitmap corresponds to one standard block (as defined by `block_size` in the superblock). A bit value of 1 means the block is allocated, and 0 means it is free. Deduplication blocks that span multiple standard blocks (when `dedup_block_size` is a multiple of `block_size`) occupy several consecutive bits in the bitmap.
+
+The first bitmap block begins with a header:
+
+```c
+struct bitmap_header {
+    uint64_t magic; //< "OBMABMAP"
+    uint64_t total_blocks; //< Total number of blocks tracked by the bitmap
+    uint8_t checksum[32]; //< Checksum of all bitmap data (excluding this header)
+};
+```
+
+Where `magic` is used to identify the block as an allocation bitmap block, `total_blocks` records the total number of blocks in the filesystem that the bitmap tracks, and `checksum` contains a checksum computed over all of the bitmap data bytes (spread across one or more blocks). The checksum is recomputed and written every time the bitmap is persisted to disk, and is verified when the bitmap is loaded at mount time.
+
+The bitmap data follows immediately after the header in the first block. If the bitmap data does not fit in a single block (after accounting for the header), it continues in subsequent blocks which contain only bitmap data with no additional headers.
+
+The on-disk layout of the bitmap blocks is:
+
+| Block | Content |
+|---|---|
+| `bitmap_lba` | `bitmap_header` + bitmap data bytes |
+| `bitmap_lba + 1` | bitmap data bytes (continuation) |
+| ... | ... |
+| `bitmap_lba + N-1` | bitmap data bytes (last block, may be partially filled) |
+
+When the filesystem is created, blocks reserved for the superblock, tree headers, root nodes, and the bitmap itself are marked as allocated in the bitmap. All remaining blocks are marked as free.
+
+When blocks are allocated (for new files, directory entries, inodes, or data), the allocator searches the bitmap for a contiguous run of free bits of the requested length, marks them as allocated, recomputes the checksum, and writes the bitmap back to disk. When blocks are freed (on file deletion or truncation), the corresponding bits are cleared, the checksum is recomputed, and the bitmap is persisted.
 
 ## The B+Tree Structures
 
