@@ -20,6 +20,8 @@ struct __attribute__((packed)) obmafs3_sb {
     uint64_t media_tag_lba;      /**< LBA of the media tag (btree) structure */
     uint16_t checksum_type;      /**< Type of checksum used for the filesystem */
     uint64_t creation_time;      /**< Creation time of the filesystem */
+    uint64_t next_free_lba;      /**< Next free logical block address for allocation */
+    uint64_t next_inode_id;      /**< Next available inode ID */
     uint8_t  volume_label[256];  /**< Volume label of the filesystem */
 };
 

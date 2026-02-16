@@ -159,6 +159,8 @@ int obmafs3_create(const char *path, uint64_t total_size,
     sb.media_tag_lba   = 0;   /* reserved */
     sb.checksum_type   = kChecksumTypeXXH64;
     sb.creation_time   = (uint64_t)time(NULL);
+    sb.next_free_lba   = 7;   /* first block after initial structures */
+    sb.next_inode_id   = 3;   /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label,
             sizeof(sb.volume_label) - 1);
 
