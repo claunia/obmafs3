@@ -57,6 +57,13 @@ struct __attribute__((packed)) btree_node_inode {
     uint64_t sector_count;       /**< Total number of sectors in the media image */
     uint64_t sector_map_size;    /**< Number of sector_map_entries written so far */
 };
+
+struct __attribute__((packed)) btree_node_dedup {
+    struct btree_node_header header;
+    /* Followed by node_keys × struct dedup_entry records.
+     * Maximum entries per node =
+     *   (block_size - sizeof(btree_node_header)) / sizeof(dedup_entry).
+     * For a 4096-byte block: (4096 - 69) / 24 = 167 entries. */
 };
 
 #endif /* OBMAFS3_BTREE_H */
