@@ -43,6 +43,17 @@ struct __attribute__((packed)) extent_run {
     uint64_t block_count;  /**< Number of blocks in the extent run */
 };
 
+/**
+ * An overflow extent entry stored in the overflow tree.
+ * Associates an inode_id with an extent_run for files that
+ * need more than 8 inline extents.
+ */
+struct __attribute__((packed)) overflow_extent {
+    uint64_t inode_id;     /**< Inode this extent belongs to */
+    uint64_t start_block;  /**< Starting block of the extent run */
+    uint64_t block_count;  /**< Number of blocks in the extent run */
+};
+
 struct __attribute__((packed)) bitmap_header {
     uint64_t magic;          /**< "OBMABMAP" */
     uint64_t total_blocks;   /**< Total number of blocks tracked by bitmap */
