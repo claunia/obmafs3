@@ -545,8 +545,14 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
+    /* Always persist the inode so that other processes (e.g. ls) see
+     * the up-to-date file_size and extents.  We keep the in-memory
+     * cached copy for our own reads to avoid a B+Tree lookup. */
     if (ffctx) {
-        ffctx->inode_dirty = 1;
+        rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        ffctx->inode_dirty = 0;
     } else {
         rc = obmafs3_inode_put(g_ctx, &inode);
         if (rc != OBMAFS3_OK)
@@ -563,9 +569,12 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
     const char *name;
     struct btree_node_filename cat_entry;
     struct btree_node_inode inode;
+    struct btree_node_inode *ip;
     int rc;
 
-    (void)fi;
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
 
     rc = resolve_path(path, &parent_id, &name);
     if (rc != 0)
@@ -575,18 +584,23 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if (ffctx) {
+        ip = &ffctx->inode;
+    } else {
+        rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        ip = &inode;
+    }
 
-    if ((uint64_t)newsize > inode.file_size) {
+    if ((uint64_t)newsize > ip->file_size) {
         /* Extending: write zeros to fill the gap */
-        size_t gap = (size_t)((uint64_t)newsize - inode.file_size);
+        size_t gap = (size_t)((uint64_t)newsize - ip->file_size);
         void *zeros = calloc(1, gap);
         if (!zeros)
             return -ENOMEM;
-        rc = obmafs3_write_file_data(g_ctx, &inode,
-                                     inode.file_size, zeros, gap);
+        rc = obmafs3_write_file_data(g_ctx, ip,
+                                     ip->file_size, zeros, gap);
         free(zeros);
         if (rc != OBMAFS3_OK)
             return -EIO;
@@ -596,7 +610,7 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
         size_t data_capacity = (size_t)block_size -
                                sizeof(struct block_header);
         uint64_t old_blocks =
-            (inode.file_size + data_capacity - 1) / data_capacity;
+            (ip->file_size + data_capacity - 1) / data_capacity;
         uint64_t new_blocks_needed = (newsize > 0)
             ? ((uint64_t)newsize + data_capacity - 1) / data_capacity
             : 0;
@@ -605,10 +619,10 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
             /* Walk extents and free trailing blocks */
             uint64_t block_idx = 0;
             for (int ei = 0; ei < 8; ei++) {
-                if (inode.extents[ei].block_count == 0)
+                if (ip->extents[ei].block_count == 0)
                     continue;
                 uint64_t ext_end = block_idx +
-                                   inode.extents[ei].block_count;
+                                   ip->extents[ei].block_count;
                 if (ext_end <= new_blocks_needed) {
                     block_idx = ext_end;
                     continue;
@@ -617,32 +631,35 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
                     /* Free entire extent */
                     obmafs3_free_blocks(
                         g_ctx,
-                        inode.extents[ei].start_block,
-                        inode.extents[ei].block_count);
-                    inode.extents[ei].start_block = 0;
-                    inode.extents[ei].block_count = 0;
+                        ip->extents[ei].start_block,
+                        ip->extents[ei].block_count);
+                    ip->extents[ei].start_block = 0;
+                    ip->extents[ei].block_count = 0;
                 } else {
                     /* Partially free this extent */
                     uint64_t keep = new_blocks_needed - block_idx;
                     uint64_t free_count =
-                        inode.extents[ei].block_count - keep;
+                        ip->extents[ei].block_count - keep;
                     obmafs3_free_blocks(
                         g_ctx,
-                        inode.extents[ei].start_block + keep,
+                        ip->extents[ei].start_block + keep,
                         free_count);
-                    inode.extents[ei].block_count = keep;
+                    ip->extents[ei].block_count = keep;
                 }
                 block_idx = ext_end;
             }
         }
 
-        inode.file_size = (uint64_t)newsize;
+        ip->file_size = (uint64_t)newsize;
     }
 
-    inode.modification_time = (uint64_t)time(NULL);
-    rc = obmafs3_inode_put(g_ctx, &inode);
+    ip->modification_time = (uint64_t)time(NULL);
+    rc = obmafs3_inode_put(g_ctx, ip);
     if (rc != OBMAFS3_OK)
         return -EIO;
+
+    if (ffctx)
+        ffctx->inode_dirty = 0;
 
     return 0;
 }
