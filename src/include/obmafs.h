@@ -149,6 +149,7 @@ struct dedup_block_cache {
     int       dirty;         /**< Whether the buffer has been modified */
     int       initialized;   /**< Non-zero once first init has run */
     void     *bg_compress;   /**< Opaque background compression context */
+    void     *node_cache;    /**< Opaque dedup B+Tree node cache */
 };
 
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,

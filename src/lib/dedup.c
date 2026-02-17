@@ -8,6 +8,7 @@
 #include "obmafs.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zstd.h>
@@ -183,6 +184,240 @@ static void compute_node_checksum(uint8_t *buf)
     size_t data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
     memset(nhdr->checksum, 0, sizeof(nhdr->checksum));
     obmafs3_checksum_block(buf, data_size, nhdr->checksum);
+}
+
+/* ------------------------------------------------------------------ */
+/*  In-memory write-back cache for dedup B+Tree nodes                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Slot in the open-addressing hash table.
+ * A slot is empty when buf == NULL.
+ */
+struct dedup_cache_slot {
+    uint64_t lba;       /**< Block LBA */
+    uint8_t *buf;       /**< Cached block data (block_size bytes), NULL = empty */
+    int      dirty;     /**< Needs write-back to disk */
+};
+
+/**
+ * Write-back cache for dedup B+Tree nodes.
+ *
+ * Keeps recently-accessed tree nodes in RAM so that the root and
+ * index nodes (accessed on every lookup / insert) are read from disk
+ * only once.  Dirty entries are flushed before the btree header is
+ * written, preserving on-disk consistency.
+ */
+struct dedup_node_cache {
+    struct dedup_cache_slot *slots;
+    uint32_t capacity;      /**< Always a power of 2 */
+    uint32_t count;          /**< Number of occupied slots */
+    size_t   block_size;
+};
+
+#define DEDUP_CACHE_INIT_CAP 2048  /* power of 2 */
+
+static struct dedup_node_cache *dedup_cache_create(size_t block_size)
+{
+    struct dedup_node_cache *nc = calloc(1, sizeof(*nc));
+    if (!nc)
+        return NULL;
+    nc->capacity   = DEDUP_CACHE_INIT_CAP;
+    nc->block_size = block_size;
+    nc->slots      = calloc(nc->capacity, sizeof(struct dedup_cache_slot));
+    if (!nc->slots) {
+        free(nc);
+        return NULL;
+    }
+    return nc;
+}
+
+/** Fibonacci-hashing of an LBA to a table index. */
+static uint32_t cache_hash(uint64_t lba, uint32_t mask)
+{
+    return (uint32_t)((lba * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+/** Find the slot for @lba, or NULL if not cached. */
+static struct dedup_cache_slot *cache_find_slot(
+    struct dedup_node_cache *nc, uint64_t lba)
+{
+    uint32_t mask = nc->capacity - 1;
+    uint32_t idx  = cache_hash(lba, mask);
+    for (uint32_t i = 0; i < nc->capacity; i++) {
+        uint32_t s = (idx + i) & mask;
+        if (nc->slots[s].buf == NULL)
+            return NULL;          /* end of probe chain */
+        if (nc->slots[s].lba == lba)
+            return &nc->slots[s];
+    }
+    return NULL;
+}
+
+/** Double the table capacity and re-hash all entries. */
+static int cache_grow(struct dedup_node_cache *nc)
+{
+    uint32_t new_cap = nc->capacity * 2;
+    struct dedup_cache_slot *ns =
+        calloc(new_cap, sizeof(struct dedup_cache_slot));
+    if (!ns)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint32_t new_mask = new_cap - 1;
+    for (uint32_t i = 0; i < nc->capacity; i++) {
+        if (nc->slots[i].buf == NULL)
+            continue;
+        uint32_t idx = cache_hash(nc->slots[i].lba, new_mask);
+        for (uint32_t j = 0; j < new_cap; j++) {
+            uint32_t s = (idx + j) & new_mask;
+            if (ns[s].buf == NULL) {
+                ns[s] = nc->slots[i];
+                break;
+            }
+        }
+    }
+    free(nc->slots);
+    nc->slots    = ns;
+    nc->capacity = new_cap;
+    return OBMAFS3_OK;
+}
+
+/**
+ * Read a tree node through the cache.
+ * On a cache miss the block is read from disk and stored in the cache.
+ * @buf receives a copy of the cached data.
+ */
+static int dedup_cache_read(struct dedup_node_cache *nc,
+                            struct obmafs3_ctx *ctx,
+                            uint64_t lba, void *buf, size_t bsz)
+{
+    struct dedup_cache_slot *s = cache_find_slot(nc, lba);
+    if (s) {
+        memcpy(buf, s->buf, nc->block_size);
+        return OBMAFS3_OK;
+    }
+
+    /* Cache miss — read from disk */
+    int rc = obmafs3_block_read(ctx, lba, buf, bsz);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    /* Grow the table when >= 75 % full */
+    if (nc->count * 4 >= nc->capacity * 3) {
+        rc = cache_grow(nc);
+        if (rc != OBMAFS3_OK)
+            return OBMAFS3_OK;  /* tolerate: data is in buf already */
+    }
+
+    uint32_t mask = nc->capacity - 1;
+    uint32_t idx  = cache_hash(lba, mask);
+    for (uint32_t i = 0; i < nc->capacity; i++) {
+        uint32_t slot = (idx + i) & mask;
+        if (nc->slots[slot].buf == NULL) {
+            nc->slots[slot].lba = lba;
+            nc->slots[slot].buf = malloc(nc->block_size);
+            if (nc->slots[slot].buf) {
+                memcpy(nc->slots[slot].buf, buf, nc->block_size);
+                nc->slots[slot].dirty = 0;
+                nc->count++;
+            }
+            break;
+        }
+    }
+    return OBMAFS3_OK;
+}
+
+/**
+ * Write a tree node through the cache (write-back).
+ * The data is stored in the cache and marked dirty; no disk I/O
+ * happens until dedup_cache_flush().
+ */
+static int dedup_cache_write(struct dedup_node_cache *nc,
+                             struct obmafs3_ctx *ctx,
+                             uint64_t lba, const void *buf, size_t bsz)
+{
+    (void)ctx; (void)bsz;  /* used only for fallback / symmetry */
+
+    struct dedup_cache_slot *s = cache_find_slot(nc, lba);
+    if (s) {
+        memcpy(s->buf, buf, nc->block_size);
+        s->dirty = 1;
+        return OBMAFS3_OK;
+    }
+
+    /* New entry */
+    if (nc->count * 4 >= nc->capacity * 3) {
+        int rc = cache_grow(nc);
+        if (rc != OBMAFS3_OK)
+            return rc;
+    }
+
+    uint32_t mask = nc->capacity - 1;
+    uint32_t idx  = cache_hash(lba, mask);
+    for (uint32_t i = 0; i < nc->capacity; i++) {
+        uint32_t slot = (idx + i) & mask;
+        if (nc->slots[slot].buf == NULL) {
+            nc->slots[slot].lba = lba;
+            nc->slots[slot].buf = malloc(nc->block_size);
+            if (!nc->slots[slot].buf)
+                return OBMAFS3_ERR_NOMEM;
+            memcpy(nc->slots[slot].buf, buf, nc->block_size);
+            nc->slots[slot].dirty = 1;
+            nc->count++;
+            return OBMAFS3_OK;
+        }
+    }
+    return OBMAFS3_ERR_NOMEM;  /* table full (shouldn't happen) */
+}
+
+/** Flush all dirty entries to disk, clear dirty flags. */
+static int dedup_cache_flush(struct dedup_node_cache *nc,
+                             struct obmafs3_ctx *ctx)
+{
+    for (uint32_t i = 0; i < nc->capacity; i++) {
+        if (nc->slots[i].buf && nc->slots[i].dirty) {
+            int rc = obmafs3_block_write(ctx, nc->slots[i].lba,
+                                         nc->slots[i].buf,
+                                         nc->block_size);
+            if (rc != OBMAFS3_OK)
+                return rc;
+            nc->slots[i].dirty = 0;
+        }
+    }
+    return OBMAFS3_OK;
+}
+
+/** Free all memory held by the node cache. */
+static void dedup_cache_free(struct dedup_node_cache *nc)
+{
+    if (!nc)
+        return;
+    for (uint32_t i = 0; i < nc->capacity; i++)
+        free(nc->slots[i].buf);   /* free(NULL) is safe */
+    free(nc->slots);
+    free(nc);
+}
+
+/**
+ * Wrappers that dispatch to the cache when available,
+ * falling back to direct I/O when nc is NULL.
+ */
+static int nc_block_read(struct dedup_node_cache *nc,
+                         struct obmafs3_ctx *ctx,
+                         uint64_t lba, void *buf, size_t bsz)
+{
+    if (nc)
+        return dedup_cache_read(nc, ctx, lba, buf, bsz);
+    return obmafs3_block_read(ctx, lba, buf, bsz);
+}
+
+static int nc_block_write(struct dedup_node_cache *nc,
+                          struct obmafs3_ctx *ctx,
+                          uint64_t lba, const void *buf, size_t bsz)
+{
+    if (nc)
+        return dedup_cache_write(nc, ctx, lba, buf, bsz);
+    return obmafs3_block_write(ctx, lba, buf, bsz);
 }
 
 /* ------------------------------------------------------------------ */
@@ -445,6 +680,7 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx,
             memcpy(&ie,
                    data + (size_t)slot * sizeof(ie),
                    sizeof(ie));
+
             lba = ie.child_lba;
             continue;
         }
@@ -504,56 +740,59 @@ struct dedup_btree_path {
 };
 
 /**
- * Insert a dedup_entry into the dedup B+Tree.
- *
- * Descends from root to leaf tracking the path through index nodes.
- * Performs sorted insertion by hash key in the leaf with binary search.
- * If the leaf is full, splits and propagates upward.
+ * Saved traversal state from dedup_upsert_find(), used by
+ * dedup_upsert_insert() to insert without re-traversing.
  */
-static int dedup_insert_node(struct obmafs3_ctx *ctx,
-                             struct btree_header *hdr, uint64_t hdr_lba,
-                             const struct dedup_entry *entry)
-{
-    size_t   bsz       = (size_t)ctx->sb.block_size;
-    uint64_t root_lba  = hdr->root_node_lba;
-    int rc;
-
-    /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = calloc(1, bsz);
-    if (!buf)
-        return OBMAFS3_ERR_NOMEM;
-
+struct dedup_upsert_ctx {
     struct dedup_btree_path path[DEDUP_BTREE_MAX_DEPTH];
-    int depth = 0;
-    uint64_t lba = root_lba;
+    int                     depth;
+    uint64_t                leaf_lba;
+    int                     insert_pos;
+    struct btree_node_header leaf_hdr;
+};
+
+/**
+ * Phase 1 of upsert: traverse from root to leaf looking for @hash.
+ *
+ * If found, fills @existing and returns OBMAFS3_OK.
+ * If not found, saves traversal state in @uctx (path, leaf LBA,
+ * insert position, leaf header) and returns OBMAFS3_ERR_NOTFOUND.
+ * The caller can then call dedup_upsert_insert() to store a new
+ * entry without re-traversing the tree.
+ *
+ * @buf is a caller-owned buffer of at least block_size bytes.
+ * On return it holds the leaf node.
+ */
+static int dedup_upsert_find(struct obmafs3_ctx *ctx,
+                             const struct btree_header *hdr,
+                             uint64_t hash,
+                             struct dedup_entry *existing,
+                             struct dedup_upsert_ctx *uctx,
+                             uint8_t *buf,
+                             struct dedup_node_cache *nc)
+{
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint64_t lba = hdr->root_node_lba;
+    uctx->depth  = 0;
 
     while (1) {
-        rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if (rc != OBMAFS3_OK) {
-            free(buf);
+        int rc = nc_block_read(nc, ctx, lba, buf, bsz);
+        if (rc != OBMAFS3_OK)
             return rc;
-        }
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
-            free(buf);
+        if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
             return OBMAFS3_ERR_BADMAGIC;
-        }
 
-        if (nhdr.level == 0)
-            break; /* reached leaf; buf holds it at lba */
+        if (nhdr.level > 0) {
+            /* Index node */
+            if (uctx->depth >= DEDUP_BTREE_MAX_DEPTH)
+                return OBMAFS3_ERR_INVAL;
 
-        if (depth >= DEDUP_BTREE_MAX_DEPTH) {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
-
-        /* Binary search for the child slot to follow */
-        const uint8_t *data = buf + sizeof(struct btree_node_header);
-        uint16_t slot = 0;
-        {
+            const uint8_t *data = buf + sizeof(struct btree_node_header);
+            uint16_t slot = 0;
             int lo = 0, hi = (int)nhdr.node_keys - 1;
             while (lo <= hi) {
                 int mid = lo + (hi - lo) / 2;
@@ -561,45 +800,75 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
                 memcpy(&mid_key,
                        data + (size_t)mid * sizeof(struct btree_index_entry),
                        sizeof(mid_key));
-                if (mid_key <= entry->hash) {
+                if (mid_key <= hash) {
                     slot = (uint16_t)mid;
                     lo = mid + 1;
                 } else {
                     hi = mid - 1;
                 }
             }
+
+            uctx->path[uctx->depth].lba  = lba;
+            uctx->path[uctx->depth].slot = slot;
+            uctx->depth++;
+
+            struct btree_index_entry ie;
+            memcpy(&ie,
+                   data + (size_t)slot * sizeof(ie),
+                   sizeof(ie));
+            lba = ie.child_lba;
+            continue;
         }
 
-        path[depth].lba  = lba;
-        path[depth].slot = slot;
-        depth++;
+        /* Leaf node: binary search */
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        int lo = 0, hi = (int)nhdr.node_keys - 1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            uint64_t mid_hash;
+            memcpy(&mid_hash,
+                   data + (size_t)mid * sizeof(struct dedup_entry),
+                   sizeof(mid_hash));
+            if (mid_hash == hash) {
+                memcpy(existing,
+                       data + (size_t)mid * sizeof(struct dedup_entry),
+                       sizeof(*existing));
+                return OBMAFS3_OK;
+            }
+            if (mid_hash < hash)
+                lo = mid + 1;
+            else
+                hi = mid - 1;
+        }
 
-        struct btree_index_entry ie;
-        memcpy(&ie,
-               data + (size_t)slot * sizeof(ie),
-               sizeof(ie));
-        lba = ie.child_lba;
+        /* Not found — save state for insert */
+        uctx->leaf_lba   = lba;
+        uctx->insert_pos = lo;
+        memcpy(&uctx->leaf_hdr, &nhdr, sizeof(nhdr));
+        return OBMAFS3_ERR_NOTFOUND;
     }
+}
 
-    /* ---- buf holds the leaf node at lba ---- */
-    struct btree_node_header leaf_hdr;
-    memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
-
-    /* Binary search for insertion point */
-    const uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
-    int lo = 0, hi = (int)leaf_hdr.node_keys - 1;
-    while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        uint64_t mid_hash;
-        memcpy(&mid_hash,
-               leaf_data + (size_t)mid * sizeof(struct dedup_entry),
-               sizeof(mid_hash));
-        if (mid_hash < entry->hash)
-            lo = mid + 1;
-        else
-            hi = mid - 1;
-    }
-    int insert_pos = lo;
+/**
+ * Phase 2 of upsert: insert @entry at the position found by
+ * dedup_upsert_find().
+ *
+ * @buf must still contain the leaf node from the find phase.
+ * Updates @hdr in memory (total_nodes, root_node_lba) but does NOT
+ * write the btree header to disk — the caller is responsible for that.
+ */
+static int dedup_upsert_insert(struct obmafs3_ctx *ctx,
+                               struct btree_header *hdr,
+                               const struct dedup_entry *entry,
+                               struct dedup_upsert_ctx *uctx,
+                               uint8_t *buf,
+                               struct dedup_node_cache *nc)
+{
+    size_t   bsz       = (size_t)ctx->sb.block_size;
+    uint64_t lba       = uctx->leaf_lba;
+    int      insert_pos = uctx->insert_pos;
+    struct btree_node_header leaf_hdr = uctx->leaf_hdr;
+    int rc;
 
     uint16_t max_leaf = dedup_leaf_max_keys(ctx);
     size_t   rec_sz   = sizeof(struct dedup_entry);
@@ -621,18 +890,14 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
         memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
         compute_node_checksum(buf);
 
-        rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
-        return rc;
+        return nc_block_write(nc, ctx, lba, buf, bsz);
     }
 
     /* ---- Leaf is full: split ---- */
     uint16_t total = max_leaf + 1;
     struct dedup_entry *all = calloc(total, rec_sz);
-    if (!all) {
-        free(buf);
+    if (!all)
         return OBMAFS3_ERR_NOMEM;
-    }
 
     uint8_t *ld = buf + sizeof(struct btree_node_header);
 
@@ -656,7 +921,6 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
     rc = obmafs3_alloc_block(ctx, &new_leaf_lba);
     if (rc != OBMAFS3_OK) {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -665,10 +929,9 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
     leaf_hdr.right_link  = new_leaf_lba;
     memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
     compute_node_checksum(buf);
-    rc = obmafs3_block_write(ctx, lba, buf, bsz);
+    rc = nc_block_write(nc, ctx, lba, buf, bsz);
     if (rc != OBMAFS3_OK) {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -686,10 +949,9 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
     memcpy(buf + sizeof(nh), &all[left_count],
            (size_t)right_count * rec_sz);
     compute_node_checksum(buf);
-    rc = obmafs3_block_write(ctx, new_leaf_lba, buf, bsz);
+    rc = nc_block_write(nc, ctx, new_leaf_lba, buf, bsz);
     if (rc != OBMAFS3_OK) {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -702,16 +964,15 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
     hdr->total_nodes++;
 
     /* ---- Propagate split upward through index nodes ---- */
+    int depth = uctx->depth;
     while (depth > 0) {
         depth--;
-        uint64_t parent_lba  = path[depth].lba;
-        uint16_t parent_slot = path[depth].slot;
+        uint64_t parent_lba  = uctx->path[depth].lba;
+        uint16_t parent_slot = uctx->path[depth].slot;
 
-        rc = obmafs3_block_read(ctx, parent_lba, buf, bsz);
-        if (rc != OBMAFS3_OK) {
-            free(buf);
+        rc = nc_block_read(nc, ctx, parent_lba, buf, bsz);
+        if (rc != OBMAFS3_OK)
             return rc;
-        }
 
         struct btree_node_header phdr;
         memcpy(&phdr, buf, sizeof(phdr));
@@ -723,6 +984,16 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
         if (phdr.node_keys < max_idx) {
             /* Room in parent — insert */
             uint8_t *id = buf + sizeof(struct btree_node_header);
+
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct btree_index_entry upd;
+            memcpy(&upd, id + (size_t)parent_slot * ie_sz, sizeof(upd));
+            upd.key = left_first_key;
+            memcpy(id + (size_t)parent_slot * ie_sz, &upd, sizeof(upd));
 
             if (idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz,
@@ -740,22 +1011,24 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
             memcpy(buf, &phdr, sizeof(phdr));
             compute_node_checksum(buf);
 
-            rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
-            free(buf);
-            if (rc != OBMAFS3_OK)
-                return rc;
-            return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+            return nc_block_write(nc, ctx, parent_lba, buf, bsz);
         }
 
         /* Parent is full — split the index node */
         uint16_t idx_total = max_idx + 1;
         struct btree_index_entry *aie = calloc(idx_total, ie_sz);
-        if (!aie) {
-            free(buf);
+        if (!aie)
             return OBMAFS3_ERR_NOMEM;
-        }
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct btree_index_entry upd;
+        memcpy(&upd, id + (size_t)parent_slot * ie_sz, sizeof(upd));
+        upd.key = left_first_key;
+        memcpy(id + (size_t)parent_slot * ie_sz, &upd, sizeof(upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         aie[idx_insert].key       = push_key;
         aie[idx_insert].child_lba = push_child;
@@ -773,10 +1046,9 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
         phdr.keys_length = (uint16_t)(il * ie_sz);
         memcpy(buf, &phdr, sizeof(phdr));
         compute_node_checksum(buf);
-        rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
+        rc = nc_block_write(nc, ctx, parent_lba, buf, bsz);
         if (rc != OBMAFS3_OK) {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -784,7 +1056,6 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
         rc = obmafs3_alloc_block(ctx, &new_idx_lba);
         if (rc != OBMAFS3_OK) {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -799,10 +1070,9 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
         memcpy(buf, &nih, sizeof(nih));
         memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
         compute_node_checksum(buf);
-        rc = obmafs3_block_write(ctx, new_idx_lba, buf, bsz);
+        rc = nc_block_write(nc, ctx, new_idx_lba, buf, bsz);
         if (rc != OBMAFS3_OK) {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -818,17 +1088,14 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
     rc = obmafs3_alloc_block(ctx, &new_root_lba);
-    if (rc != OBMAFS3_OK) {
-        free(buf);
+    if (rc != OBMAFS3_OK)
         return rc;
-    }
 
     /* Read old root to get its level */
-    rc = obmafs3_block_read(ctx, left_lba, buf, bsz);
-    if (rc != OBMAFS3_OK) {
-        free(buf);
+    rc = nc_block_read(nc, ctx, left_lba, buf, bsz);
+    if (rc != OBMAFS3_OK)
         return rc;
-    }
+
     struct btree_node_header old_hdr;
     memcpy(&old_hdr, buf, sizeof(old_hdr));
 
@@ -850,14 +1117,13 @@ static int dedup_insert_node(struct obmafs3_ctx *ctx,
     memcpy(buf + sizeof(rh), roots, sizeof(roots));
     compute_node_checksum(buf);
 
-    rc = obmafs3_block_write(ctx, new_root_lba, buf, bsz);
-    free(buf);
+    rc = nc_block_write(nc, ctx, new_root_lba, buf, bsz);
     if (rc != OBMAFS3_OK)
         return rc;
 
     hdr->root_node_lba = new_root_lba;
     hdr->total_nodes++;
-    return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+    return OBMAFS3_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1268,6 +1534,26 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
     }
     uint64_t sme_count = 0;
 
+    /* Pre-allocate a single buffer for dedup tree traversal, reused
+     * across all sectors to avoid per-sector malloc/free overhead. */
+    uint8_t *tree_buf = malloc((size_t)ctx->sb.block_size);
+    if (!tree_buf) {
+        free(sme_buf);
+        if (!db_is_cached)
+            dedup_block_free(db);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    /* Create the dedup B+Tree node cache if the caller provides a
+     * persistent dedup block cache (i.e. across FUSE write calls). */
+    if (db_cache && !db_cache->node_cache) {
+        struct dedup_node_cache *nc =
+            dedup_cache_create((size_t)ctx->sb.block_size);
+        if (nc)
+            db_cache->node_cache = nc;
+        /* Non-fatal: if allocation fails, we fall back to direct I/O */
+    }
+
     /*
      * Phase 1: Process sectors — hash, dedup lookup/store, collect
      *          sector_map_entries in memory.  All dedup tree node
@@ -1300,9 +1586,14 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
         /* Hash the sector data */
         uint64_t hash = obmafs3_checksum_xxh64(sector_data, sector_data_len);
 
-        /* Look up in the dedup tree */
+        /* Look up in the dedup tree, saving traversal for insert */
         struct dedup_entry existing;
-        rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, hash, &existing);
+        struct dedup_upsert_ctx uctx;
+        struct dedup_node_cache *nc = db_cache
+            ? (struct dedup_node_cache *)db_cache->node_cache
+            : NULL;
+        rc = dedup_upsert_find(ctx, &dedup_hdr, hash,
+                               &existing, &uctx, tree_buf, nc);
 
         if (rc == OBMAFS3_OK) {
             /* Already stored — skip the data, just record the mapping */
@@ -1317,14 +1608,15 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
             if (rc != OBMAFS3_OK)
                 goto out;
 
-            /* Insert into the dedup tree */
+            /* Insert at the position found by upsert_find (no
+             * re-traversal, no redundant header write) */
             struct dedup_entry new_entry;
             new_entry.hash         = hash;
             new_entry.block_lba    = stored_lba;
             new_entry.block_offset = stored_offset;
 
-            rc = dedup_insert_node(ctx, &dedup_hdr, dedup_hdr_lba,
-                                   &new_entry);
+            rc = dedup_upsert_insert(ctx, &dedup_hdr, &new_entry,
+                                     &uctx, tree_buf, nc);
             if (rc != OBMAFS3_OK)
                 goto out;
         } else {
@@ -1351,7 +1643,6 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
      *          are contiguous (single extent), since no other allocations
      *          happen between them.
      */
-
     /* Wait for any pending background compression before syncing */
     if (db_cache && db_cache->bg_compress) {
         int bg_rc = bg_compress_wait(
@@ -1360,11 +1651,24 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
             rc = bg_rc;
     }
 
-    /* Flush any remaining dedup block data to disk (synchronous) */
-    if (db->dirty) {
+    /* Flush any remaining dedup block data to disk (synchronous).
+     * Skip intermediate flushes when using a persistent cache —
+     * the block will be flushed when it fills up (in dedup_block_store)
+     * or on file close (obmafs3_flush_dedup_block_cache).  Flushing
+     * on every FUSE write is extremely expensive because it re-compresses
+     * the entire partial block (up to 4 MiB at ZSTD level 15). */
+    if (!db_is_cached && db->dirty) {
         int flush_rc = dedup_block_flush(ctx, db);
         if (rc == OBMAFS3_OK)
             rc = flush_rc;
+    }
+
+    /* Flush cached tree nodes to disk before updating the header */
+    if (db_cache && db_cache->node_cache) {
+        int nc_rc = dedup_cache_flush(
+            (struct dedup_node_cache *)db_cache->node_cache, ctx);
+        if (rc == OBMAFS3_OK)
+            rc = nc_rc;
     }
 
     /* Update the tree header with the current partial block state */
@@ -1409,6 +1713,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
         }
     }
 
+    free(tree_buf);
     free(sme_buf);
     /* Copy updated state back to the persistent cache if used */
     if (db_is_cached) {
@@ -1421,6 +1726,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
     } else {
         dedup_block_free(db);
     }
+
     return rc;
 
 out:
@@ -1430,10 +1736,16 @@ out:
     if (db->dirty)
         dedup_block_flush(ctx, db);
 
+    /* Flush cached tree nodes even on error to keep disk consistent */
+    if (db_cache && db_cache->node_cache)
+        dedup_cache_flush(
+            (struct dedup_node_cache *)db_cache->node_cache, ctx);
+
     dedup_hdr.last_block_lba    = db->block_lba;
     dedup_hdr.last_block_offset = db->offset;
     obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
 
+    free(tree_buf);
     free(sme_buf);
     if (db_is_cached) {
         db_cache->data       = db->data;
@@ -1486,6 +1798,14 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx,
         }
     }
 
+    /* Flush any cached tree nodes to disk */
+    if (db_cache->node_cache) {
+        int nc_rc = dedup_cache_flush(
+            (struct dedup_node_cache *)db_cache->node_cache, ctx);
+        if (rc == OBMAFS3_OK)
+            rc = nc_rc;
+    }
+
     /* Update the tree header with the current partial block state */
     struct btree_header dedup_hdr;
     uint64_t dedup_hdr_lba;
@@ -1511,6 +1831,12 @@ void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
         return;
     /* Stop the background compression worker if running */
     obmafs3_bg_compress_stop(db_cache);
+    /* Free the B+Tree node cache */
+    if (db_cache->node_cache) {
+        dedup_cache_free(
+            (struct dedup_node_cache *)db_cache->node_cache);
+        db_cache->node_cache = NULL;
+    }
     free(db_cache->data);
     db_cache->data = NULL;
     db_cache->initialized = 0;
