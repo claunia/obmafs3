@@ -737,7 +737,14 @@ static int obmafs3_fuse_utimens(const char *path,
     return 0;
 }
 
-static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
+/**
+ * Flush is called on every close() of a file descriptor.  Unlike
+ * release, flush is synchronous — close() blocks until flush returns.
+ * We must persist all cached sector_map_entries and the inode here so
+ * that a subsequent open() (possibly by another process) sees the
+ * up-to-date on-disk state.
+ */
+static int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
 
@@ -751,6 +758,37 @@ static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
     int rc = 0;
 
     /* Flush cached sector_map_entries for media image files */
+    if (ffctx->sector_size && ffctx->sme_cache.count > 0) {
+        rc = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
+                                            &ffctx->sme_cache);
+        ffctx->inode_dirty = 1;
+    }
+
+    /* Write back the cached inode */
+    if (ffctx->inode_dirty) {
+        int put_rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
+        if (rc == OBMAFS3_OK)
+            rc = put_rc;
+        ffctx->inode_dirty = 0;
+    }
+
+    return (rc == OBMAFS3_OK) ? 0 : -EIO;
+}
+
+static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
+
+    if (!ffctx)
+        return 0;
+
+    int rc = 0;
+
+    /* Flush any remaining cached data (in case flush was not called) */
     if (ffctx->sector_size && ffctx->sme_cache.count > 0) {
         rc = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
                                             &ffctx->sme_cache);
@@ -778,6 +816,7 @@ struct fuse_operations obmafs3_fuse_ops = {
     .read     = obmafs3_fuse_read,
     .create   = obmafs3_fuse_create,
     .write    = obmafs3_fuse_write,
+    .flush    = obmafs3_fuse_flush,
     .release  = obmafs3_fuse_release,
     .truncate = obmafs3_fuse_truncate,
     .unlink   = obmafs3_fuse_unlink,
