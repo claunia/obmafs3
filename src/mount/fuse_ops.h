@@ -4,7 +4,7 @@
 #ifndef OBMAFS3_FUSE_OPS_H
 #define OBMAFS3_FUSE_OPS_H
 
-#define FUSE_USE_VERSION 31
+#define FUSE_USE_VERSION 35
 
 #include <fuse3/fuse.h>
 #include "obmafs.h"

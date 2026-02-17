@@ -4,7 +4,6 @@
  * Implements read-write access for regular files:
  *   getattr, readdir, open, read, create, write, truncate, unlink, utimens
  */
-#define FUSE_USE_VERSION 31
 
 #include "fuse_ops.h"
 
@@ -14,6 +13,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <linux/stat.h>
 #include <time.h>
 #include <stdio.h>
 
@@ -199,15 +199,17 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
         if (rc != OBMAFS3_OK)
             return -EIO;
 
-        stbuf->st_ino   = inode.inode_id;
-        stbuf->st_mode  = S_IFDIR | inode.mode;
-        stbuf->st_nlink = inode.ref_count;
-        stbuf->st_uid   = inode.uid;
-        stbuf->st_gid   = inode.gid;
-        stbuf->st_size  = (off_t)inode.file_size;
-        stbuf->st_atime = (time_t)inode.access_time;
-        stbuf->st_mtime = (time_t)inode.modification_time;
-        stbuf->st_ctime = (time_t)inode.creation_time;
+        stbuf->st_ino     = inode.inode_id;
+        stbuf->st_mode    = S_IFDIR | inode.mode;
+        stbuf->st_nlink   = inode.ref_count;
+        stbuf->st_uid     = inode.uid;
+        stbuf->st_gid     = inode.gid;
+        stbuf->st_size    = (off_t)inode.file_size;
+        stbuf->st_blksize = (blksize_t)g_ctx->sb.block_size;
+        stbuf->st_blocks  = (blkcnt_t)((inode.file_size + 511) / 512);
+        stbuf->st_atime   = (time_t)inode.access_time;
+        stbuf->st_mtime   = (time_t)inode.modification_time;
+        stbuf->st_ctime   = (time_t)inode.creation_time;
         return 0;
     }
 
@@ -240,13 +242,15 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
         stbuf->st_mode = S_IFLNK | 0777;
     else
         stbuf->st_mode = S_IFREG | ip->mode;
-    stbuf->st_nlink = ip->ref_count;
-    stbuf->st_uid   = ip->uid;
-    stbuf->st_gid   = ip->gid;
-    stbuf->st_size  = (off_t)ip->file_size;
-    stbuf->st_atime = (time_t)ip->access_time;
-    stbuf->st_mtime = (time_t)ip->modification_time;
-    stbuf->st_ctime = (time_t)ip->creation_time;
+    stbuf->st_nlink   = ip->ref_count;
+    stbuf->st_uid     = ip->uid;
+    stbuf->st_gid     = ip->gid;
+    stbuf->st_size    = (off_t)ip->file_size;
+    stbuf->st_blksize = (blksize_t)g_ctx->sb.block_size;
+    stbuf->st_blocks  = (blkcnt_t)((ip->file_size + 511) / 512);
+    stbuf->st_atime   = (time_t)ip->access_time;
+    stbuf->st_mtime   = (time_t)ip->modification_time;
+    stbuf->st_ctime   = (time_t)ip->creation_time;
     return 0;
 }
 
@@ -1221,6 +1225,83 @@ static int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
     return 0;
 }
 
+static int obmafs3_fuse_statx(const char *path, int flags, int mask,
+                              struct statx *stxbuf,
+                              struct fuse_file_info *fi)
+{
+    struct inode_record inode;
+    struct inode_record *ip;
+    int rc;
+    int is_dir = 0;
+
+    (void)flags;
+
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
+
+    memset(stxbuf, 0, sizeof(*stxbuf));
+
+    if (strcmp(path, "/") == 0) {
+        rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        ip = &inode;
+        is_dir = 1;
+    } else {
+        uint64_t parent_id;
+        const char *name;
+        rc = resolve_path(path, &parent_id, &name);
+        if (rc != 0)
+            return rc;
+
+        struct catalog_record cat_entry;
+        rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+        if (rc == OBMAFS3_ERR_NOTFOUND)
+            return -ENOENT;
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        if (ffctx) {
+            ip = &ffctx->inode;
+        } else {
+            rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+            ip = &inode;
+        }
+        is_dir = cat_entry.directory_flag ||
+                 ip->file_type == kFileTypeDirectory;
+    }
+
+    stxbuf->stx_mask = STATX_BASIC_STATS | STATX_BTIME;
+    stxbuf->stx_blksize = (__u32)g_ctx->sb.block_size;
+    stxbuf->stx_nlink = (__u32)ip->ref_count;
+    stxbuf->stx_uid   = (__u32)ip->uid;
+    stxbuf->stx_gid   = (__u32)ip->gid;
+    stxbuf->stx_ino   = ip->inode_id;
+    stxbuf->stx_size  = ip->file_size;
+    stxbuf->stx_blocks = (ip->file_size + 511) / 512;
+
+    if (is_dir)
+        stxbuf->stx_mode = S_IFDIR | ip->mode;
+    else if (ip->file_type == kFileTypeSymlink)
+        stxbuf->stx_mode = S_IFLNK | 0777;
+    else
+        stxbuf->stx_mode = S_IFREG | ip->mode;
+
+    stxbuf->stx_atime.tv_sec  = (__s64)ip->access_time;
+    stxbuf->stx_mtime.tv_sec  = (__s64)ip->modification_time;
+    stxbuf->stx_ctime.tv_sec  = (__s64)ip->creation_time;
+    stxbuf->stx_btime.tv_sec  = (__s64)ip->creation_time;
+
+    stxbuf->stx_attributes_mask |= STATX_ATTR_COMPRESSED;
+    if (ip->file_type == kFileTypeMediaImage && g_ctx->compression)
+        stxbuf->stx_attributes |= STATX_ATTR_COMPRESSED;
+
+    return 0;
+}
+
 struct fuse_operations obmafs3_fuse_ops = {
     .getattr  = obmafs3_fuse_getattr,
     .readdir  = obmafs3_fuse_readdir,
@@ -1241,4 +1322,5 @@ struct fuse_operations obmafs3_fuse_ops = {
     .chmod    = obmafs3_fuse_chmod,
     .chown    = obmafs3_fuse_chown,
     .statfs   = obmafs3_fuse_statfs,
+    .statx    = obmafs3_fuse_statx,
 };

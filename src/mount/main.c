@@ -1,7 +1,6 @@
 /*
  * mount.obmafs - FUSE mount helper for OBMAFS3 filesystems
  */
-#define FUSE_USE_VERSION 31
 
 #include "fuse_ops.h"
 
