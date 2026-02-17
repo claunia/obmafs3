@@ -73,4 +73,12 @@ struct __attribute__((packed)) bitmap_header {
     uint8_t  checksum[32];   /**< Checksum of the bitmap data */
 };
 
+typedef struct CdEccContext
+{
+    bool      inited_edc;   ///< True once EDC/ECC tables have been initialized.
+    uint8_t  *ecc_b_table;  ///< Backward (B) ECC table (allocated, size implementation-defined).
+    uint8_t  *ecc_f_table;  ///< Forward (F) ECC table.
+    uint32_t *edc_table;    ///< EDC (CRC) lookup table.
+} CdEccContext;
+
 #endif /* OBMAFS3_DEFS_H */

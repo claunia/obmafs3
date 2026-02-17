@@ -29,10 +29,13 @@ struct obmafs3_ctx *g_ctx = NULL;
 struct fuse_file_ctx {
     uint64_t                inode_id;
     uint16_t                sector_size;   /* 0 for non-media-image files */
-    struct inode_record inode;         /* cached inode */
+    struct inode_record     inode;         /* cached inode */
     int                     inode_dirty;   /* needs write-back on release */
     struct sector_map_cache sme_cache;
     struct dedup_block_cache db_cache;     /* persistent dedup block accumulator */
+    struct cd_sector_map_cache cd_sme_cache; /* CD sector map cache */
+    void                   *ecc_ctx;       /* CD ECC context (lazy-init) */
+    int64_t                 cd_next_sector; /* next expected CD sector LBA */
 };
 
 /* Disk image extension-to-sector-size mappings */
@@ -1147,6 +1150,15 @@ static int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
         ffctx->inode_dirty = 1;
     }
 
+    /* Flush cached CD sector_map_entries */
+    if (ffctx->cd_sme_cache.count > 0) {
+        int crc = obmafs3_flush_cd_sector_map_cache(g_ctx, &ffctx->inode,
+                                                    &ffctx->cd_sme_cache);
+        if (rc == OBMAFS3_OK)
+            rc = crc;
+        ffctx->inode_dirty = 1;
+    }
+
     /* Write back the cached inode */
     if (ffctx->inode_dirty) {
         int put_rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
@@ -1188,6 +1200,15 @@ static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
         ffctx->inode_dirty = 1;
     }
 
+    /* Flush remaining CD sector map entries */
+    if (ffctx->cd_sme_cache.count > 0) {
+        int crc = obmafs3_flush_cd_sector_map_cache(g_ctx, &ffctx->inode,
+                                                    &ffctx->cd_sme_cache);
+        if (rc == OBMAFS3_OK)
+            rc = crc;
+        ffctx->inode_dirty = 1;
+    }
+
     /* Write back the cached inode */
     if (ffctx->inode_dirty) {
         int put_rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
@@ -1197,6 +1218,9 @@ static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
 
     obmafs3_free_dedup_block_cache(&ffctx->db_cache);
     obmafs3_free_sector_map_cache(&ffctx->sme_cache);
+    obmafs3_free_cd_sector_map_cache(&ffctx->cd_sme_cache);
+    if (ffctx->ecc_ctx)
+        ecc_cd_free(ffctx->ecc_ctx);
     free(ffctx);
     fi->fh = 0;
 
@@ -1649,6 +1673,336 @@ struct obmafs3_ioctl_tag_arg {
 #define OBMAFS3_IOC_GET_MEDIA_TAG \
     _IOWR('O', 2, struct obmafs3_ioctl_tag_arg)
 
+/* ---- ioctl for compact disc images ---- */
+
+#define OBMAFS3_IOC_SET_CD_IMAGE \
+    _IO('O', 3)
+
+#define CD_RAW_SECTOR_SIZE  2352
+#define CD_RAW_PLUS_SUB     2448
+#define CD_SUBCHANNEL_SIZE  96
+#define CD_PREFIX_SIZE      16
+#define CD_SUFFIX_SIZE      288
+#define CD_DATA_SIZE        2048   /* 2352 - 16 - 288 */
+
+struct obmafs3_ioctl_cd_write_arg {
+    uint32_t buffer_size;  /**< 2352 or 2448 */
+    uint8_t  sector_mode;  /**< enum obmafs3_cd_sector_mode */
+    uint8_t  buffer[CD_RAW_PLUS_SUB];
+};
+
+#define OBMAFS3_IOC_CD_WRITE_LONG \
+    _IOW('O', 4, struct obmafs3_ioctl_cd_write_arg)
+
+/**
+ * Check if the 16-byte prefix of a raw CD sector matches the expected
+ * sync + MSF + mode for the given LBA and track mode.
+ */
+static bool cd_prefix_is_generatable(const uint8_t *sector,
+                                     int64_t lba, uint8_t mode)
+{
+    /* Build expected prefix */
+    uint8_t expected[CD_PREFIX_SIZE];
+
+    /* Sync pattern: 00 FF FF FF FF FF FF FF FF FF FF 00 */
+    expected[0]  = 0x00;
+    for (int i = 1; i <= 10; i++)
+        expected[i] = 0xFF;
+    expected[11] = 0x00;
+
+    /* MSF in BCD */
+    uint8_t minute, second, frame;
+    cd_lba_to_msf(lba, &minute, &second, &frame);
+    expected[12] = (uint8_t)(((minute / 10) << 4) + minute % 10);
+    expected[13] = (uint8_t)(((second / 10) << 4) + second % 10);
+    expected[14] = (uint8_t)(((frame  / 10) << 4) + frame  % 10);
+
+    /* Mode byte */
+    switch ((enum obmafs3_cd_sector_mode)mode) {
+    case kCdSectorMode1:
+        expected[15] = 0x01;
+        break;
+    case kCdSectorMode2:
+    case kCdSectorMode2Form1:
+    case kCdSectorMode2Form2:
+        expected[15] = 0x02;
+        break;
+    default:
+        return false;
+    }
+
+    return memcmp(sector, expected, CD_PREFIX_SIZE) == 0;
+}
+
+static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx,
+                                 const struct obmafs3_ioctl_cd_write_arg *arg)
+{
+    if (!arg)
+        return -EINVAL;
+
+    uint32_t bufsz = arg->buffer_size;
+    if (bufsz != CD_RAW_SECTOR_SIZE && bufsz != CD_RAW_PLUS_SUB)
+        return -EINVAL;
+
+    uint8_t mode = arg->sector_mode;
+    if (mode > kCdSectorMode2Form2)
+        return -EINVAL;
+
+    const uint8_t *raw = arg->buffer;
+    int64_t sector_lba = ffctx->cd_next_sector;
+
+    /* Build the cd_sector_map_entry */
+    struct cd_sector_map_entry sme;
+    memset(&sme, 0, sizeof(sme));
+    sme.sector      = sector_lba;
+    sme.sector_mode = mode;
+
+    /* --- Subchannel handling --- */
+    if (bufsz == CD_RAW_PLUS_SUB) {
+        const uint8_t *sub = raw + CD_RAW_SECTOR_SIZE;
+        uint64_t sub_hash = obmafs3_checksum_xxh64(sub, CD_SUBCHANNEL_SIZE);
+        sme.subchannel_hash = sub_hash;
+
+        /* Store subchannel data in the tree (dedup by hash) */
+        uint8_t existing[CD_SUBCHANNEL_DATA_SIZE];
+        int rc = obmafs3_cd_subchannel_get(g_ctx, sub_hash, existing);
+        if (rc == OBMAFS3_ERR_NOTFOUND) {
+            rc = obmafs3_cd_subchannel_put(g_ctx, sub_hash, sub);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        } else if (rc != OBMAFS3_OK) {
+            return -EIO;
+        }
+    }
+
+    /* --- Audio mode: entire 2352 bytes stored as data, no prefix/suffix --- */
+    if (mode == kCdSectorModeAudio) {
+        sme.sector_size      = CD_RAW_SECTOR_SIZE;
+        sme.generated_prefix = 0;
+        sme.generated_suffix = 0;
+
+        uint64_t hash = obmafs3_checksum_xxh64(raw, CD_RAW_SECTOR_SIZE);
+        sme.hash = hash;
+
+        /* Dedup the 2352-byte audio sector */
+        struct btree_header dedup_hdr;
+        uint64_t dedup_hdr_lba;
+        int rc = obmafs3_dedup_get_tree(g_ctx, CD_RAW_SECTOR_SIZE,
+                                        &dedup_hdr, &dedup_hdr_lba);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        struct dedup_entry existing;
+        rc = obmafs3_dedup_lookup(g_ctx, &dedup_hdr, hash, &existing);
+        if (rc == OBMAFS3_ERR_NOTFOUND) {
+            /* New sector — store via the write path */
+            if (!ffctx->db_cache.initialized) {
+                /* Bootstrap dedup block cache for 2352-byte sectors */
+                ffctx->sector_size = CD_RAW_SECTOR_SIZE;
+            }
+            struct dedup_block_cache *dbc = &ffctx->db_cache;
+            if (!dbc->bg_compress) {
+                int brc = obmafs3_bg_compress_start(g_ctx, dbc);
+                if (brc != OBMAFS3_OK)
+                    return -EIO;
+            }
+
+            /* Write via the media image data path (handles dedup storage) */
+            uint64_t offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
+            struct sector_map_cache dummy_cache; /* unused */
+            memset(&dummy_cache, 0, sizeof(dummy_cache));
+            rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode,
+                                                offset, raw,
+                                                CD_RAW_SECTOR_SIZE,
+                                                CD_RAW_SECTOR_SIZE,
+                                                &dummy_cache, dbc);
+            obmafs3_free_sector_map_cache(&dummy_cache);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        } else if (rc != OBMAFS3_OK) {
+            return -EIO;
+        }
+
+        goto cache_and_done;
+    }
+
+    /* --- Data modes (Mode 1, Mode 2, Mode 2 Form 1, Mode 2 Form 2) --- */
+
+    /* Lazy-init the ECC context */
+    if (!ffctx->ecc_ctx) {
+        ffctx->ecc_ctx = ecc_cd_init();
+        if (!ffctx->ecc_ctx)
+            return -ENOMEM;
+    }
+
+    /* Check if prefix is generatable */
+    bool pfx_gen = cd_prefix_is_generatable(raw, sector_lba, mode);
+    sme.generated_prefix = pfx_gen ? 1 : 0;
+
+    if (!pfx_gen) {
+        /* Store the non-generatable prefix */
+        uint64_t pfx_hash = obmafs3_checksum_xxh64(raw, CD_PREFIX_SIZE);
+        sme.prefix_hash = pfx_hash;
+
+        uint8_t existing[CD_PREFIX_DATA_SIZE];
+        int rc = obmafs3_cd_prefix_get(g_ctx, pfx_hash, existing);
+        if (rc == OBMAFS3_ERR_NOTFOUND) {
+            rc = obmafs3_cd_prefix_put(g_ctx, pfx_hash, raw);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        } else if (rc != OBMAFS3_OK) {
+            return -EIO;
+        }
+    }
+
+    /* Check if suffix is generatable (only for modes with ECC/EDC) */
+    bool sfx_gen = false;
+    switch ((enum obmafs3_cd_sector_mode)mode) {
+    case kCdSectorMode1:
+        sfx_gen = ecc_cd_is_suffix_correct(ffctx->ecc_ctx, raw);
+        break;
+    case kCdSectorMode2Form1:
+    case kCdSectorMode2Form2:
+        sfx_gen = ecc_cd_is_suffix_correct_mode2(ffctx->ecc_ctx, raw);
+        break;
+    case kCdSectorMode2:
+        /* Raw Mode 2 has no ECC/EDC suffix — the entire remaining
+         * 2336 bytes is data.  Suffix is trivially "generatable" (empty). */
+        sfx_gen = true;
+        break;
+    default:
+        break;
+    }
+
+    sme.generated_suffix = sfx_gen ? 1 : 0;
+
+    if (!sfx_gen) {
+        /* Store the non-generatable suffix (last 288 bytes of raw sector) */
+        const uint8_t *suffix = raw + CD_RAW_SECTOR_SIZE - CD_SUFFIX_SIZE;
+        uint64_t sfx_hash = obmafs3_checksum_xxh64(suffix, CD_SUFFIX_SIZE);
+        sme.suffix_hash = sfx_hash;
+
+        uint8_t existing[CD_SUFFIX_DATA_SIZE];
+        int rc = obmafs3_cd_suffix_get(g_ctx, sfx_hash, existing);
+        if (rc == OBMAFS3_ERR_NOTFOUND) {
+            rc = obmafs3_cd_suffix_put(g_ctx, sfx_hash, suffix);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        } else if (rc != OBMAFS3_OK) {
+            return -EIO;
+        }
+    }
+
+    /* Store subheader for Mode 2 variants (bytes 16-23) */
+    if (mode == kCdSectorMode2 ||
+        mode == kCdSectorMode2Form1 ||
+        mode == kCdSectorMode2Form2) {
+        memcpy(sme.subheader, raw + CD_PREFIX_SIZE, 8);
+    }
+
+    /* Determine data portion and its size */
+    const uint8_t *data_ptr;
+    uint16_t data_size;
+    switch ((enum obmafs3_cd_sector_mode)mode) {
+    case kCdSectorMode1:
+        /* prefix(16) + data(2048) + suffix(288) */
+        data_ptr  = raw + CD_PREFIX_SIZE;
+        data_size = CD_DATA_SIZE;
+        break;
+    case kCdSectorMode2:
+        /* prefix(16) + data(2336) — no suffix */
+        data_ptr  = raw + CD_PREFIX_SIZE;
+        data_size = 2336;
+        break;
+    case kCdSectorMode2Form1:
+        /* prefix(16) + subheader(8) + data(2048) + EDC(4) + ECC(276)
+         * The subheader is stored separately; data is the 2048 user bytes */
+        data_ptr  = raw + CD_PREFIX_SIZE + 8;
+        data_size = CD_DATA_SIZE;
+        break;
+    case kCdSectorMode2Form2:
+        /* prefix(16) + subheader(8) + data(2328) — no ECC, optional EDC
+         * For Form 2, the 2328 bytes after subheader are user data */
+        data_ptr  = raw + CD_PREFIX_SIZE + 8;
+        data_size = 2328;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    sme.sector_size = data_size;
+
+    /* Hash and dedup the data portion */
+    uint64_t hash = obmafs3_checksum_xxh64(data_ptr, data_size);
+    sme.hash = hash;
+
+    {
+        struct btree_header dedup_hdr;
+        uint64_t dedup_hdr_lba;
+        int rc = obmafs3_dedup_get_tree(g_ctx, data_size,
+                                        &dedup_hdr, &dedup_hdr_lba);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        struct dedup_entry existing;
+        rc = obmafs3_dedup_lookup(g_ctx, &dedup_hdr, hash, &existing);
+        if (rc == OBMAFS3_ERR_NOTFOUND) {
+            /* New data — store via media image write path */
+            if (!ffctx->db_cache.initialized)
+                ffctx->sector_size = data_size;
+
+            struct dedup_block_cache *dbc = &ffctx->db_cache;
+            if (!dbc->bg_compress) {
+                int brc = obmafs3_bg_compress_start(g_ctx, dbc);
+                if (brc != OBMAFS3_OK)
+                    return -EIO;
+            }
+
+            uint64_t offset = (uint64_t)sector_lba * data_size;
+            struct sector_map_cache dummy_cache;
+            memset(&dummy_cache, 0, sizeof(dummy_cache));
+            rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode,
+                                                offset, data_ptr,
+                                                data_size, data_size,
+                                                &dummy_cache, dbc);
+            obmafs3_free_sector_map_cache(&dummy_cache);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        } else if (rc != OBMAFS3_OK) {
+            return -EIO;
+        }
+    }
+
+cache_and_done:
+    /* Append cd_sector_map_entry to the cache */
+    {
+        struct cd_sector_map_cache *cache = &ffctx->cd_sme_cache;
+        if (cache->count >= cache->capacity) {
+            uint64_t new_cap = cache->capacity;
+            if (new_cap == 0)
+                new_cap = 1024;
+            else
+                new_cap *= 2;
+            struct cd_sector_map_entry *tmp =
+                realloc(cache->entries,
+                        (size_t)(new_cap * sizeof(*tmp)));
+            if (!tmp)
+                return -ENOMEM;
+            cache->entries  = tmp;
+            cache->capacity = new_cap;
+        }
+        cache->entries[cache->count++] = sme;
+    }
+
+    /* Update inode sector count and advance the sector LBA */
+    ffctx->cd_next_sector++;
+    if ((uint64_t)ffctx->cd_next_sector > ffctx->inode.sector_count)
+        ffctx->inode.sector_count = (uint64_t)ffctx->cd_next_sector;
+    ffctx->inode_dirty = 1;
+
+    return 0;
+}
+
 static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
                                void *arg, struct fuse_file_info *fi,
                                unsigned int flags, void *data)
@@ -1662,14 +2016,15 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
     if (!ffctx)
         return -EBADF;
 
-    if (ffctx->inode.file_type != kFileTypeMediaImage)
-        return -ENOTTY;
-
-    struct obmafs3_ioctl_tag_arg *tag_arg =
-        (struct obmafs3_ioctl_tag_arg *)data;
-
     switch (cmd) {
+
+    /* ---- media tag ioctls (media image files only) ---- */
+
     case OBMAFS3_IOC_SET_MEDIA_TAG: {
+        if (ffctx->inode.file_type != kFileTypeMediaImage)
+            return -ENOTTY;
+        struct obmafs3_ioctl_tag_arg *tag_arg =
+            (struct obmafs3_ioctl_tag_arg *)data;
         if (!tag_arg || tag_arg->data_length > OBMAFS3_IOC_MAX_TAG_DATA)
             return -EINVAL;
         int rc = obmafs3_media_tag_put(g_ctx, ffctx->inode_id,
@@ -1680,6 +2035,10 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
     }
 
     case OBMAFS3_IOC_GET_MEDIA_TAG: {
+        if (ffctx->inode.file_type != kFileTypeMediaImage)
+            return -ENOTTY;
+        struct obmafs3_ioctl_tag_arg *tag_arg =
+            (struct obmafs3_ioctl_tag_arg *)data;
         if (!tag_arg)
             return -EINVAL;
         void *buf;
@@ -1699,6 +2058,31 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
         memcpy(tag_arg->data, buf, length);
         obmafs3_media_tag_data_free(buf);
         return 0;
+    }
+
+    /* ---- compact disc image ioctl ---- */
+
+    case OBMAFS3_IOC_SET_CD_IMAGE: {
+        /* Only allow conversion of regular empty files */
+        if (ffctx->inode.file_type != kFileTypeRegular)
+            return -ENOTTY;
+        if (ffctx->inode.file_size != 0)
+            return -ENOTEMPTY;
+
+        ffctx->inode.file_type       = kFileTypeCompactDiscImage;
+        ffctx->inode.sector_count    = 0;
+        ffctx->inode.sector_map_size = 0;
+        ffctx->cd_next_sector        = 0;
+
+        int rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
+        return rc == OBMAFS3_OK ? 0 : -EIO;
+    }
+
+    case OBMAFS3_IOC_CD_WRITE_LONG: {
+        if (ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        return obmafs3_cd_write_long(
+            ffctx, (const struct obmafs3_ioctl_cd_write_arg *)data);
     }
 
     default:

@@ -2134,3 +2134,58 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
     free(dedup_buf);
     return OBMAFS3_OK;
 }
+
+/* ------------------------------------------------------------------ */
+/*  CD sector map cache flush / free                                   */
+/* ------------------------------------------------------------------ */
+
+static int write_cd_sector_map_batch(struct obmafs3_ctx *ctx,
+                                     struct inode_record *inode,
+                                     const struct cd_sector_map_entry *entries,
+                                     uint64_t count)
+{
+    if (count == 0)
+        return OBMAFS3_OK;
+
+    size_t entry_size = sizeof(struct cd_sector_map_entry);
+    uint64_t map_offset = inode->sector_map_size * entry_size;
+    size_t total_bytes = (size_t)(count * entry_size);
+
+    uint64_t saved_file_size = inode->file_size;
+    inode->file_size = map_offset;
+
+    int rc = obmafs3_write_file_data(ctx, inode, map_offset, entries,
+                                     total_bytes);
+
+    inode->file_size = saved_file_size;
+
+    if (rc == OBMAFS3_OK)
+        inode->sector_map_size += count;
+
+    return rc;
+}
+
+int obmafs3_flush_cd_sector_map_cache(struct obmafs3_ctx *ctx,
+                                      struct inode_record *inode,
+                                      struct cd_sector_map_cache *cache)
+{
+    if (!cache || cache->count == 0)
+        return OBMAFS3_OK;
+
+    int rc = write_cd_sector_map_batch(ctx, inode, cache->entries,
+                                       cache->count);
+    if (rc == OBMAFS3_OK) {
+        cache->count = 0;
+    }
+    return rc;
+}
+
+void obmafs3_free_cd_sector_map_cache(struct cd_sector_map_cache *cache)
+{
+    if (!cache)
+        return;
+    free(cache->entries);
+    cache->entries  = NULL;
+    cache->count    = 0;
+    cache->capacity = 0;
+}

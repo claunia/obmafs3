@@ -5,6 +5,7 @@ add_library(obmafs STATIC
     block.c
     checksum.c
     dedup.c
+    ecc_cd.c
     io.c
 )
 

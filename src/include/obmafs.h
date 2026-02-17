@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #include "superblock.h"
 #include "btree.h"
@@ -217,6 +218,31 @@ int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash,
 int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash,
                               const uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
 int obmafs3_cd_subchannel_delete(struct obmafs3_ctx *ctx, uint64_t hash);
+
+/* --- CD ECC/EDC operations --- */
+void   *ecc_cd_init(void);
+void    ecc_cd_free(void *ctx);
+bool    ecc_cd_is_suffix_correct(void *context, const uint8_t *sector);
+bool    ecc_cd_is_suffix_correct_mode2(void *context, const uint8_t *sector);
+void    ecc_cd_reconstruct_prefix(uint8_t *sector, uint8_t type, int64_t lba);
+void    ecc_cd_reconstruct(void *context, uint8_t *sector, uint8_t type);
+void    cd_lba_to_msf(int64_t pos, uint8_t *minute, uint8_t *second, uint8_t *frame);
+
+/* --- CD sector map cache --- */
+
+/**
+ * In-memory cache of cd_sector_map_entries, analogous to sector_map_cache.
+ */
+struct cd_sector_map_cache {
+    struct cd_sector_map_entry *entries;
+    uint64_t count;
+    uint64_t capacity;
+};
+
+int  obmafs3_flush_cd_sector_map_cache(struct obmafs3_ctx *ctx,
+                                       struct inode_record *inode,
+                                       struct cd_sector_map_cache *cache);
+void obmafs3_free_cd_sector_map_cache(struct cd_sector_map_cache *cache);
 
 /* --- Checksum operations --- */
 uint64_t obmafs3_checksum_xxh64(const void *data, size_t size);
