@@ -1694,6 +1694,14 @@ struct obmafs3_ioctl_cd_write_arg {
 #define OBMAFS3_IOC_CD_WRITE_LONG \
     _IOW('O', 4, struct obmafs3_ioctl_cd_write_arg)
 
+struct obmafs3_ioctl_cd_read_arg {
+    int64_t  sector;                    /**< Sector LBA to read */
+    uint8_t  buffer[CD_RAW_SECTOR_SIZE]; /**< Output: reconstructed 2352-byte sector */
+};
+
+#define OBMAFS3_IOC_CD_READ_LONG \
+    _IOWR('O', 5, struct obmafs3_ioctl_cd_read_arg)
+
 /**
  * Check if the 16-byte prefix of a raw CD sector matches the expected
  * sync + MSF + mode for the given LBA and track mode.
@@ -2003,6 +2011,148 @@ cache_and_done:
     return 0;
 }
 
+/**
+ * Read a single CD sector by LBA, reconstructing the full 2352-byte
+ * raw sector.  For audio sectors the dedup data is the full 2352 bytes.
+ * For data sectors: prefix is generated or fetched from the CD prefix
+ * tree, data is read from dedup, suffix is generated or fetched from
+ * the CD suffix tree, and the subheader is restored as applicable.
+ */
+static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx,
+                                struct obmafs3_ioctl_cd_read_arg *arg)
+{
+    if (!arg)
+        return -EINVAL;
+
+    int64_t sector_lba = arg->sector;
+    if (sector_lba < 0 || (uint64_t)sector_lba >= ffctx->inode.sector_count)
+        return -EINVAL;
+
+    /* Read the cd_sector_map_entry for this sector from inode data */
+    struct inode_record map_inode;
+    memcpy(&map_inode, &ffctx->inode, sizeof(map_inode));
+    map_inode.file_size = ffctx->inode.sector_map_size *
+                          sizeof(struct cd_sector_map_entry);
+
+    struct cd_sector_map_entry sme;
+    uint64_t sme_offset = (uint64_t)sector_lba *
+                          sizeof(struct cd_sector_map_entry);
+    int rc = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset,
+                                    &sme, sizeof(sme));
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    uint8_t *out = arg->buffer;
+    memset(out, 0, CD_RAW_SECTOR_SIZE);
+
+    /* --- Audio: dedup data IS the full 2352 bytes --- */
+    if (sme.sector_mode == kCdSectorModeAudio) {
+        /* Look up and read the 2352-byte sector from dedup */
+        struct btree_header dedup_hdr;
+        uint64_t dedup_hdr_lba;
+        rc = obmafs3_dedup_get_tree(g_ctx, CD_RAW_SECTOR_SIZE,
+                                    &dedup_hdr, &dedup_hdr_lba);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        rc = obmafs3_read_media_image_data(g_ctx, &ffctx->inode,
+                                           (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE,
+                                           out, CD_RAW_SECTOR_SIZE,
+                                           CD_RAW_SECTOR_SIZE);
+        return (rc == OBMAFS3_OK) ? 0 : -EIO;
+    }
+
+    /* --- Data modes --- */
+
+    /* Determine data portion size */
+    uint16_t data_size;
+    int has_subheader = 0;
+    switch ((enum obmafs3_cd_sector_mode)sme.sector_mode) {
+    case kCdSectorMode1:
+        data_size = CD_DATA_SIZE;     /* 2048 */
+        break;
+    case kCdSectorMode2:
+        data_size = 2336;
+        break;
+    case kCdSectorMode2Form1:
+        data_size = CD_DATA_SIZE;     /* 2048 */
+        has_subheader = 1;
+        break;
+    case kCdSectorMode2Form2:
+        data_size = 2328;
+        has_subheader = 1;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    /* 1. Reconstruct prefix (bytes 0-15) */
+    if (sme.generated_prefix) {
+        /* Generate sync + MSF + mode from LBA */
+        ecc_cd_reconstruct_prefix(out, sme.sector_mode, sector_lba);
+    } else {
+        /* Fetch stored prefix from the CD prefix tree */
+        uint8_t pfx[CD_PREFIX_DATA_SIZE];
+        rc = obmafs3_cd_prefix_get(g_ctx, sme.prefix_hash, pfx);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        memcpy(out, pfx, CD_PREFIX_SIZE);
+    }
+
+    /* 2. Restore subheader (bytes 16-23) for Mode 2 variants */
+    if (has_subheader) {
+        /* subheader[8] contains both the subheader and its copy */
+        memcpy(out + CD_PREFIX_SIZE, sme.subheader, 4);
+        memcpy(out + CD_PREFIX_SIZE + 4, sme.subheader + 4, 4);
+    }
+
+    /* 3. Read data portion from dedup */
+    {
+        int data_offset_in_sector;
+        if (has_subheader)
+            data_offset_in_sector = CD_PREFIX_SIZE + 8;  /* after prefix + subheader */
+        else if (sme.sector_mode == kCdSectorMode2)
+            data_offset_in_sector = CD_PREFIX_SIZE;      /* Mode 2 raw: data starts after prefix */
+        else
+            data_offset_in_sector = CD_PREFIX_SIZE;      /* Mode 1: data starts after prefix */
+
+        /* Read from media image data path using the data portion's
+         * sector size for dedup tree lookup */
+        struct inode_record data_inode;
+        memcpy(&data_inode, &ffctx->inode, sizeof(data_inode));
+        /* The data was stored with offset = sector_lba * data_size */
+        rc = obmafs3_read_media_image_data(g_ctx, &data_inode,
+                                           (uint64_t)sector_lba * data_size,
+                                           out + data_offset_in_sector,
+                                           data_size, data_size);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    }
+
+    /* 4. Reconstruct suffix (last 288 bytes, position 2064-2351) */
+    if (sme.sector_mode == kCdSectorMode2) {
+        /* Raw Mode 2 has no suffix — all 2336 bytes after prefix are data */
+    } else if (sme.generated_suffix) {
+        /* Generate EDC/ECC from the data using ecc_cd facilities */
+        if (!ffctx->ecc_ctx) {
+            ffctx->ecc_ctx = ecc_cd_init();
+            if (!ffctx->ecc_ctx)
+                return -ENOMEM;
+        }
+        ecc_cd_reconstruct(ffctx->ecc_ctx, out, sme.sector_mode);
+    } else {
+        /* Fetch stored suffix from the CD suffix tree */
+        uint8_t sfx[CD_SUFFIX_DATA_SIZE];
+        rc = obmafs3_cd_suffix_get(g_ctx, sme.suffix_hash, sfx);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        memcpy(out + CD_RAW_SECTOR_SIZE - CD_SUFFIX_SIZE,
+               sfx, CD_SUFFIX_SIZE);
+    }
+
+    return 0;
+}
+
 static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
                                void *arg, struct fuse_file_info *fi,
                                unsigned int flags, void *data)
@@ -2083,6 +2233,13 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
             return -ENOTTY;
         return obmafs3_cd_write_long(
             ffctx, (const struct obmafs3_ioctl_cd_write_arg *)data);
+    }
+
+    case OBMAFS3_IOC_CD_READ_LONG: {
+        if (ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        return obmafs3_cd_read_long(
+            ffctx, (struct obmafs3_ioctl_cd_read_arg *)data);
     }
 
     default:
