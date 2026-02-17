@@ -352,6 +352,126 @@ void obmafs3_catalog_list_free(struct catalog_record *entries)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Resolve inode_id → full path via catalog scan                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Find a catalog entry with the given inode_id by scanning all leaves.
+ * The catalog is sorted by (parent_id, name) so we must do a full scan.
+ * Returns OBMAFS3_OK and fills *out on success, OBMAFS3_ERR_NOTFOUND otherwise.
+ */
+static int catalog_find_by_inode(struct obmafs3_ctx *ctx,
+                                uint64_t target_inode,
+                                struct catalog_record *out)
+{
+    uint64_t lba = ctx->catalog_hdr.root_node_lba;
+    if (lba == 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    /* Descend to leftmost leaf */
+    while (1) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+        if (hdr.level == 0) break;
+
+        /* Follow leftmost child (slot 0) */
+        struct catalog_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain */
+    while (lba != 0) {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for (uint16_t i = 0; i < hdr.node_keys; i++) {
+            struct catalog_record rec;
+            memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
+            if (rec.inode_id == target_inode) {
+                *out = rec;
+                free(buf);
+                return OBMAFS3_OK;
+            }
+        }
+
+        lba = hdr.right_link;
+        if (lba != 0) {
+            int rc = obmafs3_block_read(ctx, lba, buf,
+                                        (size_t)ctx->sb.block_size);
+            if (rc != OBMAFS3_OK) { free(buf); return rc; }
+        }
+    }
+
+    free(buf);
+    return OBMAFS3_ERR_NOTFOUND;
+}
+
+int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx,
+                               uint64_t inode_id,
+                               char *path_buf, size_t path_buf_size)
+{
+    if (path_buf_size == 0)
+        return OBMAFS3_ERR_NOMEM;
+
+    if (inode_id == OBMAFS3_ROOT_INODE_ID) {
+        path_buf[0] = '/';
+        path_buf[1] = '\0';
+        return OBMAFS3_OK;
+    }
+
+    /* Collect path components bottom-up (max depth 256) */
+    const int MAX_DEPTH = 256;
+    char (*components)[256] = malloc((size_t)MAX_DEPTH * 256);
+    if (!components)
+        return OBMAFS3_ERR_NOMEM;
+
+    int depth = 0;
+    uint64_t cur = inode_id;
+
+    while (cur != OBMAFS3_ROOT_INODE_ID && depth < MAX_DEPTH) {
+        struct catalog_record cat;
+        int rc = catalog_find_by_inode(ctx, cur, &cat);
+        if (rc != OBMAFS3_OK) {
+            free(components);
+            return rc;
+        }
+        memcpy(components[depth], cat.name, 256);
+        depth++;
+        cur = cat.parent_id;
+    }
+
+    /* Build path top-down */
+    size_t pos = 0;
+    for (int i = depth - 1; i >= 0; i--) {
+        size_t nlen = strlen(components[i]);
+        if (pos + 1 + nlen + 1 > path_buf_size) {
+            free(components);
+            return OBMAFS3_ERR_NOMEM;
+        }
+        path_buf[pos++] = '/';
+        memcpy(path_buf + pos, components[i], nlen);
+        pos += nlen;
+    }
+    path_buf[pos] = '\0';
+
+    free(components);
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Inode B+Tree helpers                                               */
 /* ------------------------------------------------------------------ */
 
@@ -4831,10 +4951,10 @@ void obmafs3_metadata_list_free(char **keys, uint32_t count)
 
 int obmafs3_metadata_query(struct obmafs3_ctx *ctx,
                            const char *key, const char *value,
-                           uint64_t **inode_ids, uint32_t *count)
+                           char ***paths, uint32_t *count)
 {
-    *inode_ids = NULL;
-    *count     = 0;
+    *paths = NULL;
+    *count = 0;
 
     if (ctx->sb.metadata_idx_lba == 0)
         return OBMAFS3_OK;
@@ -4873,8 +4993,8 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx,
 
     /* Scan leaf chain for entries matching (key, value) */
     uint32_t cap = 16;
-    uint64_t *ids = malloc(cap * sizeof(uint64_t));
-    if (!ids) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    char **result = malloc(cap * sizeof(char *));
+    if (!result) { free(buf); return OBMAFS3_ERR_NOMEM; }
 
     uint32_t n = 0;
 
@@ -4897,25 +5017,53 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx,
             if (vcmp < 0) continue;
             if (vcmp > 0) goto query_done;
 
-            /* key and value match */
+            /* key and value match — resolve inode to path */
+            char path[4096];
+            int prc = obmafs3_resolve_inode_path(ctx, rec.inode_id,
+                                                 path, sizeof(path));
+            if (prc != OBMAFS3_OK)
+                continue;  /* skip unresolvable inodes */
+
             if (n >= cap) {
                 cap *= 2;
-                uint64_t *tmp = realloc(ids, cap * sizeof(uint64_t));
-                if (!tmp) { free(ids); free(buf); return OBMAFS3_ERR_NOMEM; }
-                ids = tmp;
+                char **tmp = realloc(result, cap * sizeof(char *));
+                if (!tmp) {
+                    for (uint32_t j = 0; j < n; j++) free(result[j]);
+                    free(result); free(buf);
+                    return OBMAFS3_ERR_NOMEM;
+                }
+                result = tmp;
             }
-            ids[n++] = rec.inode_id;
+            result[n] = strdup(path);
+            if (!result[n]) {
+                for (uint32_t j = 0; j < n; j++) free(result[j]);
+                free(result); free(buf);
+                return OBMAFS3_ERR_NOMEM;
+            }
+            n++;
         }
 
         if (hdr.right_link == 0) break;
 
         int rc = meta_node_read(ctx, hdr.right_link, buf);
-        if (rc != OBMAFS3_OK) { free(ids); free(buf); return rc; }
+        if (rc != OBMAFS3_OK) {
+            for (uint32_t j = 0; j < n; j++) free(result[j]);
+            free(result); free(buf);
+            return rc;
+        }
     }
 
 query_done:
     free(buf);
-    *inode_ids = ids;
-    *count     = n;
+    *paths = result;
+    *count = n;
     return OBMAFS3_OK;
+}
+
+void obmafs3_metadata_query_free(char **paths, uint32_t count)
+{
+    if (!paths) return;
+    for (uint32_t i = 0; i < count; i++)
+        free(paths[i]);
+    free(paths);
 }

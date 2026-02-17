@@ -1753,12 +1753,15 @@ struct obmafs3_ioctl_metadata_list_arg {
  * Query which images have a given key=value pair.
  * Returns a paginated list of inode_ids.
  */
+#define METADATA_QUERY_PATH_MAX 1024
+#define METADATA_QUERY_MAX_RESULTS 8
+
 struct obmafs3_ioctl_metadata_query_arg {
     char     key[METADATA_KEY_MAX];       /**< Input: key */
     char     value[METADATA_VALUE_MAX];   /**< Input: value */
     uint32_t offset;                      /**< Input: starting offset */
-    uint32_t count;                       /**< Output: inode_ids returned */
-    uint64_t inode_ids[64];               /**< Output: up to 64 inode_ids */
+    uint32_t count;                       /**< Output: paths returned */
+    char     paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX];  /**< Output: up to 8 paths */
 };
 
 #define OBMAFS3_IOC_QUERY_METADATA \
@@ -2425,19 +2428,20 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
         /* This query is filesystem-level; works on any open image file */
         struct obmafs3_ioctl_metadata_query_arg *qa =
             (struct obmafs3_ioctl_metadata_query_arg *)data;
-        uint64_t *ids;
+        char **paths;
         uint32_t total;
         int rc = obmafs3_metadata_query(g_ctx, qa->key, qa->value,
-                                        &ids, &total);
+                                        &paths, &total);
         if (rc != OBMAFS3_OK)
             return -EIO;
         uint32_t start = qa->offset;
         uint32_t n = 0;
-        memset(qa->inode_ids, 0, sizeof(qa->inode_ids));
-        for (uint32_t i = start; i < total && n < 64; i++, n++)
-            qa->inode_ids[n] = ids[i];
+        memset(qa->paths, 0, sizeof(qa->paths));
+        for (uint32_t i = start;
+             i < total && n < METADATA_QUERY_MAX_RESULTS; i++, n++)
+            strncpy(qa->paths[n], paths[i], METADATA_QUERY_PATH_MAX - 1);
         qa->count = n;
-        free(ids);
+        obmafs3_metadata_query_free(paths, total);
         return 0;
     }
 

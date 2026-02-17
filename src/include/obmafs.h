@@ -235,7 +235,11 @@ int  obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
 void obmafs3_metadata_list_free(char **keys, uint32_t count);
 int  obmafs3_metadata_query(struct obmafs3_ctx *ctx,
                             const char *key, const char *value,
-                            uint64_t **inode_ids, uint32_t *count);
+                            char ***paths, uint32_t *count);
+void obmafs3_metadata_query_free(char **paths, uint32_t count);
+int  obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx,
+                                uint64_t inode_id,
+                                char *path_buf, size_t path_buf_size);
 
 /* --- CD ECC/EDC operations --- */
 void   *ecc_cd_init(void);
