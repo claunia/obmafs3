@@ -439,6 +439,38 @@ static int dedup_block_init(struct obmafs3_ctx *ctx,
             db->data = NULL;
             return rc;
         }
+
+        /* If the block was compressed on a previous flush, decompress
+         * it back into raw form so we can continue appending data at
+         * db->offset.  The dedup entries already stored reference
+         * uncompressed offsets, so this preserves correctness. */
+        struct block_header bhdr;
+        memcpy(&bhdr, db->data, sizeof(bhdr));
+        if ((bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) &&
+            bhdr.original_size > 0) {
+            uint8_t *temp = malloc((size_t)bhdr.original_size);
+            if (!temp) {
+                free(db->data);
+                db->data = NULL;
+                return OBMAFS3_ERR_NOMEM;
+            }
+            rc = obmafs3_decompress(
+                db->data + sizeof(bhdr),
+                (size_t)bhdr.compressed_size,
+                temp, (size_t)bhdr.original_size);
+            if (rc != OBMAFS3_OK) {
+                free(temp);
+                free(db->data);
+                db->data = NULL;
+                return rc;
+            }
+            /* Rebuild uncompressed layout: [header][raw payload] */
+            memset(db->data + sizeof(bhdr), 0,
+                   (size_t)db->capacity - sizeof(bhdr));
+            memcpy(db->data + sizeof(bhdr), temp,
+                   (size_t)bhdr.original_size);
+            free(temp);
+        }
     } else {
         db->block_lba = 0;
         db->offset    = 0;
@@ -463,8 +495,15 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
     bhdr.magic         = OBMAFS3_BLOCK_MAGIC;
     bhdr.original_size = db->offset - sizeof(struct block_header);
 
-    /* Try ZSTD compression */
+    /* Try ZSTD compression.
+     *
+     * IMPORTANT: We must NOT overwrite db->data with the compressed
+     * payload.  db->data holds the uncompressed accumulator and may
+     * still be appended to if this is a partial (not-yet-full) block.
+     * Instead, build the on-disk image in a separate buffer.  */
+    uint8_t *disk_buf = NULL;
     int compressed = 0;
+
     if (ctx->compression && bhdr.original_size > 0) {
         size_t comp_bound = ZSTD_compressBound((size_t)bhdr.original_size);
         uint8_t *comp_buf = malloc(comp_bound);
@@ -481,14 +520,13 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
                 bhdr.compressed_size  = comp_size;
                 obmafs3_checksum_block(comp_buf, comp_size,
                                        bhdr.checksum);
-                memcpy(db->data, &bhdr, sizeof(bhdr));
-                memcpy(db->data + sizeof(bhdr), comp_buf, comp_size);
-                /* Zero-fill remainder */
-                size_t used = sizeof(bhdr) + comp_size;
-                if (used < (size_t)db->capacity)
-                    memset(db->data + used, 0,
-                           (size_t)db->capacity - used);
-                compressed = 1;
+
+                disk_buf = calloc(1, (size_t)db->capacity);
+                if (disk_buf) {
+                    memcpy(disk_buf, &bhdr, sizeof(bhdr));
+                    memcpy(disk_buf + sizeof(bhdr), comp_buf, comp_size);
+                    compressed = 1;
+                }
             }
             free(comp_buf);
         }
@@ -503,8 +541,10 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
         memcpy(db->data, &bhdr, sizeof(bhdr));
     }
 
-    int rc = obmafs3_block_write(ctx, db->block_lba, db->data,
+    const void *write_src = compressed ? disk_buf : db->data;
+    int rc = obmafs3_block_write(ctx, db->block_lba, write_src,
                                  (size_t)db->capacity);
+    free(disk_buf);
     if (rc != OBMAFS3_OK)
         return rc;
 
