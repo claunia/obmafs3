@@ -284,14 +284,21 @@ int obmafs3_create(const char *path, uint64_t total_size,
     rc = write_block(fd, block_size, 3, &ino_hdr, sizeof(ino_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
-    /* --- Block 4: Root directory inode --- */
-    struct btree_node_inode root_ino;
+    /* --- Block 4: Root directory inode (B+Tree leaf with one record) --- */
+    uint8_t *ino_buf = calloc(1, block_size);
+    if (!ino_buf) { close(fd); return OBMAFS3_ERR_NOMEM; }
+
+    struct btree_node_header ino_node_hdr;
+    memset(&ino_node_hdr, 0, sizeof(ino_node_hdr));
+    ino_node_hdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    ino_node_hdr.record_type = kBtreeDataTypeInode;
+    ino_node_hdr.level       = 0;
+    ino_node_hdr.node_keys   = 1;
+    ino_node_hdr.keys_length = (uint16_t)sizeof(struct inode_record);
+    memcpy(ino_buf, &ino_node_hdr, sizeof(ino_node_hdr));
+
+    struct inode_record root_ino;
     memset(&root_ino, 0, sizeof(root_ino));
-    root_ino.header.magic       = OBMAFS3_BTREE_NODE_MAGIC;
-    root_ino.header.record_type = kBtreeDataTypeInode;
-    root_ino.header.node_keys   = 1;
-    root_ino.header.keys_length = (uint16_t)(sizeof(root_ino) -
-                                             sizeof(root_ino.header));
     root_ino.inode_id          = OBMAFS3_ROOT_INODE_ID;
     root_ino.uid               = 0;
     root_ino.gid               = 0;
@@ -301,10 +308,19 @@ int obmafs3_create(const char *path, uint64_t total_size,
     root_ino.access_time       = sb.creation_time;
     root_ino.file_size         = 0;
     root_ino.file_type         = kFileTypeDirectory;
-    obmafs3_checksum_block(&root_ino, sizeof(root_ino),
-                           root_ino.header.checksum);
+    memcpy(ino_buf + sizeof(ino_node_hdr), &root_ino, sizeof(root_ino));
 
-    rc = write_block(fd, block_size, 4, &root_ino, sizeof(root_ino));
+    /* Compute checksum the same way btree.c does:
+       zero the checksum field, hash header + keys_length bytes */
+    {
+        struct btree_node_header *nhdr = (struct btree_node_header *)ino_buf;
+        size_t data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
+        memset(nhdr->checksum, 0, sizeof(nhdr->checksum));
+        obmafs3_checksum_block(ino_buf, data_size, nhdr->checksum);
+    }
+
+    rc = write_block(fd, block_size, 4, ino_buf, block_size);
+    free(ino_buf);
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
     /* --- Block 5: Overflow tree header (empty) --- */

@@ -74,9 +74,9 @@ void obmafs3_catalog_list_free(struct btree_node_filename *entries);
 
 /* --- Inode operations --- */
 int obmafs3_inode_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
-                      struct btree_node_inode *inode);
+                      struct inode_record *inode);
 int obmafs3_inode_put(struct obmafs3_ctx *ctx,
-                      const struct btree_node_inode *inode);
+                      const struct inode_record *inode);
 int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id);
 
 /* --- Allocation bitmap --- */
@@ -107,10 +107,10 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id,
 
 /* --- File data operations --- */
 int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
-                           const struct btree_node_inode *inode,
+                           const struct inode_record *inode,
                            uint64_t offset, void *buf, size_t size);
 int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
-                            struct btree_node_inode *inode,
+                            struct inode_record *inode,
                             uint64_t offset, const void *buf, size_t size);
 
 /* --- Deduplication operations --- */
@@ -152,7 +152,7 @@ struct dedup_block_cache {
 };
 
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
-                                   struct btree_node_inode *inode,
+                                   struct inode_record *inode,
                                    uint64_t offset, const void *buf,
                                    size_t size, uint16_t sector_size,
                                    struct sector_map_cache *cache,
@@ -168,12 +168,12 @@ int  obmafs3_bg_compress_start(struct obmafs3_ctx *ctx,
 /** Wait for any pending background compression and shut down the worker. */
 void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
-                                   struct btree_node_inode *inode,
+                                   struct inode_record *inode,
                                    struct sector_map_cache *cache);
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
 
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
-                                  const struct btree_node_inode *inode,
+                                  const struct inode_record *inode,
                                   uint64_t offset, void *buf,
                                   size_t size, uint16_t sector_size);
 

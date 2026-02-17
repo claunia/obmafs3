@@ -26,7 +26,7 @@ struct obmafs3_ctx *g_ctx = NULL;
 struct fuse_file_ctx {
     uint64_t                inode_id;
     uint16_t                sector_size;   /* 0 for non-media-image files */
-    struct btree_node_inode inode;         /* cached inode */
+    struct inode_record inode;         /* cached inode */
     int                     inode_dirty;   /* needs write-back on release */
     struct sector_map_cache sme_cache;
     struct dedup_block_cache db_cache;     /* persistent dedup block accumulator */
@@ -183,8 +183,8 @@ static int resolve_path(const char *path,
 static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
                                 struct fuse_file_info *fi)
 {
-    struct btree_node_inode inode;
-    struct btree_node_inode *ip;
+    struct inode_record inode;
+    struct inode_record *ip;
     int rc;
 
     memset(stbuf, 0, sizeof(*stbuf));
@@ -347,8 +347,8 @@ static int obmafs3_fuse_read(const char *path, char *buf, size_t size,
     struct fuse_file_ctx *ffctx = fi
         ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
         : NULL;
-    struct btree_node_inode inode;
-    struct btree_node_inode *ip;
+    struct inode_record inode;
+    struct inode_record *ip;
     int rc;
 
     if (ffctx) {
@@ -448,13 +448,8 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     uint64_t now = (uint64_t)time(NULL);
     struct fuse_context *fctx = fuse_get_context();
 
-    struct btree_node_inode new_inode;
+    struct inode_record new_inode;
     memset(&new_inode, 0, sizeof(new_inode));
-    new_inode.header.magic       = OBMAFS3_BTREE_NODE_MAGIC;
-    new_inode.header.record_type = kBtreeDataTypeInode;
-    new_inode.header.node_keys   = 1;
-    new_inode.header.keys_length = (uint16_t)(sizeof(new_inode) -
-                                              sizeof(new_inode.header));
     new_inode.inode_id          = new_inode_id;
     new_inode.uid               = fctx->uid;
     new_inode.gid               = fctx->gid;
@@ -491,8 +486,8 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
                               size_t size, off_t offset,
                               struct fuse_file_info *fi)
 {
-    struct btree_node_inode inode;
-    struct btree_node_inode *ip;
+    struct inode_record inode;
+    struct inode_record *ip;
     int rc;
 
     struct fuse_file_ctx *ffctx = fi
@@ -578,8 +573,8 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
     uint64_t parent_id;
     const char *name;
     struct btree_node_filename cat_entry;
-    struct btree_node_inode inode;
-    struct btree_node_inode *ip;
+    struct inode_record inode;
+    struct inode_record *ip;
     int rc;
 
     struct fuse_file_ctx *ffctx = fi
@@ -714,7 +709,7 @@ static int obmafs3_fuse_utimens(const char *path,
     uint64_t parent_id;
     const char *name;
     struct btree_node_filename cat_entry;
-    struct btree_node_inode inode;
+    struct inode_record inode;
     int rc;
 
     (void)fi;

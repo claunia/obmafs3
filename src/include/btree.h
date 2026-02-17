@@ -26,6 +26,7 @@ struct __attribute__((packed)) btree_header {
 struct __attribute__((packed)) btree_node_header {
     uint64_t magic;          /**< "BTREENDE" */
     uint8_t  record_type;    /**< Type of records in this node */
+    uint8_t  level;          /**< 0 = leaf node, >0 = index node (B+Tree depth) */
     uint64_t left_link;      /**< LBA of left sibling node */
     uint64_t right_link;     /**< LBA of right sibling node */
     uint64_t overflow_link;  /**< LBA of overflow node */
@@ -42,8 +43,11 @@ struct __attribute__((packed)) btree_node_filename {
     char     name[256];      /**< Name in UTF-8 NUL-terminated format */
 };
 
-struct __attribute__((packed)) btree_node_inode {
-    struct btree_node_header header;
+/**
+ * Inode record stored in B+Tree leaf nodes.
+ * This is the public API type for inode operations and the on-disk format.
+ */
+struct __attribute__((packed)) inode_record {
     uint64_t inode_id;           /**< Unique identifier for the file */
     uint32_t uid;                /**< User ID of the file owner */
     uint32_t gid;                /**< Group ID of the file owner */
@@ -63,7 +67,13 @@ struct __attribute__((packed)) btree_node_dedup {
     /* Followed by node_keys × struct dedup_entry records.
      * Maximum entries per node =
      *   (block_size - sizeof(btree_node_header)) / sizeof(dedup_entry).
-     * For a 4096-byte block: (4096 - 69) / 24 = 167 entries. */
+     * For a 4096-byte block: (4096 - 70) / 24 = 167 entries. */
+};
+
+/** Index entry for B+Tree internal (index) nodes: key + child pointer. */
+struct __attribute__((packed)) btree_index_entry {
+    uint64_t key;           /**< Smallest key reachable through child */
+    uint64_t child_lba;     /**< LBA of the child node */
 };
 
 #endif /* OBMAFS3_BTREE_H */

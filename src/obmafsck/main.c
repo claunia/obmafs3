@@ -98,6 +98,159 @@ static int walk_tree_nodes(struct obmafs3_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Walk all nodes in the inode B+Tree (DFS)                           */
+/* ------------------------------------------------------------------ */
+
+static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx,
+                                  uint64_t root_lba,
+                                  uint64_t **out_lbas,
+                                  uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if (root_lba == 0)
+        return OBMAFS3_OK;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t *lbas    = NULL;
+    uint64_t count    = 0;
+    uint64_t cap      = 0;
+
+    /* Iterative DFS via explicit stack */
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t stk_size  = 0;
+    uint64_t stk_cap   = 64;
+    if (!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    stack[stk_size++] = root_lba;
+
+    while (stk_size > 0) {
+        uint64_t lba = stack[--stk_size];
+
+        /* Grow output array */
+        if (count >= cap) {
+            cap = cap == 0 ? 64 : cap * 2;
+            uint64_t *tmp = realloc(lbas, cap * sizeof(*tmp));
+            if (!tmp) {
+                free(buf); free(stack); free(lbas);
+                return OBMAFS3_ERR_NOMEM;
+            }
+            lbas = tmp;
+        }
+        lbas[count++] = lba;
+
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            free(buf); free(stack); free(lbas);
+            return rc;
+        }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); free(stack); free(lbas);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level > 0) {
+            /* Index node: push children onto stack */
+            for (uint16_t i = 0; i < hdr.node_keys; i++) {
+                struct btree_index_entry ie;
+                memcpy(&ie,
+                       buf + sizeof(struct btree_node_header)
+                           + (size_t)i * sizeof(ie),
+                       sizeof(ie));
+
+                if (stk_size >= stk_cap) {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack,
+                                            stk_cap * sizeof(*tmp));
+                    if (!tmp) {
+                        free(buf); free(stack); free(lbas);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                    stack = tmp;
+                }
+                stack[stk_size++] = ie.child_lba;
+            }
+        }
+    }
+
+    free(buf);
+    free(stack);
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Verify checksums for a list of B+Tree node LBAs                    */
+/* ------------------------------------------------------------------ */
+
+static int verify_btree_node_checksums(struct obmafs3_ctx *ctx,
+                                       const uint64_t *node_lbas,
+                                       uint64_t node_count,
+                                       const char *tree_name,
+                                       uint64_t *bad_count)
+{
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t bad = 0;
+
+    for (uint64_t n = 0; n < node_count; n++) {
+        uint64_t lba = node_lbas[n];
+
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            fprintf(stderr,
+                    "  %s node at LBA %" PRIu64 ": bad magic\n",
+                    tree_name, lba);
+            bad++;
+            continue;
+        }
+
+        size_t data_size = sizeof(struct btree_node_header) +
+                           hdr.keys_length;
+        uint8_t stored[32];
+        memcpy(stored, hdr.checksum, 32);
+        memset(buf + __builtin_offsetof(struct btree_node_header,
+                                        checksum),
+               0, 32);
+        uint8_t computed[32];
+        obmafs3_checksum_block(buf, data_size, computed);
+        memcpy(buf + __builtin_offsetof(struct btree_node_header,
+                                        checksum),
+               stored, 32);
+
+        if (memcmp(stored, computed, 32) != 0) {
+            fprintf(stderr,
+                    "  %s node at LBA %" PRIu64
+                    ": checksum mismatch\n",
+                    tree_name, lba);
+            bad++;
+        }
+    }
+
+    free(buf);
+    *bad_count = bad;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Collect data-block LBAs from all inodes                            */
 /* ------------------------------------------------------------------ */
 
@@ -106,6 +259,12 @@ static int collect_inode_data_blocks(struct obmafs3_ctx *ctx,
                                      uint64_t **out_lbas,
                                      uint64_t *out_count)
 {
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if (inode_root_lba == 0)
+        return OBMAFS3_OK;
+
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if (!buf)
         return OBMAFS3_ERR_NOMEM;
@@ -113,44 +272,87 @@ static int collect_inode_data_blocks(struct obmafs3_ctx *ctx,
     uint64_t *lbas = NULL;
     uint64_t count = 0;
     uint64_t cap = 0;
-    uint64_t lba = inode_root_lba;
 
-    while (lba != 0) {
+    /* Iterative DFS via explicit stack (avoids stale right_link
+       references to freed leaf nodes) */
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t stk_size  = 0;
+    uint64_t stk_cap   = 64;
+    if (!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    stack[stk_size++] = inode_root_lba;
+
+    while (stk_size > 0) {
+        uint64_t lba = stack[--stk_size];
+
         int rc = obmafs3_block_read(ctx, lba, buf,
                                     (size_t)ctx->sb.block_size);
         if (rc != OBMAFS3_OK) {
-            free(buf); free(lbas); return rc;
+            free(buf); free(stack); free(lbas); return rc;
         }
 
-        struct btree_node_inode node;
-        memcpy(&node, buf, sizeof(node));
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
 
-        if (node.header.magic != OBMAFS3_BTREE_NODE_MAGIC) {
-            free(buf); free(lbas); return OBMAFS3_ERR_BADMAGIC;
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); free(stack); free(lbas);
+            return OBMAFS3_ERR_BADMAGIC;
         }
 
-        /* collect extent blocks */
-        for (int e = 0; e < 8; e++) {
-            if (node.extents[e].block_count == 0)
-                continue;
-            for (uint64_t b = 0; b < node.extents[e].block_count; b++) {
-                if (count >= cap) {
-                    cap = (cap == 0) ? 128 : cap * 2;
-                    uint64_t *tmp = realloc(lbas, cap * sizeof(*tmp));
+        if (hdr.level > 0) {
+            /* Index node: push children onto stack */
+            for (uint16_t i = 0; i < hdr.node_keys; i++) {
+                struct btree_index_entry ie;
+                memcpy(&ie,
+                       buf + sizeof(struct btree_node_header)
+                           + (size_t)i * sizeof(ie),
+                       sizeof(ie));
+                if (stk_size >= stk_cap) {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack,
+                                            stk_cap * sizeof(*tmp));
                     if (!tmp) {
-                        free(buf); free(lbas);
+                        free(buf); free(stack); free(lbas);
                         return OBMAFS3_ERR_NOMEM;
                     }
-                    lbas = tmp;
+                    stack = tmp;
                 }
-                lbas[count++] = node.extents[e].start_block + b;
+                stack[stk_size++] = ie.child_lba;
             }
+            continue;
         }
 
-        lba = node.header.right_link;
+        /* Leaf node: collect extent blocks from inode records */
+        for (uint16_t i = 0; i < hdr.node_keys; i++) {
+            struct inode_record rec;
+            memcpy(&rec,
+                   buf + sizeof(struct btree_node_header)
+                       + (size_t)i * sizeof(rec),
+                   sizeof(rec));
+
+            for (int e = 0; e < 8; e++) {
+                if (rec.extents[e].block_count == 0)
+                    continue;
+                for (uint64_t b = 0; b < rec.extents[e].block_count;
+                     b++) {
+                    if (count >= cap) {
+                        cap = (cap == 0) ? 128 : cap * 2;
+                        uint64_t *tmp = realloc(lbas,
+                                                cap * sizeof(*tmp));
+                        if (!tmp) {
+                            free(buf); free(stack); free(lbas);
+                            return OBMAFS3_ERR_NOMEM;
+                        }
+                        lbas = tmp;
+                    }
+                    lbas[count++] = rec.extents[e].start_block + b;
+                }
+            }
+        }
     }
 
     free(buf);
+    free(stack);
     *out_lbas  = lbas;
     *out_count = count;
     return OBMAFS3_OK;
@@ -432,13 +634,14 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
         }
     }
 
-    /* Inode tree: header + nodes */
+    /* Inode tree: header + nodes (B+Tree: DFS walk) */
     MARK(ctx->sb.inode_lba);
     {
         uint64_t *ino_nodes = NULL;
         uint64_t ino_count = 0;
-        int rc = walk_tree_nodes(ctx, ctx->inode_hdr.root_node_lba,
-                                 &ino_nodes, &ino_count);
+        int rc = walk_inode_btree_nodes(ctx,
+                                        ctx->inode_hdr.root_node_lba,
+                                        &ino_nodes, &ino_count);
         if (rc == OBMAFS3_OK) {
             for (uint64_t i = 0; i < ino_count; i++)
                 MARK(ino_nodes[i]);
@@ -1036,14 +1239,26 @@ int main(int argc, char *argv[])
     printf("  Total nodes:      %u\n", ctx->inode_hdr.total_nodes);
 
     if (ctx->inode_hdr.root_node_lba != 0) {
-        uint64_t ino_bad = 0;
-        verify_tree_node_checksums(ctx, ctx->inode_hdr.root_node_lba,
-                                   "Inode", &ino_bad);
-        if (ino_bad > 0) {
-            printf("  Node checksums:   %" PRIu64 " BAD\n", ino_bad);
-            errors++;
+        uint64_t *ino_nodes = NULL;
+        uint64_t ino_node_count = 0;
+        int wrc = walk_inode_btree_nodes(ctx,
+                                         ctx->inode_hdr.root_node_lba,
+                                         &ino_nodes, &ino_node_count);
+        if (wrc == OBMAFS3_OK) {
+            uint64_t ino_bad = 0;
+            verify_btree_node_checksums(ctx, ino_nodes, ino_node_count,
+                                        "Inode", &ino_bad);
+            free(ino_nodes);
+            if (ino_bad > 0) {
+                printf("  Node checksums:   %" PRIu64 " BAD\n",
+                       ino_bad);
+                errors++;
+            } else {
+                printf("  Node checksums:   OK\n");
+            }
         } else {
-            printf("  Node checksums:   OK\n");
+            printf("  Node checksums:   could not walk tree\n");
+            errors++;
         }
     }
 

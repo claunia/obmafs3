@@ -826,7 +826,7 @@ static void dedup_block_free(struct dedup_block_ctx *db)
  * with dedup tree node allocations, preventing inode extent fragmentation.
  */
 static int write_sector_map_batch(struct obmafs3_ctx *ctx,
-                                  struct btree_node_inode *inode,
+                                  struct inode_record *inode,
                                   const struct sector_map_entry *entries,
                                   uint64_t count)
 {
@@ -882,7 +882,7 @@ static int write_sector_map_batch(struct obmafs3_ctx *ctx,
  * file size is not a multiple of sector_size.
  */
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
-                                   struct btree_node_inode *inode,
+                                   struct inode_record *inode,
                                    uint64_t offset, const void *buf,
                                    size_t size, uint16_t sector_size,
                                    struct sector_map_cache *cache,
@@ -1270,7 +1270,7 @@ void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache)
 /* ------------------------------------------------------------------ */
 
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
-                                   struct btree_node_inode *inode,
+                                   struct inode_record *inode,
                                    struct sector_map_cache *cache)
 {
     if (!cache || cache->count == 0)
@@ -1314,7 +1314,7 @@ void obmafs3_free_sector_map_cache(struct sector_map_cache *cache)
  * @return OBMAFS3_OK on success, error code otherwise.
  */
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
-                                  const struct btree_node_inode *inode,
+                                  const struct inode_record *inode,
                                   uint64_t offset, void *buf,
                                   size_t size, uint16_t sector_size)
 {
@@ -1348,7 +1348,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
     int      cached_compressed = 0;
 
     /* Temporary inode copy for reading sector map (need to adjust file_size) */
-    struct btree_node_inode map_inode;
+    struct inode_record map_inode;
     memcpy(&map_inode, inode, sizeof(map_inode));
     map_inode.file_size = inode->sector_map_size *
                           sizeof(struct sector_map_entry);

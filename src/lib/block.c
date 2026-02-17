@@ -296,7 +296,7 @@ static uint64_t overflow_count_blocks(struct obmafs3_ctx *ctx,
 /* ------------------------------------------------------------------ */
 
 int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
-                           const struct btree_node_inode *inode,
+                           const struct inode_record *inode,
                            uint64_t offset, void *buf, size_t size)
 {
     uint64_t block_size = ctx->sb.block_size;
@@ -430,7 +430,7 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
 /* ------------------------------------------------------------------ */
 
 int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
-                            struct btree_node_inode *inode,
+                            struct inode_record *inode,
                             uint64_t offset, const void *buf, size_t size)
 {
     uint64_t block_size = ctx->sb.block_size;

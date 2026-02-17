@@ -175,9 +175,10 @@ struct btree_node_filename {                 /* packed */
 
 ### Inode Tree (file metadata)
 
+The inode tree is a proper B+Tree: leaf nodes (level 0) store packed `inode_record` entries sorted by `inode_id`, and index nodes (level > 0) store `btree_index_entry` entries pointing to child nodes. Each leaf node can hold up to `(block_size - sizeof(btree_node_header)) / sizeof(inode_record)` records (20 records for a 4096-byte block).
+
 ```c
-struct btree_node_inode {                    /* packed */
-    struct btree_node_header header;
+struct inode_record {                        /* packed, 197 bytes */
     uint64_t inode_id;
     uint32_t uid;
     uint32_t gid;
