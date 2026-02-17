@@ -71,6 +71,7 @@ struct __attribute__((packed)) inode_record {
     uint8_t  file_type;          /**< Type of file (regular, media image, etc.) */
     uint64_t sector_count;       /**< Total number of sectors in the media image */
     uint64_t sector_map_size;    /**< Number of sector_map_entries written so far */
+    uint32_t ref_count;          /**< Number of catalog entries (hardlinks) pointing to this inode */
 };
 
 struct __attribute__((packed)) btree_node_dedup {

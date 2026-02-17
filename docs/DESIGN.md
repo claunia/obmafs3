@@ -178,7 +178,7 @@ struct btree_node_filename {                 /* packed */
 The inode tree is a proper B+Tree: leaf nodes (level 0) store packed `inode_record` entries sorted by `inode_id`, and index nodes (level > 0) store `btree_index_entry` entries pointing to child nodes. Each leaf node can hold up to `(block_size - sizeof(btree_node_header)) / sizeof(inode_record)` records (20 records for a 4096-byte block).
 
 ```c
-struct inode_record {                        /* packed, 197 bytes */
+struct inode_record {                        /* packed, 201 bytes */
     uint64_t inode_id;
     uint32_t uid;
     uint32_t gid;
@@ -191,10 +191,17 @@ struct inode_record {                        /* packed, 197 bytes */
     uint8_t  file_type;          /* 0=regular, 1=directory, 2=media image */
     uint64_t sector_count;       /* Media images: total number of sectors */
     uint64_t sector_map_size;    /* Media images: number of sector_map_entries written */
+    uint32_t ref_count;          /* Number of hardlinks (catalog entries) pointing to this inode */
 };
 ```
 
 The `extents` array holds up to 8 inline extent runs. For regular files, these point to data blocks. For media image files, they point to blocks containing a flat array of `sector_map_entry` structures that map each sector to its deduplicated copy. The `sector_count` and `sector_map_size` fields are only used for media image files.
+
+#### Hardlinks
+
+Files support hardlinks: multiple catalog entries can point to the same inode. The `ref_count` field tracks the number of catalog entries referencing each inode. When a hardlink is created, a new catalog entry is added pointing to the existing inode and the reference count is incremented. When a file is unlinked, the catalog entry is removed and the reference count is decremented; the inode and its data blocks are only freed when the reference count reaches zero.
+
+Directories do not support hardlinks. A directory's inode is deleted only when the directory is empty (no children in the catalog) and its single catalog entry is removed.
 
 ```c
 struct extent_run {                          /* packed, 16 bytes */

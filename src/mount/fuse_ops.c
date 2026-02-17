@@ -200,7 +200,7 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
 
         stbuf->st_ino   = inode.inode_id;
         stbuf->st_mode  = S_IFDIR | inode.mode;
-        stbuf->st_nlink = 2;
+        stbuf->st_nlink = inode.ref_count;
         stbuf->st_uid   = inode.uid;
         stbuf->st_gid   = inode.gid;
         stbuf->st_size  = (off_t)inode.file_size;
@@ -237,7 +237,7 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
         stbuf->st_mode = S_IFDIR | ip->mode;
     else
         stbuf->st_mode = S_IFREG | ip->mode;
-    stbuf->st_nlink = cat_entry.directory_flag ? 2 : 1;
+    stbuf->st_nlink = ip->ref_count;
     stbuf->st_uid   = ip->uid;
     stbuf->st_gid   = ip->gid;
     stbuf->st_size  = (off_t)ip->file_size;
@@ -456,6 +456,7 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     new_inode.file_type         = kFileTypeRegular;
     new_inode.sector_count      = 0;
     new_inode.sector_map_size   = 0;
+    new_inode.ref_count          = 1;
 
     /* Check if this file should be treated as a media/disk image */
     uint16_t ss = lookup_disk_image_sector_size(name);
@@ -664,6 +665,67 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
     return 0;
 }
 
+static int obmafs3_fuse_link(const char *oldpath, const char *newpath)
+{
+    uint64_t old_parent_id, new_parent_id;
+    const char *old_name, *new_name;
+    struct catalog_record cat_entry;
+    int rc;
+
+    /* Resolve source */
+    rc = resolve_path(oldpath, &old_parent_id, &old_name);
+    if (rc != 0)
+        return rc;
+
+    rc = obmafs3_catalog_lookup(g_ctx, old_parent_id, old_name, &cat_entry);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Hardlinks to directories are not allowed */
+    if (cat_entry.directory_flag)
+        return -EPERM;
+
+    /* Resolve destination */
+    rc = resolve_path(newpath, &new_parent_id, &new_name);
+    if (rc != 0)
+        return rc;
+
+    /* Check destination doesn't already exist */
+    struct catalog_record tmp;
+    rc = obmafs3_catalog_lookup(g_ctx, new_parent_id, new_name, &tmp);
+    if (rc == OBMAFS3_OK)
+        return -EEXIST;
+    if (rc != OBMAFS3_ERR_NOTFOUND)
+        return -EIO;
+
+    /* Create new catalog entry pointing to the same inode */
+    struct catalog_record new_cat;
+    memset(&new_cat, 0, sizeof(new_cat));
+    new_cat.inode_id       = cat_entry.inode_id;
+    new_cat.parent_id      = new_parent_id;
+    new_cat.directory_flag = 0;
+    strncpy(new_cat.name, new_name, sizeof(new_cat.name) - 1);
+
+    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Increment the reference count */
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    inode.ref_count++;
+    rc = obmafs3_inode_put(g_ctx, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
 static int obmafs3_fuse_unlink(const char *path)
 {
     uint64_t parent_id;
@@ -689,10 +751,23 @@ static int obmafs3_fuse_unlink(const char *path)
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    /* Remove the inode */
-    rc = obmafs3_inode_delete(g_ctx, cat_entry.inode_id);
+    /* Decrement the reference count; delete inode only when it reaches 0 */
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
     if (rc != OBMAFS3_OK)
         return -EIO;
+
+    if (inode.ref_count > 1) {
+        inode.ref_count--;
+        rc = obmafs3_inode_put(g_ctx, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    } else {
+        /* Last reference — delete the inode (and its data) */
+        rc = obmafs3_inode_delete(g_ctx, cat_entry.inode_id);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    }
 
     return 0;
 }
@@ -749,6 +824,7 @@ static int obmafs3_fuse_mkdir(const char *path, mode_t mode)
     new_inode.access_time       = now;
     new_inode.file_size         = 0;
     new_inode.file_type         = kFileTypeDirectory;
+    new_inode.ref_count          = 1;
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
     if (rc != OBMAFS3_OK)
@@ -946,6 +1022,7 @@ struct fuse_operations obmafs3_fuse_ops = {
     .release  = obmafs3_fuse_release,
     .truncate = obmafs3_fuse_truncate,
     .unlink   = obmafs3_fuse_unlink,
+    .link     = obmafs3_fuse_link,
     .mkdir    = obmafs3_fuse_mkdir,
     .rmdir    = obmafs3_fuse_rmdir,
     .utimens  = obmafs3_fuse_utimens,

@@ -323,6 +323,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
     root_ino.access_time       = sb.creation_time;
     root_ino.file_size         = 0;
     root_ino.file_type         = kFileTypeDirectory;
+    root_ino.ref_count          = 1;
     memcpy(ino_buf + sizeof(ino_node_hdr), &root_ino, sizeof(root_ino));
 
     /* Compute checksum the same way btree.c does:
