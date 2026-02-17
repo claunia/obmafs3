@@ -132,11 +132,34 @@ struct sector_map_cache {
     uint64_t capacity;
 };
 
+/**
+ * Persistent cache of the dedup data block accumulator.  When non-NULL
+ * is passed to obmafs3_write_media_image_data, the 4 MiB in-memory
+ * dedup block is kept alive across calls — avoiding a costly disk
+ * read + decompression on every FUSE write.  The caller must call
+ * obmafs3_flush_dedup_block_cache before close/release, then
+ * obmafs3_free_dedup_block_cache to free the memory.
+ */
+struct dedup_block_cache {
+    uint8_t  *data;          /**< In-memory dedup data block buffer */
+    uint64_t  block_lba;     /**< LBA of this dedup block */
+    uint64_t  offset;        /**< Next write offset within the block */
+    uint64_t  capacity;      /**< Total capacity (dedup_block_size) */
+    uint64_t  std_blocks;    /**< Number of standard blocks per dedup block */
+    int       dirty;         /**< Whether the buffer has been modified */
+    int       initialized;   /**< Non-zero once first init has run */
+};
+
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
                                    struct btree_node_inode *inode,
                                    uint64_t offset, const void *buf,
                                    size_t size, uint16_t sector_size,
-                                   struct sector_map_cache *cache);
+                                   struct sector_map_cache *cache,
+                                   struct dedup_block_cache *db_cache);
+int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx,
+                                    uint16_t sector_size,
+                                    struct dedup_block_cache *db_cache);
+void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
                                    struct btree_node_inode *inode,
                                    struct sector_map_cache *cache);

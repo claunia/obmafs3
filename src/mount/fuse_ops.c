@@ -29,6 +29,7 @@ struct fuse_file_ctx {
     struct btree_node_inode inode;         /* cached inode */
     int                     inode_dirty;   /* needs write-back on release */
     struct sector_map_cache sme_cache;
+    struct dedup_block_cache db_cache;     /* persistent dedup block accumulator */
 };
 
 /* Disk image extension-to-sector-size mappings */
@@ -531,10 +532,12 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
 
         struct sector_map_cache *cache =
             (ffctx && ffctx->sector_size) ? &ffctx->sme_cache : NULL;
+        struct dedup_block_cache *dbc =
+            (ffctx && ffctx->sector_size) ? &ffctx->db_cache : NULL;
 
         rc = obmafs3_write_media_image_data(g_ctx, ip,
                                             (uint64_t)offset, buf,
-                                            size, ss, cache);
+                                            size, ss, cache, dbc);
     } else {
         rc = obmafs3_write_file_data(g_ctx, ip,
                                      (uint64_t)offset, buf, size);
@@ -757,10 +760,20 @@ static int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
 
     int rc = 0;
 
+    /* Flush the dedup block accumulator to disk */
+    if (ffctx->sector_size && ffctx->db_cache.initialized) {
+        int drc = obmafs3_flush_dedup_block_cache(g_ctx,
+                      ffctx->sector_size, &ffctx->db_cache);
+        if (rc == OBMAFS3_OK)
+            rc = drc;
+    }
+
     /* Flush cached sector_map_entries for media image files */
     if (ffctx->sector_size && ffctx->sme_cache.count > 0) {
-        rc = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
-                                            &ffctx->sme_cache);
+        int src = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
+                                                 &ffctx->sme_cache);
+        if (rc == OBMAFS3_OK)
+            rc = src;
         ffctx->inode_dirty = 1;
     }
 
@@ -788,10 +801,20 @@ static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
 
     int rc = 0;
 
+    /* Flush the dedup block accumulator */
+    if (ffctx->sector_size && ffctx->db_cache.initialized) {
+        int drc = obmafs3_flush_dedup_block_cache(g_ctx,
+                      ffctx->sector_size, &ffctx->db_cache);
+        if (rc == OBMAFS3_OK)
+            rc = drc;
+    }
+
     /* Flush any remaining cached data (in case flush was not called) */
     if (ffctx->sector_size && ffctx->sme_cache.count > 0) {
-        rc = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
-                                            &ffctx->sme_cache);
+        int src = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
+                                                 &ffctx->sme_cache);
+        if (rc == OBMAFS3_OK)
+            rc = src;
         ffctx->inode_dirty = 1;
     }
 
@@ -802,6 +825,7 @@ static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
             rc = put_rc;
     }
 
+    obmafs3_free_dedup_block_cache(&ffctx->db_cache);
     obmafs3_free_sector_map_cache(&ffctx->sme_cache);
     free(ffctx);
     fi->fh = 0;

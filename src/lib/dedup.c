@@ -685,6 +685,10 @@ static int write_sector_map_batch(struct obmafs3_ctx *ctx,
  * cache instead of being written to disk.  Call
  * obmafs3_flush_sector_map_cache() to write them out.
  *
+ * If @db_cache is non-NULL, the dedup data block accumulator is kept
+ * alive across calls instead of being re-read from disk each time.
+ * The caller must call obmafs3_flush_dedup_block_cache() on close.
+ *
  * The last sector of the file may be smaller than sector_size if the
  * file size is not a multiple of sector_size.
  */
@@ -692,7 +696,8 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
                                    struct btree_node_inode *inode,
                                    uint64_t offset, const void *buf,
                                    size_t size, uint16_t sector_size,
-                                   struct sector_map_cache *cache)
+                                   struct sector_map_cache *cache,
+                                   struct dedup_block_cache *db_cache)
 {
     int rc;
 
@@ -709,11 +714,50 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
     if (rc != OBMAFS3_OK)
         return rc;
 
-    /* Initialize the in-memory dedup block from the tree's partial block */
-    struct dedup_block_ctx db;
-    rc = dedup_block_init(ctx, &dedup_hdr, &db);
-    if (rc != OBMAFS3_OK)
-        return rc;
+    /* Initialize the in-memory dedup block — use the persistent cache
+     * if the caller provided one, otherwise fall back to a local ctx
+     * that is read from disk each call. */
+    struct dedup_block_ctx db_local;
+    struct dedup_block_ctx *db;
+    int db_is_cached = 0;
+
+    if (db_cache) {
+        if (!db_cache->initialized) {
+            /* First call — bootstrap the cache from the tree header */
+            db_local.data       = NULL;
+            db_local.block_lba  = 0;
+            db_local.offset     = 0;
+            db_local.capacity   = 0;
+            db_local.std_blocks = 0;
+            db_local.dirty      = 0;
+            rc = dedup_block_init(ctx, &dedup_hdr, &db_local);
+            if (rc != OBMAFS3_OK)
+                return rc;
+            /* Migrate into the persistent cache struct */
+            db_cache->data       = db_local.data;
+            db_cache->block_lba  = db_local.block_lba;
+            db_cache->offset     = db_local.offset;
+            db_cache->capacity   = db_local.capacity;
+            db_cache->std_blocks = db_local.std_blocks;
+            db_cache->dirty      = db_local.dirty;
+            db_cache->initialized = 1;
+        }
+        /* Wrap the cache fields into a stack-local dedup_block_ctx
+         * that points to the same buffer.  We copy back at the end. */
+        db_local.data       = db_cache->data;
+        db_local.block_lba  = db_cache->block_lba;
+        db_local.offset     = db_cache->offset;
+        db_local.capacity   = db_cache->capacity;
+        db_local.std_blocks = db_cache->std_blocks;
+        db_local.dirty      = db_cache->dirty;
+        db = &db_local;
+        db_is_cached = 1;
+    } else {
+        rc = dedup_block_init(ctx, &dedup_hdr, &db_local);
+        if (rc != OBMAFS3_OK)
+            return rc;
+        db = &db_local;
+    }
 
     /*
      * Pre-allocate a buffer for sector_map_entries.
@@ -723,7 +767,8 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
     struct sector_map_entry *sme_buf =
         malloc((size_t)(max_sectors * sizeof(struct sector_map_entry)));
     if (!sme_buf) {
-        dedup_block_free(&db);
+        if (!db_is_cached)
+            dedup_block_free(db);
         return OBMAFS3_ERR_NOMEM;
     }
     uint64_t sme_count = 0;
@@ -769,7 +814,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
         } else if (rc == OBMAFS3_ERR_NOTFOUND) {
             /* New sector — store in the dedup data block */
             uint64_t stored_lba, stored_offset;
-            rc = dedup_block_store(ctx, &db, sector_data, sector_data_len,
+            rc = dedup_block_store(ctx, db, sector_data, sector_data_len,
                                    &stored_lba, &stored_offset);
             if (rc != OBMAFS3_OK)
                 goto out;
@@ -810,15 +855,15 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
      */
 
     /* Flush any remaining dedup block data to disk */
-    if (db.dirty) {
-        int flush_rc = dedup_block_flush(ctx, &db);
+    if (db->dirty) {
+        int flush_rc = dedup_block_flush(ctx, db);
         if (rc == OBMAFS3_OK)
             rc = flush_rc;
     }
 
     /* Update the tree header with the current partial block state */
-    dedup_hdr.last_block_lba    = db.block_lba;
-    dedup_hdr.last_block_offset = db.offset;
+    dedup_hdr.last_block_lba    = db->block_lba;
+    dedup_hdr.last_block_offset = db->offset;
     int hdr_rc = obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
     if (rc == OBMAFS3_OK)
         rc = hdr_rc;
@@ -859,21 +904,98 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
     }
 
     free(sme_buf);
-    dedup_block_free(&db);
+    /* Copy updated state back to the persistent cache if used */
+    if (db_is_cached) {
+        db_cache->data       = db->data;
+        db_cache->block_lba  = db->block_lba;
+        db_cache->offset     = db->offset;
+        db_cache->capacity   = db->capacity;
+        db_cache->std_blocks = db->std_blocks;
+        db_cache->dirty      = db->dirty;
+    } else {
+        dedup_block_free(db);
+    }
     return rc;
 
 out:
     /* Error path — still flush dedup state */
-    if (db.dirty)
-        dedup_block_flush(ctx, &db);
+    if (db->dirty)
+        dedup_block_flush(ctx, db);
 
-    dedup_hdr.last_block_lba    = db.block_lba;
-    dedup_hdr.last_block_offset = db.offset;
+    dedup_hdr.last_block_lba    = db->block_lba;
+    dedup_hdr.last_block_offset = db->offset;
     obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
 
     free(sme_buf);
-    dedup_block_free(&db);
+    if (db_is_cached) {
+        db_cache->data       = db->data;
+        db_cache->block_lba  = db->block_lba;
+        db_cache->offset     = db->offset;
+        db_cache->capacity   = db->capacity;
+        db_cache->std_blocks = db->std_blocks;
+        db_cache->dirty      = db->dirty;
+    } else {
+        dedup_block_free(db);
+    }
     return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dedup block cache flush / free                                     */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx,
+                                    uint16_t sector_size,
+                                    struct dedup_block_cache *db_cache)
+{
+    if (!db_cache || !db_cache->initialized)
+        return OBMAFS3_OK;
+
+    /* Build a temporary dedup_block_ctx from the cache */
+    struct dedup_block_ctx db;
+    db.data       = db_cache->data;
+    db.block_lba  = db_cache->block_lba;
+    db.offset     = db_cache->offset;
+    db.capacity   = db_cache->capacity;
+    db.std_blocks = db_cache->std_blocks;
+    db.dirty      = db_cache->dirty;
+
+    int rc = OBMAFS3_OK;
+
+    if (db.dirty) {
+        rc = dedup_block_flush(ctx, &db);
+        if (rc != OBMAFS3_OK) {
+            db_cache->dirty = db.dirty;
+            return rc;
+        }
+    }
+
+    /* Update the tree header with the current partial block state */
+    struct btree_header dedup_hdr;
+    uint64_t dedup_hdr_lba;
+    int hrc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr,
+                                     &dedup_hdr_lba);
+    if (hrc == OBMAFS3_OK) {
+        dedup_hdr.last_block_lba    = db.block_lba;
+        dedup_hdr.last_block_offset = db.offset;
+        obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
+    }
+
+    /* Copy state back */
+    db_cache->block_lba  = db.block_lba;
+    db_cache->offset     = db.offset;
+    db_cache->dirty      = db.dirty;
+
+    return rc;
+}
+
+void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
+{
+    if (!db_cache)
+        return;
+    free(db_cache->data);
+    db_cache->data = NULL;
+    db_cache->initialized = 0;
 }
 
 /* ------------------------------------------------------------------ */
