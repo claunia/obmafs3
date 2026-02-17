@@ -16,7 +16,10 @@ enum obmafs3_btree_type {
     kBtreeTypeOverflow      = 2,
     kBtreeTypeDeduplication = 3,
     kBtreeTypeMetadata      = 4,
-    kBtreeTypeMediaTag      = 5
+    kBtreeTypeMediaTag      = 5,
+    kBtreeTypeCdPrefix      = 6,
+    kBtreeTypeCdSuffix      = 7,
+    kBtreeTypeCdSubchannel  = 8
 };
 
 enum obmafs3_btree_data_type {
@@ -25,14 +28,26 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeExtent             = 2,
     kBtreeDataTypeDeduplicationEntry = 3,
     kBtreeDataTypeMetadataEntry      = 4,
-    kBtreeDataTypeMediaTagEntry      = 5
+    kBtreeDataTypeMediaTagEntry      = 5,
+    kBtreeDataTypeCdPrefixEntry      = 6,
+    kBtreeDataTypeCdSuffixEntry      = 7,
+    kBtreeDataTypeCdSubchannelEntry  = 8
 };
 
 enum obmafs3_file_type {
     kFileTypeRegular    = 0,
     kFileTypeDirectory  = 1,
     kFileTypeMediaImage = 2,
-    kFileTypeSymlink    = 3
+    kFileTypeSymlink    = 3,
+    kFileTypeCompactDiscImage = 4
+};
+
+enum obmafs3_cd_sector_mode {
+    kCdSectorModeAudio = 0,
+    kCdSectorMode1 = 1,
+    kCdSectorMode2 = 2,
+    kCdSectorMode2Form1 = 3,
+    kCdSectorMode2Form2 = 4,
 };
 
 #endif /* OBMAFS3_ENUMS_H */

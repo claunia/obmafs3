@@ -38,6 +38,19 @@ struct __attribute__((packed)) sector_map_entry {
     uint64_t hash;         /**< Hash of the sector data for deduplication */
 };
 
+struct __attribute__((packed)) cd_sector_map_entry {
+    int64_t sector;       /**< Logical sector number within the CD image */
+    uint16_t sector_size;  /**< Size of the CD sector in bytes (e.g. 2048, 2336, 2352) */
+    uint64_t hash;         /**< Hash of the CD sector data for deduplication */
+    uint8_t generated_prefix; /**< Indicates if prefix can be generated and is therefore not stored */
+    uint64_t prefix_hash;  /**< Hash of the CD sector prefix data (e.g. 16 bytes before main data) */
+    uint8_t generated_suffix; /**< Indicates if suffix can be generated and is therefore not stored */
+    uint64_t suffix_hash;  /**< Hash of the CD sector suffix data (e.g. 288 bytes after main data) */
+    uint64_t subchannel_hash; /**< Hash of the CD sector subchannel data (e.g. 96 bytes), 0 if not stored*/
+    uint8_t subheader[8]; /**< Subheader data for CD-ROM XA sectors, 0 if not applicable */
+    uint8_t sector_mode /* Audio, Mode 1, Mode 2 Form 1, Mode 2 Form 2, etc. for CD-ROM XA sectors */;
+};
+
 struct __attribute__((packed)) extent_run {
     uint64_t start_block;  /**< Starting block of the extent run */
     uint64_t block_count;  /**< Number of blocks in the extent run */

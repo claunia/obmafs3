@@ -18,6 +18,9 @@ struct __attribute__((packed)) obmafs3_sb {
     uint64_t dedup_lba;          /**< LBA of the deduplication tree list header */
     uint64_t metadata_lba;       /**< LBA of the metadata (btree) structure */
     uint64_t media_tag_lba;      /**< LBA of the media tag (btree) structure */
+    uint64_t cd_prefix_lba;      /**< LBA of the CD prefix (btree) structure */
+    uint64_t cd_suffix_lba;      /**< LBA of the CD suffix (btree) structure */
+    uint64_t cd_subchannel_lba;  /**< LBA of the CD subchannel (btree) structure */
     uint16_t checksum_type;      /**< Type of checksum used for the filesystem */
     uint64_t creation_time;      /**< Creation time of the filesystem */
     uint64_t next_free_lba;      /**< Next free logical block address for allocation */

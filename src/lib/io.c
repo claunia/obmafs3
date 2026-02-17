@@ -117,6 +117,33 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
                 close(fd); free(c); return rc;
             }
         }
+
+        if (c->sb.cd_prefix_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.cd_prefix_lba,
+                                                   &c->cd_prefix_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
+
+        if (c->sb.cd_suffix_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.cd_suffix_lba,
+                                                   &c->cd_suffix_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
+
+        if (c->sb.cd_subchannel_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.cd_subchannel_lba,
+                                                   &c->cd_subchannel_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
     } else {
         rc = obmafs3_btree_header_read(c, c->sb.catalog_lba,
                                        &c->catalog_hdr);
@@ -134,6 +161,24 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         if (c->sb.media_tag_lba != 0) {
             rc = obmafs3_btree_header_read(c, c->sb.media_tag_lba,
                                            &c->media_tag_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
+
+        if (c->sb.cd_prefix_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.cd_prefix_lba,
+                                           &c->cd_prefix_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
+
+        if (c->sb.cd_suffix_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.cd_suffix_lba,
+                                           &c->cd_suffix_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
+
+        if (c->sb.cd_subchannel_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.cd_subchannel_lba,
+                                           &c->cd_subchannel_hdr);
             if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
         }
     }
@@ -225,6 +270,9 @@ int obmafs3_create(const char *path, uint64_t total_size,
     sb.dedup_lba       = 6;   /* block 6 */
     sb.metadata_lba    = 0;   /* reserved */
     sb.media_tag_lba   = 7;   /* block 7 */
+    sb.cd_prefix_lba   = 8;   /* block 8 */
+    sb.cd_suffix_lba   = 9;   /* block 9 */
+    sb.cd_subchannel_lba = 10; /* block 10 */
     sb.checksum_type   = kChecksumTypeXXH64;
     sb.creation_time   = (uint64_t)time(NULL);
 
@@ -241,9 +289,9 @@ int obmafs3_create(const char *path, uint64_t total_size,
         bitmap_blks = 1 + (bitmap_bytes - first_block_capacity +
                            block_size - 1) / block_size;
 
-    sb.bitmap_lba      = 8;                   /* bitmap starts at block 8 */
+    sb.bitmap_lba      = 11;                  /* bitmap starts at block 11 */
     sb.bitmap_blocks   = bitmap_blks;
-    sb.next_free_lba   = 8 + bitmap_blks;     /* first block after bitmap */
+    sb.next_free_lba   = 11 + bitmap_blks;    /* first block after bitmap */
     sb.next_inode_id   = 3;                    /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label,
             sizeof(sb.volume_label) - 1);
@@ -389,14 +437,50 @@ int obmafs3_create(const char *path, uint64_t total_size,
     rc = write_block(fd, block_size, 7, &tag_hdr, sizeof(tag_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
-    /* --- Blocks 8..8+N-1: Allocation bitmap --- */
+    /* --- Block 8: CD prefix tree header (empty) --- */
+    struct btree_header cdpfx_hdr;
+    memset(&cdpfx_hdr, 0, sizeof(cdpfx_hdr));
+    cdpfx_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    cdpfx_hdr.data_type = kBtreeDataTypeCdPrefixEntry;
+    cdpfx_hdr.node_size = (uint16_t)block_size;
+    cdpfx_hdr.tree_type = kBtreeTypeCdPrefix;
+    obmafs3_checksum_block(&cdpfx_hdr, sizeof(cdpfx_hdr), cdpfx_hdr.checksum);
+
+    rc = write_block(fd, block_size, 8, &cdpfx_hdr, sizeof(cdpfx_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 9: CD suffix tree header (empty) --- */
+    struct btree_header cdsfx_hdr;
+    memset(&cdsfx_hdr, 0, sizeof(cdsfx_hdr));
+    cdsfx_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    cdsfx_hdr.data_type = kBtreeDataTypeCdSuffixEntry;
+    cdsfx_hdr.node_size = (uint16_t)block_size;
+    cdsfx_hdr.tree_type = kBtreeTypeCdSuffix;
+    obmafs3_checksum_block(&cdsfx_hdr, sizeof(cdsfx_hdr), cdsfx_hdr.checksum);
+
+    rc = write_block(fd, block_size, 9, &cdsfx_hdr, sizeof(cdsfx_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 10: CD subchannel tree header (empty) --- */
+    struct btree_header cdsub_hdr;
+    memset(&cdsub_hdr, 0, sizeof(cdsub_hdr));
+    cdsub_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    cdsub_hdr.data_type = kBtreeDataTypeCdSubchannelEntry;
+    cdsub_hdr.node_size = (uint16_t)block_size;
+    cdsub_hdr.tree_type = kBtreeTypeCdSubchannel;
+    obmafs3_checksum_block(&cdsub_hdr, sizeof(cdsub_hdr), cdsub_hdr.checksum);
+
+    rc = write_block(fd, block_size, 10, &cdsub_hdr, sizeof(cdsub_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Blocks 11..11+N-1: Allocation bitmap --- */
     {
         /* Build the flat bitmap data */
         uint8_t *bitmap = calloc(1, (size_t)bitmap_bytes);
         if (!bitmap) { close(fd); return OBMAFS3_ERR_NOMEM; }
 
-        /* Mark blocks 0 through (8 + bitmap_blks - 1) as allocated */
-        uint64_t reserved = 8 + bitmap_blks;
+        /* Mark blocks 0 through (11 + bitmap_blks - 1) as allocated */
+        uint64_t reserved = 11 + bitmap_blks;
         for (uint64_t b = 0; b < reserved; b++)
             bitmap[b / 8] |= (1u << (b % 8));
 
@@ -435,7 +519,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
                 data_remaining -= copy;
             }
 
-            rc = write_block(fd, block_size, 8 + i, blk,
+            rc = write_block(fd, block_size, 11 + i, blk,
                              (size_t)block_size);
             if (rc != OBMAFS3_OK) {
                 free(blk);

@@ -130,4 +130,40 @@ struct __attribute__((packed)) media_tag_index_entry {
     uint64_t child_lba;    /**< LBA of the child node */
 };
 
+/* ---- Compact Disc image B+Trees ---- */
+
+#define CD_PREFIX_DATA_SIZE     16
+#define CD_SUFFIX_DATA_SIZE    288
+#define CD_SUBCHANNEL_DATA_SIZE 96
+
+/**
+ * CD prefix record stored in B+Tree leaf nodes.
+ * Key: XXH64 hash of the prefix data.
+ * Data: 16-byte prefix stored inline.
+ */
+struct __attribute__((packed)) cd_prefix_record {
+    uint64_t hash;                          /**< XXH64 hash of the prefix */
+    uint8_t  data[CD_PREFIX_DATA_SIZE];     /**< Inline prefix data */
+};
+
+/**
+ * CD suffix record stored in B+Tree leaf nodes.
+ * Key: XXH64 hash of the suffix data.
+ * Data: 288-byte suffix stored inline.
+ */
+struct __attribute__((packed)) cd_suffix_record {
+    uint64_t hash;                          /**< XXH64 hash of the suffix */
+    uint8_t  data[CD_SUFFIX_DATA_SIZE];     /**< Inline suffix data */
+};
+
+/**
+ * CD subchannel record stored in B+Tree leaf nodes.
+ * Key: XXH64 hash of the subchannel data.
+ * Data: 96-byte subchannel stored inline.
+ */
+struct __attribute__((packed)) cd_subchannel_record {
+    uint64_t hash;                              /**< XXH64 hash of the subchannel */
+    uint8_t  data[CD_SUBCHANNEL_DATA_SIZE];     /**< Inline subchannel data */
+};
+
 #endif /* OBMAFS3_BTREE_H */

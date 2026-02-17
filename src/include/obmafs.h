@@ -30,6 +30,9 @@ struct obmafs3_ctx {
     struct btree_header inode_hdr;   /**< Cached inode tree header */
     struct btree_header overflow_hdr;/**< Cached overflow tree header */
     struct btree_header media_tag_hdr;/**< Cached media tag tree header */
+    struct btree_header cd_prefix_hdr;/**< Cached CD prefix tree header */
+    struct btree_header cd_suffix_hdr;/**< Cached CD suffix tree header */
+    struct btree_header cd_subchannel_hdr;/**< Cached CD subchannel tree header */
     uint8_t *bitmap;                 /**< In-memory allocation bitmap */
     uint64_t bitmap_size;            /**< Size of allocation bitmap in bytes */
     int compression;                 /**< Non-zero to compress data blocks on write */
@@ -195,6 +198,25 @@ int  obmafs3_media_tag_delete_all(struct obmafs3_ctx *ctx,
 int  obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
                             uint16_t **tag_types, uint32_t *count);
 void obmafs3_media_tag_list_free(uint16_t *tag_types);
+
+/* --- CD prefix/suffix/subchannel B+Tree operations --- */
+int obmafs3_cd_prefix_get(struct obmafs3_ctx *ctx, uint64_t hash,
+                          uint8_t data[CD_PREFIX_DATA_SIZE]);
+int obmafs3_cd_prefix_put(struct obmafs3_ctx *ctx, uint64_t hash,
+                          const uint8_t data[CD_PREFIX_DATA_SIZE]);
+int obmafs3_cd_prefix_delete(struct obmafs3_ctx *ctx, uint64_t hash);
+
+int obmafs3_cd_suffix_get(struct obmafs3_ctx *ctx, uint64_t hash,
+                          uint8_t data[CD_SUFFIX_DATA_SIZE]);
+int obmafs3_cd_suffix_put(struct obmafs3_ctx *ctx, uint64_t hash,
+                          const uint8_t data[CD_SUFFIX_DATA_SIZE]);
+int obmafs3_cd_suffix_delete(struct obmafs3_ctx *ctx, uint64_t hash);
+
+int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash,
+                              uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
+int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash,
+                              const uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
+int obmafs3_cd_subchannel_delete(struct obmafs3_ctx *ctx, uint64_t hash);
 
 /* --- Checksum operations --- */
 uint64_t obmafs3_checksum_xxh64(const void *data, size_t size);
