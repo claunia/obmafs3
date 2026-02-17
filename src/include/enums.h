@@ -31,7 +31,8 @@ enum obmafs3_btree_data_type {
 enum obmafs3_file_type {
     kFileTypeRegular    = 0,
     kFileTypeDirectory  = 1,
-    kFileTypeMediaImage = 2
+    kFileTypeMediaImage = 2,
+    kFileTypeSymlink    = 3
 };
 
 #endif /* OBMAFS3_ENUMS_H */

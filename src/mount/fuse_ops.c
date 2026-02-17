@@ -235,6 +235,8 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
     stbuf->st_ino = ip->inode_id;
     if (cat_entry.directory_flag || ip->file_type == kFileTypeDirectory)
         stbuf->st_mode = S_IFDIR | ip->mode;
+    else if (ip->file_type == kFileTypeSymlink)
+        stbuf->st_mode = S_IFLNK | 0777;
     else
         stbuf->st_mode = S_IFREG | ip->mode;
     stbuf->st_nlink = ip->ref_count;
@@ -726,6 +728,107 @@ static int obmafs3_fuse_link(const char *oldpath, const char *newpath)
     return 0;
 }
 
+static int obmafs3_fuse_symlink(const char *target, const char *linkpath)
+{
+    uint64_t parent_id;
+    const char *name;
+    struct catalog_record cat_entry;
+    int rc;
+
+    rc = resolve_path(linkpath, &parent_id, &name);
+    if (rc != 0)
+        return rc;
+
+    /* Check if the name already exists */
+    rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+    if (rc == OBMAFS3_OK)
+        return -EEXIST;
+    if (rc != OBMAFS3_ERR_NOTFOUND)
+        return -EIO;
+
+    /* Allocate a new inode ID */
+    uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
+
+    /* Create the catalog entry */
+    struct catalog_record new_cat;
+    memset(&new_cat, 0, sizeof(new_cat));
+    new_cat.inode_id       = new_inode_id;
+    new_cat.parent_id      = parent_id;
+    new_cat.directory_flag = 0;
+    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
+
+    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Create the inode */
+    uint64_t now = (uint64_t)time(NULL);
+    struct fuse_context *fctx = fuse_get_context();
+
+    struct inode_record new_inode;
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.inode_id          = new_inode_id;
+    new_inode.uid               = fctx->uid;
+    new_inode.gid               = fctx->gid;
+    new_inode.mode              = 0777;
+    new_inode.creation_time     = now;
+    new_inode.modification_time = now;
+    new_inode.access_time       = now;
+    new_inode.file_size         = 0;
+    new_inode.file_type         = kFileTypeSymlink;
+    new_inode.ref_count         = 1;
+
+    /* Write the symlink target as file data in the first extent */
+    size_t target_len = strlen(target);
+    rc = obmafs3_write_file_data(g_ctx, &new_inode, 0, target, target_len);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    rc = obmafs3_inode_put(g_ctx, &new_inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
+static int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
+{
+    uint64_t parent_id;
+    const char *name;
+    struct catalog_record cat_entry;
+    struct inode_record inode;
+    int rc;
+
+    rc = resolve_path(path, &parent_id, &name);
+    if (rc != 0)
+        return rc;
+
+    rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    if (inode.file_type != kFileTypeSymlink)
+        return -EINVAL;
+
+    /* Read the target from file data */
+    size_t to_read = inode.file_size;
+    if (to_read >= size)
+        to_read = size - 1;
+
+    rc = obmafs3_read_file_data(g_ctx, &inode, 0, buf, to_read);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    buf[to_read] = '\0';
+    return 0;
+}
+
 static int obmafs3_fuse_unlink(const char *path)
 {
     uint64_t parent_id;
@@ -1102,6 +1205,8 @@ struct fuse_operations obmafs3_fuse_ops = {
     .truncate = obmafs3_fuse_truncate,
     .unlink   = obmafs3_fuse_unlink,
     .link     = obmafs3_fuse_link,
+    .symlink  = obmafs3_fuse_symlink,
+    .readlink = obmafs3_fuse_readlink,
     .mkdir    = obmafs3_fuse_mkdir,
     .rmdir    = obmafs3_fuse_rmdir,
     .utimens  = obmafs3_fuse_utimens,
