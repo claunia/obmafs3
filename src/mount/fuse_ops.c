@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <stdio.h>
 
@@ -1193,6 +1194,33 @@ static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
     return (rc == OBMAFS3_OK) ? 0 : -EIO;
 }
 
+static int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
+{
+    (void)path;
+
+    uint64_t block_size   = g_ctx->sb.block_size;
+    uint64_t total_blocks = g_ctx->sb.total_bytes / block_size;
+
+    /* Count free blocks from the in-memory allocation bitmap */
+    uint64_t used = 0;
+    for (uint64_t i = 0; i < g_ctx->bitmap_size; i++)
+        used += (uint64_t)__builtin_popcount(g_ctx->bitmap[i]);
+
+    uint64_t free_blocks = total_blocks > used ? total_blocks - used : 0;
+
+    memset(stbuf, 0, sizeof(*stbuf));
+    stbuf->f_bsize   = block_size;
+    stbuf->f_frsize  = block_size;
+    stbuf->f_blocks  = total_blocks;
+    stbuf->f_bfree   = free_blocks;
+    stbuf->f_bavail  = free_blocks;
+    stbuf->f_files   = g_ctx->sb.next_inode_id - 1;
+    stbuf->f_ffree   = 0;    /* inodes allocated on demand, no fixed limit */
+    stbuf->f_namemax = 255;
+
+    return 0;
+}
+
 struct fuse_operations obmafs3_fuse_ops = {
     .getattr  = obmafs3_fuse_getattr,
     .readdir  = obmafs3_fuse_readdir,
@@ -1212,4 +1240,5 @@ struct fuse_operations obmafs3_fuse_ops = {
     .utimens  = obmafs3_fuse_utimens,
     .chmod    = obmafs3_fuse_chmod,
     .chown    = obmafs3_fuse_chown,
+    .statfs   = obmafs3_fuse_statfs,
 };
