@@ -1,15 +1,18 @@
 #ifndef OBMAFS3_ENUMS_H
 #define OBMAFS3_ENUMS_H
 
+/// Supported compression algorithms.
 enum obmafs3_compression {
     kCompressionNone = 0,
     kCompressionZstd = 1
 };
 
+/// Supported checksum algorithms.
 enum obmafs3_checksum_type {
     kChecksumTypeXXH64 = 0
 };
 
+/// Identifies which B+Tree a header belongs to.
 enum obmafs3_btree_type {
     kBtreeTypeCatalog       = 0,
     kBtreeTypeInode         = 1,
@@ -23,6 +26,7 @@ enum obmafs3_btree_type {
     kBtreeTypeMetadataIndex = 9
 };
 
+/// Identifies the record format stored in a B+Tree.
 enum obmafs3_btree_data_type {
     kBtreeDataTypeFilename           = 0,
     kBtreeDataTypeInode              = 1,
@@ -36,6 +40,7 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeMetadataIndexEntry = 9
 };
 
+/// Inode file type stored in inode_record::file_type.
 enum obmafs3_file_type {
     kFileTypeRegular    = 0,
     kFileTypeDirectory  = 1,
@@ -44,6 +49,7 @@ enum obmafs3_file_type {
     kFileTypeCompactDiscImage = 4
 };
 
+/// CD sector encoding mode.
 enum obmafs3_cd_sector_mode {
     kCdSectorModeAudio = 0,
     kCdSectorMode1 = 1,

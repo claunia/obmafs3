@@ -25,14 +25,14 @@
  */
 struct fuse_file_ctx {
     uint64_t                inode_id;
-    uint16_t                sector_size;   /* 0 for non-media-image files */
-    struct inode_record     inode;         /* cached inode */
-    int                     inode_dirty;   /* needs write-back on release */
+    uint16_t                sector_size;     ///< 0 for non-media-image files
+    struct inode_record     inode;            ///< cached inode
+    int                     inode_dirty;      ///< needs write-back on release
     struct sector_map_cache sme_cache;
-    struct dedup_block_cache db_cache;     /* persistent dedup block accumulator */
-    struct cd_sector_map_cache cd_sme_cache; /* CD sector map cache */
-    void                   *ecc_ctx;       /* CD ECC context (lazy-init) */
-    int64_t                 cd_next_sector; /* next expected CD sector LBA */
+    struct dedup_block_cache db_cache;        ///< persistent dedup block accumulator
+    struct cd_sector_map_cache cd_sme_cache;  ///< CD sector map cache
+    void                   *ecc_ctx;          ///< CD ECC context (lazy-init)
+    int64_t                 cd_next_sector;   ///< next expected CD sector LBA
 };
 
 /* ---- helpers defined in fuse_ops.c ---- */

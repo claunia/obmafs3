@@ -25,26 +25,26 @@
 
 /** Filesystem context */
 struct obmafs3_ctx {
-    int fd;                          /**< File descriptor for the backing file */
-    struct obmafs3_sb sb;            /**< Cached superblock */
-    struct btree_header catalog_hdr; /**< Cached catalog tree header */
-    struct btree_header inode_hdr;   /**< Cached inode tree header */
-    struct btree_header overflow_hdr;/**< Cached overflow tree header */
-    struct btree_header media_tag_hdr;/**< Cached media tag tree header */
-    struct btree_header cd_prefix_hdr;/**< Cached CD prefix tree header */
-    struct btree_header cd_suffix_hdr;/**< Cached CD suffix tree header */
-    struct btree_header cd_subchannel_hdr;/**< Cached CD subchannel tree header */
-    struct btree_header metadata_hdr;    /**< Cached metadata tree header */
-    struct btree_header metadata_idx_hdr;/**< Cached metadata index tree header */
-    uint8_t *bitmap;                 /**< In-memory allocation bitmap */
-    uint64_t bitmap_size;            /**< Size of allocation bitmap in bytes */
-    int compression;                 /**< Non-zero to compress data blocks on write */
-    int zstd_level;                  /**< ZSTD compression level (1-15) */
+    int fd;                          ///< File descriptor for the backing file
+    struct obmafs3_sb sb;            ///< Cached superblock
+    struct btree_header catalog_hdr; ///< Cached catalog tree header
+    struct btree_header inode_hdr;   ///< Cached inode tree header
+    struct btree_header overflow_hdr;///< Cached overflow tree header
+    struct btree_header media_tag_hdr;///< Cached media tag tree header
+    struct btree_header cd_prefix_hdr;///< Cached CD prefix tree header
+    struct btree_header cd_suffix_hdr;///< Cached CD suffix tree header
+    struct btree_header cd_subchannel_hdr;///< Cached CD subchannel tree header
+    struct btree_header metadata_hdr;    ///< Cached metadata tree header
+    struct btree_header metadata_idx_hdr;///< Cached metadata index tree header
+    uint8_t *bitmap;                 ///< In-memory allocation bitmap
+    uint64_t bitmap_size;            ///< Size of allocation bitmap in bytes
+    int compression;                 ///< Non-zero to compress data blocks on write
+    int zstd_level;                  ///< ZSTD compression level (1-15)
 };
 
 /* Open flags */
-#define OBMAFS3_OPEN_SKIP_BITMAP  0x01  /**< Do not load/validate bitmap */
-#define OBMAFS3_OPEN_LENIENT      0x02  /**< Tolerate checksum errors (for fsck) */
+#define OBMAFS3_OPEN_SKIP_BITMAP  0x01  ///< Do not load/validate bitmap
+#define OBMAFS3_OPEN_LENIENT      0x02  ///< Tolerate checksum errors (for fsck)
 
 /* --- Context management --- */
 int  obmafs3_open(const char *path, struct obmafs3_ctx **ctx);
@@ -149,15 +149,15 @@ struct sector_map_cache {
  * obmafs3_free_dedup_block_cache to free the memory.
  */
 struct dedup_block_cache {
-    uint8_t  *data;          /**< In-memory dedup data block buffer */
-    uint64_t  block_lba;     /**< LBA of this dedup block */
-    uint64_t  offset;        /**< Next write offset within the block */
-    uint64_t  capacity;      /**< Total capacity (dedup_block_size) */
-    uint64_t  std_blocks;    /**< Number of standard blocks per dedup block */
-    int       dirty;         /**< Whether the buffer has been modified */
-    int       initialized;   /**< Non-zero once first init has run */
-    void     *bg_compress;   /**< Opaque background compression context */
-    void     *node_cache;    /**< Opaque dedup B+Tree node cache */
+    uint8_t  *data;          ///< In-memory dedup data block buffer
+    uint64_t  block_lba;     ///< LBA of this dedup block
+    uint64_t  offset;        ///< Next write offset within the block
+    uint64_t  capacity;      ///< Total capacity (dedup_block_size)
+    uint64_t  std_blocks;    ///< Number of standard blocks per dedup block
+    int       dirty;         ///< Whether the buffer has been modified
+    int       initialized;   ///< Non-zero once first init has run
+    void     *bg_compress;   ///< Opaque background compression context
+    void     *node_cache;    ///< Opaque dedup B+Tree node cache
 };
 
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,

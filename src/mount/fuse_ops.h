@@ -13,8 +13,8 @@
 
 /** Maps a file extension to a sector size for disk image handling */
 struct disk_image_mapping {
-    char     extension[32]; /**< File extension (without dot), e.g. "dsk" */
-    uint16_t sector_size;   /**< Sector size in bytes, e.g. 512 */
+    char     extension[32]; ///< File extension (without dot), e.g. "dsk"
+    uint16_t sector_size;   ///< Sector size in bytes, e.g. 512
 };
 
 extern struct fuse_operations obmafs3_fuse_ops;
