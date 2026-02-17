@@ -1444,14 +1444,28 @@ static int is_mediatag_xattr(const char *name)
                    MEDIATAG_XATTR_PREFIX_LEN) == 0;
 }
 
+#define METADATA_XATTR_PREFIX     "user.metadata."
+#define METADATA_XATTR_PREFIX_LEN 14   /* strlen("user.metadata.") */
+
+static int is_metadata_xattr(const char *name)
+{
+    return strncmp(name, METADATA_XATTR_PREFIX,
+                   METADATA_XATTR_PREFIX_LEN) == 0;
+}
+
+/** Return true if the file type is a disk or CD image. */
+static int is_image_file_type(uint8_t ft)
+{
+    return ft == kFileTypeMediaImage || ft == kFileTypeCompactDiscImage;
+}
+
 static int obmafs3_fuse_getxattr(const char *path, const char *name,
                                   char *value, size_t size)
 {
-    if (!is_mediatag_xattr(name))
-        return -ENODATA;
+    int want_mediatag = is_mediatag_xattr(name);
+    int want_metadata = is_metadata_xattr(name);
 
-    int tag_type = parse_mediatag_xattr(name);
-    if (tag_type < 0)
+    if (!want_mediatag && !want_metadata)
         return -ENODATA;
 
     if (strcmp(path, "/") == 0)
@@ -1475,31 +1489,56 @@ static int obmafs3_fuse_getxattr(const char *path, const char *name,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    if (inode.file_type != kFileTypeMediaImage)
+    if (!is_image_file_type(inode.file_type))
         return -ENODATA;
 
-    void *data;
-    uint32_t data_length;
-    rc = obmafs3_media_tag_get(g_ctx, cat_entry.inode_id,
-                               (uint16_t)tag_type, &data, &data_length);
+    if (want_mediatag) {
+        int tag_type = parse_mediatag_xattr(name);
+        if (tag_type < 0)
+            return -ENODATA;
+
+        void *data;
+        uint32_t data_length;
+        rc = obmafs3_media_tag_get(g_ctx, cat_entry.inode_id,
+                                   (uint16_t)tag_type, &data, &data_length);
+        if (rc == OBMAFS3_ERR_NOTFOUND)
+            return -ENODATA;
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        if (size == 0) {
+            obmafs3_media_tag_data_free(data);
+            return (int)data_length;
+        }
+        if (size < data_length) {
+            obmafs3_media_tag_data_free(data);
+            return -ERANGE;
+        }
+        memcpy(value, data, data_length);
+        obmafs3_media_tag_data_free(data);
+        return (int)data_length;
+    }
+
+    /* user.metadata.<key> */
+    const char *meta_key = name + METADATA_XATTR_PREFIX_LEN;
+    if (*meta_key == '\0')
+        return -ENODATA;
+
+    char meta_value[METADATA_VALUE_MAX];
+    rc = obmafs3_metadata_get(g_ctx, cat_entry.inode_id,
+                              meta_key, meta_value, sizeof(meta_value));
     if (rc == OBMAFS3_ERR_NOTFOUND)
         return -ENODATA;
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    if (size == 0) {
-        obmafs3_media_tag_data_free(data);
-        return (int)data_length;
-    }
-
-    if (size < data_length) {
-        obmafs3_media_tag_data_free(data);
+    size_t vlen = strlen(meta_value);
+    if (size == 0)
+        return (int)vlen;
+    if (size < vlen)
         return -ERANGE;
-    }
-
-    memcpy(value, data, data_length);
-    obmafs3_media_tag_data_free(data);
-    return (int)data_length;
+    memcpy(value, meta_value, vlen);
+    return (int)vlen;
 }
 
 static int obmafs3_fuse_setxattr(const char *path, const char *name,
@@ -1507,11 +1546,10 @@ static int obmafs3_fuse_setxattr(const char *path, const char *name,
 {
     (void)flags;
 
-    if (!is_mediatag_xattr(name))
-        return -ENOTSUP;
+    int want_mediatag = is_mediatag_xattr(name);
+    int want_metadata = is_metadata_xattr(name);
 
-    int tag_type = parse_mediatag_xattr(name);
-    if (tag_type < 0)
+    if (!want_mediatag && !want_metadata)
         return -ENOTSUP;
 
     if (strcmp(path, "/") == 0)
@@ -1535,15 +1573,40 @@ static int obmafs3_fuse_setxattr(const char *path, const char *name,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    if (inode.file_type != kFileTypeMediaImage)
+    if (!is_image_file_type(inode.file_type))
         return -ENOTSUP;
 
-    rc = obmafs3_media_tag_put(g_ctx, cat_entry.inode_id,
-                                (uint16_t)tag_type, value,
-                                (uint32_t)size);
+    if (want_mediatag) {
+        int tag_type = parse_mediatag_xattr(name);
+        if (tag_type < 0)
+            return -ENOTSUP;
+
+        rc = obmafs3_media_tag_put(g_ctx, cat_entry.inode_id,
+                                    (uint16_t)tag_type, value,
+                                    (uint32_t)size);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        return 0;
+    }
+
+    /* user.metadata.<key> */
+    const char *meta_key = name + METADATA_XATTR_PREFIX_LEN;
+    if (*meta_key == '\0')
+        return -ENOTSUP;
+    if (strlen(meta_key) >= METADATA_KEY_MAX)
+        return -ENAMETOOLONG;
+    if (size >= METADATA_VALUE_MAX)
+        return -ERANGE;
+
+    /* Ensure NUL-terminated value */
+    char meta_value[METADATA_VALUE_MAX];
+    memcpy(meta_value, value, size);
+    meta_value[size] = '\0';
+
+    rc = obmafs3_metadata_put(g_ctx, cat_entry.inode_id,
+                              meta_key, meta_value);
     if (rc != OBMAFS3_OK)
         return -EIO;
-
     return 0;
 }
 
@@ -1570,19 +1633,19 @@ static int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    if (inode.file_type != kFileTypeMediaImage)
+    if (!is_image_file_type(inode.file_type))
         return 0;
 
-    uint16_t *tag_types;
-    uint32_t count;
+    /* ---- media tag xattrs ---- */
+    uint16_t *tag_types = NULL;
+    uint32_t tag_count = 0;
     rc = obmafs3_media_tag_list(g_ctx, cat_entry.inode_id,
-                                &tag_types, &count);
+                                &tag_types, &tag_count);
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    /* Calculate total size of all xattr names */
     size_t total = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < tag_count; i++) {
         if (tag_types[i] < MEDIA_TAG_XATTR_COUNT &&
             media_tag_xattr_names[tag_types[i]]) {
             total += MEDIATAG_XATTR_PREFIX_LEN +
@@ -1590,38 +1653,59 @@ static int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
         }
     }
 
+    /* ---- metadata xattrs ---- */
+    char **meta_keys = NULL;
+    uint32_t meta_count = 0;
+    rc = obmafs3_metadata_list(g_ctx, cat_entry.inode_id,
+                               &meta_keys, &meta_count);
+    if (rc != OBMAFS3_OK) {
+        obmafs3_media_tag_list_free(tag_types);
+        return -EIO;
+    }
+
+    for (uint32_t i = 0; i < meta_count; i++)
+        total += METADATA_XATTR_PREFIX_LEN + strlen(meta_keys[i]) + 1;
+
     if (size == 0) {
         obmafs3_media_tag_list_free(tag_types);
+        obmafs3_metadata_list_free(meta_keys, meta_count);
         return (int)total;
     }
 
     if (size < total) {
         obmafs3_media_tag_list_free(tag_types);
+        obmafs3_metadata_list_free(meta_keys, meta_count);
         return -ERANGE;
     }
 
     char *p = list;
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < tag_count; i++) {
         if (tag_types[i] < MEDIA_TAG_XATTR_COUNT &&
             media_tag_xattr_names[tag_types[i]]) {
             int n = snprintf(p, size - (size_t)(p - list),
                              "%s%s", MEDIATAG_XATTR_PREFIX,
                              media_tag_xattr_names[tag_types[i]]);
-            p += n + 1;   /* include NUL terminator */
+            p += n + 1;
         }
+    }
+    for (uint32_t i = 0; i < meta_count; i++) {
+        int n = snprintf(p, size - (size_t)(p - list),
+                         "%s%s", METADATA_XATTR_PREFIX,
+                         meta_keys[i]);
+        p += n + 1;
     }
 
     obmafs3_media_tag_list_free(tag_types);
+    obmafs3_metadata_list_free(meta_keys, meta_count);
     return (int)total;
 }
 
 static int obmafs3_fuse_removexattr(const char *path, const char *name)
 {
-    if (!is_mediatag_xattr(name))
-        return -ENOTSUP;
+    int want_mediatag = is_mediatag_xattr(name);
+    int want_metadata = is_metadata_xattr(name);
 
-    int tag_type = parse_mediatag_xattr(name);
-    if (tag_type < 0)
+    if (!want_mediatag && !want_metadata)
         return -ENOTSUP;
 
     if (strcmp(path, "/") == 0)
@@ -1645,16 +1729,33 @@ static int obmafs3_fuse_removexattr(const char *path, const char *name)
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    if (inode.file_type != kFileTypeMediaImage)
+    if (!is_image_file_type(inode.file_type))
         return -ENOTSUP;
 
-    rc = obmafs3_media_tag_delete(g_ctx, cat_entry.inode_id,
-                                   (uint16_t)tag_type);
+    if (want_mediatag) {
+        int tag_type = parse_mediatag_xattr(name);
+        if (tag_type < 0)
+            return -ENOTSUP;
+
+        rc = obmafs3_media_tag_delete(g_ctx, cat_entry.inode_id,
+                                       (uint16_t)tag_type);
+        if (rc == OBMAFS3_ERR_NOTFOUND)
+            return -ENODATA;
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        return 0;
+    }
+
+    /* user.metadata.<key> */
+    const char *meta_key = name + METADATA_XATTR_PREFIX_LEN;
+    if (*meta_key == '\0')
+        return -ENOTSUP;
+
+    rc = obmafs3_metadata_delete(g_ctx, cat_entry.inode_id, meta_key);
     if (rc == OBMAFS3_ERR_NOTFOUND)
         return -ENODATA;
     if (rc != OBMAFS3_OK)
         return -EIO;
-
     return 0;
 }
 
