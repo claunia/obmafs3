@@ -1,0 +1,1492 @@
+/*
+ * metadata.c - OBMAFS3 Image Metadata B+Trees
+ *
+ * Two trees are maintained in tandem:
+ *
+ * 1. Per-image metadata tree (metadata_hdr / metadata_lba)
+ *    Composite key: (inode_id, key).
+ *    Leaf: metadata_record.  Index: metadata_index_entry.
+ *
+ * 2. Reverse-index tree (metadata_idx_hdr / metadata_idx_lba)
+ *    Composite key: (key, value, inode_id).
+ *    Leaf: metadata_idx_record.  Index: metadata_idx_index_entry.
+ *
+ * Both trees use multi-block nodes (METADATA_NODE_BLOCKS blocks
+ * each = 32768 bytes with default 4096-byte block size).
+ */
+#include "btree_internal.h"
+
+#define METADATA_BTREE_MAX_DEPTH 16
+
+/** Compute node buffer size for metadata trees. */
+static size_t meta_node_size(const struct obmafs3_ctx *ctx)
+{
+    return (size_t)METADATA_NODE_BLOCKS * (size_t)ctx->sb.block_size;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Per-image metadata tree helpers                                    */
+/* ------------------------------------------------------------------ */
+
+static uint16_t meta_leaf_max_keys(const struct obmafs3_ctx *ctx)
+{
+    return (uint16_t)((meta_node_size(ctx) -
+                       sizeof(struct btree_node_header))
+                      / sizeof(struct metadata_record));
+}
+
+static uint16_t meta_index_max_keys(const struct obmafs3_ctx *ctx)
+{
+    return (uint16_t)((meta_node_size(ctx) -
+                       sizeof(struct btree_node_header))
+                      / sizeof(struct metadata_index_entry));
+}
+
+/** Compare composite key (inode_id, key). */
+static int meta_key_cmp(uint64_t id_a, const char *key_a,
+                        uint64_t id_b, const char *key_b)
+{
+    if (id_a < id_b) return -1;
+    if (id_a > id_b) return  1;
+    return strncmp(key_a, key_b, METADATA_KEY_MAX);
+}
+
+/** Binary search in a metadata leaf node. Returns index or -(ins)-1. */
+static int meta_leaf_find(const uint8_t *buf, uint16_t node_keys,
+                          uint64_t inode_id, const char *key)
+{
+    const uint8_t *data = buf + sizeof(struct btree_node_header);
+    int lo = 0, hi = (int)node_keys - 1;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const struct metadata_record *rec =
+            (const struct metadata_record *)
+            (data + (size_t)mid * sizeof(struct metadata_record));
+
+        int cmp = meta_key_cmp(rec->inode_id, rec->key,
+                               inode_id, key);
+        if (cmp == 0) return mid;
+        if (cmp < 0)  lo = mid + 1;
+        else          hi = mid - 1;
+    }
+    return -(lo + 1);
+}
+
+/** Binary search in a metadata index node. Returns slot to descend. */
+static uint16_t meta_index_find(const uint8_t *buf, uint16_t node_keys,
+                                uint64_t inode_id, const char *key)
+{
+    const uint8_t *data = buf + sizeof(struct btree_node_header);
+    int lo = 0, hi = (int)node_keys - 1;
+    uint16_t result = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const struct metadata_index_entry *ie =
+            (const struct metadata_index_entry *)
+            (data + (size_t)mid * sizeof(struct metadata_index_entry));
+
+        int cmp = meta_key_cmp(ie->inode_id, ie->key,
+                               inode_id, key);
+        if (cmp <= 0) {
+            result = (uint16_t)mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return result;
+}
+
+struct meta_btree_path {
+    uint64_t lba;
+    uint16_t slot;
+};
+
+/** Allocate a multi-block node. */
+static int meta_alloc_node(struct obmafs3_ctx *ctx, uint64_t *lba)
+{
+    return obmafs3_alloc_blocks(ctx, METADATA_NODE_BLOCKS, lba);
+}
+
+/** Free a multi-block node. */
+static void meta_free_node(struct obmafs3_ctx *ctx, uint64_t lba)
+{
+    obmafs3_free_blocks(ctx, lba, METADATA_NODE_BLOCKS);
+}
+
+/** Read a multi-block node. */
+static int meta_node_read(struct obmafs3_ctx *ctx, uint64_t lba,
+                          uint8_t *buf)
+{
+    return obmafs3_block_read(ctx, lba, buf, meta_node_size(ctx));
+}
+
+/** Write a multi-block node. */
+static int meta_node_write(struct obmafs3_ctx *ctx, uint64_t lba,
+                           const uint8_t *buf)
+{
+    return obmafs3_block_write(ctx, lba, buf, meta_node_size(ctx));
+}
+
+/* ---- Per-image metadata tree: lookup ---- */
+
+static int meta_tree_lookup(struct obmafs3_ctx *ctx,
+                            uint64_t inode_id, const char *key,
+                            struct metadata_record *record)
+{
+    uint64_t lba = ctx->metadata_hdr.root_node_lba;
+    if (lba == 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    size_t nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    while (1) {
+        int rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level > 0) {
+            uint16_t slot = meta_index_find(buf, hdr.node_keys,
+                                            inode_id, key);
+            struct metadata_index_entry ie;
+            memcpy(&ie,
+                   buf + sizeof(struct btree_node_header)
+                       + (size_t)slot * sizeof(ie),
+                   sizeof(ie));
+            lba = ie.child_lba;
+        } else {
+            int idx = meta_leaf_find(buf, hdr.node_keys,
+                                     inode_id, key);
+            if (idx >= 0) {
+                memcpy(record,
+                       buf + sizeof(struct btree_node_header)
+                           + (size_t)idx * sizeof(*record),
+                       sizeof(*record));
+                free(buf);
+                return OBMAFS3_OK;
+            }
+            free(buf);
+            return OBMAFS3_ERR_NOTFOUND;
+        }
+    }
+}
+
+/* ---- Per-image metadata tree: insert / update ---- */
+
+static int meta_tree_put(struct obmafs3_ctx *ctx,
+                         const struct metadata_record *rec)
+{
+    size_t   nsz      = meta_node_size(ctx);
+    uint64_t root_lba = ctx->metadata_hdr.root_node_lba;
+    int rc;
+
+    /* Empty tree: create a single leaf as root */
+    if (root_lba == 0) {
+        uint64_t new_lba;
+        rc = meta_alloc_node(ctx, &new_lba);
+        if (rc != OBMAFS3_OK) return rc;
+
+        uint8_t *buf = calloc(1, nsz);
+        if (!buf) return OBMAFS3_ERR_NOMEM;
+
+        struct btree_node_header hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+        hdr.record_type = kBtreeDataTypeMetadataEntry;
+        hdr.level       = 0;
+        hdr.node_keys   = 1;
+        hdr.keys_length = (uint16_t)sizeof(struct metadata_record);
+        memcpy(buf, &hdr, sizeof(hdr));
+        memcpy(buf + sizeof(hdr), rec, sizeof(*rec));
+        compute_node_checksum(buf);
+
+        rc = meta_node_write(ctx, new_lba, buf);
+        free(buf);
+        if (rc != OBMAFS3_OK) return rc;
+
+        ctx->metadata_hdr.root_node_lba = new_lba;
+        ctx->metadata_hdr.total_nodes   = 1;
+        return obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba,
+                                          &ctx->metadata_hdr);
+    }
+
+    /* Traverse from root to leaf, recording path */
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf) return OBMAFS3_ERR_NOMEM;
+
+    struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
+    int depth = 0;
+    uint64_t lba = root_lba;
+
+    while (1) {
+        rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level == 0) break;
+
+        if (depth >= METADATA_BTREE_MAX_DEPTH) {
+            free(buf); return OBMAFS3_ERR_INVAL;
+        }
+
+        uint16_t slot = meta_index_find(buf, hdr.node_keys,
+                                        rec->inode_id, rec->key);
+        path[depth].lba  = lba;
+        path[depth].slot = slot;
+        depth++;
+
+        struct metadata_index_entry ie;
+        memcpy(&ie,
+               buf + sizeof(struct btree_node_header)
+                   + (size_t)slot * sizeof(ie),
+               sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* buf holds the leaf node at lba */
+    struct btree_node_header leaf_hdr;
+    memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
+
+    /* Check for update-in-place */
+    int idx = meta_leaf_find(buf, leaf_hdr.node_keys,
+                             rec->inode_id, rec->key);
+    if (idx >= 0) {
+        memcpy(buf + sizeof(struct btree_node_header)
+                   + (size_t)idx * sizeof(struct metadata_record),
+               rec, sizeof(*rec));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, lba, buf);
+        free(buf);
+        return rc;
+    }
+
+    /* Insert */
+    int      insert_pos = -(idx + 1);
+    uint16_t max_leaf   = meta_leaf_max_keys(ctx);
+    size_t   rec_sz     = sizeof(struct metadata_record);
+
+    if (leaf_hdr.node_keys < max_leaf) {
+        uint8_t *data = buf + sizeof(struct btree_node_header);
+        if (insert_pos < leaf_hdr.node_keys)
+            memmove(data + ((size_t)insert_pos + 1) * rec_sz,
+                    data + (size_t)insert_pos * rec_sz,
+                    ((size_t)leaf_hdr.node_keys -
+                     (size_t)insert_pos) * rec_sz);
+        memcpy(data + (size_t)insert_pos * rec_sz, rec, rec_sz);
+        leaf_hdr.node_keys++;
+        leaf_hdr.keys_length = (uint16_t)(leaf_hdr.node_keys * rec_sz);
+        memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, lba, buf);
+        free(buf);
+        return rc;
+    }
+
+    /* Leaf full — split */
+    uint16_t total = max_leaf + 1;
+    struct metadata_record *all = calloc(total, rec_sz);
+    if (!all) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
+    memcpy(all, leaf_data, (size_t)insert_pos * rec_sz);
+    memcpy(&all[insert_pos], rec, rec_sz);
+    memcpy(&all[insert_pos + 1],
+           leaf_data + (size_t)insert_pos * rec_sz,
+           ((size_t)max_leaf - (size_t)insert_pos) * rec_sz);
+
+    uint16_t left_count  = total / 2;
+    uint16_t right_count = total - left_count;
+
+    memset(leaf_data, 0, nsz - sizeof(struct btree_node_header));
+    memcpy(leaf_data, all, (size_t)left_count * rec_sz);
+
+    uint64_t old_right = leaf_hdr.right_link;
+    uint64_t new_leaf_lba;
+    rc = meta_alloc_node(ctx, &new_leaf_lba);
+    if (rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
+
+    leaf_hdr.node_keys   = left_count;
+    leaf_hdr.keys_length = (uint16_t)(left_count * rec_sz);
+    leaf_hdr.right_link  = new_leaf_lba;
+    memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
+    compute_node_checksum(buf);
+    rc = meta_node_write(ctx, lba, buf);
+    if (rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
+
+    memset(buf, 0, nsz);
+    struct btree_node_header nh;
+    memset(&nh, 0, sizeof(nh));
+    nh.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    nh.record_type = kBtreeDataTypeMetadataEntry;
+    nh.level       = 0;
+    nh.node_keys   = right_count;
+    nh.keys_length = (uint16_t)(right_count * rec_sz);
+    nh.right_link  = old_right;
+    memcpy(buf, &nh, sizeof(nh));
+    memcpy(buf + sizeof(nh), &all[left_count],
+           (size_t)right_count * rec_sz);
+    compute_node_checksum(buf);
+    rc = meta_node_write(ctx, new_leaf_lba, buf);
+    if (rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
+
+    struct metadata_index_entry push_ie;
+    push_ie.inode_id  = all[left_count].inode_id;
+    strncpy(push_ie.key, all[left_count].key, METADATA_KEY_MAX);
+    push_ie.child_lba = new_leaf_lba;
+
+    struct metadata_index_entry left_ie;
+    left_ie.inode_id  = all[0].inode_id;
+    strncpy(left_ie.key, all[0].key, METADATA_KEY_MAX);
+    left_ie.child_lba = lba;
+
+    uint64_t left_lba = lba;
+    free(all);
+    ctx->metadata_hdr.total_nodes++;
+
+    /* Propagate split upward */
+    while (depth > 0) {
+        depth--;
+        uint64_t parent_lba  = path[depth].lba;
+        uint16_t parent_slot = path[depth].slot;
+
+        rc = meta_node_read(ctx, parent_lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header phdr;
+        memcpy(&phdr, buf, sizeof(phdr));
+
+        uint16_t max_idx    = meta_index_max_keys(ctx);
+        uint16_t idx_insert = parent_slot + 1;
+        size_t   ie_sz      = sizeof(struct metadata_index_entry);
+
+        if (phdr.node_keys < max_idx) {
+            uint8_t *id = buf + sizeof(struct btree_node_header);
+            if (idx_insert < phdr.node_keys)
+                memmove(id + ((size_t)idx_insert + 1) * ie_sz,
+                        id + (size_t)idx_insert * ie_sz,
+                        ((size_t)phdr.node_keys -
+                         (size_t)idx_insert) * ie_sz);
+            memcpy(id + (size_t)idx_insert * ie_sz, &push_ie, ie_sz);
+            phdr.node_keys++;
+            phdr.keys_length = (uint16_t)(phdr.node_keys * ie_sz);
+            memcpy(buf, &phdr, sizeof(phdr));
+            compute_node_checksum(buf);
+            rc = meta_node_write(ctx, parent_lba, buf);
+            free(buf);
+            if (rc != OBMAFS3_OK) return rc;
+            return obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba,
+                                              &ctx->metadata_hdr);
+        }
+
+        /* Parent full — split index node */
+        uint16_t idx_total = max_idx + 1;
+        struct metadata_index_entry *aie = calloc(idx_total, ie_sz);
+        if (!aie) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+        uint8_t *id = buf + sizeof(struct btree_node_header);
+        memcpy(aie, id, (size_t)idx_insert * ie_sz);
+        memcpy(&aie[idx_insert], &push_ie, ie_sz);
+        memcpy(&aie[idx_insert + 1],
+               id + (size_t)idx_insert * ie_sz,
+               ((size_t)max_idx - (size_t)idx_insert) * ie_sz);
+
+        uint16_t il = idx_total / 2;
+        uint16_t ir = idx_total - il;
+
+        memset(id, 0, nsz - sizeof(struct btree_node_header));
+        memcpy(id, aie, (size_t)il * ie_sz);
+        phdr.node_keys   = il;
+        phdr.keys_length = (uint16_t)(il * ie_sz);
+        memcpy(buf, &phdr, sizeof(phdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, parent_lba, buf);
+        if (rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
+
+        uint64_t new_idx_lba;
+        rc = meta_alloc_node(ctx, &new_idx_lba);
+        if (rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
+
+        memset(buf, 0, nsz);
+        struct btree_node_header nih;
+        memset(&nih, 0, sizeof(nih));
+        nih.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+        nih.record_type = kBtreeDataTypeMetadataEntry;
+        nih.level       = phdr.level;
+        nih.node_keys   = ir;
+        nih.keys_length = (uint16_t)(ir * ie_sz);
+        memcpy(buf, &nih, sizeof(nih));
+        memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, new_idx_lba, buf);
+        if (rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
+
+        push_ie.inode_id = aie[il].inode_id;
+        strncpy(push_ie.key, aie[il].key, METADATA_KEY_MAX);
+        push_ie.child_lba = new_idx_lba;
+
+        left_ie.inode_id = aie[0].inode_id;
+        strncpy(left_ie.key, aie[0].key, METADATA_KEY_MAX);
+        left_ie.child_lba = parent_lba;
+
+        left_lba = parent_lba;
+        free(aie);
+        ctx->metadata_hdr.total_nodes++;
+    }
+
+    /* Create new root */
+    uint64_t new_root_lba;
+    rc = meta_alloc_node(ctx, &new_root_lba);
+    if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+    rc = meta_node_read(ctx, left_lba, buf);
+    if (rc != OBMAFS3_OK) { free(buf); return rc; }
+    struct btree_node_header old_hdr;
+    memcpy(&old_hdr, buf, sizeof(old_hdr));
+
+    memset(buf, 0, nsz);
+    struct btree_node_header rh;
+    memset(&rh, 0, sizeof(rh));
+    rh.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    rh.record_type = kBtreeDataTypeMetadataEntry;
+    rh.level       = old_hdr.level + 1;
+    rh.node_keys   = 2;
+    rh.keys_length = (uint16_t)(2 * sizeof(struct metadata_index_entry));
+    memcpy(buf, &rh, sizeof(rh));
+
+    left_ie.child_lba = left_lba;
+    struct metadata_index_entry roots[2];
+    roots[0] = left_ie;
+    roots[1] = push_ie;
+    memcpy(buf + sizeof(rh), roots, sizeof(roots));
+    compute_node_checksum(buf);
+
+    rc = meta_node_write(ctx, new_root_lba, buf);
+    free(buf);
+    if (rc != OBMAFS3_OK) return rc;
+
+    ctx->metadata_hdr.root_node_lba = new_root_lba;
+    ctx->metadata_hdr.total_nodes++;
+    return obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba,
+                                      &ctx->metadata_hdr);
+}
+
+/* ---- Per-image metadata tree: delete ---- */
+
+static int meta_tree_delete(struct obmafs3_ctx *ctx,
+                            uint64_t inode_id, const char *key)
+{
+    size_t   nsz      = meta_node_size(ctx);
+    uint64_t root_lba = ctx->metadata_hdr.root_node_lba;
+    int rc;
+
+    if (root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
+
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf) return OBMAFS3_ERR_NOMEM;
+
+    struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
+    int depth = 0;
+    uint64_t lba = root_lba;
+
+    while (1) {
+        rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level == 0) break;
+
+        if (depth >= METADATA_BTREE_MAX_DEPTH) {
+            free(buf); return OBMAFS3_ERR_INVAL;
+        }
+
+        uint16_t slot = meta_index_find(buf, hdr.node_keys,
+                                        inode_id, key);
+        path[depth].lba  = lba;
+        path[depth].slot = slot;
+        depth++;
+
+        struct metadata_index_entry ie;
+        memcpy(&ie,
+               buf + sizeof(struct btree_node_header)
+                   + (size_t)slot * sizeof(ie),
+               sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    struct btree_node_header leaf_hdr;
+    memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
+
+    int idx = meta_leaf_find(buf, leaf_hdr.node_keys,
+                             inode_id, key);
+    if (idx < 0) { free(buf); return OBMAFS3_ERR_NOTFOUND; }
+
+    size_t rec_sz = sizeof(struct metadata_record);
+    leaf_hdr.node_keys--;
+
+    if (leaf_hdr.node_keys == 0) {
+        if (depth == 0) {
+            ctx->metadata_hdr.root_node_lba = 0;
+            ctx->metadata_hdr.total_nodes--;
+            rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba,
+                                            &ctx->metadata_hdr);
+            meta_free_node(ctx, lba);
+        } else {
+            uint64_t plba  = path[depth - 1].lba;
+            uint16_t pslot = path[depth - 1].slot;
+
+            uint8_t *pbuf = calloc(1, nsz);
+            if (!pbuf) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+            rc = meta_node_read(ctx, plba, pbuf);
+            if (rc != OBMAFS3_OK) {
+                free(pbuf); free(buf); return rc;
+            }
+
+            struct btree_node_header phdr;
+            memcpy(&phdr, pbuf, sizeof(phdr));
+
+            uint8_t *pdata = pbuf + sizeof(struct btree_node_header);
+            size_t ie_sz = sizeof(struct metadata_index_entry);
+
+            if (pslot < phdr.node_keys - 1)
+                memmove(pdata + (size_t)pslot * ie_sz,
+                        pdata + ((size_t)pslot + 1) * ie_sz,
+                        ((size_t)phdr.node_keys - (size_t)pslot - 1) * ie_sz);
+            phdr.node_keys--;
+            phdr.keys_length = (uint16_t)(phdr.node_keys * ie_sz);
+
+            if (phdr.node_keys == 0 && depth == 1) {
+                ctx->metadata_hdr.root_node_lba = 0;
+                ctx->metadata_hdr.total_nodes -= 2;
+                rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba,
+                                                &ctx->metadata_hdr);
+                meta_free_node(ctx, lba);
+                meta_free_node(ctx, plba);
+            } else if (phdr.node_keys == 1 && depth == 1) {
+                struct metadata_index_entry remaining;
+                memcpy(&remaining, pdata, sizeof(remaining));
+                ctx->metadata_hdr.root_node_lba = remaining.child_lba;
+                ctx->metadata_hdr.total_nodes -= 2;
+                rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba,
+                                                &ctx->metadata_hdr);
+                meta_free_node(ctx, lba);
+                meta_free_node(ctx, plba);
+            } else {
+                memcpy(pbuf, &phdr, sizeof(phdr));
+                compute_node_checksum(pbuf);
+                rc = meta_node_write(ctx, plba, pbuf);
+                if (rc == OBMAFS3_OK) {
+                    ctx->metadata_hdr.total_nodes--;
+                    rc = obmafs3_btree_header_write(
+                        ctx, ctx->sb.metadata_lba, &ctx->metadata_hdr);
+                }
+                meta_free_node(ctx, lba);
+            }
+            free(pbuf);
+        }
+    } else {
+        uint8_t *data = buf + sizeof(struct btree_node_header);
+        if ((uint16_t)idx < leaf_hdr.node_keys)
+            memmove(data + (size_t)idx * rec_sz,
+                    data + ((size_t)idx + 1) * rec_sz,
+                    ((size_t)leaf_hdr.node_keys - (size_t)idx) * rec_sz);
+        memset(data + (size_t)leaf_hdr.node_keys * rec_sz, 0, rec_sz);
+        leaf_hdr.keys_length = (uint16_t)(leaf_hdr.node_keys * rec_sz);
+        memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, lba, buf);
+    }
+
+    free(buf);
+    return rc;
+}
+
+/* ================================================================== */
+/*  Metadata reverse-index B+Tree                                      */
+/*                                                                     */
+/*  Composite key: (key, value, inode_id).                             */
+/* ================================================================== */
+
+static uint16_t midx_leaf_max_keys(const struct obmafs3_ctx *ctx)
+{
+    return (uint16_t)((meta_node_size(ctx) -
+                       sizeof(struct btree_node_header))
+                      / sizeof(struct metadata_idx_record));
+}
+
+static uint16_t midx_index_max_keys(const struct obmafs3_ctx *ctx)
+{
+    return (uint16_t)((meta_node_size(ctx) -
+                       sizeof(struct btree_node_header))
+                      / sizeof(struct metadata_idx_index_entry));
+}
+
+/** Compare composite key (key, value, inode_id). */
+static int midx_key_cmp(const char *key_a, const char *val_a, uint64_t id_a,
+                         const char *key_b, const char *val_b, uint64_t id_b)
+{
+    int c = strncmp(key_a, key_b, METADATA_KEY_MAX);
+    if (c != 0) return c;
+    c = strncmp(val_a, val_b, METADATA_VALUE_MAX);
+    if (c != 0) return c;
+    if (id_a < id_b) return -1;
+    if (id_a > id_b) return  1;
+    return 0;
+}
+
+static int midx_leaf_find(const uint8_t *buf, uint16_t node_keys,
+                           const char *key, const char *value,
+                           uint64_t inode_id)
+{
+    const uint8_t *data = buf + sizeof(struct btree_node_header);
+    int lo = 0, hi = (int)node_keys - 1;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const struct metadata_idx_record *rec =
+            (const struct metadata_idx_record *)
+            (data + (size_t)mid * sizeof(struct metadata_idx_record));
+
+        int cmp = midx_key_cmp(rec->key, rec->value, rec->inode_id,
+                                key, value, inode_id);
+        if (cmp == 0) return mid;
+        if (cmp < 0)  lo = mid + 1;
+        else          hi = mid - 1;
+    }
+    return -(lo + 1);
+}
+
+static uint16_t midx_index_find(const uint8_t *buf, uint16_t node_keys,
+                                 const char *key, const char *value,
+                                 uint64_t inode_id)
+{
+    const uint8_t *data = buf + sizeof(struct btree_node_header);
+    int lo = 0, hi = (int)node_keys - 1;
+    uint16_t result = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const struct metadata_idx_index_entry *ie =
+            (const struct metadata_idx_index_entry *)
+            (data + (size_t)mid *
+             sizeof(struct metadata_idx_index_entry));
+
+        int cmp = midx_key_cmp(ie->key, ie->value, ie->inode_id,
+                                key, value, inode_id);
+        if (cmp <= 0) {
+            result = (uint16_t)mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return result;
+}
+
+/* ---- Reverse-index tree: insert ---- */
+
+static int midx_tree_put(struct obmafs3_ctx *ctx,
+                          const struct metadata_idx_record *rec)
+{
+    size_t   nsz      = meta_node_size(ctx);
+    uint64_t root_lba = ctx->metadata_idx_hdr.root_node_lba;
+    int rc;
+
+    if (root_lba == 0) {
+        uint64_t new_lba;
+        rc = meta_alloc_node(ctx, &new_lba);
+        if (rc != OBMAFS3_OK) return rc;
+
+        uint8_t *buf = calloc(1, nsz);
+        if (!buf) return OBMAFS3_ERR_NOMEM;
+
+        struct btree_node_header hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+        hdr.record_type = kBtreeDataTypeMetadataIndexEntry;
+        hdr.level       = 0;
+        hdr.node_keys   = 1;
+        hdr.keys_length = (uint16_t)sizeof(struct metadata_idx_record);
+        memcpy(buf, &hdr, sizeof(hdr));
+        memcpy(buf + sizeof(hdr), rec, sizeof(*rec));
+        compute_node_checksum(buf);
+
+        rc = meta_node_write(ctx, new_lba, buf);
+        free(buf);
+        if (rc != OBMAFS3_OK) return rc;
+
+        ctx->metadata_idx_hdr.root_node_lba = new_lba;
+        ctx->metadata_idx_hdr.total_nodes   = 1;
+        return obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba,
+                                          &ctx->metadata_idx_hdr);
+    }
+
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf) return OBMAFS3_ERR_NOMEM;
+
+    struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
+    int depth = 0;
+    uint64_t lba = root_lba;
+
+    while (1) {
+        rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level == 0) break;
+
+        if (depth >= METADATA_BTREE_MAX_DEPTH) {
+            free(buf); return OBMAFS3_ERR_INVAL;
+        }
+
+        uint16_t slot = midx_index_find(buf, hdr.node_keys,
+                                         rec->key, rec->value,
+                                         rec->inode_id);
+        path[depth].lba  = lba;
+        path[depth].slot = slot;
+        depth++;
+
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie,
+               buf + sizeof(struct btree_node_header)
+                   + (size_t)slot * sizeof(ie),
+               sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    struct btree_node_header leaf_hdr;
+    memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
+
+    /* Check for duplicate (should not happen if caller is correct) */
+    int idx = midx_leaf_find(buf, leaf_hdr.node_keys,
+                              rec->key, rec->value, rec->inode_id);
+    if (idx >= 0) {
+        /* Already exists — update in place */
+        memcpy(buf + sizeof(struct btree_node_header)
+                   + (size_t)idx * sizeof(struct metadata_idx_record),
+               rec, sizeof(*rec));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, lba, buf);
+        free(buf);
+        return rc;
+    }
+
+    int      insert_pos = -(idx + 1);
+    uint16_t max_leaf   = midx_leaf_max_keys(ctx);
+    size_t   rec_sz     = sizeof(struct metadata_idx_record);
+
+    if (leaf_hdr.node_keys < max_leaf) {
+        uint8_t *data = buf + sizeof(struct btree_node_header);
+        if (insert_pos < leaf_hdr.node_keys)
+            memmove(data + ((size_t)insert_pos + 1) * rec_sz,
+                    data + (size_t)insert_pos * rec_sz,
+                    ((size_t)leaf_hdr.node_keys -
+                     (size_t)insert_pos) * rec_sz);
+        memcpy(data + (size_t)insert_pos * rec_sz, rec, rec_sz);
+        leaf_hdr.node_keys++;
+        leaf_hdr.keys_length = (uint16_t)(leaf_hdr.node_keys * rec_sz);
+        memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, lba, buf);
+        free(buf);
+        return rc;
+    }
+
+    /* Leaf full — split */
+    uint16_t total = max_leaf + 1;
+    struct metadata_idx_record *all = calloc(total, rec_sz);
+    if (!all) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
+    memcpy(all, leaf_data, (size_t)insert_pos * rec_sz);
+    memcpy(&all[insert_pos], rec, rec_sz);
+    memcpy(&all[insert_pos + 1],
+           leaf_data + (size_t)insert_pos * rec_sz,
+           ((size_t)max_leaf - (size_t)insert_pos) * rec_sz);
+
+    uint16_t left_count  = total / 2;
+    uint16_t right_count = total - left_count;
+
+    memset(leaf_data, 0, nsz - sizeof(struct btree_node_header));
+    memcpy(leaf_data, all, (size_t)left_count * rec_sz);
+
+    uint64_t old_right = leaf_hdr.right_link;
+    uint64_t new_leaf_lba;
+    rc = meta_alloc_node(ctx, &new_leaf_lba);
+    if (rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
+
+    leaf_hdr.node_keys   = left_count;
+    leaf_hdr.keys_length = (uint16_t)(left_count * rec_sz);
+    leaf_hdr.right_link  = new_leaf_lba;
+    memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
+    compute_node_checksum(buf);
+    rc = meta_node_write(ctx, lba, buf);
+    if (rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
+
+    memset(buf, 0, nsz);
+    struct btree_node_header nh;
+    memset(&nh, 0, sizeof(nh));
+    nh.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    nh.record_type = kBtreeDataTypeMetadataIndexEntry;
+    nh.level       = 0;
+    nh.node_keys   = right_count;
+    nh.keys_length = (uint16_t)(right_count * rec_sz);
+    nh.right_link  = old_right;
+    memcpy(buf, &nh, sizeof(nh));
+    memcpy(buf + sizeof(nh), &all[left_count],
+           (size_t)right_count * rec_sz);
+    compute_node_checksum(buf);
+    rc = meta_node_write(ctx, new_leaf_lba, buf);
+    if (rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
+
+    struct metadata_idx_index_entry push_ie;
+    strncpy(push_ie.key,   all[left_count].key,   METADATA_KEY_MAX);
+    strncpy(push_ie.value, all[left_count].value,  METADATA_VALUE_MAX);
+    push_ie.inode_id  = all[left_count].inode_id;
+    push_ie.child_lba = new_leaf_lba;
+
+    struct metadata_idx_index_entry left_ie;
+    strncpy(left_ie.key,   all[0].key,   METADATA_KEY_MAX);
+    strncpy(left_ie.value, all[0].value,  METADATA_VALUE_MAX);
+    left_ie.inode_id  = all[0].inode_id;
+    left_ie.child_lba = lba;
+
+    uint64_t left_lba = lba;
+    free(all);
+    ctx->metadata_idx_hdr.total_nodes++;
+
+    /* Propagate split upward */
+    while (depth > 0) {
+        depth--;
+        uint64_t parent_lba  = path[depth].lba;
+        uint16_t parent_slot = path[depth].slot;
+
+        rc = meta_node_read(ctx, parent_lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header phdr;
+        memcpy(&phdr, buf, sizeof(phdr));
+
+        uint16_t max_idx    = midx_index_max_keys(ctx);
+        uint16_t idx_insert = parent_slot + 1;
+        size_t   ie_sz      = sizeof(struct metadata_idx_index_entry);
+
+        if (phdr.node_keys < max_idx) {
+            uint8_t *id = buf + sizeof(struct btree_node_header);
+            if (idx_insert < phdr.node_keys)
+                memmove(id + ((size_t)idx_insert + 1) * ie_sz,
+                        id + (size_t)idx_insert * ie_sz,
+                        ((size_t)phdr.node_keys -
+                         (size_t)idx_insert) * ie_sz);
+            memcpy(id + (size_t)idx_insert * ie_sz, &push_ie, ie_sz);
+            phdr.node_keys++;
+            phdr.keys_length = (uint16_t)(phdr.node_keys * ie_sz);
+            memcpy(buf, &phdr, sizeof(phdr));
+            compute_node_checksum(buf);
+            rc = meta_node_write(ctx, parent_lba, buf);
+            free(buf);
+            if (rc != OBMAFS3_OK) return rc;
+            return obmafs3_btree_header_write(
+                ctx, ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr);
+        }
+
+        /* Parent full — split index node */
+        uint16_t idx_total = max_idx + 1;
+        struct metadata_idx_index_entry *aie = calloc(idx_total, ie_sz);
+        if (!aie) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+        uint8_t *id = buf + sizeof(struct btree_node_header);
+        memcpy(aie, id, (size_t)idx_insert * ie_sz);
+        memcpy(&aie[idx_insert], &push_ie, ie_sz);
+        memcpy(&aie[idx_insert + 1],
+               id + (size_t)idx_insert * ie_sz,
+               ((size_t)max_idx - (size_t)idx_insert) * ie_sz);
+
+        uint16_t il = idx_total / 2;
+        uint16_t ir = idx_total - il;
+
+        memset(id, 0, nsz - sizeof(struct btree_node_header));
+        memcpy(id, aie, (size_t)il * ie_sz);
+        phdr.node_keys   = il;
+        phdr.keys_length = (uint16_t)(il * ie_sz);
+        memcpy(buf, &phdr, sizeof(phdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, parent_lba, buf);
+        if (rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
+
+        uint64_t new_idx_lba;
+        rc = meta_alloc_node(ctx, &new_idx_lba);
+        if (rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
+
+        memset(buf, 0, nsz);
+        struct btree_node_header nih;
+        memset(&nih, 0, sizeof(nih));
+        nih.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+        nih.record_type = kBtreeDataTypeMetadataIndexEntry;
+        nih.level       = phdr.level;
+        nih.node_keys   = ir;
+        nih.keys_length = (uint16_t)(ir * ie_sz);
+        memcpy(buf, &nih, sizeof(nih));
+        memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, new_idx_lba, buf);
+        if (rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
+
+        strncpy(push_ie.key,   aie[il].key,   METADATA_KEY_MAX);
+        strncpy(push_ie.value, aie[il].value,  METADATA_VALUE_MAX);
+        push_ie.inode_id  = aie[il].inode_id;
+        push_ie.child_lba = new_idx_lba;
+
+        strncpy(left_ie.key,   aie[0].key,   METADATA_KEY_MAX);
+        strncpy(left_ie.value, aie[0].value,  METADATA_VALUE_MAX);
+        left_ie.inode_id  = aie[0].inode_id;
+        left_ie.child_lba = parent_lba;
+
+        left_lba = parent_lba;
+        free(aie);
+        ctx->metadata_idx_hdr.total_nodes++;
+    }
+
+    /* Create new root */
+    uint64_t new_root_lba;
+    rc = meta_alloc_node(ctx, &new_root_lba);
+    if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+    rc = meta_node_read(ctx, left_lba, buf);
+    if (rc != OBMAFS3_OK) { free(buf); return rc; }
+    struct btree_node_header old_hdr;
+    memcpy(&old_hdr, buf, sizeof(old_hdr));
+
+    memset(buf, 0, nsz);
+    struct btree_node_header rh;
+    memset(&rh, 0, sizeof(rh));
+    rh.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    rh.record_type = kBtreeDataTypeMetadataIndexEntry;
+    rh.level       = old_hdr.level + 1;
+    rh.node_keys   = 2;
+    rh.keys_length =
+        (uint16_t)(2 * sizeof(struct metadata_idx_index_entry));
+    memcpy(buf, &rh, sizeof(rh));
+
+    left_ie.child_lba = left_lba;
+    struct metadata_idx_index_entry roots[2];
+    roots[0] = left_ie;
+    roots[1] = push_ie;
+    memcpy(buf + sizeof(rh), roots, sizeof(roots));
+    compute_node_checksum(buf);
+
+    rc = meta_node_write(ctx, new_root_lba, buf);
+    free(buf);
+    if (rc != OBMAFS3_OK) return rc;
+
+    ctx->metadata_idx_hdr.root_node_lba = new_root_lba;
+    ctx->metadata_idx_hdr.total_nodes++;
+    return obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba,
+                                      &ctx->metadata_idx_hdr);
+}
+
+/* ---- Reverse-index tree: delete ---- */
+
+static int midx_tree_delete(struct obmafs3_ctx *ctx,
+                             const char *key, const char *value,
+                             uint64_t inode_id)
+{
+    size_t   nsz      = meta_node_size(ctx);
+    uint64_t root_lba = ctx->metadata_idx_hdr.root_node_lba;
+    int rc;
+
+    if (root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
+
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf) return OBMAFS3_ERR_NOMEM;
+
+    struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
+    int depth = 0;
+    uint64_t lba = root_lba;
+
+    while (1) {
+        rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level == 0) break;
+
+        if (depth >= METADATA_BTREE_MAX_DEPTH) {
+            free(buf); return OBMAFS3_ERR_INVAL;
+        }
+
+        uint16_t slot = midx_index_find(buf, hdr.node_keys,
+                                         key, value, inode_id);
+        path[depth].lba  = lba;
+        path[depth].slot = slot;
+        depth++;
+
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie,
+               buf + sizeof(struct btree_node_header)
+                   + (size_t)slot * sizeof(ie),
+               sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    struct btree_node_header leaf_hdr;
+    memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
+
+    int idx = midx_leaf_find(buf, leaf_hdr.node_keys,
+                              key, value, inode_id);
+    if (idx < 0) { free(buf); return OBMAFS3_ERR_NOTFOUND; }
+
+    size_t rec_sz = sizeof(struct metadata_idx_record);
+    leaf_hdr.node_keys--;
+
+    if (leaf_hdr.node_keys == 0) {
+        if (depth == 0) {
+            ctx->metadata_idx_hdr.root_node_lba = 0;
+            ctx->metadata_idx_hdr.total_nodes--;
+            rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba,
+                                            &ctx->metadata_idx_hdr);
+            meta_free_node(ctx, lba);
+        } else {
+            uint64_t plba  = path[depth - 1].lba;
+            uint16_t pslot = path[depth - 1].slot;
+
+            uint8_t *pbuf = calloc(1, nsz);
+            if (!pbuf) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+            rc = meta_node_read(ctx, plba, pbuf);
+            if (rc != OBMAFS3_OK) {
+                free(pbuf); free(buf); return rc;
+            }
+
+            struct btree_node_header phdr;
+            memcpy(&phdr, pbuf, sizeof(phdr));
+
+            uint8_t *pdata = pbuf + sizeof(struct btree_node_header);
+            size_t ie_sz = sizeof(struct metadata_idx_index_entry);
+
+            if (pslot < phdr.node_keys - 1)
+                memmove(pdata + (size_t)pslot * ie_sz,
+                        pdata + ((size_t)pslot + 1) * ie_sz,
+                        ((size_t)phdr.node_keys -
+                         (size_t)pslot - 1) * ie_sz);
+            phdr.node_keys--;
+            phdr.keys_length = (uint16_t)(phdr.node_keys * ie_sz);
+
+            if (phdr.node_keys == 0 && depth == 1) {
+                ctx->metadata_idx_hdr.root_node_lba = 0;
+                ctx->metadata_idx_hdr.total_nodes -= 2;
+                rc = obmafs3_btree_header_write(
+                    ctx, ctx->sb.metadata_idx_lba,
+                    &ctx->metadata_idx_hdr);
+                meta_free_node(ctx, lba);
+                meta_free_node(ctx, plba);
+            } else if (phdr.node_keys == 1 && depth == 1) {
+                struct metadata_idx_index_entry remaining;
+                memcpy(&remaining, pdata, sizeof(remaining));
+                ctx->metadata_idx_hdr.root_node_lba =
+                    remaining.child_lba;
+                ctx->metadata_idx_hdr.total_nodes -= 2;
+                rc = obmafs3_btree_header_write(
+                    ctx, ctx->sb.metadata_idx_lba,
+                    &ctx->metadata_idx_hdr);
+                meta_free_node(ctx, lba);
+                meta_free_node(ctx, plba);
+            } else {
+                memcpy(pbuf, &phdr, sizeof(phdr));
+                compute_node_checksum(pbuf);
+                rc = meta_node_write(ctx, plba, pbuf);
+                if (rc == OBMAFS3_OK) {
+                    ctx->metadata_idx_hdr.total_nodes--;
+                    rc = obmafs3_btree_header_write(
+                        ctx, ctx->sb.metadata_idx_lba,
+                        &ctx->metadata_idx_hdr);
+                }
+                meta_free_node(ctx, lba);
+            }
+            free(pbuf);
+        }
+    } else {
+        uint8_t *data = buf + sizeof(struct btree_node_header);
+        if ((uint16_t)idx < leaf_hdr.node_keys)
+            memmove(data + (size_t)idx * rec_sz,
+                    data + ((size_t)idx + 1) * rec_sz,
+                    ((size_t)leaf_hdr.node_keys - (size_t)idx) * rec_sz);
+        memset(data + (size_t)leaf_hdr.node_keys * rec_sz, 0, rec_sz);
+        leaf_hdr.keys_length = (uint16_t)(leaf_hdr.node_keys * rec_sz);
+        memcpy(buf, &leaf_hdr, sizeof(leaf_hdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, lba, buf);
+    }
+
+    free(buf);
+    return rc;
+}
+
+/* ================================================================== */
+/*  Metadata public API                                                */
+/* ================================================================== */
+
+int obmafs3_metadata_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                         const char *key, char *value, size_t value_size)
+{
+    if (ctx->sb.metadata_lba == 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    struct metadata_record rec;
+    int rc = meta_tree_lookup(ctx, inode_id, key, &rec);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    strncpy(value, rec.value, value_size);
+    if (value_size > 0)
+        value[value_size - 1] = '\0';
+    return OBMAFS3_OK;
+}
+
+int obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                         const char *key, const char *value)
+{
+    if (ctx->sb.metadata_lba == 0 || ctx->sb.metadata_idx_lba == 0)
+        return OBMAFS3_ERR_INVAL;
+    if (!key || strlen(key) == 0 || strlen(key) > 255)
+        return OBMAFS3_ERR_INVAL;
+    if (!value || strlen(value) > 1024)
+        return OBMAFS3_ERR_INVAL;
+
+    /* If key already exists, remove old index entry first */
+    struct metadata_record old_rec;
+    int rc = meta_tree_lookup(ctx, inode_id, key, &old_rec);
+    if (rc == OBMAFS3_OK) {
+        /* Remove old reverse-index entry */
+        midx_tree_delete(ctx, old_rec.key, old_rec.value, inode_id);
+    } else if (rc != OBMAFS3_ERR_NOTFOUND) {
+        return rc;
+    }
+
+    /* Build and insert the per-image record */
+    struct metadata_record new_rec;
+    memset(&new_rec, 0, sizeof(new_rec));
+    new_rec.inode_id = inode_id;
+    strncpy(new_rec.key, key, METADATA_KEY_MAX - 1);
+    strncpy(new_rec.value, value, METADATA_VALUE_MAX - 1);
+
+    rc = meta_tree_put(ctx, &new_rec);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    /* Insert reverse-index entry */
+    struct metadata_idx_record idx_rec;
+    memset(&idx_rec, 0, sizeof(idx_rec));
+    strncpy(idx_rec.key, key, METADATA_KEY_MAX - 1);
+    strncpy(idx_rec.value, value, METADATA_VALUE_MAX - 1);
+    idx_rec.inode_id = inode_id;
+
+    return midx_tree_put(ctx, &idx_rec);
+}
+
+int obmafs3_metadata_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                            const char *key)
+{
+    if (ctx->sb.metadata_lba == 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    /* Look up the value so we can delete the index entry */
+    struct metadata_record rec;
+    int rc = meta_tree_lookup(ctx, inode_id, key, &rec);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    /* Delete from per-image tree */
+    rc = meta_tree_delete(ctx, inode_id, key);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    /* Delete from reverse-index tree */
+    if (ctx->sb.metadata_idx_lba != 0)
+        midx_tree_delete(ctx, rec.key, rec.value, inode_id);
+
+    return OBMAFS3_OK;
+}
+
+int obmafs3_metadata_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id)
+{
+    if (ctx->sb.metadata_lba == 0)
+        return OBMAFS3_OK;
+
+    while (1) {
+        char **keys;
+        uint32_t count;
+        int rc = obmafs3_metadata_list(ctx, inode_id, &keys, &count);
+        if (rc != OBMAFS3_OK)
+            return rc;
+        if (count == 0) {
+            obmafs3_metadata_list_free(keys, count);
+            return OBMAFS3_OK;
+        }
+
+        char first_key[METADATA_KEY_MAX];
+        strncpy(first_key, keys[0], METADATA_KEY_MAX);
+        first_key[METADATA_KEY_MAX - 1] = '\0';
+        obmafs3_metadata_list_free(keys, count);
+
+        rc = obmafs3_metadata_delete(ctx, inode_id, first_key);
+        if (rc != OBMAFS3_OK)
+            return rc;
+    }
+}
+
+int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                          char ***keys, uint32_t *count)
+{
+    *keys  = NULL;
+    *count = 0;
+
+    if (ctx->sb.metadata_lba == 0)
+        return OBMAFS3_OK;
+
+    uint64_t lba = ctx->metadata_hdr.root_node_lba;
+    if (lba == 0)
+        return OBMAFS3_OK;
+
+    size_t nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    /* Traverse to the leaf that would contain (inode_id, "") */
+    while (1) {
+        int rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level == 0) break;
+
+        uint16_t slot = meta_index_find(buf, hdr.node_keys,
+                                        inode_id, "");
+        struct metadata_index_entry ie;
+        memcpy(&ie,
+               buf + sizeof(struct btree_node_header)
+                   + (size_t)slot * sizeof(ie),
+               sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain */
+    uint32_t cap = 16;
+    char **kl = malloc(cap * sizeof(char *));
+    if (!kl) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    uint32_t n = 0;
+
+    while (1) {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for (uint16_t i = 0; i < hdr.node_keys; i++) {
+            struct metadata_record rec;
+            memcpy(&rec,
+                   data + (size_t)i * sizeof(rec),
+                   sizeof(rec));
+
+            if (rec.inode_id == inode_id) {
+                if (n >= cap) {
+                    cap *= 2;
+                    char **tmp = realloc(kl, cap * sizeof(char *));
+                    if (!tmp) {
+                        for (uint32_t j = 0; j < n; j++) free(kl[j]);
+                        free(kl); free(buf);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                    kl = tmp;
+                }
+                kl[n] = strndup(rec.key, METADATA_KEY_MAX);
+                if (!kl[n]) {
+                    for (uint32_t j = 0; j < n; j++) free(kl[j]);
+                    free(kl); free(buf);
+                    return OBMAFS3_ERR_NOMEM;
+                }
+                n++;
+            } else if (rec.inode_id > inode_id) {
+                goto list_done;
+            }
+        }
+
+        if (hdr.right_link == 0) break;
+
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if (rc != OBMAFS3_OK) {
+            for (uint32_t j = 0; j < n; j++) free(kl[j]);
+            free(kl); free(buf);
+            return rc;
+        }
+    }
+
+list_done:
+    free(buf);
+    *keys  = kl;
+    *count = n;
+    return OBMAFS3_OK;
+}
+
+void obmafs3_metadata_list_free(char **keys, uint32_t count)
+{
+    if (!keys) return;
+    for (uint32_t i = 0; i < count; i++)
+        free(keys[i]);
+    free(keys);
+}
+
+int obmafs3_metadata_query(struct obmafs3_ctx *ctx,
+                           const char *key, const char *value,
+                           char ***paths, uint32_t *count)
+{
+    *paths = NULL;
+    *count = 0;
+
+    if (ctx->sb.metadata_idx_lba == 0)
+        return OBMAFS3_OK;
+
+    uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
+    if (lba == 0)
+        return OBMAFS3_OK;
+
+    size_t nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    /* Traverse to the leaf that would contain (key, value, 0) */
+    while (1) {
+        int rc = meta_node_read(ctx, lba, buf);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level == 0) break;
+
+        uint16_t slot = midx_index_find(buf, hdr.node_keys,
+                                         key, value, 0);
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie,
+               buf + sizeof(struct btree_node_header)
+                   + (size_t)slot * sizeof(ie),
+               sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain for entries matching (key, value) */
+    uint32_t cap = 16;
+    char **result = malloc(cap * sizeof(char *));
+    if (!result) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    uint32_t n = 0;
+
+    while (1) {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for (uint16_t i = 0; i < hdr.node_keys; i++) {
+            struct metadata_idx_record rec;
+            memcpy(&rec,
+                   data + (size_t)i * sizeof(rec),
+                   sizeof(rec));
+
+            int kcmp = strncmp(rec.key, key, METADATA_KEY_MAX);
+            if (kcmp < 0) continue;
+            if (kcmp > 0) goto query_done;
+
+            int vcmp = strncmp(rec.value, value, METADATA_VALUE_MAX);
+            if (vcmp < 0) continue;
+            if (vcmp > 0) goto query_done;
+
+            /* key and value match — resolve inode to path */
+            char path[4096];
+            int prc = obmafs3_resolve_inode_path(ctx, rec.inode_id,
+                                                 path, sizeof(path));
+            if (prc != OBMAFS3_OK)
+                continue;  /* skip unresolvable inodes */
+
+            if (n >= cap) {
+                cap *= 2;
+                char **tmp = realloc(result, cap * sizeof(char *));
+                if (!tmp) {
+                    for (uint32_t j = 0; j < n; j++) free(result[j]);
+                    free(result); free(buf);
+                    return OBMAFS3_ERR_NOMEM;
+                }
+                result = tmp;
+            }
+            result[n] = strdup(path);
+            if (!result[n]) {
+                for (uint32_t j = 0; j < n; j++) free(result[j]);
+                free(result); free(buf);
+                return OBMAFS3_ERR_NOMEM;
+            }
+            n++;
+        }
+
+        if (hdr.right_link == 0) break;
+
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if (rc != OBMAFS3_OK) {
+            for (uint32_t j = 0; j < n; j++) free(result[j]);
+            free(result); free(buf);
+            return rc;
+        }
+    }
+
+query_done:
+    free(buf);
+    *paths = result;
+    *count = n;
+    return OBMAFS3_OK;
+}
+
+void obmafs3_metadata_query_free(char **paths, uint32_t count)
+{
+    if (!paths) return;
+    for (uint32_t i = 0; i < count; i++)
+        free(paths[i]);
+    free(paths);
+}

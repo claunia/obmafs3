@@ -1,6 +1,11 @@
 add_library(obmafs STATIC
     superblock.c
     btree.c
+    catalog.c
+    inode.c
+    media_tag.c
+    cd_btree.c
+    metadata.c
     bitmap.c
     block.c
     checksum.c

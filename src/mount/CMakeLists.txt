@@ -1,6 +1,12 @@
 add_executable(mount.obmafs
     main.c
     fuse_ops.c
+    fuse_read.c
+    fuse_write.c
+    fuse_dir.c
+    fuse_attr.c
+    fuse_xattr.c
+    fuse_ioctl.c
 )
 
 target_include_directories(mount.obmafs PRIVATE
