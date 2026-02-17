@@ -11,6 +11,7 @@ add_library(obmafs STATIC
     checksum.c
     dedup.c
     ecc_cd.c
+    refcount.c
     io.c
 )
 

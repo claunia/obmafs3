@@ -1285,6 +1285,23 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
         }
     }
 
+    /* Refcount tree header and nodes (if present) */
+    if (ctx->sb.refcount_lba != 0) {
+        MARK(ctx->sb.refcount_lba);
+        if (ctx->refcount_hdr.root_node_lba != 0) {
+            uint64_t *nodes = NULL;
+            uint64_t count = 0;
+            int rc = walk_inode_btree_nodes(ctx,
+                                            ctx->refcount_hdr.root_node_lba,
+                                            &nodes, &count);
+            if (rc == OBMAFS3_OK) {
+                for (uint64_t i = 0; i < count; i++)
+                    MARK(nodes[i]);
+                free(nodes);
+            }
+        }
+    }
+
     /* Bitmap blocks */
     for (uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++)
         MARK(ctx->sb.bitmap_lba + i);
@@ -2728,6 +2745,47 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if (bad > 0) {
                     printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
+                    errors++;
+                } else {
+                    printf("  Node checksums:   OK\n");
+                }
+            } else {
+                printf("  Node checksums:   could not walk tree\n");
+                errors++;
+            }
+        }
+    }
+
+    /* ---- Refcount tree ---- */
+    if (ctx->sb.refcount_lba != 0) {
+        printf("\nRefcount tree:\n");
+        printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+               ctx->refcount_hdr.magic,
+               ctx->refcount_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+                   ? "OK" : "BAD");
+        {
+            int cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.refcount_lba,
+                                              &ctx->refcount_hdr,
+                                              &cs_ok);
+            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if (!cs_ok) errors++;
+        }
+
+        if (ctx->refcount_hdr.root_node_lba != 0) {
+            uint64_t *nodes = NULL;
+            uint64_t node_count = 0;
+            int wrc = walk_inode_btree_nodes(ctx,
+                                             ctx->refcount_hdr.root_node_lba,
+                                             &nodes, &node_count);
+            if (wrc == OBMAFS3_OK) {
+                uint64_t bad = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count,
+                                            "Refcount", &bad);
+                free(nodes);
+                if (bad > 0) {
+                    printf("  Node checksums:   %" PRIu64 " BAD\n",
+                           bad);
                     errors++;
                 } else {
                     printf("  Node checksums:   OK\n");

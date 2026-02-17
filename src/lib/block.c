@@ -830,6 +830,395 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Copy-on-Write helpers                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Compact and merge adjacent inline extents that are physically contiguous.
+ *
+ * Removes gaps (zero-count entries between used ones) and merges
+ * neighbouring extents whose physical LBAs are consecutive.
+ * This reclaims inline extent slots after CoW splits.
+ *
+ * @param inode  Inode whose inline extents are coalesced in place.
+ */
+static void coalesce_inline_extents(struct inode_record *inode)
+{
+    /* Compact: move all non-empty entries to the front */
+    int wp = 0;
+    for (int i = 0; i < 8; i++) {
+        if (inode->extents[i].block_count > 0) {
+            if (wp != i)
+                inode->extents[wp] = inode->extents[i];
+            wp++;
+        }
+    }
+    for (int i = wp; i < 8; i++) {
+        inode->extents[i].start_block = 0;
+        inode->extents[i].block_count = 0;
+    }
+
+    /* Merge contiguous */
+    for (int i = 0; i < 7; i++) {
+        if (inode->extents[i].block_count == 0)
+            break;
+        if (inode->extents[i + 1].block_count == 0)
+            break;
+        if (inode->extents[i].start_block +
+                inode->extents[i].block_count ==
+            inode->extents[i + 1].start_block) {
+            inode->extents[i].block_count +=
+                inode->extents[i + 1].block_count;
+            for (int j = i + 1; j < 7; j++)
+                inode->extents[j] = inode->extents[j + 1];
+            inode->extents[7].start_block = 0;
+            inode->extents[7].block_count = 0;
+            i--; /* recheck merged entry */
+        }
+    }
+}
+
+/**
+ * Replace one physical block inside an inline extent with a new LBA.
+ *
+ * Finds the inline extent containing @p old_phys (after coalescing),
+ * splits it so that @p old_phys is replaced by @p new_phys, and shifts
+ * any subsequent extents to make room.
+ *
+ * @param inode     Inode record (modified in place).
+ * @param old_phys  Physical LBA that must be replaced.
+ * @param new_phys  Replacement physical LBA.
+ * @return @c OBMAFS3_OK, @c OBMAFS3_ERR_NOTFOUND, or
+ *         @c OBMAFS3_ERR_NOSPC if not enough inline slots.
+ */
+static int cow_replace_block(struct inode_record *inode,
+                             uint64_t old_phys,
+                             uint64_t new_phys)
+{
+    coalesce_inline_extents(inode);
+
+    /* Locate the extent containing old_phys */
+    int ext_idx = -1;
+    uint64_t offset = 0;
+    for (int i = 0; i < 8; i++) {
+        if (inode->extents[i].block_count == 0)
+            continue;
+        if (old_phys >= inode->extents[i].start_block &&
+            old_phys < inode->extents[i].start_block +
+                           inode->extents[i].block_count) {
+            ext_idx = i;
+            offset = old_phys - inode->extents[i].start_block;
+            break;
+        }
+    }
+    if (ext_idx < 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    uint64_t old_start = inode->extents[ext_idx].start_block;
+    uint64_t old_count = inode->extents[ext_idx].block_count;
+
+    /* Single-block extent: just replace the LBA */
+    if (old_count == 1) {
+        inode->extents[ext_idx].start_block = new_phys;
+        return OBMAFS3_OK;
+    }
+
+    /* Find last used inline slot */
+    int last_used = -1;
+    for (int j = 7; j >= 0; j--) {
+        if (inode->extents[j].block_count > 0) {
+            last_used = j;
+            break;
+        }
+    }
+
+    int extra = (offset == 0 || offset == old_count - 1) ? 1 : 2;
+    if (last_used + extra > 7)
+        return OBMAFS3_ERR_NOSPC;
+
+    if (offset == 0) {
+        /* First block — need 1 extra slot */
+        for (int j = last_used; j > ext_idx; j--)
+            inode->extents[j + 1] = inode->extents[j];
+        inode->extents[ext_idx].start_block = new_phys;
+        inode->extents[ext_idx].block_count = 1;
+        inode->extents[ext_idx + 1].start_block = old_start + 1;
+        inode->extents[ext_idx + 1].block_count = old_count - 1;
+        return OBMAFS3_OK;
+    }
+
+    if (offset == old_count - 1) {
+        /* Last block — need 1 extra slot */
+        for (int j = last_used; j > ext_idx; j--)
+            inode->extents[j + 1] = inode->extents[j];
+        inode->extents[ext_idx].block_count = old_count - 1;
+        inode->extents[ext_idx + 1].start_block = new_phys;
+        inode->extents[ext_idx + 1].block_count = 1;
+        return OBMAFS3_OK;
+    }
+
+    /* Middle block — need 2 extra slots */
+    uint64_t right_start = old_start + offset + 1;
+    uint64_t right_count = old_count - offset - 1;
+
+    for (int j = last_used; j > ext_idx; j--)
+        inode->extents[j + 2] = inode->extents[j];
+
+    inode->extents[ext_idx].block_count     = offset;
+    inode->extents[ext_idx + 1].start_block = new_phys;
+    inode->extents[ext_idx + 1].block_count = 1;
+    inode->extents[ext_idx + 2].start_block = right_start;
+    inode->extents[ext_idx + 2].block_count = right_count;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Overflow helpers for clone / CoW / truncate                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Collect every physical LBA stored in the overflow B+Tree for
+ * @a inode_id.  Each extent is expanded into individual LBAs in the
+ * order they appear in the tree (ascending physical start_block),
+ * which mirrors the logical ordering used by overflow_find_phys().
+ *
+ * The caller must free @c *out_lbas when done.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode whose overflow blocks are collected.
+ * @param out_lbas  Receives a malloc'd array of physical LBAs.
+ * @param out_count Receives the number of elements in @c *out_lbas.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+static int overflow_collect_lbas(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                                 uint64_t **out_lbas, uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    uint64_t total = overflow_count_blocks(ctx, inode_id);
+    if (total == 0)
+        return OBMAFS3_OK;
+
+    uint64_t *lbas = calloc((size_t)total, sizeof(uint64_t));
+    if (!lbas)
+        return OBMAFS3_ERR_NOMEM;
+
+    struct btree_header *hdr = &ctx->overflow_hdr;
+    if (hdr->root_node_lba == 0) {
+        free(lbas);
+        return OBMAFS3_OK;
+    }
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf) {
+        free(lbas);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    /* Navigate index nodes to reach the first relevant leaf */
+    uint64_t lba = hdr->root_node_lba;
+    for (;;) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) { free(buf); free(lbas); return rc; }
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        if (nhdr.level == 0) break;
+        uint16_t slot = overflow_index_find(buf, nhdr.node_keys,
+                                            inode_id);
+        struct btree_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header) +
+               (size_t)slot * sizeof(ie), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaves, expanding each extent into individual LBAs */
+    uint64_t idx = 0;
+    while (lba != 0 && idx < total) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) break;
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        int past = 0;
+        for (uint16_t i = 0; i < nhdr.node_keys && idx < total; i++) {
+            struct overflow_extent oe;
+            memcpy(&oe, entries + (size_t)i * sizeof(oe), sizeof(oe));
+            if (oe.inode_id < inode_id) continue;
+            if (oe.inode_id > inode_id) { past = 1; break; }
+            for (uint64_t j = 0; j < oe.block_count && idx < total; j++)
+                lbas[idx++] = oe.start_block + j;
+        }
+        if (past) break;
+        lba = nhdr.right_link;
+    }
+
+    free(buf);
+    *out_lbas  = lbas;
+    *out_count = idx;
+    return OBMAFS3_OK;
+}
+
+/**
+ * Remove every overflow extent entry for @a inode_id from the
+ * overflow B+Tree.  Entries for other inodes are left intact.
+ *
+ * The tree is @b not rebalanced; leaves may become underfull or
+ * empty.  This is acceptable for a subsequent rebuild via
+ * overflow_insert().
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode whose overflow entries are removed.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+static int overflow_clear_inode(struct obmafs3_ctx *ctx, uint64_t inode_id)
+{
+    struct btree_header *hdr = &ctx->overflow_hdr;
+    if (hdr->root_node_lba == 0)
+        return OBMAFS3_OK;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf) return OBMAFS3_ERR_NOMEM;
+
+    /* Navigate to the first leaf that may contain this inode */
+    uint64_t lba = hdr->root_node_lba;
+    for (;;) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        if (nhdr.level == 0) break;
+        uint16_t slot = overflow_index_find(buf, nhdr.node_keys,
+                                            inode_id);
+        struct btree_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header) +
+               (size_t)slot * sizeof(ie), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Walk leaves, compacting out entries that match inode_id */
+    const size_t rec_sz = sizeof(struct overflow_extent);
+    while (lba != 0) {
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        uint8_t *entries = buf + sizeof(struct btree_node_header);
+        int modified = 0, past = 0;
+        uint16_t wp = 0;
+
+        for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+            struct overflow_extent oe;
+            memcpy(&oe, entries + (size_t)i * rec_sz, rec_sz);
+            if (oe.inode_id == inode_id) {
+                modified = 1;
+                continue;                /* skip / remove */
+            }
+            if (oe.inode_id > inode_id)
+                past = 1;
+            if (wp != i)
+                memmove(entries + (size_t)wp * rec_sz,
+                        entries + (size_t)i * rec_sz, rec_sz);
+            wp++;
+        }
+
+        if (modified) {
+            if (wp < nhdr.node_keys)
+                memset(entries + (size_t)wp * rec_sz, 0,
+                       ((size_t)nhdr.node_keys - wp) * rec_sz);
+            nhdr.node_keys  = wp;
+            nhdr.keys_length = (uint16_t)(wp * rec_sz);
+            memcpy(buf, &nhdr, sizeof(nhdr));
+            compute_node_checksum(buf);
+            rc = obmafs3_block_write(ctx, lba, buf,
+                                     (size_t)ctx->sb.block_size);
+            if (rc != OBMAFS3_OK) { free(buf); return rc; }
+        }
+
+        if (past) break;
+        lba = nhdr.right_link;
+    }
+
+    free(buf);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Rebuild an inode's inline extents and overflow entries from a flat
+ * array of physical LBAs (in logical order).  Contiguous LBAs are
+ * coalesced into extent runs; the first 8 runs are stored in the
+ * inline extent slots, and any remaining runs are inserted into the
+ * overflow B+Tree via overflow_insert().
+ *
+ * The caller must have already cleared old overflow entries for this
+ * inode (via overflow_clear_inode()) before calling this function.
+ *
+ * @param ctx          Filesystem context.
+ * @param inode        Inode record to update (modified in place).
+ * @param lbas         Array of physical LBAs in logical order.
+ * @param total_blocks Number of elements in @a lbas.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+static int rebuild_extent_map(struct obmafs3_ctx *ctx,
+                              struct inode_record *inode,
+                              const uint64_t *lbas,
+                              uint64_t total_blocks)
+{
+    memset(inode->extents, 0, sizeof(inode->extents));
+    if (total_blocks == 0)
+        return OBMAFS3_OK;
+
+    /* Count extent runs */
+    uint64_t run_count = 1;
+    for (uint64_t i = 1; i < total_blocks; i++) {
+        if (lbas[i] != lbas[i - 1] + 1)
+            run_count++;
+    }
+
+    struct extent_run *runs = calloc((size_t)run_count, sizeof(*runs));
+    if (!runs)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t ri = 0;
+    runs[0].start_block = lbas[0];
+    runs[0].block_count = 1;
+    for (uint64_t i = 1; i < total_blocks; i++) {
+        if (lbas[i] == runs[ri].start_block + runs[ri].block_count) {
+            runs[ri].block_count++;
+        } else {
+            ri++;
+            runs[ri].start_block = lbas[i];
+            runs[ri].block_count = 1;
+        }
+    }
+
+    /* First 8 runs go to inline extent slots */
+    uint64_t inline_runs = (run_count <= 8) ? run_count : 8;
+    for (uint64_t i = 0; i < inline_runs; i++)
+        inode->extents[i] = runs[i];
+
+    /* Remaining runs go to the overflow B+Tree */
+    int rc = OBMAFS3_OK;
+    for (uint64_t i = 8; i < run_count; i++) {
+        struct overflow_extent oe;
+        oe.inode_id    = inode->inode_id;
+        oe.start_block = runs[i].start_block;
+        oe.block_count = runs[i].block_count;
+        rc = overflow_insert(ctx, &oe);
+        if (rc != OBMAFS3_OK)
+            break;
+    }
+
+    free(runs);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
 /*  File data writing                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -838,7 +1227,10 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
  *
  * Allocates blocks as needed (extending inline extents and the overflow
  * extent tree), writes data with optional ZSTD compression, and updates
- * the inode's file size.
+ * the inode's file size.  When writing to a block whose refcount is
+ * greater than 1 (shared via clone), a copy-on-write is performed:
+ * a new block is allocated, the old refcount is decremented, and the
+ * inode's extent map is updated to point to the private copy.
  *
  * @param ctx     Filesystem context.
  * @param inode   Inode record to update (modified in place).
@@ -974,7 +1366,109 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
 
         if (!found) {
             free(block_buf);
+            free(work_buf);
             return OBMAFS3_ERR_IO;
+        }
+
+        /* Copy-on-Write: if this block is shared (refcount > 1),
+         * allocate a private copy.  The old data is still read from
+         * phys_lba; the modified data is written to write_lba. */
+        uint64_t write_lba = phys_lba;
+        if (found && ctx->refcount_hdr.root_node_lba != 0) {
+            uint32_t ref;
+            rc = obmafs3_refcount_get(ctx, phys_lba, &ref);
+            if (rc == OBMAFS3_OK && ref > 1) {
+                uint64_t new_lba;
+                rc = obmafs3_alloc_block(ctx, &new_lba);
+                if (rc != OBMAFS3_OK) {
+                    free(block_buf);
+                    free(work_buf);
+                    return rc;
+                }
+                if (i < 8) {
+                    /* Inline extent — split in place */
+                    rc = cow_replace_block(inode, phys_lba, new_lba);
+                    if (rc != OBMAFS3_OK) {
+                        obmafs3_free_block(ctx, new_lba);
+                        free(block_buf);
+                        free(work_buf);
+                        return rc;
+                    }
+                } else {
+                    /* Overflow extent — flatten, mutate, rebuild */
+                    uint64_t inl_count = 0;
+                    for (int ii = 0; ii < 8; ii++)
+                        inl_count += inode->extents[ii].block_count;
+
+                    uint64_t *ovf_lbas  = NULL;
+                    uint64_t  ovf_count = 0;
+                    rc = overflow_collect_lbas(ctx, inode->inode_id,
+                                              &ovf_lbas, &ovf_count);
+                    if (rc != OBMAFS3_OK) {
+                        obmafs3_free_block(ctx, new_lba);
+                        free(block_buf);
+                        free(work_buf);
+                        return rc;
+                    }
+
+                    int replaced = 0;
+                    for (uint64_t oi = 0; oi < ovf_count; oi++) {
+                        if (ovf_lbas[oi] == phys_lba) {
+                            ovf_lbas[oi] = new_lba;
+                            replaced = 1;
+                            break;
+                        }
+                    }
+
+                    if (!replaced) {
+                        free(ovf_lbas);
+                        obmafs3_free_block(ctx, new_lba);
+                        free(block_buf);
+                        free(work_buf);
+                        return OBMAFS3_ERR_IO;
+                    }
+
+                    rc = overflow_clear_inode(ctx, inode->inode_id);
+                    if (rc != OBMAFS3_OK) {
+                        free(ovf_lbas);
+                        free(block_buf);
+                        free(work_buf);
+                        return rc;
+                    }
+
+                    uint64_t total = inl_count + ovf_count;
+                    uint64_t *all_lbas = calloc((size_t)total,
+                                                sizeof(uint64_t));
+                    if (!all_lbas) {
+                        free(ovf_lbas);
+                        free(block_buf);
+                        free(work_buf);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+
+                    uint64_t ai = 0;
+                    for (int ii = 0; ii < 8; ii++)
+                        for (uint64_t jj = 0;
+                             jj < inode->extents[ii].block_count;
+                             jj++)
+                            all_lbas[ai++] =
+                                inode->extents[ii].start_block + jj;
+                    for (uint64_t oi = 0; oi < ovf_count; oi++)
+                        all_lbas[ai++] = ovf_lbas[oi];
+                    free(ovf_lbas);
+
+                    rc = rebuild_extent_map(ctx, inode,
+                                            all_lbas, total);
+                    free(all_lbas);
+                    if (rc != OBMAFS3_OK) {
+                        free(block_buf);
+                        free(work_buf);
+                        return rc;
+                    }
+                }
+                obmafs3_refcount_dec(ctx, phys_lba, NULL);
+                write_lba = new_lba;
+            }
         }
 
         /* Read the existing block */
@@ -1082,7 +1576,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
             memcpy(block_buf, &bhdr, sizeof(bhdr));
         }
 
-        rc = obmafs3_block_write(ctx, phys_lba, out_buf,
+        rc = obmafs3_block_write(ctx, write_lba, out_buf,
                                  (size_t)block_size);
         free(comp_block);
         if (rc != OBMAFS3_OK) {
@@ -1096,5 +1590,352 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
 
     free(block_buf);
     free(work_buf);
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Refcount-aware block freeing                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Free all data blocks owned by an inode, respecting refcounts.
+ *
+ * For each physical block in the inode's inline extents and overflow
+ * B+Tree entries, the block refcount is checked.  Shared blocks
+ * (refcount > 1) have their refcount decremented; unshared blocks
+ * are freed to the bitmap.  All inline extent slots and overflow
+ * entries are cleared afterwards.
+ *
+ * @param ctx    Filesystem context.
+ * @param inode  Inode whose data blocks are freed (modified in place).
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_free_file_blocks(struct obmafs3_ctx *ctx,
+                             struct inode_record *inode)
+{
+    /* Free inline extent blocks */
+    for (int i = 0; i < 8; i++) {
+        if (inode->extents[i].block_count == 0)
+            continue;
+        for (uint64_t j = 0; j < inode->extents[i].block_count; j++) {
+            uint64_t lba = inode->extents[i].start_block + j;
+            uint32_t ref = 1;
+            obmafs3_refcount_get(ctx, lba, &ref);
+            if (ref > 1)
+                obmafs3_refcount_dec(ctx, lba, NULL);
+            else
+                obmafs3_free_block(ctx, lba);
+        }
+        inode->extents[i].start_block = 0;
+        inode->extents[i].block_count = 0;
+    }
+
+    /* Free overflow extent blocks */
+    uint64_t *ovf_lbas  = NULL;
+    uint64_t  ovf_count = 0;
+    int rc = overflow_collect_lbas(ctx, inode->inode_id,
+                                  &ovf_lbas, &ovf_count);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    for (uint64_t j = 0; j < ovf_count; j++) {
+        uint32_t ref = 1;
+        obmafs3_refcount_get(ctx, ovf_lbas[j], &ref);
+        if (ref > 1)
+            obmafs3_refcount_dec(ctx, ovf_lbas[j], NULL);
+        else
+            obmafs3_free_block(ctx, ovf_lbas[j]);
+    }
+    free(ovf_lbas);
+
+    if (ovf_count > 0)
+        overflow_clear_inode(ctx, inode->inode_id);
+
+    return OBMAFS3_OK;
+}
+
+/**
+ * Truncate an inode's data blocks to @a new_block_count blocks.
+ *
+ * Blocks beyond @a new_block_count are freed (refcount-aware).  The
+ * remaining blocks' extent map is rebuilt: first 8 coalesced runs
+ * go to inline extents; any surplus goes to the overflow B+Tree.
+ *
+ * @param ctx             Filesystem context.
+ * @param inode           Inode record to update (modified in place).
+ * @param new_block_count Number of data blocks to keep.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_truncate_file_blocks(struct obmafs3_ctx *ctx,
+                                 struct inode_record *inode,
+                                 uint64_t new_block_count)
+{
+    /* Count inline blocks */
+    uint64_t inline_count = 0;
+    for (int i = 0; i < 8; i++)
+        inline_count += inode->extents[i].block_count;
+
+    /* Collect overflow blocks */
+    uint64_t *ovf_lbas  = NULL;
+    uint64_t  ovf_count = 0;
+    int rc = overflow_collect_lbas(ctx, inode->inode_id,
+                                  &ovf_lbas, &ovf_count);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    uint64_t total = inline_count + ovf_count;
+    if (new_block_count >= total) {
+        free(ovf_lbas);
+        return OBMAFS3_OK;   /* nothing to free */
+    }
+
+    /* Build flat LBA array */
+    uint64_t *all_lbas = calloc((size_t)total, sizeof(uint64_t));
+    if (!all_lbas) {
+        free(ovf_lbas);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    uint64_t ai = 0;
+    for (int i = 0; i < 8; i++)
+        for (uint64_t j = 0; j < inode->extents[i].block_count; j++)
+            all_lbas[ai++] = inode->extents[i].start_block + j;
+    for (uint64_t j = 0; j < ovf_count; j++)
+        all_lbas[ai++] = ovf_lbas[j];
+    free(ovf_lbas);
+
+    /* Free / decrement blocks beyond new_block_count */
+    for (uint64_t b = new_block_count; b < total; b++) {
+        uint32_t ref = 1;
+        obmafs3_refcount_get(ctx, all_lbas[b], &ref);
+        if (ref > 1)
+            obmafs3_refcount_dec(ctx, all_lbas[b], NULL);
+        else
+            obmafs3_free_block(ctx, all_lbas[b]);
+    }
+
+    /* Clear overflow entries and rebuild with the kept blocks */
+    if (ovf_count > 0) {
+        rc = overflow_clear_inode(ctx, inode->inode_id);
+        if (rc != OBMAFS3_OK) {
+            free(all_lbas);
+            return rc;
+        }
+    }
+
+    rc = rebuild_extent_map(ctx, inode, all_lbas, new_block_count);
+    free(all_lbas);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Clone / reflink file range                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Clone a range of data blocks from one inode to another by sharing
+ * physical blocks and incrementing their refcounts.
+ *
+ * Both offsets and length must be aligned to the filesystem's data
+ * capacity (block_size - block_header).  Source blocks may reside in
+ * inline extents or the overflow B+Tree.  The destination's existing
+ * blocks in the target range are freed (refcount-aware), and the
+ * resulting extent map is rebuilt — spilling to the overflow tree
+ * when more than 8 non-contiguous runs are required.
+ *
+ * @param ctx         Filesystem context.
+ * @param src_inode   Source inode (read-only).
+ * @param src_offset  Byte offset into the source file (aligned).
+ * @param dst_inode   Destination inode (modified in place).
+ * @param dst_offset  Byte offset into the destination file (aligned).
+ * @param length      Number of bytes to clone (aligned).
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_clone_file_range(struct obmafs3_ctx *ctx,
+                             const struct inode_record *src_inode,
+                             uint64_t src_offset,
+                             struct inode_record *dst_inode,
+                             uint64_t dst_offset,
+                             uint64_t length)
+{
+    size_t data_cap = (size_t)(ctx->sb.block_size -
+                               sizeof(struct block_header));
+    int rc;
+
+    /* Validate alignment */
+    if (src_offset % data_cap || dst_offset % data_cap ||
+        length % data_cap || length == 0)
+        return OBMAFS3_ERR_INVAL;
+
+    /* Same inode not supported */
+    if (src_inode->inode_id == dst_inode->inode_id)
+        return OBMAFS3_ERR_INVAL;
+
+    uint64_t num_blocks  = length / data_cap;
+    uint64_t src_start   = src_offset / data_cap;
+    uint64_t dst_start   = dst_offset / data_cap;
+
+    /* Verify source range is within file bounds */
+    uint64_t src_total =
+        (src_inode->file_size + data_cap - 1) / data_cap;
+    if (src_start + num_blocks > src_total)
+        return OBMAFS3_ERR_INVAL;
+
+    /* Count source inline blocks */
+    uint64_t src_inline = 0;
+    for (int i = 0; i < 8; i++)
+        src_inline += src_inode->extents[i].block_count;
+
+    /* Collect source overflow LBAs if the range extends beyond inline */
+    uint64_t *src_ovf_lbas  = NULL;
+    uint64_t  src_ovf_count = 0;
+    if (src_start + num_blocks > src_inline) {
+        rc = overflow_collect_lbas(ctx, src_inode->inode_id,
+                                   &src_ovf_lbas, &src_ovf_count);
+        if (rc != OBMAFS3_OK)
+            return rc;
+    }
+
+    uint64_t src_total_blocks = src_inline + src_ovf_count;
+    if (src_start + num_blocks > src_total_blocks) {
+        free(src_ovf_lbas);
+        return OBMAFS3_ERR_INVAL;
+    }
+
+    /* Build a flat source LBA array (inline + overflow) */
+    uint64_t *src_all = calloc((size_t)src_total_blocks,
+                               sizeof(uint64_t));
+    if (!src_all) {
+        free(src_ovf_lbas);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    uint64_t ai = 0;
+    for (int i = 0; i < 8; i++)
+        for (uint64_t j = 0;
+             j < src_inode->extents[i].block_count; j++)
+            src_all[ai++] = src_inode->extents[i].start_block + j;
+    for (uint64_t j = 0; j < src_ovf_count; j++)
+        src_all[ai++] = src_ovf_lbas[j];
+    free(src_ovf_lbas);
+
+    /* Pointer into src_all for the requested range */
+    const uint64_t *src_lbas = src_all + src_start;
+
+    /* --- Destination handling --- */
+
+    /* Count destination inline blocks */
+    uint64_t dst_inline = 0;
+    for (int i = 0; i < 8; i++)
+        dst_inline += dst_inode->extents[i].block_count;
+
+    /* Collect destination overflow LBAs */
+    uint64_t *dst_ovf_lbas  = NULL;
+    uint64_t  dst_ovf_count = 0;
+    rc = overflow_collect_lbas(ctx, dst_inode->inode_id,
+                               &dst_ovf_lbas, &dst_ovf_count);
+    if (rc != OBMAFS3_OK) {
+        free(src_all);
+        return rc;
+    }
+
+    uint64_t dst_existing = dst_inline + dst_ovf_count;
+    uint64_t dst_end_block = dst_start + num_blocks;
+    uint64_t dst_needed = dst_end_block > dst_existing
+                              ? dst_end_block : dst_existing;
+
+    /* Build flat destination LBA array */
+    uint64_t *dst_all = calloc((size_t)dst_needed, sizeof(uint64_t));
+    if (!dst_all) {
+        free(src_all);
+        free(dst_ovf_lbas);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    ai = 0;
+    for (int i = 0; i < 8; i++)
+        for (uint64_t j = 0;
+             j < dst_inode->extents[i].block_count; j++)
+            if (ai < dst_needed)
+                dst_all[ai++] = dst_inode->extents[i].start_block + j;
+    for (uint64_t j = 0; j < dst_ovf_count; j++)
+        if (ai < dst_needed)
+            dst_all[ai++] = dst_ovf_lbas[j];
+    free(dst_ovf_lbas);
+
+    /* Allocate zero-initialised blocks for any gap between the
+     * current destination end and the clone start */
+    if (dst_start > dst_existing) {
+        uint64_t gap = dst_start - dst_existing;
+        uint64_t gap_start;
+        rc = obmafs3_alloc_blocks(ctx, gap, &gap_start);
+        if (rc != OBMAFS3_OK) {
+            free(src_all);
+            free(dst_all);
+            return rc;
+        }
+        uint8_t *zbuf = calloc(1, (size_t)ctx->sb.block_size);
+        if (!zbuf) {
+            free(src_all);
+            free(dst_all);
+            return OBMAFS3_ERR_NOMEM;
+        }
+        struct block_header zhdr;
+        memset(&zhdr, 0, sizeof(zhdr));
+        zhdr.magic = OBMAFS3_BLOCK_MAGIC;
+        obmafs3_checksum_block(zbuf + sizeof(zhdr), 0, zhdr.checksum);
+        memcpy(zbuf, &zhdr, sizeof(zhdr));
+        for (uint64_t g = 0; g < gap; g++) {
+            obmafs3_block_write(ctx, gap_start + g, zbuf,
+                                (size_t)ctx->sb.block_size);
+            dst_all[dst_existing + g] = gap_start + g;
+        }
+        free(zbuf);
+    }
+
+    /* Free old destination blocks in the clone range */
+    for (uint64_t b = dst_start; b < dst_start + num_blocks; b++) {
+        if (b < dst_existing && dst_all[b] != 0) {
+            uint32_t ref = 1;
+            obmafs3_refcount_get(ctx, dst_all[b], &ref);
+            if (ref > 1)
+                obmafs3_refcount_dec(ctx, dst_all[b], NULL);
+            else
+                obmafs3_free_block(ctx, dst_all[b]);
+        }
+    }
+
+    /* Replace destination blocks in the clone range */
+    for (uint64_t k = 0; k < num_blocks; k++)
+        dst_all[dst_start + k] = src_lbas[k];
+
+    /* Increment refcounts for source blocks */
+    for (uint64_t k = 0; k < num_blocks; k++) {
+        rc = obmafs3_refcount_inc(ctx, src_lbas[k]);
+        if (rc != OBMAFS3_OK) {
+            free(src_all);
+            free(dst_all);
+            return rc;
+        }
+    }
+
+    /* Clear destination overflow entries and rebuild extent map */
+    rc = overflow_clear_inode(ctx, dst_inode->inode_id);
+    if (rc != OBMAFS3_OK) {
+        free(src_all);
+        free(dst_all);
+        return rc;
+    }
+    rc = rebuild_extent_map(ctx, dst_inode, dst_all, dst_needed);
+
+    free(src_all);
+    free(dst_all);
+    if (rc != OBMAFS3_OK)
+        return rc;
+
+    uint64_t new_end = dst_offset + length;
+    if (new_end > dst_inode->file_size)
+        dst_inode->file_size = new_end;
+
     return OBMAFS3_OK;
 }

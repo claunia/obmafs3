@@ -73,6 +73,16 @@ struct __attribute__((packed)) overflow_extent {
     uint64_t block_count;  ///< Number of blocks in the extent run
 };
 
+/**
+ * Block reference count record stored in the refcount B+Tree.
+ * Keyed by LBA.  Only blocks with ref_count > 1 need an entry;
+ * absence means refcount == 1 (or unallocated).
+ */
+struct __attribute__((packed)) refcount_record {
+    uint64_t lba;        ///< Block LBA
+    uint32_t ref_count;  ///< Number of inodes sharing this block
+};
+
 /// On-disk header for the allocation bitmap.
 struct __attribute__((packed)) bitmap_header {
     uint64_t magic;          ///< "OBMABMAP"

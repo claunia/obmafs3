@@ -17,8 +17,15 @@ All multi-byte values are stored **little-endian**. All on-disk structures use `
 | 4                   | Root directory inode                 | `BTREENDE` |
 | 5                   | Overflow B+Tree header               | `BTREEHDR` |
 | 6                   | Dedup tree list header               | `TREELIST` (0x5453494C45455254) |
-| 7 .. 7+N-1          | Allocation bitmap                    | `OBMABMAP` (0x50414D42414D424F) |
-| 7+N ..              | Data blocks, B+Tree nodes, dedup data| `OBMABLCK` / `BTREENDE` |
+| 7                   | Media Tag B+Tree header              | `BTREEHDR` |
+| 8                   | CD Prefix B+Tree header              | `BTREEHDR` |
+| 9                   | CD Suffix B+Tree header              | `BTREEHDR` |
+| 10                  | CD Subchannel B+Tree header          | `BTREEHDR` |
+| 11                  | Metadata B+Tree header               | `BTREEHDR` |
+| 12                  | Metadata Index B+Tree header         | `BTREEHDR` |
+| 13                  | Refcount B+Tree header               | `BTREEHDR` |
+| 14 .. 14+N-1        | Allocation bitmap                    | `OBMABMAP` (0x50414D42414D424F) |
+| 14+N ..             | Data blocks, B+Tree nodes, dedup data| `OBMABLCK` / `BTREENDE` |
 
 The block size for regular data (catalog, inode, overflow, file data) defaults to **4096 bytes**.
 The block size for deduplicated data defaults to **4 194 304 bytes** (4 MiB = 1024 standard blocks).
@@ -40,6 +47,7 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t dedup_lba;          /* LBA of the dedup tree list header (block 6) */
     uint64_t metadata_lba;       /* LBA of the metadata B+Tree header (reserved, 0) */
     uint64_t media_tag_lba;      /* LBA of the media tag B+Tree header (reserved, 0) */
+    uint64_t refcount_lba;       /* LBA of the refcount B+Tree header (block 13) */
     uint16_t checksum_type;      /* Checksum algorithm (0 = XXH64) */
     uint64_t creation_time;      /* Unix timestamp of filesystem creation */
     uint64_t next_free_lba;      /* Hint: next LBA to try for allocation */
@@ -60,6 +68,7 @@ The superblock identifies the filesystem, stores global parameters, and provides
 - `dedup_lba` — LBA of the Deduplication Tree List header, a list of per-sector-size B+Trees that map sector hashes to their physical locations.
 - `metadata_lba` — Reserved for a future Metadata Tree (arbitrary key-value pairs about disk images). Currently 0.
 - `media_tag_lba` — Reserved for a future Media Tag Tree (media-specific tags for disk images). Currently 0.
+- `refcount_lba` — LBA of the Refcount Tree header, a B+Tree that tracks per-block reference counts for shared (cloned) data blocks.
 - `next_free_lba` — Allocation hint; tracks the highest allocated LBA to speed up sequential allocations.
 - `bitmap_lba`, `bitmap_blocks` — Location and size of the allocation bitmap on disk.
 
@@ -142,7 +151,8 @@ enum obmafs3_btree_type {
     kBtreeTypeOverflow      = 2,
     kBtreeTypeDeduplication = 3,
     kBtreeTypeMetadata      = 4,
-    kBtreeTypeMediaTag      = 5
+    kBtreeTypeMediaTag      = 5,
+    kBtreeTypeRefcount      = 10
 };
 
 enum obmafs3_btree_data_type {
@@ -151,7 +161,8 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeExtent             = 2,
     kBtreeDataTypeDeduplicationEntry = 3,
     kBtreeDataTypeMetadataEntry      = 4,
-    kBtreeDataTypeMediaTagEntry      = 5
+    kBtreeDataTypeMediaTagEntry      = 5,
+    kBtreeDataTypeRefcountEntry      = 10
 };
 
 enum obmafs3_file_type {
@@ -227,6 +238,21 @@ struct overflow_extent {                     /* packed, 24 bytes */
 Overflow entries are sorted by the composite key `(inode_id, start_block)`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 24 = **167 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
 
 When reading file data, the system first uses the 8 inline extents from the inode, then traverses the overflow B+Tree to find any additional extents for that inode. The `level` field in the node header distinguishes index nodes (`level > 0`) from leaf nodes (`level == 0`).
+
+### Refcount Tree (block reference counts)
+
+The Refcount Tree is a B+Tree keyed by block LBA that tracks the reference count for data blocks shared between files via `FICLONERANGE`. Only blocks with a reference count greater than 1 are stored; blocks absent from the tree have an implicit reference count of 1.
+
+```c
+struct refcount_record {                     /* packed, 12 bytes */
+    uint64_t lba;            /* Block LBA */
+    uint32_t ref_count;      /* Number of inodes sharing this block */
+};
+```
+
+Entries are sorted by `lba`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 12 = **335 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
+
+When a block range is cloned from one file to another, the refcount for each shared block is incremented (creating a new entry with refcount 2 if none existed). When a file is truncated or deleted, blocks with refcount > 1 have their refcount decremented instead of being freed; blocks whose refcount drops to 1 have their entry removed from the tree. The write path checks the refcount before modifying a shared block and performs copy-on-write (allocating a new block) when the refcount is greater than 1.
 
 ### Deduplication Tree (sector hash lookup)
 
@@ -503,8 +529,75 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | `mkobmafs` (create filesystem) | Complete |
 | `mount.obmafs` (FUSE mount) | Complete |
 | `obmafsck` (filesystem checker + scrub) | Complete |
+| Clone / reflink (`copy_file_range`) | Complete |
+| Copy-on-Write for shared blocks | Complete (inline + overflow) |
+| Refcount-aware block freeing | Complete (truncate + unlink) |
 | Metadata B+Tree | Not implemented |
 | Media Tag B+Tree | Not implemented |
 | Symlinks / hard links | Not implemented |
 | Multi-level B+Tree (tree height > 1) | Not implemented |
 | Filesystem repair in `obmafsck` | Not implemented (check-only) |
+
+---
+
+## Clone / Reflink Support
+
+OBMAFS v3 supports block-level file cloning through the FUSE3
+`copy_file_range` callback.  When a file range is cloned, source and
+destination inodes share physical data blocks; a per-block reference
+count tracks sharing.
+
+### Mechanism
+
+Linux intercepts `FICLONERANGE` / `FICLONE` ioctls in `do_vfs_ioctl()`
+before they reach FUSE.  FUSE3 instead provides the `copy_file_range`
+callback, which the kernel also invokes as a fallback for
+`cp --reflink=auto`.
+
+### Shared Blocks and Refcounts
+
+Each physical data block has an implicit refcount of 1.  When a clone
+operation shares a block between two inodes, `obmafs3_refcount_inc()`
+creates an explicit entry with refcount 2 in the refcount B+Tree.
+Entries are removed when the refcount drops back to 1.
+
+### Copy-on-Write
+
+When writing to a block with refcount > 1:
+
+**Inline extent path** (block mapped via inline extent slots):
+
+1. A new block is allocated.
+2. The inline extent is split to replace the old physical LBA with
+   the new one (`cow_replace_block`).
+3. The old block's refcount is decremented.
+4. The write proceeds to the new block.
+
+Adjacent contiguous extents are merged (`coalesce_inline_extents`)
+before each split to reclaim inline extent slots.
+
+**Overflow extent path** (block mapped via the overflow B+Tree):
+
+1. A new block is allocated.
+2. All overflow LBAs for the inode are collected into a flat array
+   (`overflow_collect_lbas`).
+3. The old physical LBA is replaced with the new one in the array.
+4. Overflow entries for the inode are cleared (`overflow_clear_inode`).
+5. The extent map (inline + overflow) is rebuilt from the flat array
+   (`rebuild_extent_map`).
+6. The old block's refcount is decremented.
+7. The write proceeds to the new block.
+
+### Refcount-Aware Freeing
+
+`obmafs3_fuse_truncate` and `obmafs3_fuse_unlink` check each block's
+refcount before freeing:
+
+- **refcount > 1**: decremented (block still in use by other inodes).
+- **refcount == 1**: freed to the allocation bitmap.
+
+### Limitations
+
+- Both offsets and the clone length must be aligned to the per-block
+  data capacity (`block_size - sizeof(block_header)`).
+- Same-inode clone is not supported.

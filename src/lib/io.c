@@ -204,6 +204,15 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
                 close(fd); free(c); return rc;
             }
         }
+
+        if (c->sb.refcount_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.refcount_lba,
+                                                   &c->refcount_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
     } else {
         rc = obmafs3_btree_header_read(c, c->sb.catalog_lba,
                                        &c->catalog_hdr);
@@ -251,6 +260,12 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         if (c->sb.metadata_idx_lba != 0) {
             rc = obmafs3_btree_header_read(c, c->sb.metadata_idx_lba,
                                            &c->metadata_idx_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
+
+        if (c->sb.refcount_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.refcount_lba,
+                                           &c->refcount_hdr);
             if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
         }
     }
@@ -382,6 +397,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
     sb.cd_suffix_lba   = 9;   /* block 9 */
     sb.cd_subchannel_lba = 10; /* block 10 */
     sb.metadata_idx_lba = 12;  /* block 12 */
+    sb.refcount_lba    = 13;   /* block 13 */
     sb.checksum_type   = kChecksumTypeXXH64;
     sb.creation_time   = (uint64_t)time(NULL);
 
@@ -398,9 +414,9 @@ int obmafs3_create(const char *path, uint64_t total_size,
         bitmap_blks = 1 + (bitmap_bytes - first_block_capacity +
                            block_size - 1) / block_size;
 
-    sb.bitmap_lba      = 13;                  /* bitmap starts at block 13 */
+    sb.bitmap_lba      = 14;                  /* bitmap starts at block 14 */
     sb.bitmap_blocks   = bitmap_blks;
-    sb.next_free_lba   = 13 + bitmap_blks;    /* first block after bitmap */
+    sb.next_free_lba   = 14 + bitmap_blks;    /* first block after bitmap */
     sb.next_inode_id   = 3;                    /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label,
             sizeof(sb.volume_label) - 1);
@@ -606,14 +622,26 @@ int obmafs3_create(const char *path, uint64_t total_size,
     rc = write_block(fd, block_size, 12, &midx_hdr, sizeof(midx_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
-    /* --- Blocks 13..13+N-1: Allocation bitmap --- */
+    /* --- Block 13: Refcount tree header (empty) --- */
+    struct btree_header ref_hdr;
+    memset(&ref_hdr, 0, sizeof(ref_hdr));
+    ref_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    ref_hdr.data_type = kBtreeDataTypeRefcountEntry;
+    ref_hdr.node_size = (uint16_t)block_size;
+    ref_hdr.tree_type = kBtreeTypeRefcount;
+    obmafs3_checksum_block(&ref_hdr, sizeof(ref_hdr), ref_hdr.checksum);
+
+    rc = write_block(fd, block_size, 13, &ref_hdr, sizeof(ref_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Blocks 14..14+N-1: Allocation bitmap --- */
     {
         /* Build the flat bitmap data */
         uint8_t *bitmap = calloc(1, (size_t)bitmap_bytes);
         if (!bitmap) { close(fd); return OBMAFS3_ERR_NOMEM; }
 
-        /* Mark blocks 0 through (13 + bitmap_blks - 1) as allocated */
-        uint64_t reserved = 13 + bitmap_blks;
+        /* Mark blocks 0 through (14 + bitmap_blks - 1) as allocated */
+        uint64_t reserved = 14 + bitmap_blks;
         for (uint64_t b = 0; b < reserved; b++)
             bitmap[b / 8] |= (1u << (b % 8));
 
@@ -652,7 +680,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
                 data_remaining -= copy;
             }
 
-            rc = write_block(fd, block_size, 13 + i, blk,
+            rc = write_block(fd, block_size, 14 + i, blk,
                              (size_t)block_size);
             if (rc != OBMAFS3_OK) {
                 free(blk);

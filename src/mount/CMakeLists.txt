@@ -3,6 +3,7 @@ add_executable(mount.obmafs
     fuse_ops.c
     fuse_read.c
     fuse_write.c
+    fuse_clone.c
     fuse_dir.c
     fuse_attr.c
     fuse_xattr.c

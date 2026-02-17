@@ -193,4 +193,5 @@ struct fuse_operations obmafs3_fuse_ops = {
     .listxattr   = obmafs3_fuse_listxattr,
     .removexattr = obmafs3_fuse_removexattr,
     .ioctl       = obmafs3_fuse_ioctl,
+    .copy_file_range = obmafs3_fuse_copy_file_range,
 };

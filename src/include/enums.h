@@ -23,7 +23,8 @@ enum obmafs3_btree_type {
     kBtreeTypeCdPrefix      = 6,
     kBtreeTypeCdSuffix      = 7,
     kBtreeTypeCdSubchannel  = 8,
-    kBtreeTypeMetadataIndex = 9
+    kBtreeTypeMetadataIndex = 9,
+    kBtreeTypeRefcount     = 10
 };
 
 /// Identifies the record format stored in a B+Tree.
@@ -37,7 +38,8 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeCdPrefixEntry      = 6,
     kBtreeDataTypeCdSuffixEntry      = 7,
     kBtreeDataTypeCdSubchannelEntry  = 8,
-    kBtreeDataTypeMetadataIndexEntry = 9
+    kBtreeDataTypeMetadataIndexEntry = 9,
+    kBtreeDataTypeRefcountEntry     = 10
 };
 
 /// Inode file type stored in inode_record::file_type.

@@ -93,4 +93,13 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
                        void *arg, struct fuse_file_info *fi,
                        unsigned int flags, void *data);
 
+ssize_t obmafs3_fuse_copy_file_range(const char *path_in,
+                                     struct fuse_file_info *fi_in,
+                                     off_t offset_in,
+                                     const char *path_out,
+                                     struct fuse_file_info *fi_out,
+                                     off_t offset_out,
+                                     size_t size,
+                                     int flags);
+
 #endif /* OBMAFS3_FUSE_OPS_INTERNAL_H */

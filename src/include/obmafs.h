@@ -36,6 +36,7 @@ struct obmafs3_ctx {
     struct btree_header cd_subchannel_hdr;///< Cached CD subchannel tree header
     struct btree_header metadata_hdr;    ///< Cached metadata tree header
     struct btree_header metadata_idx_hdr;///< Cached metadata index tree header
+    struct btree_header refcount_hdr;     ///< Cached refcount tree header
     uint8_t *bitmap;                 ///< In-memory allocation bitmap
     uint64_t bitmap_size;            ///< Size of allocation bitmap in bytes
     int compression;                 ///< Non-zero to compress data blocks on write
@@ -120,6 +121,19 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
 int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
                             struct inode_record *inode,
                             uint64_t offset, const void *buf, size_t size);
+
+/* --- Clone / reflink operations --- */
+int obmafs3_clone_file_range(struct obmafs3_ctx *ctx,
+                             const struct inode_record *src_inode,
+                             uint64_t src_offset,
+                             struct inode_record *dst_inode,
+                             uint64_t dst_offset,
+                             uint64_t length);
+int obmafs3_free_file_blocks(struct obmafs3_ctx *ctx,
+                             struct inode_record *inode);
+int obmafs3_truncate_file_blocks(struct obmafs3_ctx *ctx,
+                                 struct inode_record *inode,
+                                 uint64_t new_block_count);
 
 /* --- Deduplication operations --- */
 int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size,
@@ -240,6 +254,15 @@ void obmafs3_metadata_query_free(char **paths, uint32_t count);
 int  obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx,
                                 uint64_t inode_id,
                                 char *path_buf, size_t path_buf_size);
+
+/* --- Block refcount operations --- */
+int  obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba,
+                          uint32_t *ref_count);
+int  obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba,
+                          uint32_t ref_count);
+int  obmafs3_refcount_inc(struct obmafs3_ctx *ctx, uint64_t lba);
+int  obmafs3_refcount_dec(struct obmafs3_ctx *ctx, uint64_t lba,
+                          uint32_t *new_count);
 
 /* --- CD ECC/EDC operations --- */
 void   *ecc_cd_init(void);

@@ -238,38 +238,10 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize,
             : 0;
 
         if (new_blocks_needed < old_blocks) {
-            /* Walk extents and free trailing blocks */
-            uint64_t block_idx = 0;
-            for (int ei = 0; ei < 8; ei++) {
-                if (ip->extents[ei].block_count == 0)
-                    continue;
-                uint64_t ext_end = block_idx +
-                                   ip->extents[ei].block_count;
-                if (ext_end <= new_blocks_needed) {
-                    block_idx = ext_end;
-                    continue;
-                }
-                if (block_idx >= new_blocks_needed) {
-                    /* Free entire extent */
-                    obmafs3_free_blocks(
-                        g_ctx,
-                        ip->extents[ei].start_block,
-                        ip->extents[ei].block_count);
-                    ip->extents[ei].start_block = 0;
-                    ip->extents[ei].block_count = 0;
-                } else {
-                    /* Partially free this extent */
-                    uint64_t keep = new_blocks_needed - block_idx;
-                    uint64_t free_count =
-                        ip->extents[ei].block_count - keep;
-                    obmafs3_free_blocks(
-                        g_ctx,
-                        ip->extents[ei].start_block + keep,
-                        free_count);
-                    ip->extents[ei].block_count = keep;
-                }
-                block_idx = ext_end;
-            }
+            rc = obmafs3_truncate_file_blocks(g_ctx, ip,
+                                              new_blocks_needed);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
         }
 
         ip->file_size = (uint64_t)newsize;
@@ -509,7 +481,9 @@ int obmafs3_fuse_unlink(const char *path)
         if (rc != OBMAFS3_OK)
             return -EIO;
     } else {
-        /* Last reference — delete media tags and then the inode */
+        /* Last reference — free data blocks, media tags, and inode */
+        obmafs3_free_file_blocks(g_ctx, &inode);
+
         if (inode.file_type == kFileTypeMediaImage)
             obmafs3_media_tag_delete_all(g_ctx, cat_entry.inode_id);
 
