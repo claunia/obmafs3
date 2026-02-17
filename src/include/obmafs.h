@@ -9,6 +9,7 @@
 #include "block.h"
 #include "defs.h"
 #include "enums.h"
+#include "tags.h"
 
 /* Error codes */
 #define OBMAFS3_OK            0
@@ -28,6 +29,7 @@ struct obmafs3_ctx {
     struct btree_header catalog_hdr; /**< Cached catalog tree header */
     struct btree_header inode_hdr;   /**< Cached inode tree header */
     struct btree_header overflow_hdr;/**< Cached overflow tree header */
+    struct btree_header media_tag_hdr;/**< Cached media tag tree header */
     uint8_t *bitmap;                 /**< In-memory allocation bitmap */
     uint64_t bitmap_size;            /**< Size of allocation bitmap in bytes */
     int compression;                 /**< Non-zero to compress data blocks on write */
@@ -177,6 +179,22 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
                                   const struct inode_record *inode,
                                   uint64_t offset, void *buf,
                                   size_t size, uint16_t sector_size);
+
+/* --- Media tag operations --- */
+int  obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                           uint16_t tag_type,
+                           void **data, uint32_t *data_length);
+void obmafs3_media_tag_data_free(void *data);
+int  obmafs3_media_tag_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                           uint16_t tag_type,
+                           const void *data, uint32_t data_length);
+int  obmafs3_media_tag_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                              uint16_t tag_type);
+int  obmafs3_media_tag_delete_all(struct obmafs3_ctx *ctx,
+                                  uint64_t inode_id);
+int  obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                            uint16_t **tag_types, uint32_t *count);
+void obmafs3_media_tag_list_free(uint16_t *tag_types);
 
 /* --- Checksum operations --- */
 uint64_t obmafs3_checksum_xxh64(const void *data, size_t size);

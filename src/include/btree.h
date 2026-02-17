@@ -99,4 +99,35 @@ struct __attribute__((packed)) catalog_index_entry {
     uint64_t child_lba;     /**< LBA of the child node */
 };
 
+/* ---- Media tag B+Tree ---- */
+
+#define MEDIA_TAG_INLINE_MAX 512
+#define MEDIA_TAG_FLAG_INLINE 0x01
+
+/**
+ * Media tag record stored in B+Tree leaf nodes.
+ * Sorted by (inode_id, tag_type) composite key.
+ * Tags up to MEDIA_TAG_INLINE_MAX bytes are stored inline;
+ * larger tags are stored in separately allocated blocks.
+ */
+struct __attribute__((packed)) media_tag_record {
+    uint64_t inode_id;                          /**< Disk image inode this tag belongs to */
+    uint16_t tag_type;                          /**< MediaTagType enum value */
+    uint32_t data_length;                       /**< Total length of the tag data */
+    uint8_t  flags;                             /**< MEDIA_TAG_FLAG_INLINE if data is inline */
+    uint64_t data_lba;                          /**< LBA of external data blocks (0 if inline) */
+    uint64_t data_blocks;                       /**< Number of external blocks allocated (0 if inline) */
+    uint8_t  inline_data[MEDIA_TAG_INLINE_MAX]; /**< Inline data storage */
+};
+
+/**
+ * Index entry for media tag B+Tree internal nodes.
+ * Uses composite key (inode_id, tag_type).
+ */
+struct __attribute__((packed)) media_tag_index_entry {
+    uint64_t inode_id;     /**< Smallest inode_id reachable through child */
+    uint16_t tag_type;     /**< Smallest tag_type reachable through child */
+    uint64_t child_lba;    /**< LBA of the child node */
+};
+
 #endif /* OBMAFS3_BTREE_H */

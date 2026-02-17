@@ -497,6 +497,113 @@ static int collect_overflow_data_blocks(struct obmafs3_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Collect external data blocks used by media tags                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Walk the media tag B+Tree and collect all external (non-inline)
+ * data block LBAs.
+ */
+static int collect_media_tag_data_blocks(struct obmafs3_ctx *ctx,
+                                         uint64_t **out_lbas,
+                                         uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if (ctx->sb.media_tag_lba == 0 ||
+        ctx->media_tag_hdr.root_node_lba == 0)
+        return OBMAFS3_OK;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t *lbas = NULL;
+    uint64_t count = 0;
+    uint64_t cap   = 0;
+
+    uint64_t *stack   = malloc(64 * sizeof(uint64_t));
+    uint64_t stk_size = 0;
+    uint64_t stk_cap  = 64;
+    if (!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    stack[stk_size++] = ctx->media_tag_hdr.root_node_lba;
+
+    while (stk_size > 0) {
+        uint64_t lba = stack[--stk_size];
+
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            free(buf); free(stack); free(lbas); return rc;
+        }
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+
+        if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); free(stack); free(lbas);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (nhdr.level > 0) {
+            const uint8_t *entries =
+                buf + sizeof(struct btree_node_header);
+            for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+                struct media_tag_index_entry ie;
+                memcpy(&ie,
+                       entries + i * sizeof(struct media_tag_index_entry),
+                       sizeof(ie));
+                if (stk_size >= stk_cap) {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack,
+                                            stk_cap * sizeof(*tmp));
+                    if (!tmp) {
+                        free(buf); free(stack); free(lbas);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                    stack = tmp;
+                }
+                stack[stk_size++] = ie.child_lba;
+            }
+        } else {
+            const uint8_t *entries =
+                buf + sizeof(struct btree_node_header);
+            for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+                struct media_tag_record rec;
+                memcpy(&rec,
+                       entries + i * sizeof(struct media_tag_record),
+                       sizeof(rec));
+
+                if (!(rec.flags & MEDIA_TAG_FLAG_INLINE) &&
+                    rec.data_lba != 0 && rec.data_blocks != 0) {
+                    for (uint64_t b = 0; b < rec.data_blocks; b++) {
+                        if (count >= cap) {
+                            cap = (cap == 0) ? 32 : cap * 2;
+                            uint64_t *tmp = realloc(lbas,
+                                                    cap * sizeof(*tmp));
+                            if (!tmp) {
+                                free(buf); free(stack); free(lbas);
+                                return OBMAFS3_ERR_NOMEM;
+                            }
+                            lbas = tmp;
+                        }
+                        lbas[count++] = rec.data_lba + b;
+                    }
+                }
+            }
+        }
+    }
+
+    free(buf);
+    free(stack);
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Collect all blocks used by dedup trees (headers, nodes, data)      */
 /* ------------------------------------------------------------------ */
 
@@ -806,6 +913,23 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
     if (ctx->sb.dedup_lba != 0)
         MARK(ctx->sb.dedup_lba);
 
+    /* Media tag tree header and nodes (if present) */
+    if (ctx->sb.media_tag_lba != 0) {
+        MARK(ctx->sb.media_tag_lba);
+        if (ctx->media_tag_hdr.root_node_lba != 0) {
+            uint64_t *mt_nodes = NULL;
+            uint64_t mt_count = 0;
+            int rc = walk_inode_btree_nodes(ctx,
+                                            ctx->media_tag_hdr.root_node_lba,
+                                            &mt_nodes, &mt_count);
+            if (rc == OBMAFS3_OK) {
+                for (uint64_t i = 0; i < mt_count; i++)
+                    MARK(mt_nodes[i]);
+                free(mt_nodes);
+            }
+        }
+    }
+
     /* Bitmap blocks */
     for (uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++)
         MARK(ctx->sb.bitmap_lba + i);
@@ -855,6 +979,22 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
         } else {
             fprintf(stderr,
                     "Warning: could not collect dedup tree blocks\n");
+        }
+    }
+
+    /* External media tag data blocks */
+    {
+        uint64_t *mt_data_lbas = NULL;
+        uint64_t mt_data_count = 0;
+        int rc = collect_media_tag_data_blocks(ctx, &mt_data_lbas,
+                                               &mt_data_count);
+        if (rc == OBMAFS3_OK) {
+            for (uint64_t i = 0; i < mt_data_count; i++)
+                MARK(mt_data_lbas[i]);
+            free(mt_data_lbas);
+        } else {
+            fprintf(stderr,
+                    "Warning: could not collect media tag data blocks\n");
         }
     }
 
@@ -1948,6 +2088,49 @@ int main(int argc, char *argv[])
                 errors++;
             }
             free(list_buf);
+        }
+    }
+
+    /* ---- Media tag tree ---- */
+    if (ctx->sb.media_tag_lba != 0) {
+        printf("\nMedia tag tree:\n");
+        printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+               ctx->media_tag_hdr.magic,
+               ctx->media_tag_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+                   ? "OK" : "BAD");
+        {
+            int mt_hdr_cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.media_tag_lba,
+                                              &ctx->media_tag_hdr,
+                                              &mt_hdr_cs_ok);
+            printf("  Header checksum:  %s\n",
+                   mt_hdr_cs_ok ? "OK" : "BAD");
+            if (!mt_hdr_cs_ok) errors++;
+        }
+
+        if (ctx->media_tag_hdr.root_node_lba != 0) {
+            uint64_t *mt_nodes = NULL;
+            uint64_t mt_node_count = 0;
+            int wrc = walk_inode_btree_nodes(ctx,
+                                             ctx->media_tag_hdr.root_node_lba,
+                                             &mt_nodes, &mt_node_count);
+            if (wrc == OBMAFS3_OK) {
+                uint64_t mt_bad = 0;
+                verify_btree_node_checksums(ctx, mt_nodes,
+                                            mt_node_count,
+                                            "Media tag", &mt_bad);
+                free(mt_nodes);
+                if (mt_bad > 0) {
+                    printf("  Node checksums:   %" PRIu64 " BAD\n",
+                           mt_bad);
+                    errors++;
+                } else {
+                    printf("  Node checksums:   OK\n");
+                }
+            } else {
+                printf("  Node checksums:   could not walk tree\n");
+                errors++;
+            }
         }
     }
 

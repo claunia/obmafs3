@@ -6,11 +6,13 @@
  */
 
 #include "fuse_ops.h"
+#include "tags.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <linux/stat.h>
@@ -871,7 +873,10 @@ static int obmafs3_fuse_unlink(const char *path)
         if (rc != OBMAFS3_OK)
             return -EIO;
     } else {
-        /* Last reference — delete the inode (and its data) */
+        /* Last reference — delete media tags and then the inode */
+        if (inode.file_type == kFileTypeMediaImage)
+            obmafs3_media_tag_delete_all(g_ctx, cat_entry.inode_id);
+
         rc = obmafs3_inode_delete(g_ctx, cat_entry.inode_id);
         if (rc != OBMAFS3_OK)
             return -EIO;
@@ -1302,6 +1307,405 @@ static int obmafs3_fuse_statx(const char *path, int flags, int mask,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Media tag xattr / ioctl support                                    */
+/* ------------------------------------------------------------------ */
+
+#define MEDIATAG_XATTR_PREFIX     "user.mediatag."
+#define MEDIATAG_XATTR_PREFIX_LEN 14   /* strlen("user.mediatag.") */
+
+/** Map MediaTagType ordinal to xattr suffix name.  NULL = unused slot. */
+static const char *media_tag_xattr_names[] = {
+    [kCdTableOfContents]               = "cd_toc",
+    [kCdSessionInfo]                    = "cd_session_info",
+    [kCdFullTOC]                        = "cd_full_toc",
+    [kCdPMA]                            = "cd_pma",
+    [kCdATIP]                           = "cd_atip",
+    [kCdTEXT]                           = "cd_text",
+    [kCdMCN]                            = "cd_mcn",
+    [kDvdPFI]                           = "dvd_pfi",
+    [kDvdCMI]                           = "dvd_cmi",
+    [kDvdDiscKey]                       = "dvd_disc_key",
+    [kDvdBCA]                           = "dvd_bca",
+    [kDvdDMI]                           = "dvd_dmi",
+    [kDvdMediaIdentifier]               = "dvd_media_id",
+    [kDvdMKB]                           = "dvd_mkb",
+    [kDvdRamDDS]                        = "dvd_ram_dds",
+    [kDvdRamMediumStatus]               = "dvd_ram_medium_status",
+    [kDvdRamSpareArea]                  = "dvd_ram_spare_area",
+    [kDvdRecordableRMD]                 = "dvd_recordable_rmd",
+    [kDvdRecordablePreRecordedInfo]     = "dvd_recordable_pre_recorded_info",
+    [kDvdRecordableMediaIdentifier]     = "dvd_recordable_media_id",
+    [kDvdRecordablePFI]                 = "dvd_recordable_pfi",
+    [kDvdADIP]                          = "dvd_adip",
+    [kHdDvdCPI]                         = "hddvd_cpi",
+    [kHdDvdMediumStatus]                = "hddvd_medium_status",
+    [kDvdDlLayerCapacity]               = "dvd_dl_layer_capacity",
+    [kDvdDlMiddleZoneAddress]           = "dvd_dl_middle_zone_address",
+    [kDvdDlJumpIntervalSize]            = "dvd_dl_jump_interval_size",
+    [kDvdDlManualLayerJumpLBA]          = "dvd_dl_manual_layer_jump_lba",
+    [kBdDI]                             = "bd_di",
+    [kBdBCA]                            = "bd_bca",
+    [kBdDDS]                            = "bd_dds",
+    [kBdCartridgeStatus]                = "bd_cartridge_status",
+    [kBdSpareArea]                      = "bd_spare_area",
+    [kAACS_VolumeIdentifier]            = "aacs_volume_id",
+    [kAACS_SerialNumber]                = "aacs_serial_number",
+    [kAACS_MediaIdentifier]             = "aacs_media_id",
+    [kAACS_MKB]                         = "aacs_mkb",
+    [kAACS_DataKeys]                    = "aacs_data_keys",
+    [kAACS_LBAExtents]                  = "aacs_lba_extents",
+    [kAACS_CPRM_MKB]                    = "aacs_cprm_mkb",
+    [kHybrid_RecognizedLayers]          = "hybrid_recognized_layers",
+    [kMMC_WriteProtection]              = "mmc_write_protection",
+    [kMMC_DiscInformation]              = "mmc_disc_information",
+    [kMMC_TrackResourcesInformation]    = "mmc_track_resources",
+    [kMMC_POWResourcesInformation]      = "mmc_pow_resources",
+    [kSCSI_INQUIRY]                     = "scsi_inquiry",
+    [kSCSI_MODEPAGE_2A]                 = "scsi_modepage_2a",
+    [kATA_IDENTIFY]                     = "ata_identify",
+    [kATAPI_IDENTIFY]                   = "atapi_identify",
+    [kPCMCIA_CIS]                       = "pcmcia_cis",
+    [kSecureDigital_CID]                = "sd_cid",
+    [kSecureDigital_CSD]                = "sd_csd",
+    [kSecureDigital_SCR]                = "sd_scr",
+    [kSecureDigital_OCR]                = "sd_ocr",
+    [kMMC_CID]                          = "mmc_cid",
+    [kMMC_CSD]                          = "mmc_csd",
+    [kMMC_OCR]                          = "mmc_ocr",
+    [kMMC_ExtendedCSD]                  = "mmc_extended_csd",
+    [kXbox_SecuritySector]              = "xbox_security_sector",
+    [kFloppy_LeadOut]                   = "floppy_lead_out",
+    [kDiscControlBlock]                 = "disc_control_block",
+    [kCD_FirstTrackPregap]              = "cd_first_track_pregap",
+    [kCD_LeadOut]                       = "cd_lead_out",
+    [kSCSI_MODESENSE_6]                 = "scsi_mode_sense_6",
+    [kSCSI_MODESENSE_10]                = "scsi_mode_sense_10",
+    [kUSB_Descriptors]                  = "usb_descriptors",
+    [kXbox_DMI]                         = "xbox_dmi",
+    [kXbox_PFI]                         = "xbox_pfi",
+    [kMiniDiscType]                     = "minidisc_type",
+    [kMiniDiscD5]                       = "minidisc_d5",
+    [kMiniDiscUTOC]                     = "minidisc_utoc",
+    [kMiniDiscDTOC]                     = "minidisc_dtoc",
+    [kDVD_DiscKey_Decrypted]            = "dvd_disc_key_decrypted",
+    [kDVD_PFI_2ndLayer]                 = "dvd_pfi_2nd_layer",
+    [kFloppy_WriteProtect]              = "floppy_write_protect",
+};
+
+#define MEDIA_TAG_XATTR_COUNT \
+    (sizeof(media_tag_xattr_names) / sizeof(media_tag_xattr_names[0]))
+
+/** Parse "user.mediatag.<name>" and return the tag type, or -1 on error. */
+static int parse_mediatag_xattr(const char *name)
+{
+    if (strncmp(name, MEDIATAG_XATTR_PREFIX, MEDIATAG_XATTR_PREFIX_LEN) != 0)
+        return -1;
+
+    const char *tag_name = name + MEDIATAG_XATTR_PREFIX_LEN;
+
+    for (size_t i = 0; i < MEDIA_TAG_XATTR_COUNT; i++) {
+        if (media_tag_xattr_names[i] &&
+            strcmp(tag_name, media_tag_xattr_names[i]) == 0)
+            return (int)i;
+    }
+
+    return -1;
+}
+
+/** Check whether a name starts with the mediatag xattr prefix. */
+static int is_mediatag_xattr(const char *name)
+{
+    return strncmp(name, MEDIATAG_XATTR_PREFIX,
+                   MEDIATAG_XATTR_PREFIX_LEN) == 0;
+}
+
+static int obmafs3_fuse_getxattr(const char *path, const char *name,
+                                  char *value, size_t size)
+{
+    if (!is_mediatag_xattr(name))
+        return -ENODATA;
+
+    int tag_type = parse_mediatag_xattr(name);
+    if (tag_type < 0)
+        return -ENODATA;
+
+    if (strcmp(path, "/") == 0)
+        return -ENODATA;
+
+    uint64_t parent_id;
+    const char *fname;
+    int rc = resolve_path(path, &parent_id, &fname);
+    if (rc != 0)
+        return rc;
+
+    struct catalog_record cat_entry;
+    rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    if (inode.file_type != kFileTypeMediaImage)
+        return -ENODATA;
+
+    void *data;
+    uint32_t data_length;
+    rc = obmafs3_media_tag_get(g_ctx, cat_entry.inode_id,
+                               (uint16_t)tag_type, &data, &data_length);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENODATA;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    if (size == 0) {
+        obmafs3_media_tag_data_free(data);
+        return (int)data_length;
+    }
+
+    if (size < data_length) {
+        obmafs3_media_tag_data_free(data);
+        return -ERANGE;
+    }
+
+    memcpy(value, data, data_length);
+    obmafs3_media_tag_data_free(data);
+    return (int)data_length;
+}
+
+static int obmafs3_fuse_setxattr(const char *path, const char *name,
+                                  const char *value, size_t size, int flags)
+{
+    (void)flags;
+
+    if (!is_mediatag_xattr(name))
+        return -ENOTSUP;
+
+    int tag_type = parse_mediatag_xattr(name);
+    if (tag_type < 0)
+        return -ENOTSUP;
+
+    if (strcmp(path, "/") == 0)
+        return -ENOTSUP;
+
+    uint64_t parent_id;
+    const char *fname;
+    int rc = resolve_path(path, &parent_id, &fname);
+    if (rc != 0)
+        return rc;
+
+    struct catalog_record cat_entry;
+    rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    if (inode.file_type != kFileTypeMediaImage)
+        return -ENOTSUP;
+
+    rc = obmafs3_media_tag_put(g_ctx, cat_entry.inode_id,
+                                (uint16_t)tag_type, value,
+                                (uint32_t)size);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
+static int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
+{
+    if (strcmp(path, "/") == 0)
+        return 0;
+
+    uint64_t parent_id;
+    const char *fname;
+    int rc = resolve_path(path, &parent_id, &fname);
+    if (rc != 0)
+        return rc;
+
+    struct catalog_record cat_entry;
+    rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    if (inode.file_type != kFileTypeMediaImage)
+        return 0;
+
+    uint16_t *tag_types;
+    uint32_t count;
+    rc = obmafs3_media_tag_list(g_ctx, cat_entry.inode_id,
+                                &tag_types, &count);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Calculate total size of all xattr names */
+    size_t total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (tag_types[i] < MEDIA_TAG_XATTR_COUNT &&
+            media_tag_xattr_names[tag_types[i]]) {
+            total += MEDIATAG_XATTR_PREFIX_LEN +
+                     strlen(media_tag_xattr_names[tag_types[i]]) + 1;
+        }
+    }
+
+    if (size == 0) {
+        obmafs3_media_tag_list_free(tag_types);
+        return (int)total;
+    }
+
+    if (size < total) {
+        obmafs3_media_tag_list_free(tag_types);
+        return -ERANGE;
+    }
+
+    char *p = list;
+    for (uint32_t i = 0; i < count; i++) {
+        if (tag_types[i] < MEDIA_TAG_XATTR_COUNT &&
+            media_tag_xattr_names[tag_types[i]]) {
+            int n = snprintf(p, size - (size_t)(p - list),
+                             "%s%s", MEDIATAG_XATTR_PREFIX,
+                             media_tag_xattr_names[tag_types[i]]);
+            p += n + 1;   /* include NUL terminator */
+        }
+    }
+
+    obmafs3_media_tag_list_free(tag_types);
+    return (int)total;
+}
+
+static int obmafs3_fuse_removexattr(const char *path, const char *name)
+{
+    if (!is_mediatag_xattr(name))
+        return -ENOTSUP;
+
+    int tag_type = parse_mediatag_xattr(name);
+    if (tag_type < 0)
+        return -ENOTSUP;
+
+    if (strcmp(path, "/") == 0)
+        return -ENOTSUP;
+
+    uint64_t parent_id;
+    const char *fname;
+    int rc = resolve_path(path, &parent_id, &fname);
+    if (rc != 0)
+        return rc;
+
+    struct catalog_record cat_entry;
+    rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    if (inode.file_type != kFileTypeMediaImage)
+        return -ENOTSUP;
+
+    rc = obmafs3_media_tag_delete(g_ctx, cat_entry.inode_id,
+                                   (uint16_t)tag_type);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENODATA;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
+/* ---- ioctl for media tags ---- */
+
+#define OBMAFS3_IOC_MAX_TAG_DATA 16368
+
+struct obmafs3_ioctl_tag_arg {
+    uint16_t tag_type;
+    uint32_t data_length;
+    uint8_t  data[OBMAFS3_IOC_MAX_TAG_DATA];
+};
+
+#define OBMAFS3_IOC_SET_MEDIA_TAG \
+    _IOW('O', 1, struct obmafs3_ioctl_tag_arg)
+#define OBMAFS3_IOC_GET_MEDIA_TAG \
+    _IOWR('O', 2, struct obmafs3_ioctl_tag_arg)
+
+static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
+                               void *arg, struct fuse_file_info *fi,
+                               unsigned int flags, void *data)
+{
+    (void)path;
+    (void)arg;
+    (void)flags;
+
+    struct fuse_file_ctx *ffctx =
+        fi ? (struct fuse_file_ctx *)(uintptr_t)fi->fh : NULL;
+    if (!ffctx)
+        return -EBADF;
+
+    if (ffctx->inode.file_type != kFileTypeMediaImage)
+        return -ENOTTY;
+
+    struct obmafs3_ioctl_tag_arg *tag_arg =
+        (struct obmafs3_ioctl_tag_arg *)data;
+
+    switch (cmd) {
+    case OBMAFS3_IOC_SET_MEDIA_TAG: {
+        if (!tag_arg || tag_arg->data_length > OBMAFS3_IOC_MAX_TAG_DATA)
+            return -EINVAL;
+        int rc = obmafs3_media_tag_put(g_ctx, ffctx->inode_id,
+                                        tag_arg->tag_type,
+                                        tag_arg->data,
+                                        tag_arg->data_length);
+        return rc == OBMAFS3_OK ? 0 : -EIO;
+    }
+
+    case OBMAFS3_IOC_GET_MEDIA_TAG: {
+        if (!tag_arg)
+            return -EINVAL;
+        void *buf;
+        uint32_t length;
+        int rc = obmafs3_media_tag_get(g_ctx, ffctx->inode_id,
+                                        tag_arg->tag_type,
+                                        &buf, &length);
+        if (rc == OBMAFS3_ERR_NOTFOUND)
+            return -ENODATA;
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        if (length > OBMAFS3_IOC_MAX_TAG_DATA) {
+            obmafs3_media_tag_data_free(buf);
+            return -ERANGE;
+        }
+        tag_arg->data_length = length;
+        memcpy(tag_arg->data, buf, length);
+        obmafs3_media_tag_data_free(buf);
+        return 0;
+    }
+
+    default:
+        return -ENOTTY;
+    }
+}
+
 struct fuse_operations obmafs3_fuse_ops = {
     .getattr  = obmafs3_fuse_getattr,
     .readdir  = obmafs3_fuse_readdir,
@@ -1323,4 +1727,9 @@ struct fuse_operations obmafs3_fuse_ops = {
     .chown    = obmafs3_fuse_chown,
     .statfs   = obmafs3_fuse_statfs,
     .statx    = obmafs3_fuse_statx,
+    .getxattr    = obmafs3_fuse_getxattr,
+    .setxattr    = obmafs3_fuse_setxattr,
+    .listxattr   = obmafs3_fuse_listxattr,
+    .removexattr = obmafs3_fuse_removexattr,
+    .ioctl       = obmafs3_fuse_ioctl,
 };
