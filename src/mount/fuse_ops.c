@@ -535,6 +535,13 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
         struct dedup_block_cache *dbc =
             (ffctx && ffctx->sector_size) ? &ffctx->db_cache : NULL;
 
+        /* Start the background compression worker on the first write */
+        if (dbc && !dbc->bg_compress) {
+            int brc = obmafs3_bg_compress_start(g_ctx, dbc);
+            if (brc != OBMAFS3_OK)
+                return -EIO;
+        }
+
         rc = obmafs3_write_media_image_data(g_ctx, ip,
                                             (uint64_t)offset, buf,
                                             size, ss, cache, dbc);

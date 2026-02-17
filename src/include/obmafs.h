@@ -148,6 +148,7 @@ struct dedup_block_cache {
     uint64_t  std_blocks;    /**< Number of standard blocks per dedup block */
     int       dirty;         /**< Whether the buffer has been modified */
     int       initialized;   /**< Non-zero once first init has run */
+    void     *bg_compress;   /**< Opaque background compression context */
 };
 
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
@@ -160,6 +161,12 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx,
                                     uint16_t sector_size,
                                     struct dedup_block_cache *db_cache);
 void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache);
+
+/** Start a background compression worker thread for the dedup block cache. */
+int  obmafs3_bg_compress_start(struct obmafs3_ctx *ctx,
+                               struct dedup_block_cache *db_cache);
+/** Wait for any pending background compression and shut down the worker. */
+void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
                                    struct btree_node_inode *inode,
                                    struct sector_map_cache *cache);
