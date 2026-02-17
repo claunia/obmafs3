@@ -119,10 +119,29 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size,
 int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx,
                          const struct btree_header *hdr,
                          uint64_t hash, struct dedup_entry *entry);
+
+/**
+ * In-memory cache of sector_map_entries.  When non-NULL is passed to
+ * obmafs3_write_media_image_data, entries are accumulated here instead
+ * of being written to disk on every FUSE write call.  Call
+ * obmafs3_flush_sector_map_cache to write them out (e.g. on close).
+ */
+struct sector_map_cache {
+    struct sector_map_entry *entries;
+    uint64_t count;
+    uint64_t capacity;
+};
+
 int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx,
                                    struct btree_node_inode *inode,
                                    uint64_t offset, const void *buf,
-                                   size_t size, uint16_t sector_size);
+                                   size_t size, uint16_t sector_size,
+                                   struct sector_map_cache *cache);
+int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
+                                   struct btree_node_inode *inode,
+                                   struct sector_map_cache *cache);
+void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
+
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
                                   const struct btree_node_inode *inode,
                                   uint64_t offset, void *buf,

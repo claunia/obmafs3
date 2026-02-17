@@ -18,6 +18,19 @@
 
 struct obmafs3_ctx *g_ctx = NULL;
 
+/**
+ * Per-file-handle context.  For media image files, this caches
+ * sector_map_entries in RAM across multiple FUSE write calls and
+ * flushes them to disk when the file is closed (release).
+ */
+struct fuse_file_ctx {
+    uint64_t                inode_id;
+    uint16_t                sector_size;   /* 0 for non-media-image files */
+    struct btree_node_inode inode;         /* cached inode */
+    int                     inode_dirty;   /* needs write-back on release */
+    struct sector_map_cache sme_cache;
+};
+
 /* Disk image extension-to-sector-size mappings */
 struct disk_image_mapping g_disk_image_maps[OBMAFS3_MAX_DISK_IMAGE_MAPS];
 int g_disk_image_map_count = 0;
@@ -170,10 +183,14 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
                                 struct fuse_file_info *fi)
 {
     struct btree_node_inode inode;
+    struct btree_node_inode *ip;
     int rc;
 
-    (void)fi;
     memset(stbuf, 0, sizeof(*stbuf));
+
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
 
     if (strcmp(path, "/") == 0) {
         rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
@@ -205,22 +222,27 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if (ffctx) {
+        ip = &ffctx->inode;
+    } else {
+        rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        ip = &inode;
+    }
 
-    stbuf->st_ino = inode.inode_id;
-    if (cat_entry.directory_flag || inode.file_type == kFileTypeDirectory)
-        stbuf->st_mode = S_IFDIR | inode.mode;
+    stbuf->st_ino = ip->inode_id;
+    if (cat_entry.directory_flag || ip->file_type == kFileTypeDirectory)
+        stbuf->st_mode = S_IFDIR | ip->mode;
     else
-        stbuf->st_mode = S_IFREG | inode.mode;
+        stbuf->st_mode = S_IFREG | ip->mode;
     stbuf->st_nlink = cat_entry.directory_flag ? 2 : 1;
-    stbuf->st_uid   = inode.uid;
-    stbuf->st_gid   = inode.gid;
-    stbuf->st_size  = (off_t)inode.file_size;
-    stbuf->st_atime = (time_t)inode.access_time;
-    stbuf->st_mtime = (time_t)inode.modification_time;
-    stbuf->st_ctime = (time_t)inode.creation_time;
+    stbuf->st_uid   = ip->uid;
+    stbuf->st_gid   = ip->gid;
+    stbuf->st_size  = (off_t)ip->file_size;
+    stbuf->st_atime = (time_t)ip->access_time;
+    stbuf->st_mtime = (time_t)ip->modification_time;
+    stbuf->st_ctime = (time_t)ip->creation_time;
     return 0;
 }
 
@@ -299,47 +321,76 @@ static int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
     if (cat_entry.directory_flag)
         return -EISDIR;
 
+    struct fuse_file_ctx *fctx = calloc(1, sizeof(*fctx));
+    if (!fctx)
+        return -ENOMEM;
+
+    fctx->inode_id = cat_entry.inode_id;
+
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &fctx->inode);
+    if (rc != OBMAFS3_OK) {
+        free(fctx);
+        return -EIO;
+    }
+
+    if (fctx->inode.file_type == kFileTypeMediaImage)
+        fctx->sector_size = lookup_disk_image_sector_size(name);
+
+    fi->fh = (uint64_t)(uintptr_t)fctx;
     return 0;
 }
 
 static int obmafs3_fuse_read(const char *path, char *buf, size_t size,
                              off_t offset, struct fuse_file_info *fi)
 {
-    uint64_t parent_id;
-    const char *name;
-    struct btree_node_filename cat_entry;
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
     struct btree_node_inode inode;
+    struct btree_node_inode *ip;
     int rc;
 
-    (void)fi;
+    if (ffctx) {
+        ip = &ffctx->inode;
+    } else {
+        uint64_t parent_id;
+        const char *name;
+        struct btree_node_filename cat_entry;
+        rc = resolve_path(path, &parent_id, &name);
+        if (rc != 0)
+            return rc;
+        rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        ip = &inode;
+    }
 
-    rc = resolve_path(path, &parent_id, &name);
-    if (rc != 0)
-        return rc;
-
-    rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
-
-    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
-
-    if ((uint64_t)offset >= inode.file_size)
+    if ((uint64_t)offset >= ip->file_size)
         return 0;
 
-    if ((uint64_t)offset + size > inode.file_size)
-        size = (size_t)(inode.file_size - (uint64_t)offset);
+    if ((uint64_t)offset + size > ip->file_size)
+        size = (size_t)(ip->file_size - (uint64_t)offset);
 
-    if (inode.file_type == kFileTypeMediaImage) {
-        uint16_t ss = lookup_disk_image_sector_size(name);
+    if (ip->file_type == kFileTypeMediaImage) {
+        uint16_t ss = ffctx ? ffctx->sector_size : 0;
+        if (ss == 0) {
+            uint64_t parent_id;
+            const char *name;
+            rc = resolve_path(path, &parent_id, &name);
+            if (rc != 0)
+                return rc;
+            ss = lookup_disk_image_sector_size(name);
+        }
         if (ss == 0)
             return -EINVAL;
-        rc = obmafs3_read_media_image_data(g_ctx, &inode,
+        rc = obmafs3_read_media_image_data(g_ctx, ip,
                                            (uint64_t)offset, buf,
                                            size, ss);
     } else {
-        rc = obmafs3_read_file_data(g_ctx, &inode, (uint64_t)offset,
+        rc = obmafs3_read_file_data(g_ctx, ip, (uint64_t)offset,
                                     buf, size);
     }
 
@@ -360,8 +411,6 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     const char *name;
     struct btree_node_filename cat_entry;
     int rc;
-
-    (void)fi;
 
     rc = resolve_path(path, &parent_id, &name);
     if (rc != 0)
@@ -418,12 +467,21 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     new_inode.sector_map_size   = 0;
 
     /* Check if this file should be treated as a media/disk image */
-    if (lookup_disk_image_sector_size(name) > 0)
+    uint16_t ss = lookup_disk_image_sector_size(name);
+    if (ss > 0)
         new_inode.file_type = kFileTypeMediaImage;
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
     if (rc != OBMAFS3_OK)
         return -EIO;
+
+    struct fuse_file_ctx *ffctx = calloc(1, sizeof(*ffctx));
+    if (!ffctx)
+        return -ENOMEM;
+    ffctx->inode_id    = new_inode_id;
+    ffctx->sector_size = ss;
+    ffctx->inode       = new_inode;
+    fi->fh = (uint64_t)(uintptr_t)ffctx;
 
     return 0;
 }
@@ -432,35 +490,53 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
                               size_t size, off_t offset,
                               struct fuse_file_info *fi)
 {
-    uint64_t parent_id;
-    const char *name;
-    struct btree_node_filename cat_entry;
     struct btree_node_inode inode;
+    struct btree_node_inode *ip;
     int rc;
 
-    (void)fi;
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
 
-    rc = resolve_path(path, &parent_id, &name);
-    if (rc != 0)
-        return rc;
+    if (ffctx) {
+        ip = &ffctx->inode;
+    } else {
+        uint64_t parent_id;
+        const char *name;
+        struct btree_node_filename cat_entry;
+        rc = resolve_path(path, &parent_id, &name);
+        if (rc != 0)
+            return rc;
+        rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        ip = &inode;
+    }
 
-    rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
-
-    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
-
-    if (inode.file_type == kFileTypeMediaImage) {
-        uint16_t ss = lookup_disk_image_sector_size(name);
+    if (ip->file_type == kFileTypeMediaImage) {
+        uint16_t ss = ffctx ? ffctx->sector_size : 0;
+        if (ss == 0) {
+            uint64_t parent_id;
+            const char *name;
+            rc = resolve_path(path, &parent_id, &name);
+            if (rc != 0)
+                return rc;
+            ss = lookup_disk_image_sector_size(name);
+        }
         if (ss == 0)
             return -EINVAL;
-        rc = obmafs3_write_media_image_data(g_ctx, &inode,
+
+        struct sector_map_cache *cache =
+            (ffctx && ffctx->sector_size) ? &ffctx->sme_cache : NULL;
+
+        rc = obmafs3_write_media_image_data(g_ctx, ip,
                                             (uint64_t)offset, buf,
-                                            size, ss);
+                                            size, ss, cache);
     } else {
-        rc = obmafs3_write_file_data(g_ctx, &inode,
+        rc = obmafs3_write_file_data(g_ctx, ip,
                                      (uint64_t)offset, buf, size);
     }
 
@@ -469,9 +545,13 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
     if (rc != OBMAFS3_OK)
         return -EIO;
 
-    rc = obmafs3_inode_put(g_ctx, &inode);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if (ffctx) {
+        ffctx->inode_dirty = 1;
+    } else {
+        rc = obmafs3_inode_put(g_ctx, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    }
 
     return (int)size;
 }
@@ -640,6 +720,40 @@ static int obmafs3_fuse_utimens(const char *path,
     return 0;
 }
 
+static int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+
+    struct fuse_file_ctx *ffctx = fi
+        ? (struct fuse_file_ctx *)(uintptr_t)fi->fh
+        : NULL;
+
+    if (!ffctx)
+        return 0;
+
+    int rc = 0;
+
+    /* Flush cached sector_map_entries for media image files */
+    if (ffctx->sector_size && ffctx->sme_cache.count > 0) {
+        rc = obmafs3_flush_sector_map_cache(g_ctx, &ffctx->inode,
+                                            &ffctx->sme_cache);
+        ffctx->inode_dirty = 1;
+    }
+
+    /* Write back the cached inode */
+    if (ffctx->inode_dirty) {
+        int put_rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
+        if (rc == OBMAFS3_OK)
+            rc = put_rc;
+    }
+
+    obmafs3_free_sector_map_cache(&ffctx->sme_cache);
+    free(ffctx);
+    fi->fh = 0;
+
+    return (rc == OBMAFS3_OK) ? 0 : -EIO;
+}
+
 struct fuse_operations obmafs3_fuse_ops = {
     .getattr  = obmafs3_fuse_getattr,
     .readdir  = obmafs3_fuse_readdir,
@@ -647,6 +761,7 @@ struct fuse_operations obmafs3_fuse_ops = {
     .read     = obmafs3_fuse_read,
     .create   = obmafs3_fuse_create,
     .write    = obmafs3_fuse_write,
+    .release  = obmafs3_fuse_release,
     .truncate = obmafs3_fuse_truncate,
     .unlink   = obmafs3_fuse_unlink,
     .utimens  = obmafs3_fuse_utimens,
