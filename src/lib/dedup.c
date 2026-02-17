@@ -58,6 +58,8 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx,
     uint8_t *disk_buf = NULL;
     int compressed = 0;
 
+    uint64_t write_size = offset; /* default: uncompressed payload end */
+
     if (ctx->compression && bhdr.original_size > 0) {
         size_t comp_bound = ZSTD_compressBound((size_t)bhdr.original_size);
         uint8_t *comp_buf = malloc(comp_bound);
@@ -74,7 +76,10 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx,
                 bhdr.compressed_size  = comp_size;
                 obmafs3_checksum_block(comp_buf, comp_size,
                                        bhdr.checksum);
-                disk_buf = calloc(1, (size_t)capacity);
+                write_size = sizeof(bhdr) + comp_size;
+                uint64_t bs = ctx->sb.block_size;
+                uint64_t alloc_size = ((write_size + bs - 1) / bs) * bs;
+                disk_buf = calloc(1, (size_t)alloc_size);
                 if (disk_buf) {
                     memcpy(disk_buf, &bhdr, sizeof(bhdr));
                     memcpy(disk_buf + sizeof(bhdr), comp_buf, comp_size);
@@ -92,12 +97,24 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx,
                                (size_t)bhdr.original_size,
                                bhdr.checksum);
         memcpy(data, &bhdr, sizeof(bhdr));
+        write_size = offset;
     }
+
+    /* Write only the needed standard blocks */
+    uint64_t bs = ctx->sb.block_size;
+    uint64_t needed_std = (write_size + bs - 1) / bs;
+    uint64_t total_std  = capacity / bs;
 
     const void *write_src = compressed ? disk_buf : data;
     int rc = obmafs3_block_write(ctx, block_lba, write_src,
-                                 (size_t)capacity);
+                                 (size_t)(needed_std * bs));
     free(disk_buf);
+
+    /* Free trailing unused standard blocks */
+    if (rc == OBMAFS3_OK && needed_std < total_std)
+        obmafs3_free_blocks(ctx, block_lba + needed_std,
+                            total_std - needed_std);
+
     return rc;
 }
 
@@ -1237,6 +1254,8 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
     uint8_t *disk_buf = NULL;
     int compressed = 0;
 
+    uint64_t write_size = db->offset; /* default: uncompressed payload end */
+
     if (ctx->compression && bhdr.original_size > 0) {
         size_t comp_bound = ZSTD_compressBound((size_t)bhdr.original_size);
         uint8_t *comp_buf = malloc(comp_bound);
@@ -1254,7 +1273,10 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
                 obmafs3_checksum_block(comp_buf, comp_size,
                                        bhdr.checksum);
 
-                disk_buf = calloc(1, (size_t)db->capacity);
+                write_size = sizeof(bhdr) + comp_size;
+                uint64_t bs = ctx->sb.block_size;
+                uint64_t alloc_size = ((write_size + bs - 1) / bs) * bs;
+                disk_buf = calloc(1, (size_t)alloc_size);
                 if (disk_buf) {
                     memcpy(disk_buf, &bhdr, sizeof(bhdr));
                     memcpy(disk_buf + sizeof(bhdr), comp_buf, comp_size);
@@ -1272,11 +1294,19 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
                                (size_t)bhdr.original_size,
                                bhdr.checksum);
         memcpy(db->data, &bhdr, sizeof(bhdr));
+        write_size = db->offset;
     }
+
+    /* Write only the needed standard blocks.
+     * Do NOT free trailing blocks here — the partial block may be
+     * resumed on next mount via dedup_block_init, which requires
+     * all std_per_dedup blocks to remain allocated contiguously. */
+    uint64_t bs = ctx->sb.block_size;
+    uint64_t needed_std = (write_size + bs - 1) / bs;
 
     const void *write_src = compressed ? disk_buf : db->data;
     int rc = obmafs3_block_write(ctx, db->block_lba, write_src,
-                                 (size_t)db->capacity);
+                                 (size_t)(needed_std * bs));
     free(disk_buf);
     if (rc != OBMAFS3_OK)
         return rc;
@@ -2022,18 +2052,43 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
 
         /* Read the dedup data block if not already cached */
         if (de.block_lba != cached_dedup_lba) {
+            /* Read first standard block to get the header */
             rc = obmafs3_block_read(ctx, de.block_lba, dedup_buf,
-                                    (size_t)ctx->sb.dedup_block_size);
+                                    (size_t)ctx->sb.block_size);
             if (rc != OBMAFS3_OK) {
                 free(decomp_buf);
                 free(dedup_buf);
                 return rc;
             }
-            cached_dedup_lba = de.block_lba;
 
             /* Check if the block is compressed */
             struct block_header bhdr;
             memcpy(&bhdr, dedup_buf, sizeof(bhdr));
+
+            /* Determine actual on-disk payload size and read remaining */
+            uint64_t payload_size;
+            if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                payload_size = bhdr.compressed_size;
+            else
+                payload_size = bhdr.original_size;
+
+            uint64_t total_on_disk = sizeof(bhdr) + payload_size;
+            uint64_t bs = ctx->sb.block_size;
+            uint64_t needed_std = (total_on_disk + bs - 1) / bs;
+
+            /* Read remaining standard blocks beyond the first */
+            if (needed_std > 1) {
+                rc = obmafs3_block_read(ctx, de.block_lba + 1,
+                                        dedup_buf + bs,
+                                        (size_t)((needed_std - 1) * bs));
+                if (rc != OBMAFS3_OK) {
+                    free(decomp_buf);
+                    free(dedup_buf);
+                    return rc;
+                }
+            }
+
+            cached_dedup_lba = de.block_lba;
 
             if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) {
                 if (!decomp_buf) {
