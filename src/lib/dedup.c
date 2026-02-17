@@ -234,6 +234,7 @@ struct dedup_node_cache {
 
 #define DEDUP_CACHE_INIT_CAP 2048  /* power of 2 */
 
+/** Allocate and initialise a dedup B+Tree node cache. */
 static struct dedup_node_cache *dedup_cache_create(size_t block_size)
 {
     struct dedup_node_cache *nc = calloc(1, sizeof(*nc));
@@ -428,6 +429,7 @@ static int nc_block_read(struct dedup_node_cache *nc,
     return obmafs3_block_read(ctx, lba, buf, bsz);
 }
 
+/** Cache-aware block write: delegates to the node cache or a direct write. */
 static int nc_block_write(struct dedup_node_cache *nc,
                           struct obmafs3_ctx *ctx,
                           uint64_t lba, const void *buf, size_t bsz)
@@ -1409,6 +1411,7 @@ static int dedup_block_store(struct obmafs3_ctx *ctx,
     return OBMAFS3_OK;
 }
 
+/** Free the data buffer of a dedup block context. */
 static void dedup_block_free(struct dedup_block_ctx *db)
 {
     free(db->data);
@@ -1794,6 +1797,18 @@ out:
 /*  Dedup block cache flush / free                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Flush a dirty dedup block cache to disk.
+ *
+ * Waits for any pending background compression, writes the partially
+ * filled dedup block, flushes cached B+Tree nodes, and updates the
+ * dedup tree header with the current partial-block state.
+ *
+ * @param ctx          Filesystem context.
+ * @param sector_size  Sector size used to select the correct dedup tree.
+ * @param db_cache     Dedup block cache to flush.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx,
                                     uint16_t sector_size,
                                     struct dedup_block_cache *db_cache)
@@ -1855,6 +1870,14 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx,
     return rc;
 }
 
+/**
+ * Free all resources held by a dedup block cache.
+ *
+ * Stops the background compression worker, releases the B+Tree node
+ * cache, and frees the data buffer.
+ *
+ * @param db_cache  Dedup block cache to free.
+ */
 void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
 {
     if (!db_cache)
@@ -1876,6 +1899,17 @@ void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
 /*  Background compression start / stop                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Start the background compression worker thread.
+ *
+ * The worker thread compresses dedup blocks asynchronously.  If
+ * already started this function is a no-op.
+ *
+ * @param ctx       Filesystem context.
+ * @param db_cache  Dedup block cache to associate the worker with.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO if the
+ *         thread cannot be created.
+ */
 int obmafs3_bg_compress_start(struct obmafs3_ctx *ctx,
                               struct dedup_block_cache *db_cache)
 {
@@ -1904,6 +1938,14 @@ int obmafs3_bg_compress_start(struct obmafs3_ctx *ctx,
     return OBMAFS3_OK;
 }
 
+/**
+ * Stop the background compression worker thread.
+ *
+ * Signals shutdown to the worker and joins the thread.  Safe to call
+ * even if the worker is not running.
+ *
+ * @param db_cache  Dedup block cache whose worker to stop.
+ */
 void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache)
 {
     if (!db_cache || !db_cache->bg_compress)
@@ -1931,6 +1973,17 @@ void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache)
 /*  Sector map cache flush / free                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Flush cached sector map entries to disk.
+ *
+ * Writes all accumulated @c sector_map_entry records from @p cache to
+ * the inode's data blocks in a single batch and resets the cache count.
+ *
+ * @param ctx    Filesystem context.
+ * @param inode  Inode record to update (modified in place).
+ * @param cache  Sector map cache to flush.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
                                    struct inode_record *inode,
                                    struct sector_map_cache *cache)
@@ -1946,6 +1999,11 @@ int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx,
     return rc;
 }
 
+/**
+ * Free all resources held by a sector map cache.
+ *
+ * @param cache  Sector map cache to free.
+ */
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache)
 {
     if (!cache)
@@ -2139,6 +2197,18 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
 /*  CD sector map cache flush / free                                   */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Write a batch of CD sector map entries to the inode's data blocks.
+ *
+ * Appends @p count entries at the current @c sector_map_size offset
+ * and advances the map size accordingly.
+ *
+ * @param ctx      Filesystem context.
+ * @param inode    Inode record to update (modified in place).
+ * @param entries  Array of CD sector map entries to write.
+ * @param count    Number of entries.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 static int write_cd_sector_map_batch(struct obmafs3_ctx *ctx,
                                      struct inode_record *inode,
                                      const struct cd_sector_map_entry *entries,
@@ -2165,6 +2235,17 @@ static int write_cd_sector_map_batch(struct obmafs3_ctx *ctx,
     return rc;
 }
 
+/**
+ * Flush cached CD sector map entries to disk.
+ *
+ * Writes all accumulated @c cd_sector_map_entry records from @p cache
+ * to disk and resets the cache count.
+ *
+ * @param ctx    Filesystem context.
+ * @param inode  Inode record to update.
+ * @param cache  CD sector map cache to flush.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_flush_cd_sector_map_cache(struct obmafs3_ctx *ctx,
                                       struct inode_record *inode,
                                       struct cd_sector_map_cache *cache)
@@ -2180,6 +2261,11 @@ int obmafs3_flush_cd_sector_map_cache(struct obmafs3_ctx *ctx,
     return rc;
 }
 
+/**
+ * Free all resources held by a CD sector map cache.
+ *
+ * @param cache  CD sector map cache to free.
+ */
 void obmafs3_free_cd_sector_map_cache(struct cd_sector_map_cache *cache)
 {
     if (!cache)

@@ -16,6 +16,7 @@
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+/** Generate an RFC 4122 version 4 GUID from /dev/urandom. */
 static void generate_guid(uint8_t *guid)
 {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -35,6 +36,15 @@ static void generate_guid(uint8_t *guid)
 /*  Block I/O                                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Read a block from the filesystem image.
+ *
+ * @param ctx   Filesystem context.
+ * @param lba   Logical block address to read.
+ * @param buf   Output buffer.
+ * @param size  Number of bytes to read.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on failure.
+ */
 int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba,
                        void *buf, size_t size)
 {
@@ -45,6 +55,15 @@ int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba,
     return OBMAFS3_OK;
 }
 
+/**
+ * Write a block to the filesystem image.
+ *
+ * @param ctx   Filesystem context.
+ * @param lba   Logical block address to write.
+ * @param buf   Data buffer to write.
+ * @param size  Number of bytes to write.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on failure.
+ */
 int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba,
                         const void *buf, size_t size)
 {
@@ -59,11 +78,34 @@ int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba,
 /*  Context open / close                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Open an existing OBMAFS3 filesystem (default flags).
+ *
+ * Equivalent to calling @c obmafs3_open_flags with @c flags = 0.
+ *
+ * @param path  Path to the filesystem image or device.
+ * @param ctx   Output filesystem context pointer.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_open(const char *path, struct obmafs3_ctx **ctx)
 {
     return obmafs3_open_flags(path, 0, ctx);
 }
 
+/**
+ * Open an existing OBMAFS3 filesystem with flags.
+ *
+ * Opens the file, reads and validates the superblock, loads all B+Tree
+ * headers and (unless @c OBMAFS3_OPEN_SKIP_BITMAP is set) the
+ * allocation bitmap.  When @c OBMAFS3_OPEN_LENIENT is set, checksum
+ * errors in tree headers are tolerated.
+ *
+ * @param path   Path to the filesystem image or device.
+ * @param flags  Combination of @c OBMAFS3_OPEN_LENIENT and/or
+ *               @c OBMAFS3_OPEN_SKIP_BITMAP.
+ * @param ctx    Output filesystem context pointer.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
 {
     int fd = open(path, O_RDWR);
@@ -224,6 +266,14 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     return OBMAFS3_OK;
 }
 
+/**
+ * Close the filesystem and free all associated resources.
+ *
+ * Releases the in-memory bitmap, closes the file descriptor, and frees
+ * the context structure.
+ *
+ * @param ctx  Filesystem context (may be NULL).
+ */
 void obmafs3_close(struct obmafs3_ctx *ctx)
 {
     if (!ctx)
@@ -239,6 +289,19 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
 /*  Filesystem creation (mkobmafs)                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Write a zero-padded block during filesystem creation.
+ *
+ * Copies up to @p data_size bytes from @p data into a zeroed block
+ * buffer and writes it to the given LBA.
+ *
+ * @param fd         Open file descriptor.
+ * @param block_size Block size in bytes.
+ * @param lba        Logical block address to write.
+ * @param data       Source data.
+ * @param data_size  Number of bytes to copy from @p data.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 static int write_block(int fd, uint64_t block_size, uint64_t lba,
                        const void *data, size_t data_size)
 {
@@ -259,6 +322,21 @@ static int write_block(int fd, uint64_t block_size, uint64_t lba,
     return OBMAFS3_OK;
 }
 
+/**
+ * Create a new OBMAFS3 filesystem.
+ *
+ * Initialises the superblock, B+Tree headers, root inode, allocation
+ * bitmap, and all on-disk structures in the file at @p path.  If the
+ * path does not point to a block device the file is created/truncated.
+ *
+ * @param path             Path to the image file or block device.
+ * @param total_size       Total filesystem size in bytes.
+ * @param block_size       Block size in bytes.
+ * @param dedup_block_size Deduplication block size in bytes.
+ * @param label            Volume label string.
+ * @param guid             Filesystem GUID (16 bytes), or NULL for random.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_create(const char *path, uint64_t total_size,
                    uint64_t block_size, uint64_t dedup_block_size,
                    const char *label, const uint8_t *guid)
@@ -601,6 +679,16 @@ int obmafs3_create(const char *path, uint64_t total_size,
 /*  Filesystem checking (obmafsck)                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Perform a basic filesystem check.
+ *
+ * Opens the filesystem, reads and prints the superblock, bitmap
+ * statistics, and B+Tree header information.  Does not repair any
+ * inconsistencies.
+ *
+ * @param path  Path to the filesystem image or device.
+ * @return @c OBMAFS3_OK if the check passes, or an error code.
+ */
 int obmafs3_check(const char *path)
 {
     struct obmafs3_ctx *ctx;

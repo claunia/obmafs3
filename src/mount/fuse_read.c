@@ -6,6 +6,12 @@
 
 #include "fuse_ops_internal.h"
 
+/**
+ * FUSE callback: get file/directory attributes.
+ *
+ * Fills @p stbuf with the stat information for @p path.  Uses the
+ * cached inode from the file handle when available.
+ */
 int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
                                 struct fuse_file_info *fi)
 {
@@ -79,6 +85,12 @@ int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
     return 0;
 }
 
+/**
+ * FUSE callback: list directory contents.
+ *
+ * Retrieves all catalog entries under the directory identified by
+ * @p path and feeds them to the FUSE filler callback.
+ */
 int obmafs3_fuse_readdir(const char *path, void *buf,
                                 fuse_fill_dir_t filler, off_t offset,
                                 struct fuse_file_info *fi,
@@ -134,6 +146,13 @@ int obmafs3_fuse_readdir(const char *path, void *buf,
     return 0;
 }
 
+/**
+ * FUSE callback: open a file.
+ *
+ * Resolves @p path to an inode, allocates a per-file context
+ * (@c fuse_file_ctx), and stores it in the file handle.  Detects
+ * media image files and records their sector size.
+ */
 int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
 {
     uint64_t parent_id;
@@ -173,6 +192,13 @@ int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
+/**
+ * FUSE callback: read file data.
+ *
+ * Reads up to @p size bytes at @p offset from the file identified by
+ * @p path.  Uses the cached inode from the file handle when available.
+ * Dispatches to the media image read path for media images.
+ */
 int obmafs3_fuse_read(const char *path, char *buf, size_t size,
                              off_t offset, struct fuse_file_info *fi)
 {

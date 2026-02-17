@@ -6,6 +6,12 @@
 
 #include "fuse_ops_internal.h"
 
+/**
+ * FUSE callback: set file access and modification times.
+ *
+ * Updates the access and modification timestamps stored in the
+ * inode to the values specified in @p ts.
+ */
 int obmafs3_fuse_utimens(const char *path,
                                 const struct timespec ts[2],
                                 struct fuse_file_info *fi)
@@ -46,6 +52,12 @@ int obmafs3_fuse_utimens(const char *path,
     return 0;
 }
 
+/**
+ * FUSE callback: change file permission bits.
+ *
+ * Updates the inode's permission mode to @p mode (masked to the
+ * lower 12 bits).
+ */
 int obmafs3_fuse_chmod(const char *path, mode_t mode,
                               struct fuse_file_info *fi)
 {
@@ -84,6 +96,12 @@ int obmafs3_fuse_chmod(const char *path, mode_t mode,
     return 0;
 }
 
+/**
+ * FUSE callback: change file owner and group.
+ *
+ * Updates the inode's UID and/or GID.  A value of @c (uid_t)-1 or
+ * @c (gid_t)-1 leaves the corresponding field unchanged.
+ */
 int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid,
                               struct fuse_file_info *fi)
 {
@@ -182,6 +200,14 @@ int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
     return (rc == OBMAFS3_OK) ? 0 : -EIO;
 }
 
+/**
+ * FUSE callback: release an open file.
+ *
+ * Called when the last file descriptor referring to an open file is
+ * closed.  Flushes all caches (dedup block, sector map, CD sector
+ * map), writes the inode back if dirty, and frees the per-file
+ * context.
+ */
 int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
@@ -239,6 +265,12 @@ int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
     return (rc == OBMAFS3_OK) ? 0 : -EIO;
 }
 
+/**
+ * FUSE callback: get filesystem statistics.
+ *
+ * Populates @p stbuf with block size, total/free block counts, and
+ * the number of allocated inodes.
+ */
 int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
 {
     (void)path;
@@ -266,6 +298,13 @@ int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
     return 0;
 }
 
+/**
+ * FUSE callback: get extended file attributes (statx).
+ *
+ * Returns extended attribute information including birth time and the
+ * @c STATX_ATTR_COMPRESSED flag for media image files stored with
+ * compression.
+ */
 int obmafs3_fuse_statx(const char *path, int flags, int mask,
                               struct statx *stxbuf,
                               struct fuse_file_info *fi)

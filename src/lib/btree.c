@@ -7,6 +7,18 @@
  */
 #include "btree_internal.h"
 
+/**
+ * Read a B+Tree header block from disk (strict).
+ *
+ * Reads the header and verifies its checksum.  Returns an error if the
+ * checksum does not match.
+ *
+ * @param ctx  Filesystem context.
+ * @param lba  Logical block address of the header.
+ * @param hdr  Output header structure.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_CHECKSUM on bad
+ *         checksum, or another error code on failure.
+ */
 int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
                               struct btree_header *hdr)
 {
@@ -17,6 +29,19 @@ int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
     return cs_ok ? OBMAFS3_OK : OBMAFS3_ERR_CHECKSUM;
 }
 
+/**
+ * Read a B+Tree header block from disk (lenient).
+ *
+ * Reads the header and validates the magic number.  The checksum is
+ * verified but a mismatch is reported via @p checksum_ok rather than
+ * causing an error return.
+ *
+ * @param ctx          Filesystem context.
+ * @param lba          Logical block address of the header.
+ * @param hdr          Output header structure.
+ * @param checksum_ok  Set to 1 if the checksum matches, 0 otherwise.
+ * @return @c OBMAFS3_OK on success, or an error code on read/magic failure.
+ */
 int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba,
                                       struct btree_header *hdr,
                                       int *checksum_ok)
@@ -49,6 +74,17 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba,
     return OBMAFS3_OK;
 }
 
+/**
+ * Write a B+Tree header block to disk.
+ *
+ * Computes a fresh checksum over the header structure and writes the
+ * entire block to the given LBA.
+ *
+ * @param ctx  Filesystem context.
+ * @param lba  Logical block address to write to.
+ * @param hdr  Pointer to the header structure to write.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba,
                                const struct btree_header *hdr)
 {
@@ -72,11 +108,30 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba,
 /*  Block allocation                                                   */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Allocate a single block from the free-space bitmap.
+ *
+ * @param ctx  Filesystem context.
+ * @param lba  Output LBA of the allocated block.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba)
 {
     return obmafs3_alloc_blocks(ctx, 1, lba);
 }
 
+/**
+ * Allocate a contiguous range of blocks from the free-space bitmap.
+ *
+ * Finds @p count contiguous free blocks, marks them as allocated in the
+ * bitmap, persists the bitmap and superblock to disk, and updates the
+ * @c next_free_lba hint.
+ *
+ * @param ctx        Filesystem context.
+ * @param count      Number of contiguous blocks to allocate.
+ * @param start_lba  Output LBA of the first allocated block.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count,
                          uint64_t *start_lba)
 {
@@ -100,6 +155,15 @@ int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count,
     return obmafs3_sb_write(ctx->fd, &ctx->sb);
 }
 
+/**
+ * Allocate a new inode ID.
+ *
+ * Returns the current @c next_inode_id from the superblock and
+ * increments it for the next allocation.
+ *
+ * @param ctx  Filesystem context.
+ * @return The newly allocated inode ID.
+ */
 uint64_t obmafs3_alloc_inode_id(struct obmafs3_ctx *ctx)
 {
     uint64_t id = ctx->sb.next_inode_id;

@@ -105,6 +105,19 @@ struct catalog_btree_path {
 /*  Catalog lookup (B+Tree traversal)                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Look up a catalog entry by parent inode ID and name.
+ *
+ * Traverses the catalog B+Tree from root to leaf to find the entry
+ * matching the composite key (@p parent_id, @p name).
+ *
+ * @param ctx        Filesystem context.
+ * @param parent_id  Inode ID of the parent directory.
+ * @param name       Entry name to search for.
+ * @param entry      Output catalog record.
+ * @return @c OBMAFS3_OK if found, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id,
                            const char *name,
                            struct catalog_record *entry)
@@ -165,6 +178,20 @@ int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id,
 /*  Catalog list (B+Tree traversal with right-link scan)               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * List all catalog entries under a parent directory.
+ *
+ * Traverses the catalog B+Tree to the leftmost leaf containing
+ * @p parent_id and scans the leaf chain, collecting all entries with
+ * a matching parent.
+ *
+ * @param ctx        Filesystem context.
+ * @param parent_id  Inode ID of the parent directory.
+ * @param entries    Output array of catalog records (caller frees via
+ *                   @c obmafs3_catalog_list_free).
+ * @param count      Output number of entries.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_catalog_list(struct obmafs3_ctx *ctx, uint64_t parent_id,
                          struct catalog_record **entries,
                          uint32_t *count)
@@ -266,6 +293,11 @@ done:
     return OBMAFS3_OK;
 }
 
+/**
+ * Free a catalog entry array returned by @c obmafs3_catalog_list.
+ *
+ * @param entries  Array to free (may be NULL).
+ */
 void obmafs3_catalog_list_free(struct catalog_record *entries)
 {
     free(entries);
@@ -339,6 +371,18 @@ static int catalog_find_by_inode(struct obmafs3_ctx *ctx,
     return OBMAFS3_ERR_NOTFOUND;
 }
 
+/**
+ * Resolve an inode ID to its full filesystem path.
+ *
+ * Walks the catalog bottom-up from @p inode_id to the root, collecting
+ * name components, then assembles them into an absolute path.
+ *
+ * @param ctx           Filesystem context.
+ * @param inode_id      Inode ID to resolve.
+ * @param path_buf      Output path buffer.
+ * @param path_buf_size Size of @p path_buf in bytes.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx,
                                uint64_t inode_id,
                                char *path_buf, size_t path_buf_size)
@@ -395,6 +439,16 @@ int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx,
 /*  Catalog insert (B+Tree)                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Insert a catalog record into the B+Tree.
+ *
+ * Handles leaf splitting and root promotion when the target leaf is
+ * full.  Updates the tree header on disk after insertion.
+ *
+ * @param ctx    Filesystem context.
+ * @param entry  Pointer to the catalog record to insert.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_catalog_insert(struct obmafs3_ctx *ctx,
                            const struct catalog_record *entry)
 {
@@ -776,6 +830,19 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx,
 /*  Catalog delete (B+Tree)                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Delete a catalog record from the B+Tree.
+ *
+ * Locates the leaf containing the entry keyed by (@p parent_id,
+ * @p name) and removes it.  Frees empty leaf nodes and updates the
+ * tree header.
+ *
+ * @param ctx        Filesystem context.
+ * @param parent_id  Inode ID of the parent directory.
+ * @param name       Entry name to delete.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id,
                            const char *name)
 {

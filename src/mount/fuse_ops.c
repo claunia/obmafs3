@@ -14,6 +14,15 @@ struct obmafs3_ctx *g_ctx = NULL;
 struct disk_image_mapping g_disk_image_maps[OBMAFS3_MAX_DISK_IMAGE_MAPS];
 int g_disk_image_map_count = 0;
 
+/**
+ * Parse the disk image extension-to-sector-size mapping string.
+ *
+ * Accepts a semicolon-separated list of "extension=sector_size" pairs
+ * (e.g. "dsk=512;iso=2048") and populates @c g_disk_image_maps.
+ *
+ * @param spec  Mapping specification string (may be NULL or empty).
+ * @return 0 on success, -1 on parse error.
+ */
 int parse_disk_image_maps(const char *spec)
 {
     if (!spec || !*spec) {

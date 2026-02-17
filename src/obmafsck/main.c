@@ -13,6 +13,11 @@
 /*  Options                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Print usage information for obmafsck.
+ *
+ * @param prog  Program name to display in the usage line.
+ */
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -28,6 +33,14 @@ static void usage(const char *prog)
 }
 
 /* Return value: 1 = yes, 0 = no */
+/**
+ * Prompt the user to fix a problem, or decide automatically.
+ *
+ * @param auto_yes  If non-zero, always return 1 (yes).
+ * @param auto_no   If non-zero, always return 0 (no).
+ * @param prompt    Question text displayed to the user.
+ * @return 1 if the fix should be applied, 0 otherwise.
+ */
 static int ask_fix(int auto_yes, int auto_no, const char *prompt)
 {
     if (auto_yes) return 1;
@@ -48,6 +61,18 @@ static int ask_fix(int auto_yes, int auto_no, const char *prompt)
 /*  Walk all nodes in the inode B+Tree (DFS)                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Walk all nodes in the inode B+Tree via iterative DFS.
+ *
+ * Collects the LBA of every node (both index and leaf) reachable
+ * from @p root_lba.
+ *
+ * @param ctx        Filesystem context.
+ * @param root_lba   Root node LBA of the inode tree.
+ * @param out_lbas   Output: heap-allocated array of node LBAs.
+ * @param out_count  Output: number of elements in @p out_lbas.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx,
                                   uint64_t root_lba,
                                   uint64_t **out_lbas,
@@ -141,6 +166,18 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx,
 /*  Uses catalog_index_entry instead of btree_index_entry.             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Walk all nodes in the catalog B+Tree via iterative DFS.
+ *
+ * Uses @c catalog_index_entry (rather than @c btree_index_entry) to
+ * decode index node children.
+ *
+ * @param ctx        Filesystem context.
+ * @param root_lba   Root node LBA of the catalog tree.
+ * @param out_lbas   Output: heap-allocated array of node LBAs.
+ * @param out_count  Output: number of elements in @p out_lbas.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx,
                                     uint64_t root_lba,
                                     uint64_t **out_lbas,
@@ -233,6 +270,19 @@ static int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx,
 /*  Verify checksums for a list of B+Tree node LBAs                    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Verify stored checksums of a list of B+Tree node blocks.
+ *
+ * Reads each node, recomputes its checksum, and compares it with the
+ * stored value.  Reports mismatches to stderr.
+ *
+ * @param ctx         Filesystem context.
+ * @param node_lbas   Array of node LBAs to verify.
+ * @param node_count  Number of elements in @p node_lbas.
+ * @param tree_name   Human-readable tree name for diagnostic output.
+ * @param bad_count   Output: number of nodes with bad checksums.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int verify_btree_node_checksums(struct obmafs3_ctx *ctx,
                                        const uint64_t *node_lbas,
                                        uint64_t node_count,
@@ -296,6 +346,22 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx,
 /*  index_entry_size / child_lba_off parameterize the index entry.     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Walk all nodes in a multi-block metadata B+Tree via iterative DFS.
+ *
+ * Each node spans @c METADATA_NODE_BLOCKS contiguous blocks.  The
+ * caller provides the index entry size and the byte offset of the
+ * child_lba field within that entry to locate children.
+ *
+ * @param ctx               Filesystem context.
+ * @param root_lba          Root node LBA.
+ * @param index_entry_size  Size in bytes of each index entry.
+ * @param child_lba_off     Byte offset of the @c child_lba field in
+ *                          the index entry structure.
+ * @param out_lbas          Output: heap-allocated array of node LBAs.
+ * @param out_count         Output: number of elements in @p out_lbas.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int walk_meta_btree_nodes(struct obmafs3_ctx *ctx,
                                  uint64_t root_lba,
                                  size_t index_entry_size,
@@ -388,6 +454,19 @@ static int walk_meta_btree_nodes(struct obmafs3_ctx *ctx,
 /*  Verify checksums for a list of multi-block metadata node LBAs      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Verify stored checksums of a list of multi-block metadata node
+ * blocks.
+ *
+ * Each node spans @c METADATA_NODE_BLOCKS contiguous blocks.
+ *
+ * @param ctx         Filesystem context.
+ * @param node_lbas   Array of node LBAs to verify.
+ * @param node_count  Number of elements in @p node_lbas.
+ * @param tree_name   Human-readable tree name for diagnostic output.
+ * @param bad_count   Output: number of nodes with bad checksums.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int verify_meta_node_checksums(struct obmafs3_ctx *ctx,
                                       const uint64_t *node_lbas,
                                       uint64_t node_count,
@@ -449,6 +528,18 @@ static int verify_meta_node_checksums(struct obmafs3_ctx *ctx,
 /*  Collect data-block LBAs from all inodes                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Collect data block LBAs referenced by all inode extent records.
+ *
+ * Walks the inode B+Tree via iterative DFS and extracts every data
+ * block LBA from the extent arrays of each leaf-level inode record.
+ *
+ * @param ctx             Filesystem context.
+ * @param inode_root_lba  Root node LBA of the inode tree.
+ * @param out_lbas        Output: heap-allocated array of data block LBAs.
+ * @param out_count       Output: number of elements in @p out_lbas.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int collect_inode_data_blocks(struct obmafs3_ctx *ctx,
                                      uint64_t inode_root_lba,
                                      uint64_t **out_lbas,
@@ -996,6 +1087,21 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx,
 /*  Build expected bitmap                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Reconstruct the expected allocation bitmap from on-disk structures.
+ *
+ * Walks every tree (superblock, catalog, inode, overflow, dedup, media
+ * tag, CD prefix/suffix/subchannel, metadata, metadata index) and
+ * marks every referenced block in a freshly allocated bitmap.  The
+ * result can be compared against the on-disk bitmap to detect
+ * allocation inconsistencies.
+ *
+ * @param ctx           Filesystem context.
+ * @param total_blocks  Number of blocks in the filesystem.
+ * @param bitmap_bytes  Size of the bitmap in bytes.
+ * @param out_error     Output: set to non-zero on allocation failure.
+ * @return Heap-allocated expected bitmap, or @c NULL on error.
+ */
 static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
                                       uint64_t total_blocks,
                                       uint64_t bitmap_bytes,
@@ -1257,6 +1363,13 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
 /*  Scrub: verify checksums of all data blocks                         */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Print a progress bar to stderr.
+ *
+ * @param done   Number of items processed so far.
+ * @param total  Total number of items.
+ * @param bad    Number of errors detected so far.
+ */
 static void print_progress(uint64_t done, uint64_t total, uint64_t bad)
 {
     int bar_width = 40;
@@ -1274,6 +1387,16 @@ static void print_progress(uint64_t done, uint64_t total, uint64_t bad)
     fflush(stderr);
 }
 
+/**
+ * Verify checksums of all file data blocks.
+ *
+ * Collects data block LBAs from both inline inode extents and the
+ * overflow tree, reads each block header, recomputes the checksum,
+ * and reports any mismatches.
+ *
+ * @param ctx  Filesystem context.
+ * @return Number of bad blocks detected.
+ */
 static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
 {
     /* Collect all data block LBAs from inode extents */
@@ -1605,6 +1728,11 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
 /*  Dedup statistics                                                   */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Print a byte count as a human-readable string (B/KiB/MiB/GiB/TiB).
+ *
+ * @param bytes  Number of bytes to format.
+ */
 static void print_human_size(uint64_t bytes)
 {
     if (bytes >= 1099511627776ULL)
@@ -1630,6 +1758,17 @@ struct dedup_tree_stats {
     uint64_t uncompressed_count;  /* number of uncompressed blocks */
 };
 
+/**
+ * Compute and print deduplication and compression statistics.
+ *
+ * Walks the dedup tree list, enumerates every dedup entry, counts
+ * unique data blocks, reads block headers for compression information,
+ * and prints per-tree and aggregate statistics including dedup ratio,
+ * compression ratio, and total space savings.
+ *
+ * @param ctx  Filesystem context.
+ * @return @c OBMAFS3_OK on success.
+ */
 static int compute_dedup_stats(struct obmafs3_ctx *ctx)
 {
     if (ctx->sb.dedup_lba == 0) {
@@ -2022,6 +2161,16 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Entry point for the OBMAFS3 filesystem checker.
+ *
+ * Opens the filesystem in lenient mode, validates the superblock,
+ * verifies tree header and node checksums for all B+Trees (catalog,
+ * inode, overflow, dedup, media tag, CD prefix/suffix/subchannel,
+ * metadata, metadata index), checks allocation bitmap consistency,
+ * and optionally scrubs data block checksums and reports dedup
+ * statistics.
+ */
 int main(int argc, char *argv[])
 {
     int auto_yes = 0;

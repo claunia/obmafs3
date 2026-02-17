@@ -28,6 +28,11 @@ static const struct fuse_opt option_spec[] = {
     FUSE_OPT_END
 };
 
+/**
+ * Print usage information for the FUSE mount helper.
+ *
+ * @param progname  Program name to display in the usage line.
+ */
 static void show_help(const char *progname)
 {
     printf("Usage: %s --device=<path> <mountpoint> [FUSE options]\n\n"
@@ -40,6 +45,13 @@ static void show_help(const char *progname)
            "\n", progname);
 }
 
+/**
+ * Entry point for the OBMAFS3 FUSE mount helper.
+ *
+ * Parses command-line options, opens the filesystem image, applies
+ * mount-time settings (compression, ZSTD level, disk-image extension
+ * mappings), and enters the FUSE main loop.
+ */
 int main(int argc, char *argv[])
 {
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);

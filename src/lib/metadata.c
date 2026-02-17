@@ -28,6 +28,7 @@ static size_t meta_node_size(const struct obmafs3_ctx *ctx)
 /*  Per-image metadata tree helpers                                    */
 /* ------------------------------------------------------------------ */
 
+/** Maximum metadata_record entries that fit in a leaf node. */
 static uint16_t meta_leaf_max_keys(const struct obmafs3_ctx *ctx)
 {
     return (uint16_t)((meta_node_size(ctx) -
@@ -35,6 +36,7 @@ static uint16_t meta_leaf_max_keys(const struct obmafs3_ctx *ctx)
                       / sizeof(struct metadata_record));
 }
 
+/** Maximum metadata_index_entry entries that fit in an index node. */
 static uint16_t meta_index_max_keys(const struct obmafs3_ctx *ctx)
 {
     return (uint16_t)((meta_node_size(ctx) -
@@ -132,6 +134,19 @@ static int meta_node_write(struct obmafs3_ctx *ctx, uint64_t lba,
 
 /* ---- Per-image metadata tree: lookup ---- */
 
+/**
+ * Look up a metadata record by inode ID and key.
+ *
+ * Traverses the per-image metadata B+Tree using the composite key
+ * (@p inode_id, @p key).
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID to look up.
+ * @param key       Metadata key string.
+ * @param record    Output metadata record.
+ * @return @c OBMAFS3_OK if found, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int meta_tree_lookup(struct obmafs3_ctx *ctx,
                             uint64_t inode_id, const char *key,
                             struct metadata_record *record)
@@ -183,6 +198,16 @@ static int meta_tree_lookup(struct obmafs3_ctx *ctx,
 
 /* ---- Per-image metadata tree: insert / update ---- */
 
+/**
+ * Insert or update a metadata record in the per-image B+Tree.
+ *
+ * Handles leaf splitting and root promotion when the target leaf is
+ * full.  If a record with the same key already exists it is replaced.
+ *
+ * @param ctx  Filesystem context.
+ * @param rec  Pointer to the metadata record to insert.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 static int meta_tree_put(struct obmafs3_ctx *ctx,
                          const struct metadata_record *rec)
 {
@@ -487,6 +512,18 @@ static int meta_tree_put(struct obmafs3_ctx *ctx,
 
 /* ---- Per-image metadata tree: delete ---- */
 
+/**
+ * Delete a metadata record from the per-image B+Tree.
+ *
+ * Locates and removes the record keyed by (@p inode_id, @p key).
+ * Frees empty leaf nodes and updates the tree header.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID of the record to delete.
+ * @param key       Metadata key string.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int meta_tree_delete(struct obmafs3_ctx *ctx,
                             uint64_t inode_id, const char *key)
 {
@@ -627,6 +664,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx,
 /*  Composite key: (key, value, inode_id).                             */
 /* ================================================================== */
 
+/** Maximum metadata_idx_record entries per reverse-index leaf node. */
 static uint16_t midx_leaf_max_keys(const struct obmafs3_ctx *ctx)
 {
     return (uint16_t)((meta_node_size(ctx) -
@@ -634,6 +672,7 @@ static uint16_t midx_leaf_max_keys(const struct obmafs3_ctx *ctx)
                       / sizeof(struct metadata_idx_record));
 }
 
+/** Maximum metadata_idx_index_entry entries per reverse-index index node. */
 static uint16_t midx_index_max_keys(const struct obmafs3_ctx *ctx)
 {
     return (uint16_t)((meta_node_size(ctx) -
@@ -654,6 +693,7 @@ static int midx_key_cmp(const char *key_a, const char *val_a, uint64_t id_a,
     return 0;
 }
 
+/** Binary search in a reverse-index leaf node.  Returns index or -(ins)-1. */
 static int midx_leaf_find(const uint8_t *buf, uint16_t node_keys,
                            const char *key, const char *value,
                            uint64_t inode_id)
@@ -676,6 +716,7 @@ static int midx_leaf_find(const uint8_t *buf, uint16_t node_keys,
     return -(lo + 1);
 }
 
+/** Binary search in a reverse-index index node.  Returns slot to descend. */
 static uint16_t midx_index_find(const uint8_t *buf, uint16_t node_keys,
                                  const char *key, const char *value,
                                  uint64_t inode_id)
@@ -705,6 +746,16 @@ static uint16_t midx_index_find(const uint8_t *buf, uint16_t node_keys,
 
 /* ---- Reverse-index tree: insert ---- */
 
+/**
+ * Insert a record into the metadata reverse-index B+Tree.
+ *
+ * Handles leaf splitting and root promotion.  The composite key is
+ * (key, value, inode_id).
+ *
+ * @param ctx  Filesystem context.
+ * @param rec  Pointer to the reverse-index record to insert.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 static int midx_tree_put(struct obmafs3_ctx *ctx,
                           const struct metadata_idx_record *rec)
 {
@@ -1012,6 +1063,16 @@ static int midx_tree_put(struct obmafs3_ctx *ctx,
 
 /* ---- Reverse-index tree: delete ---- */
 
+/**
+ * Delete a record from the metadata reverse-index B+Tree.
+ *
+ * @param ctx       Filesystem context.
+ * @param key       Metadata key.
+ * @param value     Metadata value.
+ * @param inode_id  Inode ID component of the composite key.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int midx_tree_delete(struct obmafs3_ctx *ctx,
                              const char *key, const char *value,
                              uint64_t inode_id)
@@ -1156,6 +1217,17 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx,
 /*  Metadata public API                                                */
 /* ================================================================== */
 
+/**
+ * Retrieve a metadata value for a given inode and key.
+ *
+ * @param ctx         Filesystem context.
+ * @param inode_id    Inode ID of the file.
+ * @param key         Metadata key to look up.
+ * @param value       Output buffer for the NUL-terminated value.
+ * @param value_size  Size of @p value in bytes.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_metadata_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
                          const char *key, char *value, size_t value_size)
 {
@@ -1173,6 +1245,19 @@ int obmafs3_metadata_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
     return OBMAFS3_OK;
 }
 
+/**
+ * Store or update a metadata key/value pair for a given inode.
+ *
+ * If the key already exists the old reverse-index entry is removed
+ * before inserting the new value into both the per-image and
+ * reverse-index trees.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID of the file.
+ * @param key       Metadata key (max 255 characters).
+ * @param value     Metadata value (max 1024 characters).
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
                          const char *key, const char *value)
 {
@@ -1214,6 +1299,18 @@ int obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
     return midx_tree_put(ctx, &idx_rec);
 }
 
+/**
+ * Delete a metadata key/value pair for a given inode.
+ *
+ * Removes the entry from both the per-image tree and the reverse-index
+ * tree.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID of the file.
+ * @param key       Metadata key to delete.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_metadata_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
                             const char *key)
 {
@@ -1238,6 +1335,15 @@ int obmafs3_metadata_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
     return OBMAFS3_OK;
 }
 
+/**
+ * Delete all metadata key/value pairs for a given inode.
+ *
+ * Repeatedly lists and deletes entries until none remain.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID of the file.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_metadata_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id)
 {
     if (ctx->sb.metadata_lba == 0)
@@ -1265,6 +1371,19 @@ int obmafs3_metadata_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id)
     }
 }
 
+/**
+ * List all metadata keys stored for a given inode.
+ *
+ * Traverses the per-image metadata B+Tree leaf chain and collects all
+ * keys associated with @p inode_id.  The caller must free the returned
+ * array with @c obmafs3_metadata_list_free.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID of the file.
+ * @param keys      Output array of key strings.
+ * @param count     Output number of keys.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
                           char ***keys, uint32_t *count)
 {
@@ -1364,6 +1483,12 @@ list_done:
     return OBMAFS3_OK;
 }
 
+/**
+ * Free a key array returned by @c obmafs3_metadata_list.
+ *
+ * @param keys   Array to free (may be NULL).
+ * @param count  Number of elements in @p keys.
+ */
 void obmafs3_metadata_list_free(char **keys, uint32_t count)
 {
     if (!keys) return;
@@ -1372,6 +1497,20 @@ void obmafs3_metadata_list_free(char **keys, uint32_t count)
     free(keys);
 }
 
+/**
+ * Query which files have a specific metadata key/value pair.
+ *
+ * Searches the reverse-index tree for all inodes matching (@p key,
+ * @p value) and resolves each to a full filesystem path.  The caller
+ * must free the returned array with @c obmafs3_metadata_query_free.
+ *
+ * @param ctx    Filesystem context.
+ * @param key    Metadata key to search for.
+ * @param value  Metadata value to match.
+ * @param paths  Output array of path strings.
+ * @param count  Output number of matching paths.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_metadata_query(struct obmafs3_ctx *ctx,
                            const char *key, const char *value,
                            char ***paths, uint32_t *count)
@@ -1483,6 +1622,12 @@ query_done:
     return OBMAFS3_OK;
 }
 
+/**
+ * Free a path array returned by @c obmafs3_metadata_query.
+ *
+ * @param paths  Array to free (may be NULL).
+ * @param count  Number of elements in @p paths.
+ */
 void obmafs3_metadata_query_free(char **paths, uint32_t count)
 {
     if (!paths) return;

@@ -91,6 +91,18 @@ struct inode_btree_path {
 /*  Inode get (B+Tree traversal)                                       */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Retrieve an inode record by inode ID.
+ *
+ * Traverses the inode B+Tree from root to leaf to locate the record
+ * for the given @p inode_id.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID to look up.
+ * @param inode     Output inode record.
+ * @return @c OBMAFS3_OK if found, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_inode_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
                       struct inode_record *inode)
 {
@@ -151,6 +163,17 @@ int obmafs3_inode_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
 /*  Inode insert / update (B+Tree)                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Insert or update an inode record in the B+Tree.
+ *
+ * If a record with the same inode_id already exists it is replaced;
+ * otherwise a new record is inserted.  Handles leaf splitting and
+ * root promotion when necessary.
+ *
+ * @param ctx    Filesystem context.
+ * @param inode  Pointer to the inode record to store.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_inode_put(struct obmafs3_ctx *ctx,
                       const struct inode_record *inode)
 {
@@ -518,6 +541,17 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx,
                                       &ctx->inode_hdr);
 }
 
+/**
+ * Delete an inode record from the B+Tree.
+ *
+ * Locates and removes the record for @p inode_id.  Frees empty leaf
+ * nodes and updates the tree header.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID to delete.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
 {
     size_t   bsz      = (size_t)ctx->sb.block_size;

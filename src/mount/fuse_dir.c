@@ -6,6 +6,12 @@
 
 #include "fuse_ops_internal.h"
 
+/**
+ * FUSE callback: create a directory.
+ *
+ * Allocates a new inode of type @c kFileTypeDirectory, inserts a
+ * catalog entry, and stores the new directory inode.
+ */
 int obmafs3_fuse_mkdir(const char *path, mode_t mode)
 {
     uint64_t parent_id;
@@ -63,6 +69,12 @@ int obmafs3_fuse_mkdir(const char *path, mode_t mode)
     return 0;
 }
 
+/**
+ * FUSE callback: remove a directory.
+ *
+ * Verifies that the directory is empty, then removes the catalog entry
+ * and deletes the inode.
+ */
 int obmafs3_fuse_rmdir(const char *path)
 {
     uint64_t parent_id;

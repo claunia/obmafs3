@@ -7,6 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/**
+ * Compress data using ZSTD.
+ *
+ * @param src       Source data buffer.
+ * @param src_size  Number of bytes in @p src.
+ * @param dst       Destination buffer for compressed data.
+ * @param dst_size  On input, capacity of @p dst; on output, compressed size.
+ * @param level     ZSTD compression level (1–22).
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on error.
+ */
 int obmafs3_compress(const void *src, size_t src_size,
                      void *dst, size_t *dst_size, int level)
 {
@@ -17,6 +27,15 @@ int obmafs3_compress(const void *src, size_t src_size,
     return OBMAFS3_OK;
 }
 
+/**
+ * Decompress ZSTD-compressed data.
+ *
+ * @param src       Compressed data buffer.
+ * @param src_size  Number of compressed bytes.
+ * @param dst       Output buffer for decompressed data.
+ * @param dst_size  Capacity of @p dst (must be >= original size).
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on error.
+ */
 int obmafs3_decompress(const void *src, size_t src_size,
                        void *dst, size_t dst_size)
 {
@@ -666,6 +685,20 @@ static uint64_t overflow_count_blocks(struct obmafs3_ctx *ctx,
 /*  File data reading                                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Read file data from the filesystem.
+ *
+ * Resolves logical block offsets through the inode's inline extents and
+ * overflow extent tree, handling block-level ZSTD decompression
+ * transparently.
+ *
+ * @param ctx     Filesystem context.
+ * @param inode   Inode record describing the file.
+ * @param offset  Byte offset within the file to start reading.
+ * @param buf     Output buffer.
+ * @param size    Number of bytes to read.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
                            const struct inode_record *inode,
                            uint64_t offset, void *buf, size_t size)
@@ -800,6 +833,20 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx,
 /*  File data writing                                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Write file data to the filesystem.
+ *
+ * Allocates blocks as needed (extending inline extents and the overflow
+ * extent tree), writes data with optional ZSTD compression, and updates
+ * the inode's file size.
+ *
+ * @param ctx     Filesystem context.
+ * @param inode   Inode record to update (modified in place).
+ * @param offset  Byte offset within the file to start writing.
+ * @param buf     Data buffer to write.
+ * @param size    Number of bytes to write.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_write_file_data(struct obmafs3_ctx *ctx,
                             struct inode_record *inode,
                             uint64_t offset, const void *buf, size_t size)

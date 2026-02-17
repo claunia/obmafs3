@@ -159,6 +159,20 @@ static bool cd_prefix_is_generatable(const uint8_t *sector,
     return memcmp(sector, expected, CD_PREFIX_SIZE) == 0;
 }
 
+/**
+ * Write a raw CD sector to the filesystem.
+ *
+ * Processes a 2352-byte (or 2448-byte with subchannel) raw CD sector.
+ * The prefix and suffix are checked for generatability; non-generatable
+ * portions are stored in the CD prefix / suffix dedup trees.  Subchannel
+ * data is stored in the subchannel tree, and the user data portion is
+ * written through the media image dedup path.  A @c cd_sector_map_entry
+ * is appended to the per-file cache.
+ *
+ * @param ffctx  Per-file FUSE context (must be a CD image file).
+ * @param arg    CD write argument containing buffer, size, and sector mode.
+ * @return 0 on success, negative errno on failure.
+ */
 static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx,
                                  const struct obmafs3_ioctl_cd_write_arg *arg)
 {
@@ -624,6 +638,21 @@ static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx,
 /*  Main ioctl dispatcher                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * FUSE callback: handle ioctl commands.
+ *
+ * Dispatches ioctl requests for media tag get/set, CD image operations
+ * (set CD image, write long, read long, read long with subchannel),
+ * and metadata operations (get, set, delete, list, query).
+ *
+ * @param path   File path (unused).
+ * @param cmd    Ioctl command number.
+ * @param arg    Ioctl argument (unused — data is used instead).
+ * @param fi     FUSE file info with the per-file context.
+ * @param flags  Ioctl flags (unused).
+ * @param data   Pointer to the ioctl data structure.
+ * @return 0 on success, negative errno on failure.
+ */
 int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
                                void *arg, struct fuse_file_info *fi,
                                unsigned int flags, void *data)

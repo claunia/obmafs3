@@ -123,6 +123,13 @@ static int is_mediatag_xattr(const char *name)
 #define METADATA_XATTR_PREFIX     "user.metadata."
 #define METADATA_XATTR_PREFIX_LEN 14   /* strlen("user.metadata.") */
 
+/**
+ * Check whether @p name starts with the metadata xattr prefix
+ * (@c "user.metadata.").
+ *
+ * @param name  Extended attribute name.
+ * @return Non-zero if @p name is a metadata xattr, zero otherwise.
+ */
 static int is_metadata_xattr(const char *name)
 {
     return strncmp(name, METADATA_XATTR_PREFIX,
@@ -139,6 +146,13 @@ static int is_image_file_type(uint8_t ft)
 /*  xattr FUSE callbacks                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * FUSE callback: retrieve an extended attribute value.
+ *
+ * Handles both media tag xattrs (@c "user.mediatag.*") and metadata
+ * xattrs (@c "user.metadata.*").  Returns @c -ENODATA if the
+ * attribute is not found or the file is not a media image.
+ */
 int obmafs3_fuse_getxattr(const char *path, const char *name,
                                   char *value, size_t size)
 {
@@ -221,6 +235,13 @@ int obmafs3_fuse_getxattr(const char *path, const char *name,
     return (int)vlen;
 }
 
+/**
+ * FUSE callback: set an extended attribute.
+ *
+ * Stores media tag data or metadata key/value pairs on media image
+ * files.  Returns @c -ENOTSUP for non-image files or unrecognised
+ * attribute namespaces.
+ */
 int obmafs3_fuse_setxattr(const char *path, const char *name,
                                   const char *value, size_t size, int flags)
 {
@@ -290,6 +311,13 @@ int obmafs3_fuse_setxattr(const char *path, const char *name,
     return 0;
 }
 
+/**
+ * FUSE callback: list extended attribute names.
+ *
+ * Enumerates all media tag and metadata xattr names attached to a
+ * media image file.  Returns the required buffer size when
+ * @p size is zero.
+ */
 int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
 {
     if (strcmp(path, "/") == 0)
@@ -380,6 +408,12 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
     return (int)total;
 }
 
+/**
+ * FUSE callback: remove an extended attribute.
+ *
+ * Deletes a media tag or metadata entry.  Returns @c -ENODATA if the
+ * attribute does not exist.
+ */
 int obmafs3_fuse_removexattr(const char *path, const char *name)
 {
     int want_mediatag = is_mediatag_xattr(name);

@@ -17,6 +17,16 @@
 #include <linux/fs.h>   /* BLKGETSIZE64 */
 #endif
 
+/**
+ * Parse a UUID string into a 16-byte array.
+ *
+ * Accepts the canonical form @c "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+ * as well as a plain 32-character hexadecimal string.
+ *
+ * @param str  NUL-terminated UUID string.
+ * @param out  Output buffer (must be at least 16 bytes).
+ * @return 0 on success, -1 on parse error.
+ */
 static int parse_guid(const char *str, uint8_t *out)
 {
     /* Accept xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or 32 hex chars */
@@ -50,6 +60,11 @@ static int parse_guid(const char *str, uint8_t *out)
     return 0;
 }
 
+/**
+ * Print usage information for mkobmafs.
+ *
+ * @param prog  Program name to display in the usage line.
+ */
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -65,6 +80,13 @@ static void usage(const char *prog)
         prog);
 }
 
+/**
+ * Entry point for mkobmafs.
+ *
+ * Parses command-line arguments for filesystem size, block size, dedup
+ * block size, volume label, and GUID, then creates a new OBMAFS3
+ * filesystem on the specified device or file.
+ */
 int main(int argc, char *argv[])
 {
     static struct option long_opts[] = {

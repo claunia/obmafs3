@@ -6,6 +6,13 @@
 
 #include "fuse_ops_internal.h"
 
+/**
+ * FUSE callback: create a new file.
+ *
+ * Allocates a new inode, inserts a catalog entry, and opens the file.
+ * Detects media image files by extension and sets the file type
+ * accordingly.
+ */
 int obmafs3_fuse_create(const char *path, mode_t mode,
                                struct fuse_file_info *fi)
 {
@@ -79,6 +86,13 @@ int obmafs3_fuse_create(const char *path, mode_t mode,
     return 0;
 }
 
+/**
+ * FUSE callback: write data to a file.
+ *
+ * Writes @p size bytes from @p buf at @p offset.  For media image
+ * files the write is dispatched through the dedup-aware media image
+ * write path with background compression.
+ */
 int obmafs3_fuse_write(const char *path, const char *buf,
                               size_t size, off_t offset,
                               struct fuse_file_info *fi)
@@ -164,6 +178,12 @@ int obmafs3_fuse_write(const char *path, const char *buf,
     return (int)size;
 }
 
+/**
+ * FUSE callback: change file size.
+ *
+ * Extends the file with zero-filled data or shrinks it by freeing
+ * trailing extent blocks.
+ */
 int obmafs3_fuse_truncate(const char *path, off_t newsize,
                                  struct fuse_file_info *fi)
 {
@@ -266,6 +286,12 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize,
     return 0;
 }
 
+/**
+ * FUSE callback: create a hard link.
+ *
+ * Creates a new catalog entry pointing to the same inode as @p oldpath
+ * and increments the reference count.
+ */
 int obmafs3_fuse_link(const char *oldpath, const char *newpath)
 {
     uint64_t old_parent_id, new_parent_id;
@@ -327,6 +353,12 @@ int obmafs3_fuse_link(const char *oldpath, const char *newpath)
     return 0;
 }
 
+/**
+ * FUSE callback: create a symbolic link.
+ *
+ * Allocates a new inode of type @c kFileTypeSymlink, stores the
+ * symlink target as file data, and inserts the catalog entry.
+ */
 int obmafs3_fuse_symlink(const char *target, const char *linkpath)
 {
     uint64_t parent_id;
@@ -390,6 +422,11 @@ int obmafs3_fuse_symlink(const char *target, const char *linkpath)
     return 0;
 }
 
+/**
+ * FUSE callback: read the target of a symbolic link.
+ *
+ * Reads the symlink target from the inode's file data into @p buf.
+ */
 int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
 {
     uint64_t parent_id;
@@ -428,6 +465,13 @@ int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
     return 0;
 }
 
+/**
+ * FUSE callback: remove a file.
+ *
+ * Removes the catalog entry, decrements the inode reference count, and
+ * deletes the inode (along with its media tags) when the last reference
+ * is removed.
+ */
 int obmafs3_fuse_unlink(const char *path)
 {
     uint64_t parent_id;

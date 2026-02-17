@@ -18,6 +18,16 @@
 /*  Bitmap I/O                                                         */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Read the allocation bitmap from disk.
+ *
+ * Reads the bitmap header (first block) and all subsequent bitmap blocks,
+ * validates the magic number and checksum, and stores the bitmap data in
+ * the context.
+ *
+ * @param ctx  Filesystem context.
+ * @return @c OBMAFS3_OK on success, or an appropriate error code.
+ */
 int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
 {
     uint64_t block_size = ctx->sb.block_size;
@@ -109,6 +119,15 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
     return OBMAFS3_OK;
 }
 
+/**
+ * Write the in-memory allocation bitmap to disk.
+ *
+ * Builds a fresh bitmap header with an updated checksum and writes all
+ * bitmap blocks to their on-disk locations.
+ *
+ * @param ctx  Filesystem context.
+ * @return @c OBMAFS3_OK on success, or an appropriate error code.
+ */
 int obmafs3_bitmap_write(struct obmafs3_ctx *ctx)
 {
     if (!ctx->bitmap)
@@ -171,6 +190,13 @@ int obmafs3_bitmap_write(struct obmafs3_ctx *ctx)
 /*  Bit manipulation                                                   */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Mark a contiguous range of blocks as allocated in the bitmap.
+ *
+ * @param ctx    Filesystem context.
+ * @param lba    Starting logical block address.
+ * @param count  Number of blocks to set.
+ */
 void obmafs3_bitmap_set(struct obmafs3_ctx *ctx, uint64_t lba,
                         uint64_t count)
 {
@@ -183,6 +209,13 @@ void obmafs3_bitmap_set(struct obmafs3_ctx *ctx, uint64_t lba,
     }
 }
 
+/**
+ * Mark a contiguous range of blocks as free in the bitmap.
+ *
+ * @param ctx    Filesystem context.
+ * @param lba    Starting logical block address.
+ * @param count  Number of blocks to clear.
+ */
 void obmafs3_bitmap_clear(struct obmafs3_ctx *ctx, uint64_t lba,
                           uint64_t count)
 {
@@ -195,6 +228,13 @@ void obmafs3_bitmap_clear(struct obmafs3_ctx *ctx, uint64_t lba,
     }
 }
 
+/**
+ * Test whether a single block is allocated.
+ *
+ * @param ctx  Filesystem context.
+ * @param lba  Logical block address to test.
+ * @return 1 if the block is allocated, 0 if free or out of range.
+ */
 int obmafs3_bitmap_is_set(struct obmafs3_ctx *ctx, uint64_t lba)
 {
     if (!ctx->bitmap)
@@ -208,6 +248,17 @@ int obmafs3_bitmap_is_set(struct obmafs3_ctx *ctx, uint64_t lba)
 /*  Free block search                                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Find a contiguous run of free blocks in the bitmap.
+ *
+ * Scans the bitmap for @p count consecutive unallocated blocks.
+ *
+ * @param ctx        Filesystem context.
+ * @param count      Number of contiguous free blocks required.
+ * @param start_lba  Output LBA of the first free block in the run.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOSPC if no
+ *         sufficiently large run exists.
+ */
 int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count,
                              uint64_t *start_lba)
 {
@@ -239,11 +290,26 @@ int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count,
 /*  Block freeing                                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Free a single block and persist the bitmap.
+ *
+ * @param ctx  Filesystem context.
+ * @param lba  Logical block address to free.
+ * @return @c OBMAFS3_OK on success, or an error code on I/O failure.
+ */
 int obmafs3_free_block(struct obmafs3_ctx *ctx, uint64_t lba)
 {
     return obmafs3_free_blocks(ctx, lba, 1);
 }
 
+/**
+ * Free a contiguous range of blocks and persist the bitmap.
+ *
+ * @param ctx    Filesystem context.
+ * @param lba    Starting logical block address.
+ * @param count  Number of blocks to free.
+ * @return @c OBMAFS3_OK on success, or an error code on I/O failure.
+ */
 int obmafs3_free_blocks(struct obmafs3_ctx *ctx, uint64_t lba,
                         uint64_t count)
 {

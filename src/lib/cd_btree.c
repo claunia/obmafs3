@@ -92,6 +92,19 @@ struct cd_hash_btree_path {
 
 /* ---- Lookup ---- */
 
+/**
+ * Look up a record in a hash-keyed CD B+Tree.
+ *
+ * Generic lookup used by CD prefix, suffix, and subchannel trees.
+ *
+ * @param ctx     Filesystem context.
+ * @param hdr     B+Tree header for the target tree.
+ * @param hash    Hash key to search for.
+ * @param record  Output record buffer.
+ * @param rec_sz  Size of each record in bytes.
+ * @return @c OBMAFS3_OK if found, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx,
                                const struct btree_header *hdr,
                                uint64_t hash, void *record,
@@ -149,6 +162,20 @@ static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx,
 
 /* ---- Insert / update ---- */
 
+/**
+ * Insert or update a record in a hash-keyed CD B+Tree.
+ *
+ * Generic insert/update used by CD prefix, suffix, and subchannel
+ * trees.  Handles leaf splitting and root promotion.
+ *
+ * @param ctx       Filesystem context.
+ * @param hdr       B+Tree header (updated on root changes).
+ * @param hdr_lba   LBA of the B+Tree header block.
+ * @param record    Pointer to the record to insert.
+ * @param rec_sz    Size of each record in bytes.
+ * @param data_type B+Tree data type tag for new nodes.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 static int cd_hash_tree_put(struct obmafs3_ctx *ctx,
                             struct btree_header *hdr,
                             uint64_t hdr_lba,
@@ -522,6 +549,20 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx,
 
 /* ---- Delete ---- */
 
+/**
+ * Delete a record from a hash-keyed CD B+Tree.
+ *
+ * Generic deletion used by CD prefix, suffix, and subchannel trees.
+ * Frees empty leaf nodes and updates the tree header.
+ *
+ * @param ctx      Filesystem context.
+ * @param hdr      B+Tree header (updated on root changes).
+ * @param hdr_lba  LBA of the B+Tree header block.
+ * @param hash     Hash key of the record to delete.
+ * @param rec_sz   Size of each record in bytes.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int cd_hash_tree_delete(struct obmafs3_ctx *ctx,
                                struct btree_header *hdr,
                                uint64_t hdr_lba,
@@ -680,6 +721,14 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx,
 
 /* ---- CD Prefix ---- */
 
+/**
+ * Retrieve CD sector prefix data by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the prefix.
+ * @param data  Output 16-byte prefix data.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
 int obmafs3_cd_prefix_get(struct obmafs3_ctx *ctx, uint64_t hash,
                           uint8_t data[CD_PREFIX_DATA_SIZE])
 {
@@ -697,6 +746,14 @@ int obmafs3_cd_prefix_get(struct obmafs3_ctx *ctx, uint64_t hash,
     return OBMAFS3_OK;
 }
 
+/**
+ * Store CD sector prefix data keyed by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the prefix.
+ * @param data  16-byte prefix data to store.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_cd_prefix_put(struct obmafs3_ctx *ctx, uint64_t hash,
                           const uint8_t data[CD_PREFIX_DATA_SIZE])
 {
@@ -713,6 +770,13 @@ int obmafs3_cd_prefix_put(struct obmafs3_ctx *ctx, uint64_t hash,
                             kBtreeDataTypeCdPrefixEntry);
 }
 
+/**
+ * Delete CD sector prefix data by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the prefix to delete.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
 int obmafs3_cd_prefix_delete(struct obmafs3_ctx *ctx, uint64_t hash)
 {
     if (ctx->sb.cd_prefix_lba == 0)
@@ -726,6 +790,14 @@ int obmafs3_cd_prefix_delete(struct obmafs3_ctx *ctx, uint64_t hash)
 
 /* ---- CD Suffix ---- */
 
+/**
+ * Retrieve CD sector suffix (ECC/EDC) data by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the suffix.
+ * @param data  Output 288-byte suffix data.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
 int obmafs3_cd_suffix_get(struct obmafs3_ctx *ctx, uint64_t hash,
                           uint8_t data[CD_SUFFIX_DATA_SIZE])
 {
@@ -743,6 +815,14 @@ int obmafs3_cd_suffix_get(struct obmafs3_ctx *ctx, uint64_t hash,
     return OBMAFS3_OK;
 }
 
+/**
+ * Store CD sector suffix (ECC/EDC) data keyed by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the suffix.
+ * @param data  288-byte suffix data to store.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_cd_suffix_put(struct obmafs3_ctx *ctx, uint64_t hash,
                           const uint8_t data[CD_SUFFIX_DATA_SIZE])
 {
@@ -759,6 +839,13 @@ int obmafs3_cd_suffix_put(struct obmafs3_ctx *ctx, uint64_t hash,
                             kBtreeDataTypeCdSuffixEntry);
 }
 
+/**
+ * Delete CD sector suffix data by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the suffix to delete.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
 int obmafs3_cd_suffix_delete(struct obmafs3_ctx *ctx, uint64_t hash)
 {
     if (ctx->sb.cd_suffix_lba == 0)
@@ -772,6 +859,14 @@ int obmafs3_cd_suffix_delete(struct obmafs3_ctx *ctx, uint64_t hash)
 
 /* ---- CD Subchannel ---- */
 
+/**
+ * Retrieve CD subchannel data by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the subchannel data.
+ * @param data  Output 96-byte subchannel data.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
 int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash,
                               uint8_t data[CD_SUBCHANNEL_DATA_SIZE])
 {
@@ -789,6 +884,14 @@ int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash,
     return OBMAFS3_OK;
 }
 
+/**
+ * Store CD subchannel data keyed by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the subchannel data.
+ * @param data  96-byte subchannel data to store.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash,
                               const uint8_t data[CD_SUBCHANNEL_DATA_SIZE])
 {
@@ -805,6 +908,13 @@ int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash,
                             kBtreeDataTypeCdSubchannelEntry);
 }
 
+/**
+ * Delete CD subchannel data by hash.
+ *
+ * @param ctx   Filesystem context.
+ * @param hash  XXH64 hash of the subchannel data to delete.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
 int obmafs3_cd_subchannel_delete(struct obmafs3_ctx *ctx, uint64_t hash)
 {
     if (ctx->sb.cd_subchannel_lba == 0)

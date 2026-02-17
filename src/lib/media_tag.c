@@ -110,6 +110,19 @@ struct media_tag_btree_path {
 
 /* ---- Internal lookup ---- */
 
+/**
+ * Look up a media tag record by inode ID and tag type.
+ *
+ * Traverses the media tag B+Tree using the composite key
+ * (@p inode_id, @p tag_type).
+ *
+ * @param ctx        Filesystem context.
+ * @param inode_id   Inode ID of the media image.
+ * @param tag_type   Media tag type enumeration value.
+ * @param record     Output media tag record.
+ * @return @c OBMAFS3_OK if found, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int media_tag_tree_lookup(struct obmafs3_ctx *ctx,
                                  uint64_t inode_id, uint16_t tag_type,
                                  struct media_tag_record *record)
@@ -258,6 +271,16 @@ static int media_tag_build_record(struct obmafs3_ctx *ctx,
 
 /* ---- Insert or update a media tag record in the B+Tree ---- */
 
+/**
+ * Insert or update a media tag record in the B+Tree.
+ *
+ * Handles leaf splitting and root promotion when the target leaf is
+ * full.  If a record with the same key already exists it is replaced.
+ *
+ * @param ctx  Filesystem context.
+ * @param rec  Pointer to the media tag record to insert or update.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 static int media_tag_tree_put(struct obmafs3_ctx *ctx,
                               const struct media_tag_record *rec)
 {
@@ -627,6 +650,18 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx,
 
 /* ---- Delete a media tag record from the B+Tree ---- */
 
+/**
+ * Delete a media tag record from the B+Tree.
+ *
+ * Frees any external data blocks associated with the tag and removes
+ * the record.  Empty leaf nodes are freed and the tree header is updated.
+ *
+ * @param ctx        Filesystem context.
+ * @param inode_id   Inode ID of the media image.
+ * @param tag_type   Media tag type to delete.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 static int media_tag_tree_delete(struct obmafs3_ctx *ctx,
                                  uint64_t inode_id, uint16_t tag_type)
 {
@@ -796,6 +831,21 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx,
 /*  Media Tag public API                                               */
 /* ================================================================== */
 
+/**
+ * Retrieve media tag data for a given inode and tag type.
+ *
+ * Looks up the tag record; if the data is inline it is copied directly,
+ * otherwise the external data blocks are read.  The caller must free
+ * the returned buffer with @c obmafs3_media_tag_data_free.
+ *
+ * @param ctx          Filesystem context.
+ * @param inode_id     Inode ID of the media image.
+ * @param tag_type     Media tag type to retrieve.
+ * @param data         Output pointer to the allocated data buffer.
+ * @param data_length  Output length of the data in bytes.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
                           uint16_t tag_type,
                           void **data, uint32_t *data_length)
@@ -847,11 +897,30 @@ int obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
     return OBMAFS3_OK;
 }
 
+/**
+ * Free a media tag data buffer returned by @c obmafs3_media_tag_get.
+ *
+ * @param data  Data buffer to free (may be NULL).
+ */
 void obmafs3_media_tag_data_free(void *data)
 {
     free(data);
 }
 
+/**
+ * Store or update a media tag for a given inode.
+ *
+ * If a tag with the same type already exists its external data is freed
+ * before storing the new data.  Small tags are stored inline; larger
+ * tags use external blocks.
+ *
+ * @param ctx          Filesystem context.
+ * @param inode_id     Inode ID of the media image.
+ * @param tag_type     Media tag type to store.
+ * @param data         Tag data buffer.
+ * @param data_length  Length of @p data in bytes.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_media_tag_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
                           uint16_t tag_type,
                           const void *data, uint32_t data_length)
@@ -876,6 +945,15 @@ int obmafs3_media_tag_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
     return media_tag_tree_put(ctx, &new_rec);
 }
 
+/**
+ * Delete a single media tag for a given inode.
+ *
+ * @param ctx        Filesystem context.
+ * @param inode_id   Inode ID of the media image.
+ * @param tag_type   Media tag type to delete.
+ * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_NOTFOUND if absent,
+ *         or another error code on failure.
+ */
 int obmafs3_media_tag_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
                              uint16_t tag_type)
 {
@@ -885,6 +963,15 @@ int obmafs3_media_tag_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
     return media_tag_tree_delete(ctx, inode_id, tag_type);
 }
 
+/**
+ * Delete all media tags for a given inode.
+ *
+ * Repeatedly lists and deletes tags until none remain.
+ *
+ * @param ctx       Filesystem context.
+ * @param inode_id  Inode ID of the media image.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_media_tag_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id)
 {
     if (ctx->sb.media_tag_lba == 0)
@@ -911,6 +998,19 @@ int obmafs3_media_tag_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id)
     }
 }
 
+/**
+ * List all media tag types stored for a given inode.
+ *
+ * Traverses the media tag B+Tree leaf chain and collects all tag type
+ * values associated with @p inode_id.  The caller must free the
+ * returned array with @c obmafs3_media_tag_list_free.
+ *
+ * @param ctx        Filesystem context.
+ * @param inode_id   Inode ID of the media image.
+ * @param tag_types  Output array of tag type values.
+ * @param count      Output number of tag types.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
 int obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
                            uint16_t **tag_types, uint32_t *count)
 {
@@ -1013,6 +1113,11 @@ scan_done:
     return OBMAFS3_OK;
 }
 
+/**
+ * Free a tag type array returned by @c obmafs3_media_tag_list.
+ *
+ * @param tag_types  Array to free (may be NULL).
+ */
 void obmafs3_media_tag_list_free(uint16_t *tag_types)
 {
     free(tag_types);
