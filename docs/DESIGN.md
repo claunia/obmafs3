@@ -207,7 +207,7 @@ If a file requires more than 8 extents, additional extents are stored in the Ove
 
 ### Overflow Tree (extra extents)
 
-The Overflow Tree stores additional extent runs for files that exceed the 8 inline extents available in the inode. Each entry associates an extent with its owning inode:
+The Overflow Tree is a B+Tree that stores additional extent runs for files that exceed the 8 inline extents available in the inode. Leaf nodes contain sorted `overflow_extent` records; index nodes use `btree_index_entry` to route lookups by `inode_id`.
 
 ```c
 struct overflow_extent {                     /* packed, 24 bytes */
@@ -217,7 +217,9 @@ struct overflow_extent {                     /* packed, 24 bytes */
 };
 ```
 
-Overflow entries are keyed by `(inode_id, start_block)`. When reading file data, the system first uses the 8 inline extents from the inode, then queries the overflow tree for any additional extents for that inode.
+Overflow entries are sorted by the composite key `(inode_id, start_block)`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 24 = **167 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
+
+When reading file data, the system first uses the 8 inline extents from the inode, then traverses the overflow B+Tree to find any additional extents for that inode. The `level` field in the node header distinguishes index nodes (`level > 0`) from leaf nodes (`level == 0`).
 
 ### Deduplication Tree (sector hash lookup)
 

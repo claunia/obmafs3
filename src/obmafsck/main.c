@@ -359,8 +359,8 @@ static int collect_inode_data_blocks(struct obmafs3_ctx *ctx,
 }
 
 /**
- * Walk the overflow tree and collect all data blocks referenced by
- * overflow_extent entries.
+ * Walk the overflow B+Tree (DFS) and collect all data blocks referenced
+ * by overflow_extent entries in leaf nodes.
  */
 static int collect_overflow_data_blocks(struct obmafs3_ctx *ctx,
                                         uint64_t **out_lbas,
@@ -379,44 +379,78 @@ static int collect_overflow_data_blocks(struct obmafs3_ctx *ctx,
     uint64_t *lbas = NULL;
     uint64_t count = 0;
     uint64_t cap = 0;
-    uint64_t lba = ctx->overflow_hdr.root_node_lba;
 
-    while (lba != 0) {
+    /* Iterative DFS via explicit stack */
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t stk_size  = 0;
+    uint64_t stk_cap   = 64;
+    if (!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
+
+    while (stk_size > 0) {
+        uint64_t lba = stack[--stk_size];
+
         int rc = obmafs3_block_read(ctx, lba, buf,
                                     (size_t)ctx->sb.block_size);
         if (rc != OBMAFS3_OK) {
-            free(buf); free(lbas); return rc;
+            free(buf); free(stack); free(lbas); return rc;
         }
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
         if (nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
-            free(buf); free(lbas); return OBMAFS3_ERR_BADMAGIC;
+            free(buf); free(stack); free(lbas);
+            return OBMAFS3_ERR_BADMAGIC;
         }
 
-        const uint8_t *entries = buf + sizeof(struct btree_node_header);
-        for (uint16_t i = 0; i < nhdr.node_keys; i++) {
-            struct overflow_extent oe;
-            memcpy(&oe, entries + i * sizeof(struct overflow_extent),
-                   sizeof(oe));
-            for (uint64_t b = 0; b < oe.block_count; b++) {
-                if (count >= cap) {
-                    cap = (cap == 0) ? 128 : cap * 2;
-                    uint64_t *tmp = realloc(lbas, cap * sizeof(*tmp));
+        if (nhdr.level > 0) {
+            /* Index node: push children onto stack */
+            for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+                struct btree_index_entry ie;
+                memcpy(&ie,
+                       buf + sizeof(struct btree_node_header)
+                           + (size_t)i * sizeof(ie),
+                       sizeof(ie));
+
+                if (stk_size >= stk_cap) {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack,
+                                            stk_cap * sizeof(*tmp));
                     if (!tmp) {
-                        free(buf); free(lbas);
+                        free(buf); free(stack); free(lbas);
                         return OBMAFS3_ERR_NOMEM;
                     }
-                    lbas = tmp;
+                    stack = tmp;
                 }
-                lbas[count++] = oe.start_block + b;
+                stack[stk_size++] = ie.child_lba;
+            }
+        } else {
+            /* Leaf node: collect data block LBAs from extents */
+            const uint8_t *entries = buf + sizeof(struct btree_node_header);
+            for (uint16_t i = 0; i < nhdr.node_keys; i++) {
+                struct overflow_extent oe;
+                memcpy(&oe, entries + i * sizeof(struct overflow_extent),
+                       sizeof(oe));
+                for (uint64_t b = 0; b < oe.block_count; b++) {
+                    if (count >= cap) {
+                        cap = (cap == 0) ? 128 : cap * 2;
+                        uint64_t *tmp = realloc(lbas,
+                                                cap * sizeof(*tmp));
+                        if (!tmp) {
+                            free(buf); free(stack); free(lbas);
+                            return OBMAFS3_ERR_NOMEM;
+                        }
+                        lbas = tmp;
+                    }
+                    lbas[count++] = oe.start_block + b;
+                }
             }
         }
-
-        lba = nhdr.right_link;
     }
 
     free(buf);
+    free(stack);
     *out_lbas  = lbas;
     *out_count = count;
     return OBMAFS3_OK;
@@ -657,9 +691,9 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
         if (ctx->overflow_hdr.root_node_lba != 0) {
             uint64_t *ovf_nodes = NULL;
             uint64_t ovf_count = 0;
-            int rc = walk_tree_nodes(ctx,
-                                     ctx->overflow_hdr.root_node_lba,
-                                     &ovf_nodes, &ovf_count);
+            int rc = walk_inode_btree_nodes(ctx,
+                                            ctx->overflow_hdr.root_node_lba,
+                                            &ovf_nodes, &ovf_count);
             if (rc == OBMAFS3_OK) {
                 for (uint64_t i = 0; i < ovf_count; i++)
                     MARK(ovf_nodes[i]);
@@ -1280,16 +1314,27 @@ int main(int argc, char *argv[])
         }
 
         if (ctx->overflow_hdr.root_node_lba != 0) {
-            uint64_t ovf_bad = 0;
-            verify_tree_node_checksums(ctx,
-                                       ctx->overflow_hdr.root_node_lba,
-                                       "Overflow", &ovf_bad);
-            if (ovf_bad > 0) {
-                printf("  Node checksums:   %" PRIu64 " BAD\n",
-                       ovf_bad);
-                errors++;
+            uint64_t *ovf_nodes = NULL;
+            uint64_t ovf_node_count = 0;
+            int wrc = walk_inode_btree_nodes(ctx,
+                                             ctx->overflow_hdr.root_node_lba,
+                                             &ovf_nodes, &ovf_node_count);
+            if (wrc == OBMAFS3_OK) {
+                uint64_t ovf_bad = 0;
+                verify_btree_node_checksums(ctx, ovf_nodes,
+                                            ovf_node_count,
+                                            "Overflow", &ovf_bad);
+                free(ovf_nodes);
+                if (ovf_bad > 0) {
+                    printf("  Node checksums:   %" PRIu64 " BAD\n",
+                           ovf_bad);
+                    errors++;
+                } else {
+                    printf("  Node checksums:   OK\n");
+                }
             } else {
-                printf("  Node checksums:   OK\n");
+                printf("  Node checksums:   could not walk tree\n");
+                errors++;
             }
         }
     }
