@@ -44,6 +44,17 @@ struct __attribute__((packed)) btree_node_filename {
 };
 
 /**
+ * Catalog record stored in B+Tree leaf nodes.
+ * Sorted by (parent_id, name) as the composite key.
+ */
+struct __attribute__((packed)) catalog_record {
+    uint64_t inode_id;       /**< Unique identifier for the file or directory */
+    uint64_t parent_id;      /**< Identifier of the parent directory */
+    uint8_t  directory_flag; /**< 1 if directory, 0 if file */
+    char     name[256];      /**< Name in UTF-8 NUL-terminated format */
+};
+
+/**
  * Inode record stored in B+Tree leaf nodes.
  * This is the public API type for inode operations and the on-disk format.
  */
@@ -73,6 +84,17 @@ struct __attribute__((packed)) btree_node_dedup {
 /** Index entry for B+Tree internal (index) nodes: key + child pointer. */
 struct __attribute__((packed)) btree_index_entry {
     uint64_t key;           /**< Smallest key reachable through child */
+    uint64_t child_lba;     /**< LBA of the child node */
+};
+
+/**
+ * Index entry for catalog B+Tree internal nodes.
+ * Uses the full composite key (parent_id, name) so that directories
+ * with hundreds of entries are correctly routed across multiple leaves.
+ */
+struct __attribute__((packed)) catalog_index_entry {
+    uint64_t parent_id;     /**< Smallest parent_id reachable through child */
+    char     name[256];     /**< Smallest name reachable through child */
     uint64_t child_lba;     /**< LBA of the child node */
 };
 

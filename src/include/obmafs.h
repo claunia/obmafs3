@@ -66,11 +66,11 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba,
 /* --- Catalog operations --- */
 int  obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id,
                             const char *name,
-                            struct btree_node_filename *entry);
+                            struct catalog_record *entry);
 int  obmafs3_catalog_list(struct obmafs3_ctx *ctx, uint64_t parent_id,
-                          struct btree_node_filename **entries,
+                          struct catalog_record **entries,
                           uint32_t *count);
-void obmafs3_catalog_list_free(struct btree_node_filename *entries);
+void obmafs3_catalog_list_free(struct catalog_record *entries);
 
 /* --- Inode operations --- */
 int obmafs3_inode_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
@@ -101,7 +101,7 @@ uint64_t obmafs3_alloc_inode_id(struct obmafs3_ctx *ctx);
 
 /* --- Catalog mutations --- */
 int obmafs3_catalog_insert(struct obmafs3_ctx *ctx,
-                           const struct btree_node_filename *entry);
+                           const struct catalog_record *entry);
 int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id,
                            const char *name);
 

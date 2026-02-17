@@ -190,6 +190,99 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Walk all nodes in the catalog B+Tree (DFS)                         */
+/*  Uses catalog_index_entry instead of btree_index_entry.             */
+/* ------------------------------------------------------------------ */
+
+static int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx,
+                                    uint64_t root_lba,
+                                    uint64_t **out_lbas,
+                                    uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if (root_lba == 0)
+        return OBMAFS3_OK;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t *lbas    = NULL;
+    uint64_t count    = 0;
+    uint64_t cap      = 0;
+
+    /* Iterative DFS via explicit stack */
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t stk_size  = 0;
+    uint64_t stk_cap   = 64;
+    if (!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    stack[stk_size++] = root_lba;
+
+    while (stk_size > 0) {
+        uint64_t lba = stack[--stk_size];
+
+        /* Grow output array */
+        if (count >= cap) {
+            cap = cap == 0 ? 64 : cap * 2;
+            uint64_t *tmp = realloc(lbas, cap * sizeof(*tmp));
+            if (!tmp) {
+                free(buf); free(stack); free(lbas);
+                return OBMAFS3_ERR_NOMEM;
+            }
+            lbas = tmp;
+        }
+        lbas[count++] = lba;
+
+        int rc = obmafs3_block_read(ctx, lba, buf,
+                                    (size_t)ctx->sb.block_size);
+        if (rc != OBMAFS3_OK) {
+            free(buf); free(stack); free(lbas);
+            return rc;
+        }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); free(stack); free(lbas);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level > 0) {
+            /* Index node: push children (catalog_index_entry) */
+            for (uint16_t i = 0; i < hdr.node_keys; i++) {
+                struct catalog_index_entry ie;
+                memcpy(&ie,
+                       buf + sizeof(struct btree_node_header)
+                           + (size_t)i * sizeof(ie),
+                       sizeof(ie));
+
+                if (stk_size >= stk_cap) {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack,
+                                            stk_cap * sizeof(*tmp));
+                    if (!tmp) {
+                        free(buf); free(stack); free(lbas);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                    stack = tmp;
+                }
+                stack[stk_size++] = ie.child_lba;
+            }
+        }
+    }
+
+    free(buf);
+    free(stack);
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Verify checksums for a list of B+Tree node LBAs                    */
 /* ------------------------------------------------------------------ */
 
@@ -652,13 +745,14 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
     /* Block 0: superblock */
     MARK(0);
 
-    /* Catalog tree: header + nodes */
+    /* Catalog tree: header + nodes (B+Tree: DFS walk) */
     MARK(ctx->sb.catalog_lba);
     {
         uint64_t *cat_nodes = NULL;
         uint64_t cat_count = 0;
-        int rc = walk_tree_nodes(ctx, ctx->catalog_hdr.root_node_lba,
-                                 &cat_nodes, &cat_count);
+        int rc = walk_catalog_btree_nodes(ctx,
+                                          ctx->catalog_hdr.root_node_lba,
+                                          &cat_nodes, &cat_count);
         if (rc == OBMAFS3_OK) {
             for (uint64_t i = 0; i < cat_count; i++)
                 MARK(cat_nodes[i]);
@@ -1243,14 +1337,25 @@ int main(int argc, char *argv[])
     printf("  Total nodes:      %u\n", ctx->catalog_hdr.total_nodes);
 
     if (ctx->catalog_hdr.root_node_lba != 0) {
-        uint64_t cat_bad = 0;
-        verify_tree_node_checksums(ctx, ctx->catalog_hdr.root_node_lba,
-                                   "Catalog", &cat_bad);
-        if (cat_bad > 0) {
-            printf("  Node checksums:   %" PRIu64 " BAD\n", cat_bad);
-            errors++;
+        uint64_t *cat_nodes = NULL;
+        uint64_t cat_node_count = 0;
+        int wrc = walk_catalog_btree_nodes(ctx,
+                                           ctx->catalog_hdr.root_node_lba,
+                                           &cat_nodes, &cat_node_count);
+        if (wrc == OBMAFS3_OK) {
+            uint64_t cat_bad = 0;
+            verify_btree_node_checksums(ctx, cat_nodes, cat_node_count,
+                                        "Catalog", &cat_bad);
+            free(cat_nodes);
+            if (cat_bad > 0) {
+                printf("  Node checksums:   %" PRIu64 " BAD\n", cat_bad);
+                errors++;
+            } else {
+                printf("  Node checksums:   OK\n");
+            }
         } else {
-            printf("  Node checksums:   OK\n");
+            printf("  Node checksums:   WALK FAILED\n");
+            errors++;
         }
     }
 

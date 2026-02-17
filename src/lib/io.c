@@ -251,23 +251,38 @@ int obmafs3_create(const char *path, uint64_t total_size,
     rc = write_block(fd, block_size, 1, &cat_hdr, sizeof(cat_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
-    /* --- Block 2: Catalog root node (root directory entry) --- */
-    struct btree_node_filename root_cat;
-    memset(&root_cat, 0, sizeof(root_cat));
-    root_cat.header.magic       = OBMAFS3_BTREE_NODE_MAGIC;
-    root_cat.header.record_type = kBtreeDataTypeFilename;
-    root_cat.header.node_keys   = 1;
-    root_cat.header.keys_length = (uint16_t)(sizeof(root_cat) -
-                                             sizeof(root_cat.header));
-    root_cat.inode_id       = OBMAFS3_ROOT_INODE_ID;
-    root_cat.parent_id      = OBMAFS3_ROOT_INODE_ID;
-    root_cat.directory_flag = 1;
-    strncpy(root_cat.name, "/", sizeof(root_cat.name) - 1);
-    /* checksum is already zeroed; hash entire node struct, store result */
-    obmafs3_checksum_block(&root_cat, sizeof(root_cat),
-                           root_cat.header.checksum);
+    /* --- Block 2: Catalog root node (root directory entry, B+Tree leaf) --- */
+    uint8_t *cat_buf = calloc(1, block_size);
+    if (!cat_buf) { close(fd); return OBMAFS3_ERR_NOMEM; }
 
-    rc = write_block(fd, block_size, 2, &root_cat, sizeof(root_cat));
+    struct btree_node_header cat_node_hdr;
+    memset(&cat_node_hdr, 0, sizeof(cat_node_hdr));
+    cat_node_hdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+    cat_node_hdr.record_type = kBtreeDataTypeFilename;
+    cat_node_hdr.level       = 0;
+    cat_node_hdr.node_keys   = 1;
+    cat_node_hdr.keys_length = (uint16_t)sizeof(struct catalog_record);
+    memcpy(cat_buf, &cat_node_hdr, sizeof(cat_node_hdr));
+
+    struct catalog_record root_rec;
+    memset(&root_rec, 0, sizeof(root_rec));
+    root_rec.inode_id       = OBMAFS3_ROOT_INODE_ID;
+    root_rec.parent_id      = OBMAFS3_ROOT_INODE_ID;
+    root_rec.directory_flag = 1;
+    strncpy(root_rec.name, "/", sizeof(root_rec.name) - 1);
+    memcpy(cat_buf + sizeof(cat_node_hdr), &root_rec, sizeof(root_rec));
+
+    /* Compute checksum the same way btree.c does:
+       zero the checksum field, hash header + keys_length bytes */
+    {
+        struct btree_node_header *nhdr = (struct btree_node_header *)cat_buf;
+        size_t data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
+        memset(nhdr->checksum, 0, sizeof(nhdr->checksum));
+        obmafs3_checksum_block(cat_buf, data_size, nhdr->checksum);
+    }
+
+    rc = write_block(fd, block_size, 2, cat_buf, block_size);
+    free(cat_buf);
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
     /* --- Block 3: Inode tree header --- */

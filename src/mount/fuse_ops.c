@@ -152,7 +152,7 @@ static int resolve_path(const char *path,
     char *component = strtok_r(parent_path + 1, "/", &saveptr); /* skip leading / */
 
     while (component) {
-        struct btree_node_filename entry;
+        struct catalog_record entry;
         int rc = obmafs3_catalog_lookup(g_ctx, current_id,
                                         component, &entry);
         if (rc == OBMAFS3_ERR_NOTFOUND) {
@@ -216,7 +216,7 @@ static int obmafs3_fuse_getattr(const char *path, struct stat *stbuf,
     if (rc != 0)
         return rc;
 
-    struct btree_node_filename cat_entry;
+    struct catalog_record cat_entry;
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
     if (rc == OBMAFS3_ERR_NOTFOUND)
         return -ENOENT;
@@ -252,7 +252,7 @@ static int obmafs3_fuse_readdir(const char *path, void *buf,
                                 struct fuse_file_info *fi,
                                 enum fuse_readdir_flags flags)
 {
-    struct btree_node_filename *entries = NULL;
+    struct catalog_record *entries = NULL;
     uint32_t count = 0;
     uint64_t dir_inode_id;
     uint32_t i;
@@ -267,7 +267,7 @@ static int obmafs3_fuse_readdir(const char *path, void *buf,
     } else {
         uint64_t parent_id;
         const char *name;
-        struct btree_node_filename cat_entry;
+        struct catalog_record cat_entry;
 
         rc = resolve_path(path, &parent_id, &name);
         if (rc != 0)
@@ -306,7 +306,7 @@ static int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
 {
     uint64_t parent_id;
     const char *name;
-    struct btree_node_filename cat_entry;
+    struct catalog_record cat_entry;
     int rc;
 
     rc = resolve_path(path, &parent_id, &name);
@@ -356,7 +356,7 @@ static int obmafs3_fuse_read(const char *path, char *buf, size_t size,
     } else {
         uint64_t parent_id;
         const char *name;
-        struct btree_node_filename cat_entry;
+        struct catalog_record cat_entry;
         rc = resolve_path(path, &parent_id, &name);
         if (rc != 0)
             return rc;
@@ -410,7 +410,7 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
 {
     uint64_t parent_id;
     const char *name;
-    struct btree_node_filename cat_entry;
+    struct catalog_record cat_entry;
     int rc;
 
     rc = resolve_path(path, &parent_id, &name);
@@ -428,13 +428,8 @@ static int obmafs3_fuse_create(const char *path, mode_t mode,
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
 
     /* Create the catalog entry */
-    struct btree_node_filename new_cat;
+    struct catalog_record new_cat;
     memset(&new_cat, 0, sizeof(new_cat));
-    new_cat.header.magic       = OBMAFS3_BTREE_NODE_MAGIC;
-    new_cat.header.record_type = kBtreeDataTypeFilename;
-    new_cat.header.node_keys   = 1;
-    new_cat.header.keys_length = (uint16_t)(sizeof(new_cat) -
-                                            sizeof(new_cat.header));
     new_cat.inode_id       = new_inode_id;
     new_cat.parent_id      = parent_id;
     new_cat.directory_flag = 0;
@@ -499,7 +494,7 @@ static int obmafs3_fuse_write(const char *path, const char *buf,
     } else {
         uint64_t parent_id;
         const char *name;
-        struct btree_node_filename cat_entry;
+        struct catalog_record cat_entry;
         rc = resolve_path(path, &parent_id, &name);
         if (rc != 0)
             return rc;
@@ -572,7 +567,7 @@ static int obmafs3_fuse_truncate(const char *path, off_t newsize,
 {
     uint64_t parent_id;
     const char *name;
-    struct btree_node_filename cat_entry;
+    struct catalog_record cat_entry;
     struct inode_record inode;
     struct inode_record *ip;
     int rc;
@@ -673,7 +668,7 @@ static int obmafs3_fuse_unlink(const char *path)
 {
     uint64_t parent_id;
     const char *name;
-    struct btree_node_filename cat_entry;
+    struct catalog_record cat_entry;
     int rc;
 
     rc = resolve_path(path, &parent_id, &name);
@@ -702,13 +697,27 @@ static int obmafs3_fuse_unlink(const char *path)
     return 0;
 }
 
+    if (child_count > 0)
+    /* Remove the catalog entry */
+    rc = obmafs3_catalog_delete(g_ctx, parent_id, name);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Remove the inode */
+    rc = obmafs3_inode_delete(g_ctx, cat_entry.inode_id);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
 static int obmafs3_fuse_utimens(const char *path,
                                 const struct timespec ts[2],
                                 struct fuse_file_info *fi)
 {
     uint64_t parent_id;
     const char *name;
-    struct btree_node_filename cat_entry;
+    struct catalog_record cat_entry;
     struct inode_record inode;
     int rc;
 
