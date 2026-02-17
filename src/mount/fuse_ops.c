@@ -956,6 +956,47 @@ static int obmafs3_fuse_chmod(const char *path, mode_t mode,
     return 0;
 }
 
+static int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid,
+                              struct fuse_file_info *fi)
+{
+    uint64_t parent_id;
+    const char *name;
+    struct catalog_record cat_entry;
+    struct inode_record inode;
+    int rc;
+
+    (void)fi;
+
+    if (strcmp(path, "/") == 0) {
+        rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    } else {
+        rc = resolve_path(path, &parent_id, &name);
+        if (rc != 0)
+            return rc;
+
+        rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    }
+
+    if (uid != (uid_t)-1)
+        inode.uid = uid;
+    if (gid != (gid_t)-1)
+        inode.gid = gid;
+
+    rc = obmafs3_inode_put(g_ctx, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
 /**
  * Flush is called on every close() of a file descriptor.  Unlike
  * release, flush is synchronous — close() blocks until flush returns.
@@ -1065,4 +1106,5 @@ struct fuse_operations obmafs3_fuse_ops = {
     .rmdir    = obmafs3_fuse_rmdir,
     .utimens  = obmafs3_fuse_utimens,
     .chmod    = obmafs3_fuse_chmod,
+    .chown    = obmafs3_fuse_chown,
 };
