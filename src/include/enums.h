@@ -19,7 +19,8 @@ enum obmafs3_btree_type {
     kBtreeTypeMediaTag      = 5,
     kBtreeTypeCdPrefix      = 6,
     kBtreeTypeCdSuffix      = 7,
-    kBtreeTypeCdSubchannel  = 8
+    kBtreeTypeCdSubchannel  = 8,
+    kBtreeTypeMetadataIndex = 9
 };
 
 enum obmafs3_btree_data_type {
@@ -31,7 +32,8 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeMediaTagEntry      = 5,
     kBtreeDataTypeCdPrefixEntry      = 6,
     kBtreeDataTypeCdSuffixEntry      = 7,
-    kBtreeDataTypeCdSubchannelEntry  = 8
+    kBtreeDataTypeCdSubchannelEntry  = 8,
+    kBtreeDataTypeMetadataIndexEntry = 9
 };
 
 enum obmafs3_file_type {

@@ -291,6 +291,161 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Walk all nodes in a multi-block metadata B+Tree (DFS)              */
+/*  Each node spans METADATA_NODE_BLOCKS contiguous blocks.            */
+/*  index_entry_size / child_lba_off parameterize the index entry.     */
+/* ------------------------------------------------------------------ */
+
+static int walk_meta_btree_nodes(struct obmafs3_ctx *ctx,
+                                 uint64_t root_lba,
+                                 size_t index_entry_size,
+                                 size_t child_lba_off,
+                                 uint64_t **out_lbas,
+                                 uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if (root_lba == 0)
+        return OBMAFS3_OK;
+
+    size_t node_sz = (size_t)METADATA_NODE_BLOCKS * ctx->sb.block_size;
+    uint8_t *buf = calloc(1, node_sz);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t *lbas   = NULL;
+    uint64_t count   = 0;
+    uint64_t cap     = 0;
+
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t stk_size  = 0;
+    uint64_t stk_cap   = 64;
+    if (!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    stack[stk_size++] = root_lba;
+
+    while (stk_size > 0) {
+        uint64_t lba = stack[--stk_size];
+
+        if (count >= cap) {
+            cap = cap == 0 ? 64 : cap * 2;
+            uint64_t *tmp = realloc(lbas, cap * sizeof(*tmp));
+            if (!tmp) {
+                free(buf); free(stack); free(lbas);
+                return OBMAFS3_ERR_NOMEM;
+            }
+            lbas = tmp;
+        }
+        lbas[count++] = lba;
+
+        int rc = obmafs3_block_read(ctx, lba, buf, node_sz);
+        if (rc != OBMAFS3_OK) {
+            free(buf); free(stack); free(lbas);
+            return rc;
+        }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            free(buf); free(stack); free(lbas);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
+
+        if (hdr.level > 0) {
+            for (uint16_t i = 0; i < hdr.node_keys; i++) {
+                uint64_t child;
+                memcpy(&child,
+                       buf + sizeof(struct btree_node_header)
+                           + (size_t)i * index_entry_size
+                           + child_lba_off,
+                       sizeof(uint64_t));
+
+                if (stk_size >= stk_cap) {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack,
+                                            stk_cap * sizeof(*tmp));
+                    if (!tmp) {
+                        free(buf); free(stack); free(lbas);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                    stack = tmp;
+                }
+                stack[stk_size++] = child;
+            }
+        }
+    }
+
+    free(buf);
+    free(stack);
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Verify checksums for a list of multi-block metadata node LBAs      */
+/* ------------------------------------------------------------------ */
+
+static int verify_meta_node_checksums(struct obmafs3_ctx *ctx,
+                                      const uint64_t *node_lbas,
+                                      uint64_t node_count,
+                                      const char *tree_name,
+                                      uint64_t *bad_count)
+{
+    size_t node_sz = (size_t)METADATA_NODE_BLOCKS * ctx->sb.block_size;
+    uint8_t *buf = calloc(1, node_sz);
+    if (!buf)
+        return OBMAFS3_ERR_NOMEM;
+
+    uint64_t bad = 0;
+
+    for (uint64_t n = 0; n < node_count; n++) {
+        uint64_t lba = node_lbas[n];
+
+        int rc = obmafs3_block_read(ctx, lba, buf, node_sz);
+        if (rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        if (hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) {
+            fprintf(stderr,
+                    "  %s node at LBA %" PRIu64 ": bad magic\n",
+                    tree_name, lba);
+            bad++;
+            continue;
+        }
+
+        size_t data_size = sizeof(struct btree_node_header) +
+                           hdr.keys_length;
+        uint8_t stored[32];
+        memcpy(stored, hdr.checksum, 32);
+        memset(buf + __builtin_offsetof(struct btree_node_header,
+                                        checksum),
+               0, 32);
+        uint8_t computed[32];
+        obmafs3_checksum_block(buf, data_size, computed);
+        memcpy(buf + __builtin_offsetof(struct btree_node_header,
+                                        checksum),
+               stored, 32);
+
+        if (memcmp(stored, computed, 32) != 0) {
+            fprintf(stderr,
+                    "  %s node at LBA %" PRIu64
+                    ": checksum mismatch\n",
+                    tree_name, lba);
+            bad++;
+        }
+    }
+
+    free(buf);
+    *bad_count = bad;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Collect data-block LBAs from all inodes                            */
 /* ------------------------------------------------------------------ */
 
@@ -976,6 +1131,49 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx,
             if (rc == OBMAFS3_OK) {
                 for (uint64_t i = 0; i < count; i++)
                     MARK(nodes[i]);
+                free(nodes);
+            }
+        }
+    }
+
+    /* Metadata tree header and nodes (multi-block, if present) */
+    if (ctx->sb.metadata_lba != 0) {
+        MARK(ctx->sb.metadata_lba);
+        if (ctx->metadata_hdr.root_node_lba != 0) {
+            uint64_t *nodes = NULL;
+            uint64_t count = 0;
+            int rc = walk_meta_btree_nodes(ctx,
+                            ctx->metadata_hdr.root_node_lba,
+                            sizeof(struct metadata_index_entry),
+                            __builtin_offsetof(struct metadata_index_entry,
+                                               child_lba),
+                            &nodes, &count);
+            if (rc == OBMAFS3_OK) {
+                for (uint64_t i = 0; i < count; i++)
+                    for (int b = 0; b < METADATA_NODE_BLOCKS; b++)
+                        MARK(nodes[i] + (uint64_t)b);
+                free(nodes);
+            }
+        }
+    }
+
+    /* Metadata index tree header and nodes (multi-block, if present) */
+    if (ctx->sb.metadata_idx_lba != 0) {
+        MARK(ctx->sb.metadata_idx_lba);
+        if (ctx->metadata_idx_hdr.root_node_lba != 0) {
+            uint64_t *nodes = NULL;
+            uint64_t count = 0;
+            int rc = walk_meta_btree_nodes(ctx,
+                            ctx->metadata_idx_hdr.root_node_lba,
+                            sizeof(struct metadata_idx_index_entry),
+                            __builtin_offsetof(
+                                struct metadata_idx_index_entry,
+                                child_lba),
+                            &nodes, &count);
+            if (rc == OBMAFS3_OK) {
+                for (uint64_t i = 0; i < count; i++)
+                    for (int b = 0; b < METADATA_NODE_BLOCKS; b++)
+                        MARK(nodes[i] + (uint64_t)b);
                 free(nodes);
             }
         }
@@ -2291,6 +2489,93 @@ int main(int argc, char *argv[])
                 uint64_t bad = 0;
                 verify_btree_node_checksums(ctx, nodes, node_count,
                                             "CD subchannel", &bad);
+                free(nodes);
+                if (bad > 0) {
+                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
+                    errors++;
+                } else {
+                    printf("  Node checksums:   OK\n");
+                }
+            } else {
+                printf("  Node checksums:   could not walk tree\n");
+                errors++;
+            }
+        }
+    }
+
+    /* ---- Metadata tree (per-image key=value) ---- */
+    if (ctx->sb.metadata_lba != 0) {
+        printf("\nMetadata tree:\n");
+        printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+               ctx->metadata_hdr.magic,
+               ctx->metadata_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+                   ? "OK" : "BAD");
+        {
+            int cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.metadata_lba,
+                                              &ctx->metadata_hdr,
+                                              &cs_ok);
+            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if (!cs_ok) errors++;
+        }
+
+        if (ctx->metadata_hdr.root_node_lba != 0) {
+            uint64_t *nodes = NULL;
+            uint64_t node_count = 0;
+            int wrc = walk_meta_btree_nodes(ctx,
+                            ctx->metadata_hdr.root_node_lba,
+                            sizeof(struct metadata_index_entry),
+                            __builtin_offsetof(struct metadata_index_entry,
+                                               child_lba),
+                            &nodes, &node_count);
+            if (wrc == OBMAFS3_OK) {
+                uint64_t bad = 0;
+                verify_meta_node_checksums(ctx, nodes, node_count,
+                                           "Metadata", &bad);
+                free(nodes);
+                if (bad > 0) {
+                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
+                    errors++;
+                } else {
+                    printf("  Node checksums:   OK\n");
+                }
+            } else {
+                printf("  Node checksums:   could not walk tree\n");
+                errors++;
+            }
+        }
+    }
+
+    /* ---- Metadata index tree (reverse key+value→inode) ---- */
+    if (ctx->sb.metadata_idx_lba != 0) {
+        printf("\nMetadata index tree:\n");
+        printf("  Magic:            0x%016" PRIx64 " (%s)\n",
+               ctx->metadata_idx_hdr.magic,
+               ctx->metadata_idx_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC
+                   ? "OK" : "BAD");
+        {
+            int cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.metadata_idx_lba,
+                                              &ctx->metadata_idx_hdr,
+                                              &cs_ok);
+            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if (!cs_ok) errors++;
+        }
+
+        if (ctx->metadata_idx_hdr.root_node_lba != 0) {
+            uint64_t *nodes = NULL;
+            uint64_t node_count = 0;
+            int wrc = walk_meta_btree_nodes(ctx,
+                            ctx->metadata_idx_hdr.root_node_lba,
+                            sizeof(struct metadata_idx_index_entry),
+                            __builtin_offsetof(
+                                struct metadata_idx_index_entry,
+                                child_lba),
+                            &nodes, &node_count);
+            if (wrc == OBMAFS3_OK) {
+                uint64_t bad = 0;
+                verify_meta_node_checksums(ctx, nodes, node_count,
+                                           "Metadata index", &bad);
                 free(nodes);
                 if (bad > 0) {
                     printf("  Node checksums:   %" PRIu64 " BAD\n", bad);

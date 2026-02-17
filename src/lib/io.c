@@ -144,6 +144,24 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
                 close(fd); free(c); return rc;
             }
         }
+
+        if (c->sb.metadata_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.metadata_lba,
+                                                   &c->metadata_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
+
+        if (c->sb.metadata_idx_lba != 0) {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.metadata_idx_lba,
+                                                   &c->metadata_idx_hdr,
+                                                   &cs_ok);
+            if (rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM) {
+                close(fd); free(c); return rc;
+            }
+        }
     } else {
         rc = obmafs3_btree_header_read(c, c->sb.catalog_lba,
                                        &c->catalog_hdr);
@@ -179,6 +197,18 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         if (c->sb.cd_subchannel_lba != 0) {
             rc = obmafs3_btree_header_read(c, c->sb.cd_subchannel_lba,
                                            &c->cd_subchannel_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
+
+        if (c->sb.metadata_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.metadata_lba,
+                                           &c->metadata_hdr);
+            if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
+        }
+
+        if (c->sb.metadata_idx_lba != 0) {
+            rc = obmafs3_btree_header_read(c, c->sb.metadata_idx_lba,
+                                           &c->metadata_idx_hdr);
             if (rc != OBMAFS3_OK) { close(fd); free(c); return rc; }
         }
     }
@@ -268,11 +298,12 @@ int obmafs3_create(const char *path, uint64_t total_size,
     sb.inode_lba       = 3;   /* block 3 */
     sb.overflow_lba    = 5;   /* block 5 */
     sb.dedup_lba       = 6;   /* block 6 */
-    sb.metadata_lba    = 0;   /* reserved */
+    sb.metadata_lba    = 11;   /* block 11 */
     sb.media_tag_lba   = 7;   /* block 7 */
     sb.cd_prefix_lba   = 8;   /* block 8 */
     sb.cd_suffix_lba   = 9;   /* block 9 */
     sb.cd_subchannel_lba = 10; /* block 10 */
+    sb.metadata_idx_lba = 12;  /* block 12 */
     sb.checksum_type   = kChecksumTypeXXH64;
     sb.creation_time   = (uint64_t)time(NULL);
 
@@ -289,9 +320,9 @@ int obmafs3_create(const char *path, uint64_t total_size,
         bitmap_blks = 1 + (bitmap_bytes - first_block_capacity +
                            block_size - 1) / block_size;
 
-    sb.bitmap_lba      = 11;                  /* bitmap starts at block 11 */
+    sb.bitmap_lba      = 13;                  /* bitmap starts at block 13 */
     sb.bitmap_blocks   = bitmap_blks;
-    sb.next_free_lba   = 11 + bitmap_blks;    /* first block after bitmap */
+    sb.next_free_lba   = 13 + bitmap_blks;    /* first block after bitmap */
     sb.next_inode_id   = 3;                    /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label,
             sizeof(sb.volume_label) - 1);
@@ -473,14 +504,38 @@ int obmafs3_create(const char *path, uint64_t total_size,
     rc = write_block(fd, block_size, 10, &cdsub_hdr, sizeof(cdsub_hdr));
     if (rc != OBMAFS3_OK) { close(fd); return rc; }
 
-    /* --- Blocks 11..11+N-1: Allocation bitmap --- */
+    /* --- Block 11: Metadata tree header (empty, multi-block nodes) --- */
+    struct btree_header meta_hdr;
+    memset(&meta_hdr, 0, sizeof(meta_hdr));
+    meta_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    meta_hdr.data_type = kBtreeDataTypeMetadataEntry;
+    meta_hdr.node_size = (uint16_t)(METADATA_NODE_BLOCKS * block_size);
+    meta_hdr.tree_type = kBtreeTypeMetadata;
+    obmafs3_checksum_block(&meta_hdr, sizeof(meta_hdr), meta_hdr.checksum);
+
+    rc = write_block(fd, block_size, 11, &meta_hdr, sizeof(meta_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Block 12: Metadata index tree header (empty, multi-block nodes) --- */
+    struct btree_header midx_hdr;
+    memset(&midx_hdr, 0, sizeof(midx_hdr));
+    midx_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    midx_hdr.data_type = kBtreeDataTypeMetadataIndexEntry;
+    midx_hdr.node_size = (uint16_t)(METADATA_NODE_BLOCKS * block_size);
+    midx_hdr.tree_type = kBtreeTypeMetadataIndex;
+    obmafs3_checksum_block(&midx_hdr, sizeof(midx_hdr), midx_hdr.checksum);
+
+    rc = write_block(fd, block_size, 12, &midx_hdr, sizeof(midx_hdr));
+    if (rc != OBMAFS3_OK) { close(fd); return rc; }
+
+    /* --- Blocks 13..13+N-1: Allocation bitmap --- */
     {
         /* Build the flat bitmap data */
         uint8_t *bitmap = calloc(1, (size_t)bitmap_bytes);
         if (!bitmap) { close(fd); return OBMAFS3_ERR_NOMEM; }
 
-        /* Mark blocks 0 through (11 + bitmap_blks - 1) as allocated */
-        uint64_t reserved = 11 + bitmap_blks;
+        /* Mark blocks 0 through (13 + bitmap_blks - 1) as allocated */
+        uint64_t reserved = 13 + bitmap_blks;
         for (uint64_t b = 0; b < reserved; b++)
             bitmap[b / 8] |= (1u << (b % 8));
 
@@ -519,7 +574,7 @@ int obmafs3_create(const char *path, uint64_t total_size,
                 data_remaining -= copy;
             }
 
-            rc = write_block(fd, block_size, 11 + i, blk,
+            rc = write_block(fd, block_size, 13 + i, blk,
                              (size_t)block_size);
             if (rc != OBMAFS3_OK) {
                 free(blk);

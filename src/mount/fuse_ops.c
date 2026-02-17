@@ -1710,6 +1710,60 @@ struct obmafs3_ioctl_cd_read_full_arg {
 #define OBMAFS3_IOC_CD_READ_LONG_SUB \
     _IOWR('O', 6, struct obmafs3_ioctl_cd_read_full_arg)
 
+/* ---- Image metadata ioctls ---- */
+
+struct obmafs3_ioctl_metadata_set_arg {
+    char key[METADATA_KEY_MAX];       /**< Metadata key (NUL-terminated) */
+    char value[METADATA_VALUE_MAX];   /**< Metadata value (NUL-terminated) */
+};
+
+#define OBMAFS3_IOC_SET_METADATA \
+    _IOW('O', 7, struct obmafs3_ioctl_metadata_set_arg)
+
+struct obmafs3_ioctl_metadata_get_arg {
+    char key[METADATA_KEY_MAX];       /**< Input: key to look up */
+    char value[METADATA_VALUE_MAX];   /**< Output: value */
+};
+
+#define OBMAFS3_IOC_GET_METADATA \
+    _IOWR('O', 8, struct obmafs3_ioctl_metadata_get_arg)
+
+struct obmafs3_ioctl_metadata_delete_arg {
+    char key[METADATA_KEY_MAX];       /**< Key to delete */
+};
+
+#define OBMAFS3_IOC_DELETE_METADATA \
+    _IOW('O', 9, struct obmafs3_ioctl_metadata_delete_arg)
+
+/**
+ * List metadata keys for an image.  Paginated: set offset to 0 for the
+ * first page, then advance by count for subsequent pages.  Returns
+ * count == 0 when no more keys remain.
+ */
+struct obmafs3_ioctl_metadata_list_arg {
+    uint32_t offset;             /**< Input: starting offset */
+    uint32_t count;              /**< Output: keys returned */
+    char     keys[16][METADATA_KEY_MAX]; /**< Output: up to 16 keys */
+};
+
+#define OBMAFS3_IOC_LIST_METADATA \
+    _IOWR('O', 10, struct obmafs3_ioctl_metadata_list_arg)
+
+/**
+ * Query which images have a given key=value pair.
+ * Returns a paginated list of inode_ids.
+ */
+struct obmafs3_ioctl_metadata_query_arg {
+    char     key[METADATA_KEY_MAX];       /**< Input: key */
+    char     value[METADATA_VALUE_MAX];   /**< Input: value */
+    uint32_t offset;                      /**< Input: starting offset */
+    uint32_t count;                       /**< Output: inode_ids returned */
+    uint64_t inode_ids[64];               /**< Output: up to 64 inode_ids */
+};
+
+#define OBMAFS3_IOC_QUERY_METADATA \
+    _IOWR('O', 11, struct obmafs3_ioctl_metadata_query_arg)
+
 /**
  * Check if the 16-byte prefix of a raw CD sector matches the expected
  * sync + MSF + mode for the given LBA and track mode.
@@ -2305,6 +2359,86 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
             return -ENOTTY;
         return obmafs3_cd_read_long_sub(
             ffctx, (struct obmafs3_ioctl_cd_read_full_arg *)data);
+    }
+
+    /* ---- Image metadata ioctls ---- */
+
+    case OBMAFS3_IOC_SET_METADATA: {
+        if (ffctx->inode.file_type != kFileTypeMediaImage &&
+            ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        const struct obmafs3_ioctl_metadata_set_arg *sa =
+            (const struct obmafs3_ioctl_metadata_set_arg *)data;
+        int rc = obmafs3_metadata_put(g_ctx, ffctx->inode.inode_id,
+                                      sa->key, sa->value);
+        return rc == OBMAFS3_OK ? 0 : -EIO;
+    }
+
+    case OBMAFS3_IOC_GET_METADATA: {
+        if (ffctx->inode.file_type != kFileTypeMediaImage &&
+            ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        struct obmafs3_ioctl_metadata_get_arg *ga =
+            (struct obmafs3_ioctl_metadata_get_arg *)data;
+        int rc = obmafs3_metadata_get(g_ctx, ffctx->inode.inode_id,
+                                      ga->key, ga->value,
+                                      METADATA_VALUE_MAX);
+        if (rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
+        return rc == OBMAFS3_OK ? 0 : -EIO;
+    }
+
+    case OBMAFS3_IOC_DELETE_METADATA: {
+        if (ffctx->inode.file_type != kFileTypeMediaImage &&
+            ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        const struct obmafs3_ioctl_metadata_delete_arg *da =
+            (const struct obmafs3_ioctl_metadata_delete_arg *)data;
+        int rc = obmafs3_metadata_delete(g_ctx, ffctx->inode.inode_id,
+                                         da->key);
+        if (rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
+        return rc == OBMAFS3_OK ? 0 : -EIO;
+    }
+
+    case OBMAFS3_IOC_LIST_METADATA: {
+        if (ffctx->inode.file_type != kFileTypeMediaImage &&
+            ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        struct obmafs3_ioctl_metadata_list_arg *la =
+            (struct obmafs3_ioctl_metadata_list_arg *)data;
+        char **keys;
+        uint32_t total;
+        int rc = obmafs3_metadata_list(g_ctx, ffctx->inode.inode_id,
+                                       &keys, &total);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        uint32_t start = la->offset;
+        uint32_t n = 0;
+        memset(la->keys, 0, sizeof(la->keys));
+        for (uint32_t i = start; i < total && n < 16; i++, n++)
+            strncpy(la->keys[n], keys[i], METADATA_KEY_MAX - 1);
+        la->count = n;
+        obmafs3_metadata_list_free(keys, total);
+        return 0;
+    }
+
+    case OBMAFS3_IOC_QUERY_METADATA: {
+        /* This query is filesystem-level; works on any open image file */
+        struct obmafs3_ioctl_metadata_query_arg *qa =
+            (struct obmafs3_ioctl_metadata_query_arg *)data;
+        uint64_t *ids;
+        uint32_t total;
+        int rc = obmafs3_metadata_query(g_ctx, qa->key, qa->value,
+                                        &ids, &total);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        uint32_t start = qa->offset;
+        uint32_t n = 0;
+        memset(qa->inode_ids, 0, sizeof(qa->inode_ids));
+        for (uint32_t i = start; i < total && n < 64; i++, n++)
+            qa->inode_ids[n] = ids[i];
+        qa->count = n;
+        free(ids);
+        return 0;
     }
 
     default:

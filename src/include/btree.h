@@ -130,6 +130,55 @@ struct __attribute__((packed)) media_tag_index_entry {
     uint64_t child_lba;    /**< LBA of the child node */
 };
 
+/* ---- Image metadata B+Trees ---- */
+
+#define METADATA_KEY_MAX     256   /* 255 chars + NUL */
+#define METADATA_VALUE_MAX  1025   /* 1024 chars + NUL */
+#define METADATA_NODE_BLOCKS   8   /* Blocks per metadata tree node */
+
+/**
+ * Metadata record stored in the per-image metadata B+Tree leaf nodes.
+ * Sorted by (inode_id, key) composite key.
+ * Stores arbitrary key=value string pairs for disk/CD images.
+ */
+struct __attribute__((packed)) metadata_record {
+    uint64_t inode_id;                    /**< Disk image inode this entry belongs to */
+    char     key[METADATA_KEY_MAX];       /**< Metadata key (NUL-terminated, max 255 chars) */
+    char     value[METADATA_VALUE_MAX];   /**< Metadata value (NUL-terminated, max 1024 chars) */
+};
+
+/**
+ * Index entry for per-image metadata B+Tree internal nodes.
+ * Uses composite key (inode_id, key).
+ */
+struct __attribute__((packed)) metadata_index_entry {
+    uint64_t inode_id;                    /**< Smallest inode_id reachable through child */
+    char     key[METADATA_KEY_MAX];       /**< Smallest key reachable through child */
+    uint64_t child_lba;                   /**< LBA of the child node */
+};
+
+/**
+ * Metadata index record stored in the reverse-index B+Tree leaf nodes.
+ * Sorted by (key, value, inode_id) composite key.
+ * Enables queries like "which images have dumper=natalia portillo?".
+ */
+struct __attribute__((packed)) metadata_idx_record {
+    char     key[METADATA_KEY_MAX];       /**< Metadata key */
+    char     value[METADATA_VALUE_MAX];   /**< Metadata value */
+    uint64_t inode_id;                    /**< Disk image inode */
+};
+
+/**
+ * Index entry for metadata reverse-index B+Tree internal nodes.
+ * Uses composite key (key, value, inode_id).
+ */
+struct __attribute__((packed)) metadata_idx_index_entry {
+    char     key[METADATA_KEY_MAX];       /**< Smallest key reachable through child */
+    char     value[METADATA_VALUE_MAX];   /**< Smallest value reachable through child */
+    uint64_t inode_id;                    /**< Smallest inode_id reachable through child */
+    uint64_t child_lba;                   /**< LBA of the child node */
+};
+
 /* ---- Compact Disc image B+Trees ---- */
 
 #define CD_PREFIX_DATA_SIZE     16

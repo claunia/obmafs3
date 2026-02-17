@@ -34,6 +34,8 @@ struct obmafs3_ctx {
     struct btree_header cd_prefix_hdr;/**< Cached CD prefix tree header */
     struct btree_header cd_suffix_hdr;/**< Cached CD suffix tree header */
     struct btree_header cd_subchannel_hdr;/**< Cached CD subchannel tree header */
+    struct btree_header metadata_hdr;    /**< Cached metadata tree header */
+    struct btree_header metadata_idx_hdr;/**< Cached metadata index tree header */
     uint8_t *bitmap;                 /**< In-memory allocation bitmap */
     uint64_t bitmap_size;            /**< Size of allocation bitmap in bytes */
     int compression;                 /**< Non-zero to compress data blocks on write */
@@ -218,6 +220,22 @@ int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash,
 int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash,
                               const uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
 int obmafs3_cd_subchannel_delete(struct obmafs3_ctx *ctx, uint64_t hash);
+
+/* --- Image metadata operations --- */
+int  obmafs3_metadata_get(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                          const char *key, char *value, size_t value_size);
+int  obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                          const char *key, const char *value);
+int  obmafs3_metadata_delete(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                             const char *key);
+int  obmafs3_metadata_delete_all(struct obmafs3_ctx *ctx,
+                                 uint64_t inode_id);
+int  obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id,
+                           char ***keys, uint32_t *count);
+void obmafs3_metadata_list_free(char **keys, uint32_t count);
+int  obmafs3_metadata_query(struct obmafs3_ctx *ctx,
+                            const char *key, const char *value,
+                            uint64_t **inode_ids, uint32_t *count);
 
 /* --- CD ECC/EDC operations --- */
 void   *ecc_cd_init(void);
