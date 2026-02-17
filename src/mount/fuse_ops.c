@@ -918,6 +918,44 @@ static int obmafs3_fuse_utimens(const char *path,
     return 0;
 }
 
+static int obmafs3_fuse_chmod(const char *path, mode_t mode,
+                              struct fuse_file_info *fi)
+{
+    uint64_t parent_id;
+    const char *name;
+    struct catalog_record cat_entry;
+    struct inode_record inode;
+    int rc;
+
+    (void)fi;
+
+    if (strcmp(path, "/") == 0) {
+        rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    } else {
+        rc = resolve_path(path, &parent_id, &name);
+        if (rc != 0)
+            return rc;
+
+        rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    }
+
+    inode.mode = mode & 07777;
+
+    rc = obmafs3_inode_put(g_ctx, &inode);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    return 0;
+}
+
 /**
  * Flush is called on every close() of a file descriptor.  Unlike
  * release, flush is synchronous — close() blocks until flush returns.
@@ -1026,4 +1064,5 @@ struct fuse_operations obmafs3_fuse_ops = {
     .mkdir    = obmafs3_fuse_mkdir,
     .rmdir    = obmafs3_fuse_rmdir,
     .utimens  = obmafs3_fuse_utimens,
+    .chmod    = obmafs3_fuse_chmod,
 };
