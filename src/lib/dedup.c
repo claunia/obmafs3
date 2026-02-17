@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <zstd.h>
 
 /* ------------------------------------------------------------------ */
 /*  Internal helpers                                                   */
@@ -459,16 +460,48 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx,
     /* Write the block header */
     struct block_header bhdr;
     memset(&bhdr, 0, sizeof(bhdr));
-    bhdr.magic           = OBMAFS3_BLOCK_MAGIC;
-    bhdr.flags           = 0;  /* dedup blocks not compressed individually */
-    bhdr.original_size   = db->offset - sizeof(struct block_header);
-    bhdr.compressed_size = bhdr.original_size;
+    bhdr.magic         = OBMAFS3_BLOCK_MAGIC;
+    bhdr.original_size = db->offset - sizeof(struct block_header);
 
-    /* Checksum over the data after the header */
-    obmafs3_checksum_block(db->data + sizeof(bhdr),
-                           (size_t)bhdr.original_size,
-                           bhdr.checksum);
-    memcpy(db->data, &bhdr, sizeof(bhdr));
+    /* Try ZSTD compression */
+    int compressed = 0;
+    if (ctx->compression && bhdr.original_size > 0) {
+        size_t comp_bound = ZSTD_compressBound((size_t)bhdr.original_size);
+        uint8_t *comp_buf = malloc(comp_bound);
+        if (comp_buf) {
+            size_t comp_size = comp_bound;
+            int crc = obmafs3_compress(
+                db->data + sizeof(bhdr),
+                (size_t)bhdr.original_size,
+                comp_buf, &comp_size, ctx->zstd_level);
+            if (crc == OBMAFS3_OK &&
+                comp_size < bhdr.original_size) {
+                bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
+                bhdr.compression_type = kCompressionZstd;
+                bhdr.compressed_size  = comp_size;
+                obmafs3_checksum_block(comp_buf, comp_size,
+                                       bhdr.checksum);
+                memcpy(db->data, &bhdr, sizeof(bhdr));
+                memcpy(db->data + sizeof(bhdr), comp_buf, comp_size);
+                /* Zero-fill remainder */
+                size_t used = sizeof(bhdr) + comp_size;
+                if (used < (size_t)db->capacity)
+                    memset(db->data + used, 0,
+                           (size_t)db->capacity - used);
+                compressed = 1;
+            }
+            free(comp_buf);
+        }
+    }
+
+    if (!compressed) {
+        bhdr.flags           = 0;
+        bhdr.compressed_size = bhdr.original_size;
+        obmafs3_checksum_block(db->data + sizeof(bhdr),
+                               (size_t)bhdr.original_size,
+                               bhdr.checksum);
+        memcpy(db->data, &bhdr, sizeof(bhdr));
+    }
 
     int rc = obmafs3_block_write(ctx, db->block_lba, db->data,
                                  (size_t)db->capacity);
@@ -878,8 +911,12 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
     if (!dedup_buf)
         return OBMAFS3_ERR_NOMEM;
 
+    /* Decompressed payload buffer (allocated on first compressed block) */
+    uint8_t *decomp_buf = NULL;
+
     /* Cache the last read dedup block LBA to avoid re-reading */
     uint64_t cached_dedup_lba = 0;
+    int      cached_compressed = 0;
 
     /* Temporary inode copy for reading sector map (need to adjust file_size) */
     struct btree_node_inode map_inode;
@@ -908,6 +945,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
         rc = obmafs3_read_file_data(ctx, &map_inode, sme_offset,
                                     &sme, sizeof(sme));
         if (rc != OBMAFS3_OK) {
+            free(decomp_buf);
             free(dedup_buf);
             return rc;
         }
@@ -916,6 +954,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
         struct dedup_entry de;
         rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, sme.hash, &de);
         if (rc != OBMAFS3_OK) {
+            free(decomp_buf);
             free(dedup_buf);
             return rc;
         }
@@ -925,19 +964,57 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx,
             rc = obmafs3_block_read(ctx, de.block_lba, dedup_buf,
                                     (size_t)ctx->sb.dedup_block_size);
             if (rc != OBMAFS3_OK) {
+                free(decomp_buf);
                 free(dedup_buf);
                 return rc;
             }
             cached_dedup_lba = de.block_lba;
+
+            /* Check if the block is compressed */
+            struct block_header bhdr;
+            memcpy(&bhdr, dedup_buf, sizeof(bhdr));
+
+            if (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) {
+                if (!decomp_buf) {
+                    decomp_buf = malloc((size_t)ctx->sb.dedup_block_size);
+                    if (!decomp_buf) {
+                        free(dedup_buf);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
+                }
+                rc = obmafs3_decompress(
+                    dedup_buf + sizeof(bhdr),
+                    (size_t)bhdr.compressed_size,
+                    decomp_buf, (size_t)bhdr.original_size);
+                if (rc != OBMAFS3_OK) {
+                    free(decomp_buf);
+                    free(dedup_buf);
+                    return rc;
+                }
+                cached_compressed = 1;
+            } else {
+                cached_compressed = 0;
+            }
         }
 
-        /* Copy sector data from the dedup block at the stored offset */
-        memcpy(out + bytes_read,
-               dedup_buf + de.block_offset + offset_in_sector,
-               chunk);
+        /* Copy sector data from the dedup block at the stored offset.
+         * block_offset includes the header prefix; for compressed blocks
+         * decomp_buf holds only the payload so subtract the header. */
+        if (cached_compressed) {
+            size_t decomp_off = de.block_offset
+                                - sizeof(struct block_header);
+            memcpy(out + bytes_read,
+                   decomp_buf + decomp_off + offset_in_sector,
+                   chunk);
+        } else {
+            memcpy(out + bytes_read,
+                   dedup_buf + de.block_offset + offset_in_sector,
+                   chunk);
+        }
         bytes_read += chunk;
     }
 
+    free(decomp_buf);
     free(dedup_buf);
     return OBMAFS3_OK;
 }

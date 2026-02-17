@@ -882,8 +882,11 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
             continue;
         }
 
-        /* Checksum covers original_size bytes after the header */
-        size_t check_size = (size_t)bhdr.original_size;
+        /* Checksum covers compressed_size for compressed blocks,
+         * original_size for uncompressed blocks */
+        size_t check_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                ? (size_t)bhdr.compressed_size
+                                : (size_t)bhdr.original_size;
         if (check_size > dedup_size - sizeof(bhdr))
             check_size = dedup_size - sizeof(bhdr);
 
