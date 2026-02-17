@@ -223,7 +223,7 @@ When reading file data, the system first uses the 8 inline extents from the inod
 
 ### Deduplication Tree (sector hash lookup)
 
-Deduplication tree nodes store entries after the standard node header. Each entry maps a sector hash to its physical location:
+The deduplication tree is a B+Tree keyed by the XXH64 hash of sector data. Leaf nodes store sorted `dedup_entry` records; index nodes use the standard `btree_index_entry` to route lookups by hash key.
 
 ```c
 struct dedup_entry {                         /* packed, 24 bytes */
@@ -233,7 +233,9 @@ struct dedup_entry {                         /* packed, 24 bytes */
 };
 ```
 
-Maximum entries per node with a 4096-byte block: (4096 - 69) / 24 = **167 entries**.
+Entries are sorted by `hash` and stored in leaf nodes (`level == 0`). Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 24 = **167 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
+
+Lookups traverse from root through index nodes (binary search on `hash` key) to the target leaf, then binary-search the leaf entries. Insertions follow the same path, performing sorted insertion in the leaf and splitting upward when full — identical to the inode and overflow trees.
 
 ---
 
