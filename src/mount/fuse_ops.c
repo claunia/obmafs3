@@ -1702,6 +1702,14 @@ struct obmafs3_ioctl_cd_read_arg {
 #define OBMAFS3_IOC_CD_READ_LONG \
     _IOWR('O', 5, struct obmafs3_ioctl_cd_read_arg)
 
+struct obmafs3_ioctl_cd_read_full_arg {
+    int64_t  sector;                    /**< Sector LBA to read */
+    uint8_t  buffer[CD_RAW_PLUS_SUB];   /**< Output: 2352 raw + 96 subchannel */
+};
+
+#define OBMAFS3_IOC_CD_READ_LONG_SUB \
+    _IOWR('O', 6, struct obmafs3_ioctl_cd_read_full_arg)
+
 /**
  * Check if the 16-byte prefix of a raw CD sector matches the expected
  * sync + MSF + mode for the given LBA and track mode.
@@ -2153,6 +2161,56 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx,
     return 0;
 }
 
+/**
+ * Read a single CD sector by LBA, returning 2352 raw bytes + 96 subchannel.
+ * If subchannel is not available, the last 96 bytes are filled with zeros.
+ */
+static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx,
+                                    struct obmafs3_ioctl_cd_read_full_arg *arg)
+{
+    if (!arg)
+        return -EINVAL;
+
+    /* Reuse the read-long handler for the first 2352 bytes */
+    struct obmafs3_ioctl_cd_read_arg rd;
+    rd.sector = arg->sector;
+    int rc = obmafs3_cd_read_long(ffctx, &rd);
+    if (rc != 0)
+        return rc;
+
+    memcpy(arg->buffer, rd.buffer, CD_RAW_SECTOR_SIZE);
+
+    /* Read the cd_sector_map_entry to get subchannel_hash */
+    struct inode_record map_inode;
+    memcpy(&map_inode, &ffctx->inode, sizeof(map_inode));
+    map_inode.file_size = ffctx->inode.sector_map_size *
+                          sizeof(struct cd_sector_map_entry);
+
+    struct cd_sector_map_entry sme;
+    uint64_t sme_offset = (uint64_t)arg->sector *
+                          sizeof(struct cd_sector_map_entry);
+    rc = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset,
+                                &sme, sizeof(sme));
+    if (rc != OBMAFS3_OK) {
+        memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+        return 0;
+    }
+
+    if (sme.subchannel_hash != 0) {
+        uint8_t sub[CD_SUBCHANNEL_DATA_SIZE];
+        rc = obmafs3_cd_subchannel_get(g_ctx, sme.subchannel_hash, sub);
+        if (rc == OBMAFS3_OK) {
+            memcpy(arg->buffer + CD_RAW_SECTOR_SIZE, sub, CD_SUBCHANNEL_SIZE);
+        } else {
+            memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+        }
+    } else {
+        memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+    }
+
+    return 0;
+}
+
 static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
                                void *arg, struct fuse_file_info *fi,
                                unsigned int flags, void *data)
@@ -2240,6 +2298,13 @@ static int obmafs3_fuse_ioctl(const char *path, unsigned int cmd,
             return -ENOTTY;
         return obmafs3_cd_read_long(
             ffctx, (struct obmafs3_ioctl_cd_read_arg *)data);
+    }
+
+    case OBMAFS3_IOC_CD_READ_LONG_SUB: {
+        if (ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            return -ENOTTY;
+        return obmafs3_cd_read_long_sub(
+            ffctx, (struct obmafs3_ioctl_cd_read_full_arg *)data);
     }
 
     default:
