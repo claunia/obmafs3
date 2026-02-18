@@ -1493,16 +1493,23 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     /*
      * Pre-allocate a buffer for sector_map_entries.
+     * When cache is NULL but db_cache is provided (CD image path),
+     * the caller manages its own sector map — skip entirely.
      * Maximum number of sectors in this write = size / sector_size + 1.
      */
-    uint64_t                 max_sectors = size / sector_size + 1;
-    struct sector_map_entry *sme_buf     = malloc((size_t)(max_sectors * sizeof(struct sector_map_entry)));
-    if(!sme_buf)
+    int                      skip_sme = (cache == NULL && db_cache != NULL);
+    struct sector_map_entry *sme_buf  = NULL;
+    uint64_t                 sme_count = 0;
+    if(!skip_sme)
     {
-        if(!db_is_cached) dedup_block_free(db);
-        return OBMAFS3_ERR_NOMEM;
+        uint64_t max_sectors = size / sector_size + 1;
+        sme_buf = malloc((size_t)(max_sectors * sizeof(struct sector_map_entry)));
+        if(!sme_buf)
+        {
+            if(!db_is_cached) dedup_block_free(db);
+            return OBMAFS3_ERR_NOMEM;
+        }
     }
-    uint64_t sme_count = 0;
 
     /* Reuse the pre-allocated node buffer for dedup tree traversal,
      * avoiding per-sector malloc/free overhead. */
@@ -1580,11 +1587,14 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             goto out;
         }
 
-        /* Collect the sector_map_entry */
-        sme_buf[sme_count].sector      = sector_num;
-        sme_buf[sme_count].sector_size = sector_size;
-        sme_buf[sme_count].hash        = hash;
-        sme_count++;
+        /* Collect the sector_map_entry (skipped for CD images) */
+        if(!skip_sme)
+        {
+            sme_buf[sme_count].sector      = sector_num;
+            sme_buf[sme_count].sector_size = sector_size;
+            sme_buf[sme_count].hash        = hash;
+            sme_count++;
+        }
 
         /* Update sector count */
         if((uint64_t)(sector_num + 1) > inode->sector_count) inode->sector_count = (uint64_t)(sector_num + 1);
@@ -1633,8 +1643,8 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     /* Keep the cached header in sync */
     if(db_cache) db_cache->dedup_hdr = dedup_hdr;
 
-    /* Now write or cache the sector map entries */
-    if(rc == OBMAFS3_OK && sme_count > 0)
+    /* Now write or cache the sector map entries (skipped for CD images) */
+    if(!skip_sme && rc == OBMAFS3_OK && sme_count > 0)
     {
         if(cache)
         {

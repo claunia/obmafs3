@@ -229,13 +229,11 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
 
         /* Write via the media image data path — dedup_upsert_find handles
          * both hit (skip data) and miss (store + insert) in one traversal,
-         * avoiding the overhead of a separate dedup_get_tree + dedup_lookup. */
-        uint64_t                offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
-        struct sector_map_cache dummy_cache; /* unused */
-        memset(&dummy_cache, 0, sizeof(dummy_cache));
+         * avoiding the overhead of a separate dedup_get_tree + dedup_lookup.
+         * Pass NULL cache: CD images use cd_sector_map_entries instead. */
+        uint64_t offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
         int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
-                                                CD_RAW_SECTOR_SIZE, &dummy_cache, dbc);
-        obmafs3_free_sector_map_cache(&dummy_cache);
+                                                CD_RAW_SECTOR_SIZE, NULL, dbc);
         if(rc != OBMAFS3_OK) return -EIO;
 
         goto cache_and_done;
@@ -365,13 +363,11 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
 
         /* Write via the media image data path — dedup_upsert_find handles
          * both hit (skip data) and miss (store + insert) in one traversal,
-         * avoiding the overhead of a separate dedup_get_tree + dedup_lookup. */
-        uint64_t                offset = (uint64_t)sector_lba * data_size;
-        struct sector_map_cache dummy_cache;
-        memset(&dummy_cache, 0, sizeof(dummy_cache));
+         * avoiding the overhead of a separate dedup_get_tree + dedup_lookup.
+         * Pass NULL cache: CD images use cd_sector_map_entries instead. */
+        uint64_t offset = (uint64_t)sector_lba * data_size;
         int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size,
-                                                &dummy_cache, dbc);
-        obmafs3_free_sector_map_cache(&dummy_cache);
+                                                NULL, dbc);
         if(rc != OBMAFS3_OK) return -EIO;
     }
 
