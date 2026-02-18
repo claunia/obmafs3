@@ -3,11 +3,16 @@
  */
 #include "obmafs.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <zstd.h>
 
 /* ------------------------------------------------------------------ */
 /*  Options                                                            */
@@ -1540,11 +1545,14 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
         return 0;
     }
 
-    uint64_t bad          = 0;
-    uint64_t bad_magic    = 0;
-    uint64_t bad_checksum = 0;
-    uint64_t read_errors  = 0;
+    uint64_t bad         = 0;
+    uint64_t read_errors = 0;
 
+    /* With variable-length extents, individual data blocks no longer
+     * carry a block_header.  Only compressed extent groups have a
+     * header (spanning multiple physical blocks).  For this per-block
+     * readability pass we simply verify that each physical block can
+     * be read successfully. */
     for(uint64_t i = 0; i < data_count; i++)
     {
         if(i % 64 == 0 || i == data_count - 1) print_progress(i + 1, data_count, bad);
@@ -1553,30 +1561,6 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
         if(rc != OBMAFS3_OK)
         {
             read_errors++;
-            bad++;
-            continue;
-        }
-
-        struct block_header bhdr;
-        memcpy(&bhdr, buf, sizeof(bhdr));
-
-        if(bhdr.magic != OBMAFS3_BLOCK_MAGIC)
-        {
-            bad_magic++;
-            bad++;
-            continue;
-        }
-
-        /* Checksum is over on-disk data after header:
-         * compressed_size for compressed blocks, original_size for raw */
-        size_t check_size =
-            (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? (size_t)bhdr.compressed_size : (size_t)bhdr.original_size;
-        uint8_t computed[32];
-        obmafs3_checksum_block(buf + sizeof(bhdr), check_size, computed);
-
-        if(memcmp(computed, bhdr.checksum, 32) != 0)
-        {
-            bad_checksum++;
             bad++;
         }
     }
@@ -1589,8 +1573,6 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
     {
         printf("  Result:           %" PRIu64 " error(s)\n", bad);
         if(read_errors > 0) printf("    Read errors:    %" PRIu64 "\n", read_errors);
-        if(bad_magic > 0) printf("    Bad magic:      %" PRIu64 "\n", bad_magic);
-        if(bad_checksum > 0) printf("    Bad checksum:   %" PRIu64 "\n", bad_checksum);
     }
 
     free(buf);
@@ -2316,13 +2298,210 @@ int main(int argc, char *argv[])
 
     const char *path = argv[optind];
 
-    /* ---- Open the filesystem (skip bitmap, tolerate checksum errors) ---- */
-    struct obmafs3_ctx *ctx;
-    int                 rc = obmafs3_open_flags(path, OBMAFS3_OPEN_SKIP_BITMAP | OBMAFS3_OPEN_LENIENT, &ctx);
-    if(rc != OBMAFS3_OK)
+    /* ---- Open the filesystem with raw I/O and detailed error reporting ---- */
+    int fd = open(path, O_RDWR);
+    if(fd < 0)
     {
-        fprintf(stderr, "Error: failed to open filesystem: %d\n", rc);
+        /* Fall back to read-only if read-write fails (e.g. read-only media) */
+        fd = open(path, O_RDONLY);
+        if(fd < 0)
+        {
+            fprintf(stderr, "Error: cannot open '%s': %s\n", path, strerror(errno));
+            return 1;
+        }
+    }
+
+    struct stat file_stat;
+    if(fstat(fd, &file_stat) < 0)
+    {
+        fprintf(stderr, "Error: cannot stat '%s': %s\n", path, strerror(errno));
+        close(fd);
         return 1;
+    }
+
+    if(!S_ISREG(file_stat.st_mode) && !S_ISBLK(file_stat.st_mode))
+    {
+        fprintf(stderr, "Error: '%s' is not a regular file or block device\n", path);
+        close(fd);
+        return 1;
+    }
+
+    /* Read the superblock directly */
+    struct obmafs3_sb sb;
+    ssize_t           nread = pread(fd, &sb, sizeof(sb), 0);
+    if(nread < 0)
+    {
+        fprintf(stderr, "Error: cannot read superblock from '%s': %s\n", path, strerror(errno));
+        close(fd);
+        return 1;
+    }
+    if((size_t)nread < sizeof(sb))
+    {
+        fprintf(stderr, "Error: '%s' is too small to contain a superblock (read %zd of %zu bytes)\n", path, nread,
+                sizeof(sb));
+        close(fd);
+        return 1;
+    }
+
+    if(sb.magic != OBMAFS3_SB_MAGIC)
+    {
+        fprintf(stderr,
+                "Error: '%s' does not contain an OBMAFS3 filesystem\n"
+                "  Expected magic: 0x%016" PRIx64 "\n"
+                "  Found magic:    0x%016" PRIx64 "\n",
+                path, (uint64_t)OBMAFS3_SB_MAGIC, sb.magic);
+        close(fd);
+        return 1;
+    }
+
+    if(sb.block_size == 0)
+    {
+        fprintf(stderr, "Error: superblock has invalid block_size = 0\n");
+        close(fd);
+        return 1;
+    }
+
+    if(sb.total_bytes == 0)
+    {
+        fprintf(stderr, "Error: superblock has invalid total_bytes = 0\n");
+        close(fd);
+        return 1;
+    }
+
+    if(sb.dedup_block_size == 0)
+    {
+        fprintf(stderr, "Error: superblock has invalid dedup_block_size = 0\n");
+        close(fd);
+        return 1;
+    }
+
+    if(sb.catalog_lba == 0)
+    {
+        fprintf(stderr, "Error: superblock has no catalog tree (catalog_lba = 0)\n");
+        close(fd);
+        return 1;
+    }
+
+    if(sb.inode_lba == 0)
+    {
+        fprintf(stderr, "Error: superblock has no inode tree (inode_lba = 0)\n");
+        close(fd);
+        return 1;
+    }
+
+    /* Build a minimal ctx for the library helpers (block_read, btree_header_read, etc.) */
+    struct obmafs3_ctx *ctx = calloc(1, sizeof(*ctx));
+    if(!ctx)
+    {
+        fprintf(stderr, "Error: out of memory allocating filesystem context\n");
+        close(fd);
+        return 1;
+    }
+    ctx->fd          = fd;
+    ctx->sb          = sb;
+    ctx->compression = 1;
+    ctx->zstd_level  = 15;
+
+    size_t group_bytes = (size_t)sb.block_size * OBMAFS3_COMPRESS_GROUP_BLOCKS;
+    ctx->hdr_buf  = malloc((size_t)sb.block_size);
+    ctx->node_buf = malloc((size_t)sb.block_size);
+    ctx->io_buf   = malloc(group_bytes);
+    ctx->io_buf2  = malloc(group_bytes);
+
+    size_t comp_need = sizeof(struct block_header) + ZSTD_compressBound(group_bytes);
+    if(comp_need < group_bytes) comp_need = group_bytes;
+    ctx->comp_buf      = malloc(comp_need);
+    ctx->comp_buf_size = comp_need;
+
+    ctx->zstd_cctx = ZSTD_createCCtx();
+    ctx->zstd_dctx = ZSTD_createDCtx();
+
+    ctx->rc_leaf_buf   = malloc((size_t)sb.block_size);
+    ctx->rc_leaf_valid = 0;
+
+    if(!ctx->hdr_buf || !ctx->node_buf || !ctx->io_buf || !ctx->io_buf2 || !ctx->comp_buf || !ctx->zstd_cctx ||
+       !ctx->zstd_dctx || !ctx->rc_leaf_buf)
+    {
+        fprintf(stderr, "Error: out of memory allocating work buffers\n");
+        obmafs3_close(ctx);
+        return 1;
+    }
+
+    /* Read B+Tree headers leniently (tolerate checksum errors so we can report them) */
+    int cs_tmp;
+    int rc;
+
+    rc = obmafs3_btree_header_read_lenient(ctx, sb.catalog_lba, &ctx->catalog_hdr, &cs_tmp);
+    if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+        fprintf(stderr, "Warning: cannot read catalog tree header at LBA %" PRIu64 " (error %d)\n", sb.catalog_lba,
+                rc);
+
+    rc = obmafs3_btree_header_read_lenient(ctx, sb.inode_lba, &ctx->inode_hdr, &cs_tmp);
+    if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+        fprintf(stderr, "Warning: cannot read inode tree header at LBA %" PRIu64 " (error %d)\n", sb.inode_lba, rc);
+
+    if(sb.overflow_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.overflow_lba, &ctx->overflow_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read overflow tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.overflow_lba, rc);
+    }
+
+    if(sb.media_tag_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.media_tag_lba, &ctx->media_tag_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read media tag tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.media_tag_lba, rc);
+    }
+
+    if(sb.cd_prefix_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.cd_prefix_lba, &ctx->cd_prefix_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read CD prefix tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.cd_prefix_lba, rc);
+    }
+
+    if(sb.cd_suffix_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.cd_suffix_lba, &ctx->cd_suffix_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read CD suffix tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.cd_suffix_lba, rc);
+    }
+
+    if(sb.cd_subchannel_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.cd_subchannel_lba, &ctx->cd_subchannel_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read CD subchannel tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.cd_subchannel_lba, rc);
+    }
+
+    if(sb.metadata_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.metadata_lba, &ctx->metadata_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read metadata tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.metadata_lba, rc);
+    }
+
+    if(sb.metadata_idx_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.metadata_idx_lba, &ctx->metadata_idx_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read metadata index tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.metadata_idx_lba, rc);
+    }
+
+    if(sb.refcount_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.refcount_lba, &ctx->refcount_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read refcount tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.refcount_lba, rc);
     }
 
     int errors = 0;
