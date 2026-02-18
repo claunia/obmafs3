@@ -67,7 +67,7 @@ int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba, const void *buf, 
 int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr);
 int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr,
                                       int *checksum_ok);
-int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, const struct btree_header *hdr);
+int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr);
 
 /* --- Catalog operations --- */
 int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id, const char *name, struct catalog_record *entry);

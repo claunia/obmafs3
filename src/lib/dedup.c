@@ -591,14 +591,6 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
         return rc;
     }
 
-    /* Re-read to get the written checksum */
-    rc = obmafs3_btree_header_read(ctx, new_hdr_lba, &new_hdr);
-    if(rc != OBMAFS3_OK)
-    {
-        free(entries);
-        return rc;
-    }
-
     /* Add the new entry to the tree list */
     struct tree_list_entry *new_entries = realloc(entries, (size_t)((count + 1) * sizeof(struct tree_list_entry)));
     if(!new_entries)
@@ -1638,9 +1630,6 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     dedup_hdr.last_block_offset = db->offset;
     int hdr_rc                  = obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
     if(rc == OBMAFS3_OK) rc = hdr_rc;
-
-    /* Re-read header to keep cached checksum in sync */
-    if(rc == OBMAFS3_OK) obmafs3_btree_header_read(ctx, dedup_hdr_lba, &dedup_hdr);
 
     /* Now write or cache the sector map entries */
     if(rc == OBMAFS3_OK && sme_count > 0)

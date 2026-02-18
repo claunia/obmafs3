@@ -80,7 +80,7 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, str
  * @param hdr  Pointer to the header structure to write.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
-int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, const struct btree_header *hdr)
+int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr)
 {
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if(!buf) return OBMAFS3_ERR_NOMEM;
@@ -91,6 +91,9 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, const stru
     struct btree_header *hdr_buf = (struct btree_header *)buf;
     memset(hdr_buf->checksum, 0, sizeof(hdr_buf->checksum));
     obmafs3_checksum_block(buf, sizeof(*hdr), hdr_buf->checksum);
+
+    /* Copy the computed checksum back so the caller stays in sync */
+    memcpy(hdr->checksum, hdr_buf->checksum, sizeof(hdr->checksum));
 
     int rc = obmafs3_block_write(ctx, lba, buf, (size_t)ctx->sb.block_size);
     free(buf);
