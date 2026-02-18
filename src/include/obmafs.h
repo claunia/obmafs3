@@ -56,6 +56,12 @@ struct obmafs3_ctx
     size_t              comp_buf_size;      ///< Size of comp_buf in bytes
     struct ZSTD_CCtx_s *zstd_cctx;          ///< Reusable ZSTD compression context
     struct ZSTD_DCtx_s *zstd_dctx;          ///< Reusable ZSTD decompression context
+    uint8_t            *rc_leaf_buf;        ///< Cached refcount B+Tree leaf node
+    uint64_t            rc_leaf_lba;        ///< LBA of the cached refcount leaf
+    uint64_t            rc_leaf_min;        ///< Smallest key in the cached leaf
+    uint64_t            rc_leaf_max;        ///< Largest key in the cached leaf
+    uint16_t            rc_leaf_count;      ///< Number of keys in the cached leaf
+    int                 rc_leaf_valid;      ///< Non-zero when the leaf cache is populated
 };
 
 /* Open flags */

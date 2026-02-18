@@ -114,6 +114,25 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
         return OBMAFS3_OK;
     }
 
+    /* Fast path: check the cached refcount leaf node */
+    if(ctx->rc_leaf_valid && lba >= ctx->rc_leaf_min && lba <= ctx->rc_leaf_max)
+    {
+        int idx = refcount_leaf_find(ctx->rc_leaf_buf, ctx->rc_leaf_count, lba);
+        if(idx >= 0)
+        {
+            struct refcount_record rec;
+            memcpy(&rec,
+                   ctx->rc_leaf_buf + sizeof(struct btree_node_header) + (size_t)idx * sizeof(rec),
+                   sizeof(rec));
+            *ref_count = rec.ref_count;
+        }
+        else
+        {
+            *ref_count = 1;
+        }
+        return OBMAFS3_OK;
+    }
+
     uint8_t *buf = ctx->node_buf;
 
     uint64_t cur = root;
@@ -137,6 +156,28 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
         }
         else
         {
+            /* Cache this leaf for future lookups */
+            memcpy(ctx->rc_leaf_buf, buf, (size_t)ctx->sb.block_size);
+            ctx->rc_leaf_lba   = cur;
+            ctx->rc_leaf_count = hdr.node_keys;
+            if(hdr.node_keys > 0)
+            {
+                struct refcount_record first_rec, last_rec;
+                memcpy(&first_rec, buf + sizeof(struct btree_node_header), sizeof(first_rec));
+                memcpy(&last_rec,
+                       buf + sizeof(struct btree_node_header) +
+                           (size_t)(hdr.node_keys - 1) * sizeof(struct refcount_record),
+                       sizeof(last_rec));
+                ctx->rc_leaf_min = first_rec.lba;
+                ctx->rc_leaf_max = last_rec.lba;
+            }
+            else
+            {
+                ctx->rc_leaf_min = UINT64_MAX;
+                ctx->rc_leaf_max = 0;
+            }
+            ctx->rc_leaf_valid = 1;
+
             int idx = refcount_leaf_find(buf, hdr.node_keys, lba);
             if(idx >= 0)
             {
@@ -171,6 +212,9 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
  */
 int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_count)
 {
+    /* Any mutation invalidates the cached refcount leaf */
+    ctx->rc_leaf_valid = 0;
+
     /* ref_count <= 1 means "remove from tree" (1 is implicit default) */
     if(ref_count <= 1)
     {

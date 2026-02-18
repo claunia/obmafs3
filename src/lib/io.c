@@ -154,13 +154,20 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     c->zstd_cctx = ZSTD_createCCtx();
     c->zstd_dctx = ZSTD_createDCtx();
 
-    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2 || !c->comp_buf || !c->zstd_cctx || !c->zstd_dctx)
+    /* Refcount leaf cache buffer (separate from node_buf so lookups
+     * don't clobber the shared traversal buffer). */
+    c->rc_leaf_buf   = malloc((size_t)c->sb.block_size);
+    c->rc_leaf_valid = 0;
+
+    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2 || !c->comp_buf || !c->zstd_cctx || !c->zstd_dctx ||
+       !c->rc_leaf_buf)
     {
         free(c->hdr_buf);
         free(c->node_buf);
         free(c->io_buf);
         free(c->io_buf2);
         free(c->comp_buf);
+        free(c->rc_leaf_buf);
         ZSTD_freeCCtx(c->zstd_cctx);
         ZSTD_freeDCtx(c->zstd_dctx);
         close(fd);
@@ -424,6 +431,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     free(ctx->io_buf);
     free(ctx->io_buf2);
     free(ctx->comp_buf);
+    free(ctx->rc_leaf_buf);
     ZSTD_freeCCtx(ctx->zstd_cctx);
     ZSTD_freeDCtx(ctx->zstd_dctx);
     if(ctx->bitmap) free(ctx->bitmap);
