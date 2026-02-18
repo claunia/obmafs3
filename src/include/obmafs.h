@@ -151,6 +151,9 @@ struct dedup_block_cache
     int      initialized;  ///< Non-zero once first init has run
     void    *bg_compress;  ///< Opaque background compression context
     void    *node_cache;   ///< Opaque dedup B+Tree node cache
+    struct btree_header dedup_hdr;     ///< Cached dedup tree header
+    uint64_t            dedup_hdr_lba; ///< Cached dedup tree header LBA
+    int                 hdr_cached;    ///< Non-zero when dedup_hdr is valid
 };
 
 int  obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record *inode, uint64_t offset,

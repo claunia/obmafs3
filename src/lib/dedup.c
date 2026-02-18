@@ -1422,11 +1422,27 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     uint64_t new_end = offset + size;
     if(new_end > inode->file_size) inode->file_size = new_end;
 
-    /* Get (or create) the dedup tree for this sector size */
+    /* Get (or create) the dedup tree for this sector size.
+     * When a persistent cache is provided and already has a valid
+     * header, skip the expensive disk read entirely. */
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
-    rc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
-    if(rc != OBMAFS3_OK) return rc;
+    if(db_cache && db_cache->hdr_cached)
+    {
+        dedup_hdr     = db_cache->dedup_hdr;
+        dedup_hdr_lba = db_cache->dedup_hdr_lba;
+    }
+    else
+    {
+        rc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
+        if(rc != OBMAFS3_OK) return rc;
+        if(db_cache)
+        {
+            db_cache->dedup_hdr     = dedup_hdr;
+            db_cache->dedup_hdr_lba = dedup_hdr_lba;
+            db_cache->hdr_cached    = 1;
+        }
+    }
 
     /* Initialize the in-memory dedup block — use the persistent cache
      * if the caller provided one, otherwise fall back to a local ctx
@@ -1614,6 +1630,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     int hdr_rc                  = obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
     if(rc == OBMAFS3_OK) rc = hdr_rc;
 
+    /* Keep the cached header in sync */
+    if(db_cache) db_cache->dedup_hdr = dedup_hdr;
+
     /* Now write or cache the sector map entries */
     if(rc == OBMAFS3_OK && sme_count > 0)
     {
@@ -1675,6 +1694,9 @@ out:
     dedup_hdr.last_block_lba    = db->block_lba;
     dedup_hdr.last_block_offset = db->offset;
     obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
+
+    /* Keep the cached header in sync */
+    if(db_cache) db_cache->dedup_hdr = dedup_hdr;
 
     free(sme_buf);
     if(db_is_cached)
@@ -1748,15 +1770,30 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_siz
         if(rc == OBMAFS3_OK) rc = nc_rc;
     }
 
-    /* Update the tree header with the current partial block state */
+    /* Update the tree header with the current partial block state.
+     * Use the cached header if available to avoid a disk read. */
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
-    int                 hrc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
+    int                 hrc;
+    if(db_cache->hdr_cached)
+    {
+        dedup_hdr     = db_cache->dedup_hdr;
+        dedup_hdr_lba = db_cache->dedup_hdr_lba;
+        hrc           = OBMAFS3_OK;
+    }
+    else
+    {
+        hrc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
+    }
     if(hrc == OBMAFS3_OK)
     {
         dedup_hdr.last_block_lba    = db.block_lba;
         dedup_hdr.last_block_offset = db.offset;
         obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
+        /* Update the cached header too */
+        db_cache->dedup_hdr     = dedup_hdr;
+        db_cache->dedup_hdr_lba = dedup_hdr_lba;
+        db_cache->hdr_cached    = 1;
     }
 
     /* Copy state back */
@@ -1789,6 +1826,7 @@ void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
     free(db_cache->data);
     db_cache->data        = NULL;
     db_cache->initialized = 0;
+    db_cache->hdr_cached  = 0;
 }
 
 /* ------------------------------------------------------------------ */
