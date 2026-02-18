@@ -1198,6 +1198,13 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
     uint8_t *block_buf = ctx->io_buf;
     uint8_t *work_buf  = ctx->io_buf2;
 
+    /* Extent cursor — avoids re-scanning all extents on every iteration
+     * when the write advances sequentially through the same extent. */
+    int      cur_ext_idx   = -1; /* inline extent index (0-7), or 8 for overflow */
+    uint64_t cur_ext_base  = 0;  /* logical block where this extent starts */
+    uint64_t cur_ext_start = 0;  /* physical start LBA of the extent */
+    uint64_t cur_ext_count = 0;  /* number of blocks in the extent */
+
     while(bytes_written < size)
     {
         /* Determine which logical data block this offset falls into */
@@ -1205,24 +1212,51 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         uint64_t logical_block   = write_pos / data_capacity;
         size_t   offset_in_block = (size_t)(write_pos % data_capacity);
 
-        /* Map logical block to physical LBA via extents */
-        uint64_t phys_lba           = 0;
-        uint64_t block_count_so_far = 0;
-        int      found              = 0;
-        for(i = 0; i < 8; i++)
+        /* Map logical block to physical LBA via extents.
+         * Fast path: check whether the cached extent still covers this
+         * logical block before scanning from scratch. */
+        uint64_t phys_lba = 0;
+        int      found    = 0;
+
+        if(cur_ext_idx >= 0 && logical_block >= cur_ext_base && logical_block < cur_ext_base + cur_ext_count)
         {
-            if(inode->extents[i].block_count == 0) continue;
-            if(logical_block < block_count_so_far + inode->extents[i].block_count)
-            {
-                phys_lba = inode->extents[i].start_block + (logical_block - block_count_so_far);
-                found    = 1;
-                break;
-            }
-            block_count_so_far += inode->extents[i].block_count;
+            phys_lba = cur_ext_start + (logical_block - cur_ext_base);
+            found    = 1;
+            i        = cur_ext_idx; /* preserve for CoW inline-vs-overflow check */
         }
 
-        /* If not found in inline extents, check overflow tree */
-        if(!found) { found = overflow_find_phys(ctx, inode->inode_id, logical_block, block_count_so_far, &phys_lba); }
+        if(!found)
+        {
+            uint64_t block_count_so_far = 0;
+            for(i = 0; i < 8; i++)
+            {
+                if(inode->extents[i].block_count == 0) continue;
+                if(logical_block < block_count_so_far + inode->extents[i].block_count)
+                {
+                    phys_lba = inode->extents[i].start_block + (logical_block - block_count_so_far);
+                    found    = 1;
+                    /* Cache this extent for fast lookup next iteration */
+                    cur_ext_idx   = i;
+                    cur_ext_base  = block_count_so_far;
+                    cur_ext_start = inode->extents[i].start_block;
+                    cur_ext_count = inode->extents[i].block_count;
+                    break;
+                }
+                block_count_so_far += inode->extents[i].block_count;
+            }
+
+            /* If not found in inline extents, check overflow tree */
+            if(!found)
+            {
+                found = overflow_find_phys(ctx, inode->inode_id, logical_block, block_count_so_far, &phys_lba);
+                if(found)
+                {
+                    cur_ext_idx   = 8; /* marks overflow */
+                    cur_ext_base  = 0;
+                    cur_ext_count = 0; /* no caching for overflow — re-lookup each time */
+                }
+            }
+        }
 
         if(!found)
         {
@@ -1319,6 +1353,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                 }
                 obmafs3_refcount_dec(ctx, phys_lba, NULL);
                 write_lba = new_lba;
+
+                /* CoW changed the extent map — invalidate the cursor */
+                cur_ext_idx = -1;
             }
         }
 
