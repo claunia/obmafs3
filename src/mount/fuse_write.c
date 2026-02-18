@@ -142,14 +142,12 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
     if(rc == OBMAFS3_ERR_NOSPC) return -ENOSPC;
     if(rc != OBMAFS3_OK) return -EIO;
 
-    /* Always persist the inode so that other processes (e.g. ls) see
-     * the up-to-date file_size and extents.  We keep the in-memory
-     * cached copy for our own reads to avoid a B+Tree lookup. */
+    /* Defer inode persistence to flush/release.  The in-memory cached
+     * copy in ffctx keeps our own reads consistent and flush/release
+     * will call obmafs3_inode_put() when the file is closed. */
     if(ffctx)
     {
-        rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
-        if(rc != OBMAFS3_OK) return -EIO;
-        ffctx->inode_dirty = 0;
+        ffctx->inode_dirty = 1;
     }
     else
     {
