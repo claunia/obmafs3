@@ -149,13 +149,20 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     c->comp_buf      = malloc(comp_need);
     c->comp_buf_size = comp_need;
 
-    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2 || !c->comp_buf)
+    /* Pre-allocate reusable ZSTD compression / decompression contexts
+     * so every compress/decompress call avoids internal alloc+free. */
+    c->zstd_cctx = ZSTD_createCCtx();
+    c->zstd_dctx = ZSTD_createDCtx();
+
+    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2 || !c->comp_buf || !c->zstd_cctx || !c->zstd_dctx)
     {
         free(c->hdr_buf);
         free(c->node_buf);
         free(c->io_buf);
         free(c->io_buf2);
         free(c->comp_buf);
+        ZSTD_freeCCtx(c->zstd_cctx);
+        ZSTD_freeDCtx(c->zstd_dctx);
         close(fd);
         free(c);
         return OBMAFS3_ERR_NOMEM;
@@ -417,6 +424,8 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     free(ctx->io_buf);
     free(ctx->io_buf2);
     free(ctx->comp_buf);
+    ZSTD_freeCCtx(ctx->zstd_cctx);
+    ZSTD_freeDCtx(ctx->zstd_dctx);
     if(ctx->bitmap) free(ctx->bitmap);
     if(ctx->fd >= 0) close(ctx->fd);
     free(ctx);

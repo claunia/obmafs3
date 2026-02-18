@@ -12,6 +12,11 @@
 #include "superblock.h"
 #include "tags.h"
 
+/* Forward-declare ZSTD context types so we can store them as pointers
+ * without pulling <zstd.h> into the public header. */
+struct ZSTD_CCtx_s;
+struct ZSTD_DCtx_s;
+
 /* Error codes */
 #define OBMAFS3_OK           0
 #define OBMAFS3_ERR_IO       -1
@@ -49,6 +54,8 @@ struct obmafs3_ctx
     uint8_t            *io_buf2;            ///< Reusable second buffer for decompression / work
     uint8_t            *comp_buf;           ///< Reusable buffer for compression output
     size_t              comp_buf_size;      ///< Size of comp_buf in bytes
+    struct ZSTD_CCtx_s *zstd_cctx;          ///< Reusable ZSTD compression context
+    struct ZSTD_DCtx_s *zstd_dctx;          ///< Reusable ZSTD decompression context
 };
 
 /* Open flags */
@@ -245,8 +252,9 @@ uint64_t obmafs3_checksum_xxh64(const void *data, size_t size);
 void     obmafs3_checksum_block(const void *data, size_t size, uint8_t *out);
 
 /* --- Compression operations --- */
-int obmafs3_compress(const void *src, size_t src_size, void *dst, size_t *dst_size, int level);
-int obmafs3_decompress(const void *src, size_t src_size, void *dst, size_t dst_size);
+int obmafs3_compress(struct ZSTD_CCtx_s *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size,
+                     int level);
+int obmafs3_decompress(struct ZSTD_DCtx_s *dctx, const void *src, size_t src_size, void *dst, size_t dst_size);
 
 /* --- Filesystem creation --- */
 int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, uint64_t dedup_block_size,

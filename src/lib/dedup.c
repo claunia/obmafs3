@@ -67,8 +67,8 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, uint8_t *data, uint
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc       = obmafs3_compress(data + sizeof(bhdr), (size_t)bhdr.original_size, comp_buf, &comp_size,
-                                                ctx->zstd_level);
+            int    crc       = obmafs3_compress(ctx->zstd_cctx, data + sizeof(bhdr), (size_t)bhdr.original_size,
+                                                comp_buf, &comp_size, ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
                 bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
@@ -1149,7 +1149,7 @@ static int dedup_block_init(struct obmafs3_ctx *ctx, const struct btree_header *
                 db->data = NULL;
                 return OBMAFS3_ERR_NOMEM;
             }
-            rc = obmafs3_decompress(db->data + sizeof(bhdr), (size_t)bhdr.compressed_size, temp,
+            rc = obmafs3_decompress(ctx->zstd_dctx, db->data + sizeof(bhdr), (size_t)bhdr.compressed_size, temp,
                                     (size_t)bhdr.original_size);
             if(rc != OBMAFS3_OK)
             {
@@ -1205,8 +1205,8 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc = obmafs3_compress(db->data + sizeof(bhdr), (size_t)bhdr.original_size, comp_buf, &comp_size,
-                                          ctx->zstd_level);
+            int    crc = obmafs3_compress(ctx->zstd_cctx, db->data + sizeof(bhdr), (size_t)bhdr.original_size,
+                                          comp_buf, &comp_size, ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
                 bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
@@ -2084,8 +2084,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                         return OBMAFS3_ERR_NOMEM;
                     }
                 }
-                rc = obmafs3_decompress(dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size, decomp_buf,
-                                        (size_t)bhdr.original_size);
+                rc = obmafs3_decompress(ctx->zstd_dctx, dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
+                                        decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
                     free(decomp_buf);

@@ -10,6 +10,7 @@
 /**
  * Compress data using ZSTD.
  *
+ * @param cctx      Reusable ZSTD compression context.
  * @param src       Source data buffer.
  * @param src_size  Number of bytes in @p src.
  * @param dst       Destination buffer for compressed data.
@@ -17,9 +18,9 @@
  * @param level     ZSTD compression level (1–22).
  * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on error.
  */
-int obmafs3_compress(const void *src, size_t src_size, void *dst, size_t *dst_size, int level)
+int obmafs3_compress(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size, int level)
 {
-    size_t result = ZSTD_compress(dst, *dst_size, src, src_size, level);
+    size_t result = ZSTD_compressCCtx(cctx, dst, *dst_size, src, src_size, level);
     if(ZSTD_isError(result)) return OBMAFS3_ERR_IO;
     *dst_size = result;
     return OBMAFS3_OK;
@@ -28,15 +29,16 @@ int obmafs3_compress(const void *src, size_t src_size, void *dst, size_t *dst_si
 /**
  * Decompress ZSTD-compressed data.
  *
+ * @param dctx      Reusable ZSTD decompression context.
  * @param src       Compressed data buffer.
  * @param src_size  Number of compressed bytes.
  * @param dst       Output buffer for decompressed data.
  * @param dst_size  Capacity of @p dst (must be >= original size).
  * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on error.
  */
-int obmafs3_decompress(const void *src, size_t src_size, void *dst, size_t dst_size)
+int obmafs3_decompress(ZSTD_DCtx *dctx, const void *src, size_t src_size, void *dst, size_t dst_size)
 {
-    size_t result = ZSTD_decompress(dst, dst_size, src, src_size);
+    size_t result = ZSTD_decompressDCtx(dctx, dst, dst_size, src, src_size);
     if(ZSTD_isError(result)) return OBMAFS3_ERR_IO;
     return OBMAFS3_OK;
 }
@@ -682,8 +684,8 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
 
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                rc = obmafs3_decompress(block_buf + sizeof(bhdr), (size_t)bhdr.compressed_size, decomp_buf,
-                                        (size_t)bhdr.original_size);
+                rc = obmafs3_decompress(ctx->zstd_dctx, block_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
+                                        decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
                     return rc;
@@ -1350,8 +1352,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         {
             if(existing_hdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                rc = obmafs3_decompress(block_buf + sizeof(struct block_header), (size_t)existing_hdr.compressed_size,
-                                        work_buf, (size_t)existing_hdr.original_size);
+                rc = obmafs3_decompress(ctx->zstd_dctx, block_buf + sizeof(struct block_header),
+                                        (size_t)existing_hdr.compressed_size, work_buf,
+                                        (size_t)existing_hdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
                     return rc;
@@ -1386,8 +1389,8 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         {
             uint8_t *comp_block = ctx->comp_buf;
             size_t   comp_size  = ctx->comp_buf_size - sizeof(struct block_header);
-            int crc = obmafs3_compress(work_buf, (size_t)block_data_end, comp_block + sizeof(struct block_header),
-                                       &comp_size, ctx->zstd_level);
+            int crc = obmafs3_compress(ctx->zstd_cctx, work_buf, (size_t)block_data_end,
+                                       comp_block + sizeof(struct block_header), &comp_size, ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < block_data_end)
             {
                 /* Compression saved space — use compressed block */
