@@ -1141,11 +1141,14 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
 
     uint64_t total_blocks_needed = (inode->file_size + data_capacity - 1) / data_capacity;
 
-    /* Count existing allocated blocks (inline + overflow) */
+    /* Count existing allocated blocks.  Start with inline extents;
+     * only query the (potentially expensive) overflow B+Tree when the
+     * inline count alone is insufficient. */
     uint64_t existing_blocks = 0;
     int      i;
     for(i = 0; i < 8; i++) existing_blocks += inode->extents[i].block_count;
-    existing_blocks += overflow_count_blocks(ctx, inode->inode_id);
+    if(existing_blocks < total_blocks_needed && ctx->overflow_hdr.root_node_lba != 0)
+        existing_blocks += overflow_count_blocks(ctx, inode->inode_id);
 
     uint64_t fresh_start = 0; /* LBA range of freshly allocated blocks */
     uint64_t fresh_end   = 0; /* (exclusive) — skip read-back for these */
