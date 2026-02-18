@@ -136,16 +136,16 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
 
     /* Pre-allocate reusable work buffers — avoids per-call malloc/free
      * on every B+Tree traversal and data I/O operation. */
+    size_t group_bytes = (size_t)c->sb.block_size * OBMAFS3_COMPRESS_GROUP_BLOCKS;
     c->hdr_buf  = malloc((size_t)c->sb.block_size);
     c->node_buf = malloc((size_t)c->sb.block_size);
-    c->io_buf   = malloc((size_t)c->sb.block_size);
-    c->io_buf2  = malloc((size_t)c->sb.block_size);
+    c->io_buf   = malloc(group_bytes); /* full compression group */
+    c->io_buf2  = malloc(group_bytes); /* decompressed work buffer */
 
     /* Pre-allocate a compression output buffer large enough for the
-     * worst-case ZSTD expansion of a full data block. */
-    size_t data_cap  = (size_t)c->sb.block_size - sizeof(struct block_header);
-    size_t comp_need = sizeof(struct block_header) + ZSTD_compressBound(data_cap);
-    if(comp_need < (size_t)c->sb.block_size) comp_need = (size_t)c->sb.block_size;
+     * worst-case ZSTD expansion of a full compression group. */
+    size_t comp_need = sizeof(struct block_header) + ZSTD_compressBound(group_bytes);
+    if(comp_need < group_bytes) comp_need = group_bytes;
     c->comp_buf      = malloc(comp_need);
     c->comp_buf_size = comp_need;
 

@@ -55,8 +55,8 @@ ssize_t obmafs3_fuse_copy_file_range(const char *path_in, struct fuse_file_info 
         size = (size_t)(src_ctx->inode.file_size - (uint64_t)offset_in);
     if(size == 0) return 0;
 
-    /* Alignment check (data_capacity) */
-    size_t data_cap = (size_t)(g_ctx->sb.block_size - sizeof(struct block_header));
+    /* Alignment check — no per-block header; data_capacity == block_size */
+    size_t data_cap = (size_t)g_ctx->sb.block_size;
     if((uint64_t)offset_in % data_cap != 0 || (uint64_t)offset_out % data_cap != 0 || size % data_cap != 0)
         return -EINVAL;
 

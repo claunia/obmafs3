@@ -12,6 +12,9 @@
 #define OBMAFS3_DEFAULT_BLOCK_SIZE       4096
 #define OBMAFS3_DEFAULT_DEDUP_BLOCK_SIZE 4194304
 
+/// Number of blocks in a compression group (16 × 4096 = 64 KiB).
+#define OBMAFS3_COMPRESS_GROUP_BLOCKS 16
+
 #define OBMAFS3_ROOT_INODE_ID 2
 
 /// Single deduplication hash-to-block mapping entry.
@@ -64,20 +67,30 @@ struct __attribute__((packed)) cd_sector_map_entry
 /// Contiguous range of allocated blocks.
 struct __attribute__((packed)) extent_run
 {
-    uint64_t start_block;  ///< Starting block of the extent run
-    uint64_t block_count;  ///< Number of blocks in the extent run
+    uint64_t start_block;     ///< Starting physical LBA of the extent run
+    uint64_t block_count;     ///< Number of physical blocks in the extent run
+    uint64_t logical_blocks;  ///< Number of logical blocks this extent covers
+    ///< When logical_blocks == block_count the data is stored
+    ///< uncompressed (one physical block per logical block, no
+    ///< header).  When logical_blocks > block_count the physical
+    ///< blocks contain a block_header followed by ZSTD-compressed
+    ///< data covering logical_blocks × block_size bytes.
 };
 
 /**
  * An overflow extent entry stored in the overflow tree.
  * Associates an inode_id with an extent_run for files that
  * need more than 8 inline extents.
+ *
+ * Sorted by (inode_id, logical_offset) in the B+Tree.
  */
 struct __attribute__((packed)) overflow_extent
 {
-    uint64_t inode_id;     ///< Inode this extent belongs to
-    uint64_t start_block;  ///< Starting block of the extent run
-    uint64_t block_count;  ///< Number of blocks in the extent run
+    uint64_t inode_id;       ///< Inode this extent belongs to
+    uint64_t logical_offset; ///< First logical block covered by this extent (sort key)
+    uint64_t start_block;    ///< Starting physical LBA of the extent run
+    uint64_t block_count;    ///< Number of physical blocks in the extent run
+    uint64_t logical_count;  ///< Number of logical blocks this extent covers
 };
 
 /**

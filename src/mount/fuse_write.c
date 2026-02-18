@@ -203,7 +203,7 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info
     {
         /* Shrinking: free blocks that are no longer needed */
         uint64_t block_size        = g_ctx->sb.block_size;
-        size_t   data_capacity     = (size_t)block_size - sizeof(struct block_header);
+        size_t   data_capacity     = (size_t)block_size; /* no per-block header */
         uint64_t old_blocks        = (ip->file_size + data_capacity - 1) / data_capacity;
         uint64_t new_blocks_needed = (newsize > 0) ? ((uint64_t)newsize + data_capacity - 1) / data_capacity : 0;
 
