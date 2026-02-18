@@ -502,7 +502,6 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
 
     sb.bitmap_lba    = 14; /* bitmap starts at block 14 */
     sb.bitmap_blocks = bitmap_blks;
-    sb.next_free_lba = 14 + bitmap_blks; /* first block after bitmap */
     sb.next_inode_id = 3;                /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label, sizeof(sb.volume_label) - 1);
 
@@ -799,8 +798,9 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
         /* Build the bitmap header with checksum over bitmap data */
         struct bitmap_header bhdr;
         memset(&bhdr, 0, sizeof(bhdr));
-        bhdr.magic        = OBMAFS3_BITMAP_MAGIC;
-        bhdr.total_blocks = total_blocks;
+        bhdr.magic         = OBMAFS3_BITMAP_MAGIC;
+        bhdr.total_blocks  = total_blocks;
+        bhdr.next_free_lba = reserved; /* first block after reserved area */
         obmafs3_checksum_block(bitmap, (size_t)bitmap_bytes, bhdr.checksum);
 
         /* Write bitmap blocks: first block = header + data */

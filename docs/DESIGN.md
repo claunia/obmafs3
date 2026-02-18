@@ -54,7 +54,6 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t refcount_lba;       /* LBA of the refcount B+Tree header (block 13) */
     uint16_t checksum_type;      /* Checksum algorithm (0 = XXH64) */
     uint64_t creation_time;      /* Unix timestamp of filesystem creation */
-    uint64_t next_free_lba;      /* Hint: next LBA to try for allocation */
     uint64_t next_inode_id;      /* Next available inode ID */
     uint64_t bitmap_lba;         /* LBA of the first allocation bitmap block (block 14) */
     uint64_t bitmap_blocks;      /* Number of blocks used by the allocation bitmap */
@@ -77,7 +76,6 @@ The superblock identifies the filesystem, stores global parameters, and provides
 - `cd_subchannel_lba` — LBA of the CD Subchannel Tree header, a B+Tree that stores 96-byte CD subchannel data keyed by XXH64 hash.
 - `metadata_idx_lba` — LBA of the Metadata Index Tree header, a reverse-index B+Tree keyed by `(key, value, inode_id)` for metadata queries.
 - `refcount_lba` — LBA of the Refcount Tree header, a B+Tree that tracks per-block reference counts for shared (cloned) data blocks.
-- `next_free_lba` — Allocation hint; tracks the highest allocated LBA to speed up sequential allocations.
 - `bitmap_lba`, `bitmap_blocks` — Location and size of the allocation bitmap on disk.
 
 ---
@@ -92,6 +90,7 @@ The first bitmap block begins with a header:
 struct bitmap_header {                       /* packed */
     uint64_t magic;          /* "OBMABMAP" (0x50414D42414D424F) */
     uint64_t total_blocks;   /* Total number of blocks tracked by the bitmap */
+    uint64_t next_free_lba;  /* Allocation hint: next LBA to try for allocation */
     uint8_t  checksum[32];   /* Checksum of all bitmap data bytes */
 };
 ```

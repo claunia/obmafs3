@@ -133,7 +133,7 @@ int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *star
     obmafs3_bitmap_set(ctx, *start_lba, count);
 
     /* Keep next_free_lba as a hint for future allocations */
-    if(*start_lba + count > ctx->sb.next_free_lba) ctx->sb.next_free_lba = *start_lba + count;
+    if(*start_lba + count > ctx->next_free_lba) ctx->next_free_lba = *start_lba + count;
 
     return OBMAFS3_OK;
 }

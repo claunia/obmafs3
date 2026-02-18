@@ -40,6 +40,7 @@ struct obmafs3_ctx
     struct btree_header refcount_hdr;       ///< Cached refcount tree header
     uint8_t            *bitmap;             ///< In-memory allocation bitmap
     uint64_t            bitmap_size;        ///< Size of allocation bitmap in bytes
+    uint64_t            next_free_lba;      ///< Allocation hint (persisted in bitmap header)
     int                 compression;        ///< Non-zero to compress data blocks on write
     int                 zstd_level;         ///< ZSTD compression level (1-15)
 };

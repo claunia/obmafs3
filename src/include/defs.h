@@ -94,9 +94,10 @@ struct __attribute__((packed)) refcount_record
 /// On-disk header for the allocation bitmap.
 struct __attribute__((packed)) bitmap_header
 {
-    uint64_t magic;         ///< "OBMABMAP"
-    uint64_t total_blocks;  ///< Total number of blocks tracked by bitmap
-    uint8_t  checksum[32];  ///< Checksum of the bitmap data
+    uint64_t magic;          ///< "OBMABMAP"
+    uint64_t total_blocks;   ///< Total number of blocks tracked by bitmap
+    uint64_t next_free_lba;  ///< Allocation hint: next LBA to try when searching for free space
+    uint8_t  checksum[32];   ///< Checksum of the bitmap data
 };
 
 /// Context for CD-ROM EDC/ECC computation and verification.

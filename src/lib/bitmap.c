@@ -82,6 +82,8 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
                 return OBMAFS3_ERR_BADMAGIC;
             }
 
+            ctx->next_free_lba = bhdr.next_free_lba;
+
             /* Copy bitmap data after the header */
             size_t avail     = (size_t)block_size - hdr_size;
             size_t copy_size = (bytes_remaining < avail) ? (size_t)bytes_remaining : avail;
@@ -142,8 +144,9 @@ int obmafs3_bitmap_write(struct obmafs3_ctx *ctx)
     /* Build header with fresh checksum */
     struct bitmap_header bhdr;
     memset(&bhdr, 0, sizeof(bhdr));
-    bhdr.magic        = OBMAFS3_BITMAP_MAGIC;
-    bhdr.total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
+    bhdr.magic         = OBMAFS3_BITMAP_MAGIC;
+    bhdr.total_blocks  = ctx->sb.total_bytes / ctx->sb.block_size;
+    bhdr.next_free_lba = ctx->next_free_lba;
     obmafs3_checksum_block(ctx->bitmap, (size_t)ctx->bitmap_size, bhdr.checksum);
 
     uint64_t bytes_remaining = ctx->bitmap_size;
@@ -256,24 +259,97 @@ int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *
     if(!ctx->bitmap) return OBMAFS3_ERR_INVAL;
 
     uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
-    uint64_t run_start    = 0;
-    uint64_t run_len      = 0;
+    if(total_blocks == 0) return OBMAFS3_ERR_NOSPC;
 
-    for(uint64_t bit = 0; bit < total_blocks; bit++)
+    /* Clamp the hint so it stays inside the volume */
+    uint64_t hint = ctx->next_free_lba;
+    if(hint >= total_blocks) hint = 0;
+
+    /*
+     * Word-level scan: cast the bitmap to 64-bit words so we can skip
+     * 64 allocated bits at a time.  A word value of 0xFFFFFFFFFFFFFFFF
+     * means all 64 bits are allocated and can be skipped entirely.
+     */
+    const uint64_t *words      = (const uint64_t *)ctx->bitmap;
+    uint64_t        total_bits = total_blocks;
+
+    /* We do two passes: [hint .. end) then [0 .. hint).  The second
+     * pass is only needed when the hint is non-zero and the first
+     * pass failed. */
+    uint64_t pass_starts[2] = {hint, 0};
+    uint64_t pass_ends[2]   = {total_bits, hint};
+    int      passes         = (hint > 0) ? 2 : 1;
+
+    for(int p = 0; p < passes; p++)
     {
-        if(!obmafs3_bitmap_is_set(ctx, bit))
+        uint64_t scan_start = pass_starts[p];
+        uint64_t scan_end   = pass_ends[p];
+        if(scan_start >= scan_end) continue;
+
+        uint64_t run_start = 0;
+        uint64_t run_len   = 0;
+        uint64_t bit       = scan_start;
+
+        while(bit < scan_end)
         {
-            if(run_len == 0) run_start = bit;
-            run_len++;
-            if(run_len >= count)
+            uint64_t word_idx    = bit / 64;
+            unsigned bit_in_word = (unsigned)(bit % 64);
+
+            uint64_t word = words[word_idx];
+
+            /* Mask out bits below our current position within the word */
+            if(bit_in_word != 0)
             {
-                *start_lba = run_start;
-                return OBMAFS3_OK;
+                /* Set lower bits so they look "allocated" and are skipped */
+                word |= ((uint64_t)1 << bit_in_word) - 1;
             }
-        }
-        else
-        {
-            run_len = 0;
+
+            /* Mask out bits beyond total_blocks in the last word */
+            uint64_t word_end = (word_idx + 1) * 64;
+            if(word_end > scan_end)
+            {
+                unsigned excess = (unsigned)(word_end - scan_end);
+                word |= ~(((uint64_t)1 << (64 - excess)) - 1);
+            }
+
+            if(word == UINT64_MAX)
+            {
+                /* Entire word is allocated – skip it */
+                run_len = 0;
+                bit = (word_idx + 1) * 64;
+                continue;
+            }
+
+            /* Scan individual free bits within this word using __builtin_ctzll */
+            uint64_t free_mask = ~word; /* 1-bits mark free blocks */
+            while(free_mask)
+            {
+                unsigned pos = (unsigned)__builtin_ctzll(free_mask);
+                uint64_t abs_bit = word_idx * 64 + pos;
+
+                if(abs_bit >= scan_end) break;
+
+                if(run_len == 0 || abs_bit != run_start + run_len)
+                {
+                    /* Not contiguous – restart the run */
+                    run_start = abs_bit;
+                    run_len   = 1;
+                }
+                else
+                {
+                    run_len++;
+                }
+
+                if(run_len >= count)
+                {
+                    *start_lba = run_start;
+                    return OBMAFS3_OK;
+                }
+
+                free_mask &= free_mask - 1; /* clear lowest set bit */
+            }
+
+            bit = (word_idx + 1) * 64;
         }
     }
 
