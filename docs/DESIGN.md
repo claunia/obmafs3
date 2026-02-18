@@ -45,14 +45,18 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t inode_lba;          /* LBA of the inode B+Tree header (block 3) */
     uint64_t overflow_lba;       /* LBA of the overflow B+Tree header (block 5) */
     uint64_t dedup_lba;          /* LBA of the dedup tree list header (block 6) */
-    uint64_t metadata_lba;       /* LBA of the metadata B+Tree header (reserved, 0) */
-    uint64_t media_tag_lba;      /* LBA of the media tag B+Tree header (reserved, 0) */
+    uint64_t metadata_lba;       /* LBA of the metadata B+Tree header (block 11) */
+    uint64_t media_tag_lba;      /* LBA of the media tag B+Tree header (block 7) */
+    uint64_t cd_prefix_lba;      /* LBA of the CD prefix B+Tree header (block 8) */
+    uint64_t cd_suffix_lba;      /* LBA of the CD suffix B+Tree header (block 9) */
+    uint64_t cd_subchannel_lba;  /* LBA of the CD subchannel B+Tree header (block 10) */
+    uint64_t metadata_idx_lba;   /* LBA of the metadata reverse-index B+Tree header (block 12) */
     uint64_t refcount_lba;       /* LBA of the refcount B+Tree header (block 13) */
     uint16_t checksum_type;      /* Checksum algorithm (0 = XXH64) */
     uint64_t creation_time;      /* Unix timestamp of filesystem creation */
     uint64_t next_free_lba;      /* Hint: next LBA to try for allocation */
     uint64_t next_inode_id;      /* Next available inode ID */
-    uint64_t bitmap_lba;         /* LBA of the first allocation bitmap block (block 7) */
+    uint64_t bitmap_lba;         /* LBA of the first allocation bitmap block (block 14) */
     uint64_t bitmap_blocks;      /* Number of blocks used by the allocation bitmap */
     uint8_t  volume_label[256];  /* Volume label, UTF-8, NUL-terminated */
 };
@@ -66,8 +70,12 @@ The superblock identifies the filesystem, stores global parameters, and provides
 - `inode_lba` — LBA of the Inode Tree header, a B+Tree keyed by inode_id that stores file metadata (permissions, timestamps, size, extents).
 - `overflow_lba` — LBA of the Overflow Tree header, a B+Tree that stores additional extents for files requiring more than 8 inline extent runs.
 - `dedup_lba` — LBA of the Deduplication Tree List header, a list of per-sector-size B+Trees that map sector hashes to their physical locations.
-- `metadata_lba` — Reserved for a future Metadata Tree (arbitrary key-value pairs about disk images). Currently 0.
-- `media_tag_lba` — Reserved for a future Media Tag Tree (media-specific tags for disk images). Currently 0.
+- `metadata_lba` — LBA of the Metadata Tree header, a B+Tree that stores arbitrary key-value pairs about disk images, keyed by `(inode_id, key)`.
+- `media_tag_lba` — LBA of the Media Tag Tree header, a B+Tree that stores binary media tags (TOC, PMA, BCA, etc.) keyed by `(inode_id, tag_type)`.
+- `cd_prefix_lba` — LBA of the CD Prefix Tree header, a B+Tree that stores 16-byte CD sector prefixes keyed by XXH64 hash.
+- `cd_suffix_lba` — LBA of the CD Suffix Tree header, a B+Tree that stores 288-byte CD sector suffixes (ECC/EDC) keyed by XXH64 hash.
+- `cd_subchannel_lba` — LBA of the CD Subchannel Tree header, a B+Tree that stores 96-byte CD subchannel data keyed by XXH64 hash.
+- `metadata_idx_lba` — LBA of the Metadata Index Tree header, a reverse-index B+Tree keyed by `(key, value, inode_id)` for metadata queries.
 - `refcount_lba` — LBA of the Refcount Tree header, a B+Tree that tracks per-block reference counts for shared (cloned) data blocks.
 - `next_free_lba` — Allocation hint; tracks the highest allocated LBA to speed up sequential allocations.
 - `bitmap_lba`, `bitmap_blocks` — Location and size of the allocation bitmap on disk.
@@ -270,6 +278,74 @@ Entries are sorted by `hash` and stored in leaf nodes (`level == 0`). Maximum re
 
 Lookups traverse from root through index nodes (binary search on `hash` key) to the target leaf, then binary-search the leaf entries. Insertions follow the same path, performing sorted insertion in the leaf and splitting upward when full — identical to the inode and overflow trees.
 
+### Media Tag Tree (binary media tags)
+
+The Media Tag Tree is a B+Tree that stores media-specific binary tags associated with disk images (e.g., CD TOC, DVD PFI, Blu-ray disc info). Leaf nodes contain sorted `media_tag_record` entries; index nodes use `media_tag_index_entry` to route lookups by the composite key `(inode_id, tag_type)`.
+
+```c
+struct media_tag_record {                    /* packed */
+    uint64_t inode_id;       /* Inode this tag belongs to */
+    uint16_t tag_type;       /* MediaTagType enum value */
+    uint32_t data_length;    /* Length of tag data in bytes */
+    uint64_t data_lba;       /* LBA of the first data block (for large tags) */
+    uint16_t data_blocks;    /* Number of blocks used by data (0 = inline) */
+    /* If data_blocks == 0, data follows inline after the header */
+};
+```
+
+Small tags are stored inline within the leaf record. Large tags that exceed inline capacity are stored in separate data blocks referenced by `data_lba`.
+
+Tag types include: CD TOC, CD session info, CD full TOC, CD PMA, CD ATIP, CD-TEXT, CD MCN, DVD PFI, DVD CMI, DVD disc key, DVD BCA, DVD DMI, and many others.
+
+### Metadata B+Tree (image key-value pairs)
+
+The Metadata B+Tree stores arbitrary key-value string pairs associated with disk images (e.g., dumper name, dump date, serial number). Uses 8-block nodes (`METADATA_NODE_BLOCKS = 8`) because records are large.
+
+```c
+struct metadata_record {                     /* packed */
+    uint64_t inode_id;                   /* Inode this entry belongs to */
+    char     key[256];                   /* Metadata key (NUL-terminated, max 255 chars) */
+    char     value[1025];                /* Metadata value (NUL-terminated, max 1024 chars) */
+};
+```
+
+Entries are sorted by the composite key `(inode_id, key)`. Index nodes use `metadata_index_entry` (inode_id + key + child_lba).
+
+A companion **Metadata Index B+Tree** (reverse-index) enables queries such as "find all images dumped by a specific person". It is keyed by `(key, value, inode_id)`:
+
+```c
+struct metadata_idx_record {                 /* packed */
+    char     key[256];                   /* Metadata key */
+    char     value[1025];                /* Metadata value */
+    uint64_t inode_id;                   /* Disk image inode */
+};
+```
+
+Both metadata trees use 8-block nodes and support full CRUD operations plus paginated key listing and reverse queries.
+
+### CD Prefix / Suffix / Subchannel B+Trees
+
+Three B+Trees store deduplicated CD raw sector components. All three share identical logic: a `uint64_t` hash key with fixed-size inline data.
+
+```c
+struct cd_prefix_record {                    /* packed, 24 bytes */
+    uint64_t hash;           /* XXH64 hash of the 16-byte prefix */
+    uint8_t  data[16];       /* CD sector prefix data */
+};
+
+struct cd_suffix_record {                    /* packed, 296 bytes */
+    uint64_t hash;           /* XXH64 hash of the 288-byte suffix */
+    uint8_t  data[288];      /* CD sector suffix (ECC/EDC) data */
+};
+
+struct cd_subchannel_record {                /* packed, 104 bytes */
+    uint64_t hash;           /* XXH64 hash of the 96-byte subchannel */
+    uint8_t  data[96];       /* CD subchannel data */
+};
+```
+
+Maximum leaf records per 4096-byte block: **167** (prefix), **13** (suffix), **38** (subchannel). All three trees support multi-level indexing with standard `btree_index_entry` nodes.
+
 ---
 
 ## Sector Map
@@ -288,6 +364,39 @@ To read a sector from the image, the system:
 1. Reads the `sector_map_entry` from the inode's data extents at `sector_num * sizeof(sector_map_entry)`.
 2. Looks up the `hash` in the appropriate dedup tree to get the `dedup_entry`.
 3. Reads the dedup data block at `dedup_entry.block_lba` and extracts the sector data at `dedup_entry.block_offset`.
+
+### CD Sector Map
+
+CD (Compact Disc) images use an extended sector map entry that also tracks the sector's raw components — prefix, suffix, subchannel, and subheader — for lossless reconstruction of raw 2352/2448-byte sectors:
+
+```c
+struct cd_sector_map_entry {                 /* packed */
+    int64_t  sector;             /* Logical sector number within the CD image */
+    uint16_t sector_size;        /* Size (e.g. 2048, 2336, 2352) */
+    uint64_t hash;               /* XXH64 hash of the CD data portion */
+    uint8_t  generated_prefix;   /* 1 if prefix can be regenerated from LBA */
+    uint64_t prefix_hash;        /* XXH64 hash of the 16-byte prefix */
+    uint8_t  generated_suffix;   /* 1 if suffix (ECC/EDC) can be regenerated */
+    uint64_t suffix_hash;        /* XXH64 hash of the 288-byte suffix */
+    uint64_t subchannel_hash;    /* XXH64 hash of 96-byte subchannel (0 = not stored) */
+    uint8_t  subheader[8];       /* Subheader for CD-ROM XA sectors (0 if N/A) */
+    uint8_t  sector_mode;        /* Audio, Mode 1, Mode 2 Form 1/2, etc. */
+};
+```
+
+When `generated_prefix` or `generated_suffix` is 1, the respective data is not stored in the CD prefix/suffix B+Trees but is instead regenerated from the sector's LBA and mode using the ECC/EDC engine (`ecc_cd_reconstruct`). This is a common case since most CD sectors have predictable sync/header bytes and valid ECC, avoiding storage overhead.
+
+---
+
+## CD Sector ECC/EDC Reconstruction
+
+The `ecc_cd` module provides CD-ROM sector error correction code (EDC/ECC) computation and verification. It enables:
+
+- **Suffix verification** (`ecc_cd_is_suffix_correct`) — checks whether a sector's 288-byte suffix (ECC+EDC) matches the data, determining if it can be regenerated rather than stored.
+- **Prefix reconstruction** (`ecc_cd_reconstruct_prefix`) — regenerates the 16-byte sync/header prefix from a sector's LBA and mode bytes.
+- **Full reconstruction** (`ecc_cd_reconstruct`) — regenerates the complete ECC/EDC suffix from the data portion.
+
+This enables significant storage savings for CD images: only sectors with non-standard or corrupted ECC/EDC need their suffix stored in the CD Suffix B+Tree.
 
 ---
 
@@ -330,9 +439,15 @@ When a file is written to the filesystem:
    - A partially filled block persists across imports so that future files with the same sector size continue filling it.
    - A `sector_map_entry` is recorded for every sector (deduplicated or not), stored in the inode's data extents.
 
-4. **Sector map caching**: During writes, `sector_map_entry` records are accumulated in an in-memory `sector_map_cache` and flushed to disk in batch on file close, reducing I/O overhead.
+4. **Sector map caching**: During writes, `sector_map_entry` records are accumulated in an in-memory `sector_map_cache` and flushed to disk in batch on file close, reducing I/O overhead. CD images use a separate `cd_sector_map_cache`.
 
 5. **Inode caching**: Per-file-handle inode caching avoids repeated B+Tree lookups during writes. The cached inode is written back once on file close if modified.
+
+6. **Dedup block cache**: The 4 MiB dedup data block accumulator is kept in memory across writes (`dedup_block_cache`). This avoids a costly disk read + decompression on every write call. The cache is flushed and freed on file close.
+
+7. **Background compression**: When enabled, a background worker thread compresses dedup data blocks in parallel with write I/O (`obmafs3_bg_compress_start`/`obmafs3_bg_compress_stop`). The writer fills the in-memory buffer; once full, the worker compresses and writes it to disk while the writer starts filling a new buffer.
+
+8. **Dedup B+Tree node cache**: Frequently accessed B+Tree nodes are cached in memory during dedup writes, reducing disk reads during hash lookups and insertions.
 
 ---
 
@@ -410,7 +525,7 @@ Creates a new empty OBMAFS v3 filesystem.
 
 Usage: `mkobmafs -s <size_bytes> -l <label> <path>`
 
-Writes: superblock, catalog tree (header + root node with root directory entry), inode tree (header + root inode), overflow tree (header, empty), dedup tree list (header, empty), and allocation bitmap.
+Writes: superblock, catalog tree (header + root node with root directory entry), inode tree (header + root inode), overflow tree (header, empty), dedup tree list (header, empty), media tag tree (header, empty), CD prefix/suffix/subchannel trees (headers, empty), metadata tree (header, empty), metadata index tree (header, empty), refcount tree (header, empty), and allocation bitmap.
 
 ### `mount.obmafs` — FUSE mount
 
@@ -431,10 +546,26 @@ Options:
 | `read`    | Read regular file data or media image data (with dedup lookup) |
 | `create`  | Create new file: catalog entry + inode, detect media image by extension |
 | `write`   | Write regular file data or deduplicated media image data |
-| `release` | Flush sector map cache and dirty inode, free per-file context |
-| `truncate`| Truncate file to new size (free excess blocks) |
-| `unlink`  | Remove file: delete catalog entry, free blocks, delete inode |
+| `flush`   | Persist dirty inode to disk without closing the file |
+| `release` | Flush sector map cache, dedup block cache and dirty inode, free per-file context |
+| `truncate`| Truncate file to new size (free excess data and overflow blocks) |
+| `unlink`  | Remove file: delete catalog entry, free blocks (inline + overflow), delete inode |
+| `link`    | Create a hard link (new catalog entry, increment inode `ref_count`) |
+| `symlink` | Create a symbolic link (stores target path as file data) |
+| `readlink` | Read the target of a symbolic link |
+| `mkdir`   | Create a new directory (catalog entry + inode) |
+| `rmdir`   | Remove an empty directory |
 | `utimens` | Update modification and access timestamps |
+| `chmod`   | Change file/directory permissions |
+| `chown`   | Change file/directory owner and group |
+| `statfs`  | Return filesystem statistics (total/free blocks, inodes) |
+| `statx`   | Return extended file attributes |
+| `getxattr`  | Read extended attributes (media tags as `user.mediatag.*`, metadata as `user.metadata.*`) |
+| `setxattr`  | Write extended attributes |
+| `listxattr` | List extended attribute names |
+| `removexattr` | Remove an extended attribute |
+| `ioctl`   | Custom ioctls for media tags, CD image sectors, and image metadata |
+| `copy_file_range` | Clone/reflink a range of blocks between files |
 
 **Per-file-handle context** (`fuse_file_ctx`):
 - `inode_id` — Cached inode ID
@@ -442,6 +573,29 @@ Options:
 - `inode` — Cached inode structure (write-back on release)
 - `inode_dirty` — Flag indicating the cached inode needs write-back
 - `sme_cache` — In-memory sector map entry cache (flushed on release)
+- `cd_sme_cache` — In-memory CD sector map entry cache (flushed on release)
+- `dedup_block_cache` — Persistent dedup data block accumulator (avoids re-reading 4 MiB blocks)
+- `bg_compress` — Background compression worker context (compresses dedup blocks in parallel)
+
+**Extended attributes (xattr):** Media tags and image metadata are exposed as extended attributes:
+- `user.mediatag.<name>` — Binary media tags (e.g., `user.mediatag.cd_toc`, `user.mediatag.dvd_pfi`). Read returns binary data; write sets the tag.
+- `user.metadata.<key>` — String key-value metadata (e.g., `user.metadata.dumper`, `user.metadata.serial`). Read returns UTF-8 value; write sets the key.
+- `listxattr` enumerates all media tag and metadata xattr names for the file.
+- `removexattr` deletes the corresponding media tag or metadata entry.
+
+**Custom ioctls:**
+| ioctl | Description |
+|-------|-------------|
+| `OBMAFS3_IOC_SET_MEDIA_TAG` | Write binary media tag data for an image |
+| `OBMAFS3_IOC_GET_MEDIA_TAG` | Read binary media tag data for an image |
+| `OBMAFS3_IOC_SET_CD_IMAGE` | Mark a file as a CD image (enables CD sector map mode) |
+| `OBMAFS3_IOC_CD_WRITE_LONG` | Write a raw 2352/2448-byte CD sector (prefix/data/suffix/subchannel split) |
+| `OBMAFS3_IOC_CD_READ_LONG` | Read a reconstructed 2352-byte raw CD sector |
+| `OBMAFS3_IOC_CD_READ_LONG_SUB` | Read a reconstructed 2448-byte raw CD sector with subchannel |
+| `OBMAFS3_IOC_SET_METADATA` | Set a key-value metadata pair for an image |
+| `OBMAFS3_IOC_GET_METADATA` | Get a metadata value by key for an image |
+| `OBMAFS3_IOC_DELETE_METADATA` | Delete a metadata entry by key |
+| `OBMAFS3_IOC_LIST_METADATA` | List metadata keys for an image (paginated) |
 
 **Media image detection**: Files with recognized disk image extensions (`.iso`, `.img`, `.bin`, `.raw`, etc.) are automatically created as `kFileTypeMediaImage`. The sector size is auto-detected from the file extension (e.g., 2048 for `.iso`, 512 for `.img`).
 
@@ -464,6 +618,11 @@ Options:
 | Catalog tree | Traverse all nodes, verify magic and checksums |
 | Inode tree | Traverse all nodes, verify magic and checksums |
 | Overflow tree | Traverse all nodes, verify magic and checksums |
+| Refcount tree | Traverse all nodes, verify magic and checksums |
+| Media tag tree | Traverse all nodes, verify magic and checksums |
+| Metadata tree | Traverse all nodes, verify magic and checksums |
+| Metadata index tree | Traverse all nodes, verify magic and checksums |
+| CD prefix/suffix/subchannel trees | Traverse all nodes, verify magic and checksums |
 | Dedup tree list | Verify list header, traverse all per-sector-size trees |
 | Cross-reference | Verify all catalog entries have valid inodes |
 | Block allocation | Verify all referenced blocks are marked allocated in bitmap |
@@ -484,11 +643,20 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Allocation: `obmafs3_alloc_block`, `obmafs3_alloc_blocks`, `obmafs3_free_block`, `obmafs3_free_blocks`, `obmafs3_alloc_inode_id`
 - Bitmap: read/write/set/clear/is_set/find_free
 - File data: `obmafs3_read_file_data`, `obmafs3_write_file_data`
+- Clone/reflink: `obmafs3_clone_file_range`, `obmafs3_free_file_blocks`, `obmafs3_truncate_file_blocks`
+- Refcount: `obmafs3_refcount_get`, `obmafs3_refcount_set`, `obmafs3_refcount_inc`, `obmafs3_refcount_dec`
 - Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`
+- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_bg_compress_start`, `obmafs3_bg_compress_stop`
 - Sector map cache: `obmafs3_flush_sector_map_cache`, `obmafs3_free_sector_map_cache`
+- CD sector map cache: `obmafs3_flush_cd_sector_map_cache`, `obmafs3_free_cd_sector_map_cache`
+- Media tags: `obmafs3_media_tag_get`, `obmafs3_media_tag_put`, `obmafs3_media_tag_delete`, `obmafs3_media_tag_delete_all`, `obmafs3_media_tag_list`
+- Image metadata: `obmafs3_metadata_get`, `obmafs3_metadata_put`, `obmafs3_metadata_delete`, `obmafs3_metadata_delete_all`, `obmafs3_metadata_list`, `obmafs3_metadata_query`
+- CD B+Trees: `obmafs3_cd_prefix_get/put/delete`, `obmafs3_cd_suffix_get/put/delete`, `obmafs3_cd_subchannel_get/put/delete`
+- ECC/EDC: `ecc_cd_init`, `ecc_cd_free`, `ecc_cd_is_suffix_correct`, `ecc_cd_reconstruct`
 - Checksum: `obmafs3_checksum_xxh64`, `obmafs3_checksum_block`
 - Compression: `obmafs3_compress`, `obmafs3_decompress`
 - Filesystem creation: `obmafs3_create`
+- Path resolution: `obmafs3_resolve_inode_path`
 
 Open flags:
 - `OBMAFS3_OPEN_SKIP_BITMAP` — Do not load/validate bitmap (for quick header-only checks)
@@ -517,6 +685,7 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | Catalog B+Tree (directories) | Complete |
 | Inode B+Tree (file metadata) | Complete |
 | Overflow B+Tree (extra extents) | Complete |
+| Multi-level B+Tree (tree height > 1) | Complete (all trees) |
 | Dedup tree list + per-sector-size trees | Complete |
 | Regular file read/write | Complete |
 | Media image write (sector-level dedup) | Complete |
@@ -524,19 +693,28 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | Dedup data block ZSTD compression | Complete |
 | Dedup data block decompression on read | Complete |
 | Regular data block ZSTD compression | Complete |
+| Background dedup compression | Complete |
+| Dedup B+Tree node cache | Complete |
 | Sector map caching (batched writes) | Complete |
 | Inode caching (per file handle) | Complete |
+| Media Tag B+Tree | Complete |
+| Metadata B+Tree + reverse-index | Complete |
+| CD prefix/suffix/subchannel B+Trees | Complete |
+| CD sector ECC/EDC reconstruction | Complete |
+| Symlinks | Complete |
+| Hard links | Complete |
+| Directories (mkdir/rmdir) | Complete |
+| Permissions (chmod/chown) | Complete |
+| Extended attributes (xattr) | Complete |
+| Custom ioctls (media tags, CD, metadata) | Complete |
+| Clone / reflink (`copy_file_range`) | Complete (inline + overflow) |
+| Copy-on-Write for shared blocks | Complete (inline + overflow) |
+| Refcount-aware block freeing | Complete (truncate + unlink) |
 | `mkobmafs` (create filesystem) | Complete |
 | `mount.obmafs` (FUSE mount) | Complete |
 | `obmafsck` (filesystem checker + scrub) | Complete |
-| Clone / reflink (`copy_file_range`) | Complete |
-| Copy-on-Write for shared blocks | Complete (inline + overflow) |
-| Refcount-aware block freeing | Complete (truncate + unlink) |
-| Metadata B+Tree | Not implemented |
-| Media Tag B+Tree | Not implemented |
-| Symlinks / hard links | Not implemented |
-| Multi-level B+Tree (tree height > 1) | Not implemented |
 | Filesystem repair in `obmafsck` | Not implemented (check-only) |
+| Rename / move | Not implemented |
 
 ---
 
