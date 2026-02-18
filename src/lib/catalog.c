@@ -121,26 +121,17 @@ int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
     uint64_t lba = ctx->catalog_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     while(1)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level > 0)
         {
@@ -157,10 +148,8 @@ int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
             if(idx >= 0)
             {
                 memcpy(entry, buf + sizeof(struct btree_node_header) + (size_t)idx * sizeof(*entry), sizeof(*entry));
-                free(buf);
                 return OBMAFS3_OK;
             }
-            free(buf);
             return OBMAFS3_ERR_NOTFOUND;
         }
     }
@@ -456,8 +445,8 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = calloc(1, bsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        uint8_t *buf = ctx->node_buf;
+        memset(buf, 0, bsz);
 
         struct btree_node_header hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -471,7 +460,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, new_lba, buf, bsz);
-        free(buf);
         if(rc != OBMAFS3_OK) return rc;
 
         ctx->catalog_hdr.root_node_lba = new_lba;
@@ -480,8 +468,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct catalog_btree_path path[CATALOG_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -490,28 +477,16 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level == 0) break; /* reached leaf; buf holds it at lba */
 
-        if(depth >= CATALOG_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= CATALOG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = catalog_index_find(buf, hdr.node_keys, entry->parent_id, entry->name);
         path[depth].lba  = lba;
@@ -536,7 +511,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
                sizeof(*entry));
         compute_node_checksum(buf);
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
@@ -561,18 +535,13 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
     /* ---- Leaf is full: split ---- */
     uint16_t               total = max_leaf + 1;
     struct catalog_record *all   = calloc(total, rec_sz);
-    if(!all)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    if(!all) return OBMAFS3_ERR_NOMEM;
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -596,7 +565,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -609,7 +577,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -630,7 +597,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -658,11 +624,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         uint16_t parent_slot = path[depth].slot;
 
         rc = obmafs3_block_read(ctx, parent_lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header phdr;
         memcpy(&phdr, buf, sizeof(phdr));
@@ -688,7 +650,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
             compute_node_checksum(buf);
 
             rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
-            free(buf);
             if(rc != OBMAFS3_OK) return rc;
             return obmafs3_btree_header_write(ctx, ctx->sb.catalog_lba, &ctx->catalog_hdr);
         }
@@ -696,11 +657,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         /* Parent is full — split the index node */
         uint16_t                    idx_total = max_idx + 1;
         struct catalog_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie)
-        {
-            free(buf);
-            return OBMAFS3_ERR_NOMEM;
-        }
+        if(!aie) return OBMAFS3_ERR_NOMEM;
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -721,7 +678,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -730,7 +686,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -749,7 +704,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -771,19 +725,11 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
     rc = obmafs3_alloc_block(ctx, &new_root_lba);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
 
     /* Read old root to get its level */
     rc = obmafs3_block_read(ctx, left_ie.child_lba, buf, bsz);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
     struct btree_node_header old_hdr;
     memcpy(&old_hdr, buf, sizeof(old_hdr));
 
@@ -804,7 +750,6 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     compute_node_checksum(buf);
 
     rc = obmafs3_block_write(ctx, new_root_lba, buf, bsz);
-    free(buf);
     if(rc != OBMAFS3_OK) return rc;
 
     ctx->catalog_hdr.root_node_lba = new_root_lba;
@@ -837,8 +782,7 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct catalog_btree_path path[CATALOG_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -848,28 +792,16 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level == 0) break;
 
-        if(depth >= CATALOG_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= CATALOG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = catalog_index_find(buf, hdr.node_keys, parent_id, name);
         path[depth].lba  = lba;
@@ -886,11 +818,7 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
     memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
 
     int idx = catalog_leaf_find(buf, leaf_hdr.node_keys, parent_id, name);
-    if(idx < 0)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOTFOUND;
-    }
+    if(idx < 0) return OBMAFS3_ERR_NOTFOUND;
 
     size_t rec_sz = sizeof(struct catalog_record);
 
@@ -915,17 +843,12 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
             uint16_t pslot = path[depth - 1].slot;
 
             uint8_t *pbuf = calloc(1, bsz);
-            if(!pbuf)
-            {
-                free(buf);
-                return OBMAFS3_ERR_NOMEM;
-            }
+            if(!pbuf) return OBMAFS3_ERR_NOMEM;
 
             rc = obmafs3_block_read(ctx, plba, pbuf, bsz);
             if(rc != OBMAFS3_OK)
             {
                 free(pbuf);
-                free(buf);
                 return rc;
             }
 
@@ -994,6 +917,5 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
     }
 
-    free(buf);
     return rc;
 }

@@ -126,26 +126,17 @@ static int media_tag_tree_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
     uint64_t lba = ctx->media_tag_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     while(1)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level > 0)
         {
@@ -160,10 +151,8 @@ static int media_tag_tree_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
             if(idx >= 0)
             {
                 memcpy(record, buf + sizeof(struct btree_node_header) + (size_t)idx * sizeof(*record), sizeof(*record));
-                free(buf);
                 return OBMAFS3_OK;
             }
-            free(buf);
             return OBMAFS3_ERR_NOTFOUND;
         }
     }
@@ -282,8 +271,8 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = calloc(1, bsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        uint8_t *buf = ctx->node_buf;
+        memset(buf, 0, bsz);
 
         struct btree_node_header hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -297,7 +286,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, new_lba, buf, bsz);
-        free(buf);
         if(rc != OBMAFS3_OK) return rc;
 
         ctx->media_tag_hdr.root_node_lba = new_lba;
@@ -306,8 +294,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct media_tag_btree_path path[MEDIA_TAG_BTREE_MAX_DEPTH];
     int                         depth = 0;
@@ -316,28 +303,16 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level == 0) break;
 
-        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = media_tag_index_find(buf, hdr.node_keys, rec->inode_id, rec->tag_type);
         path[depth].lba  = lba;
@@ -361,7 +336,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
                sizeof(*rec));
         compute_node_checksum(buf);
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
@@ -385,18 +359,13 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
     /* ---- Leaf is full: split ---- */
     uint16_t                 total = max_leaf + 1;
     struct media_tag_record *all   = calloc(total, rec_sz);
-    if(!all)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    if(!all) return OBMAFS3_ERR_NOMEM;
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -418,7 +387,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -431,7 +399,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -451,7 +418,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -478,11 +444,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         uint16_t parent_slot = path[depth].slot;
 
         rc = obmafs3_block_read(ctx, parent_lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header phdr;
         memcpy(&phdr, buf, sizeof(phdr));
@@ -507,7 +469,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
             compute_node_checksum(buf);
 
             rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
-            free(buf);
             if(rc != OBMAFS3_OK) return rc;
             return obmafs3_btree_header_write(ctx, ctx->sb.media_tag_lba, &ctx->media_tag_hdr);
         }
@@ -515,11 +476,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         /* Parent is full — split the index node */
         uint16_t                      idx_total = max_idx + 1;
         struct media_tag_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie)
-        {
-            free(buf);
-            return OBMAFS3_ERR_NOMEM;
-        }
+        if(!aie) return OBMAFS3_ERR_NOMEM;
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -539,7 +496,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -548,7 +504,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -567,7 +522,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -588,18 +542,10 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
     rc = obmafs3_alloc_block(ctx, &new_root_lba);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
 
     rc = obmafs3_block_read(ctx, left_lba, buf, bsz);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
     struct btree_node_header old_hdr;
     memcpy(&old_hdr, buf, sizeof(old_hdr));
 
@@ -621,7 +567,6 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     compute_node_checksum(buf);
 
     rc = obmafs3_block_write(ctx, new_root_lba, buf, bsz);
-    free(buf);
     if(rc != OBMAFS3_OK) return rc;
 
     ctx->media_tag_hdr.root_node_lba = new_root_lba;
@@ -651,8 +596,7 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct media_tag_btree_path path[MEDIA_TAG_BTREE_MAX_DEPTH];
     int                         depth = 0;
@@ -661,28 +605,16 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level == 0) break;
 
-        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = media_tag_index_find(buf, hdr.node_keys, inode_id, tag_type);
         path[depth].lba  = lba;
@@ -698,11 +630,7 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
     memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
 
     int idx = media_tag_leaf_find(buf, leaf_hdr.node_keys, inode_id, tag_type);
-    if(idx < 0)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOTFOUND;
-    }
+    if(idx < 0) return OBMAFS3_ERR_NOTFOUND;
 
     struct media_tag_record del_rec;
     size_t                  rec_sz = sizeof(struct media_tag_record);
@@ -725,17 +653,12 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
             uint16_t pslot = path[depth - 1].slot;
 
             uint8_t *pbuf = calloc(1, bsz);
-            if(!pbuf)
-            {
-                free(buf);
-                return OBMAFS3_ERR_NOMEM;
-            }
+            if(!pbuf) return OBMAFS3_ERR_NOMEM;
 
             rc = obmafs3_block_read(ctx, plba, pbuf, bsz);
             if(rc != OBMAFS3_OK)
             {
                 free(pbuf);
-                free(buf);
                 return rc;
             }
 
@@ -801,7 +724,6 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
     }
 
-    free(buf);
     media_tag_free_external(ctx, &del_rec);
 
     return rc;

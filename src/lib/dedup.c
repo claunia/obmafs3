@@ -626,28 +626,19 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
 int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t hash,
                          struct dedup_entry *entry)
 {
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     uint64_t lba = hdr->root_node_lba;
 
     while(1)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(nhdr.level > 0)
         {
@@ -691,7 +682,6 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
                 struct dedup_entry de;
                 memcpy(&de, data + (size_t)mid * sizeof(struct dedup_entry), sizeof(de));
                 *entry = de;
-                free(buf);
                 return OBMAFS3_OK;
             }
             if(mid_hash < hash)
@@ -700,7 +690,6 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
                 hi = mid - 1;
         }
 
-        free(buf);
         return OBMAFS3_ERR_NOTFOUND;
     }
 }
@@ -1499,15 +1488,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     }
     uint64_t sme_count = 0;
 
-    /* Pre-allocate a single buffer for dedup tree traversal, reused
-     * across all sectors to avoid per-sector malloc/free overhead. */
-    uint8_t *tree_buf = malloc((size_t)ctx->sb.block_size);
-    if(!tree_buf)
-    {
-        free(sme_buf);
-        if(!db_is_cached) dedup_block_free(db);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    /* Reuse the pre-allocated node buffer for dedup tree traversal,
+     * avoiding per-sector malloc/free overhead. */
+    uint8_t *tree_buf = ctx->node_buf;
 
     /* Create the dedup B+Tree node cache if the caller provides a
      * persistent dedup block cache (i.e. across FUSE write calls). */
@@ -1663,7 +1646,6 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         }
     }
 
-    free(tree_buf);
     free(sme_buf);
     /* Copy updated state back to the persistent cache if used */
     if(db_is_cached)
@@ -1694,7 +1676,6 @@ out:
     dedup_hdr.last_block_offset = db->offset;
     obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
 
-    free(tree_buf);
     free(sme_buf);
     if(db_is_cached)
     {

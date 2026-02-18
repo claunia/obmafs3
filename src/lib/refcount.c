@@ -114,28 +114,19 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
         return OBMAFS3_OK;
     }
 
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     uint64_t cur = root;
 
     while(1)
     {
         int rc = obmafs3_block_read(ctx, cur, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level > 0)
         {
@@ -157,7 +148,6 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
             {
                 *ref_count = 1;
             }
-            free(buf);
             return OBMAFS3_OK;
         }
     }
@@ -191,17 +181,12 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         size_t   bsz = (size_t)ctx->sb.block_size;
         uint64_t cur = ctx->refcount_hdr.root_node_lba;
 
-        uint8_t *buf = calloc(1, bsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        uint8_t *buf = ctx->node_buf;
 
         while(1)
         {
             int rc = obmafs3_block_read(ctx, cur, buf, bsz);
-            if(rc != OBMAFS3_OK)
-            {
-                free(buf);
-                return rc;
-            }
+            if(rc != OBMAFS3_OK) return rc;
 
             struct btree_node_header hdr;
             memcpy(&hdr, buf, sizeof(hdr));
@@ -219,7 +204,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
                 if(idx < 0)
                 {
                     /* Not in tree — already at implicit 1 */
-                    free(buf);
                     return OBMAFS3_OK;
                 }
                 /* Delete the record by shifting remaining entries */
@@ -235,7 +219,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
                 memcpy(buf, &hdr, sizeof(hdr));
                 compute_node_checksum(buf);
                 rc = obmafs3_block_write(ctx, cur, buf, bsz);
-                free(buf);
                 return rc;
             }
         }
@@ -257,8 +240,8 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = calloc(1, bsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        uint8_t *buf = ctx->node_buf;
+        memset(buf, 0, bsz);
 
         struct btree_node_header hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -272,7 +255,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, new_lba, buf, bsz);
-        free(buf);
         if(rc != OBMAFS3_OK) return rc;
 
         ctx->refcount_hdr.root_node_lba = new_lba;
@@ -281,8 +263,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct refcount_btree_path path[REFCOUNT_BTREE_MAX_DEPTH];
     int                        depth   = 0;
@@ -291,28 +272,16 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     while(1)
     {
         rc = obmafs3_block_read(ctx, cur_lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(hdr.level == 0) break; /* reached leaf; buf holds it at cur_lba */
 
-        if(depth >= REFCOUNT_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= REFCOUNT_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = refcount_index_find(buf, hdr.node_keys, lba);
         path[depth].lba  = cur_lba;
@@ -336,7 +305,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
                sizeof(new_rec));
         compute_node_checksum(buf);
         rc = obmafs3_block_write(ctx, cur_lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
@@ -361,18 +329,13 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, cur_lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
     /* ---- Leaf is full: split ---- */
     uint16_t                total = max_leaf + 1;
     struct refcount_record *all   = calloc(total, rec_sz);
-    if(!all)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    if(!all) return OBMAFS3_ERR_NOMEM;
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -396,7 +359,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -409,7 +371,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -430,7 +391,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -449,11 +409,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         uint16_t parent_slot = path[depth].slot;
 
         rc = obmafs3_block_read(ctx, parent_lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header phdr;
         memcpy(&phdr, buf, sizeof(phdr));
@@ -482,7 +438,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
             compute_node_checksum(buf);
 
             rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
-            free(buf);
             if(rc != OBMAFS3_OK) return rc;
             return obmafs3_btree_header_write(ctx, ctx->sb.refcount_lba, &ctx->refcount_hdr);
         }
@@ -490,11 +445,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         /* Parent is full — split the index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie)
-        {
-            free(buf);
-            return OBMAFS3_ERR_NOMEM;
-        }
+        if(!aie) return OBMAFS3_ERR_NOMEM;
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -514,7 +465,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -526,7 +476,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -545,7 +494,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -560,30 +508,19 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     /* ---- Need a new root ---- */
     uint64_t new_root_lba;
     rc = obmafs3_alloc_block(ctx, &new_root_lba);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
+
+    /* Read old root to get its level */
+    rc = obmafs3_block_read(ctx, left_lba_v, buf, bsz);
+    if(rc != OBMAFS3_OK) return rc;
+
+    struct btree_node_header old_root_hdr;
+    memcpy(&old_root_hdr, buf, sizeof(old_root_hdr));
 
     memset(buf, 0, bsz);
     struct btree_node_header rhdr;
     memset(&rhdr, 0, sizeof(rhdr));
-
-    /* Determine new root level */
-    {
-        uint8_t *tmp = calloc(1, bsz);
-        if(tmp)
-        {
-            if(obmafs3_block_read(ctx, left_lba_v, tmp, bsz) == OBMAFS3_OK)
-            {
-                struct btree_node_header chdr;
-                memcpy(&chdr, tmp, sizeof(chdr));
-                rhdr.level = chdr.level + 1;
-            }
-            free(tmp);
-        }
-    }
+    rhdr.level       = old_root_hdr.level + 1;
 
     rhdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
     rhdr.record_type = kBtreeDataTypeRefcountEntry;
@@ -604,7 +541,6 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     compute_node_checksum(buf);
 
     rc = obmafs3_block_write(ctx, new_root_lba, buf, bsz);
-    free(buf);
     if(rc != OBMAFS3_OK) return rc;
 
     ctx->refcount_hdr.root_node_lba = new_root_lba;

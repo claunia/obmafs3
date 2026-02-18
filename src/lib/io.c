@@ -133,6 +133,23 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         return rc;
     }
 
+    /* Pre-allocate reusable work buffers — avoids per-call malloc/free
+     * on every B+Tree traversal and data I/O operation. */
+    c->hdr_buf  = malloc((size_t)c->sb.block_size);
+    c->node_buf = malloc((size_t)c->sb.block_size);
+    c->io_buf   = malloc((size_t)c->sb.block_size);
+    c->io_buf2  = malloc((size_t)c->sb.block_size);
+    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2)
+    {
+        free(c->hdr_buf);
+        free(c->node_buf);
+        free(c->io_buf);
+        free(c->io_buf2);
+        close(fd);
+        free(c);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
     if(flags & OBMAFS3_OPEN_LENIENT)
     {
         int cs_ok;
@@ -384,6 +401,10 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
         obmafs3_sb_write(ctx->fd, &ctx->sb);
     }
 
+    free(ctx->hdr_buf);
+    free(ctx->node_buf);
+    free(ctx->io_buf);
+    free(ctx->io_buf2);
     if(ctx->bitmap) free(ctx->bitmap);
     if(ctx->fd >= 0) close(ctx->fd);
     free(ctx);

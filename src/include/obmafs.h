@@ -43,6 +43,10 @@ struct obmafs3_ctx
     uint64_t            next_free_lba;      ///< Allocation hint (persisted in bitmap header)
     int                 compression;        ///< Non-zero to compress data blocks on write
     int                 zstd_level;         ///< ZSTD compression level (1-15)
+    uint8_t            *hdr_buf;            ///< Reusable buffer for B+Tree header I/O
+    uint8_t            *node_buf;           ///< Reusable buffer for B+Tree node traversal
+    uint8_t            *io_buf;             ///< Reusable buffer for data block I/O
+    uint8_t            *io_buf2;            ///< Reusable second buffer for decompression / work
 };
 
 /* Open flags */

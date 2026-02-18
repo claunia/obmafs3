@@ -42,18 +42,12 @@ int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba, struct btre
  */
 int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr, int *checksum_ok)
 {
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->hdr_buf;
 
     int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
 
     memcpy(hdr, buf, sizeof(*hdr));
-    free(buf);
 
     if(hdr->magic != OBMAFS3_BTREE_HDR_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
@@ -82,8 +76,8 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, str
  */
 int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr)
 {
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->hdr_buf;
+    memset(buf, 0, (size_t)ctx->sb.block_size);
 
     memcpy(buf, hdr, sizeof(*hdr));
 
@@ -95,9 +89,7 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btr
     /* Copy the computed checksum back so the caller stays in sync */
     memcpy(hdr->checksum, hdr_buf->checksum, sizeof(hdr->checksum));
 
-    int rc = obmafs3_block_write(ctx, lba, buf, (size_t)ctx->sb.block_size);
-    free(buf);
-    return rc;
+    return obmafs3_block_write(ctx, lba, buf, (size_t)ctx->sb.block_size);
 }
 
 /* ------------------------------------------------------------------ */

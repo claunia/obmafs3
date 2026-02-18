@@ -149,8 +149,8 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         rc = obmafs3_alloc_block(ctx, &root_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = calloc(1, bsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        uint8_t *buf = ctx->node_buf;
+        memset(buf, 0, bsz);
 
         struct btree_node_header nhdr;
         memset(&nhdr, 0, sizeof(nhdr));
@@ -164,7 +164,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, root_lba, buf, bsz);
-        free(buf);
         if(rc != OBMAFS3_OK) return rc;
 
         hdr->root_node_lba = root_lba;
@@ -173,8 +172,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct overflow_btree_path path[OVERFLOW_BTREE_MAX_DEPTH];
     int                        depth = 0;
@@ -183,28 +181,16 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(nhdr.level == 0) break; /* reached leaf */
 
-        if(depth >= OVERFLOW_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= OVERFLOW_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = overflow_index_find(buf, nhdr.node_keys, entry->inode_id);
         path[depth].lba  = lba;
@@ -241,18 +227,13 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
     /* ---- Leaf is full: split ---- */
     uint16_t                total = max_leaf + 1;
     struct overflow_extent *all   = calloc(total, rec_sz);
-    if(!all)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    if(!all) return OBMAFS3_ERR_NOMEM;
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -276,7 +257,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -289,7 +269,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -310,7 +289,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -330,11 +308,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         uint16_t parent_slot = path[depth].slot;
 
         rc = obmafs3_block_read(ctx, parent_lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header phdr;
         memcpy(&phdr, buf, sizeof(phdr));
@@ -363,7 +337,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
             compute_node_checksum(buf);
 
             rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
-            free(buf);
             if(rc != OBMAFS3_OK) return rc;
             return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
         }
@@ -371,11 +344,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         /* Parent is full — split the index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie)
-        {
-            free(buf);
-            return OBMAFS3_ERR_NOMEM;
-        }
+        if(!aie) return OBMAFS3_ERR_NOMEM;
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -397,7 +366,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -406,7 +374,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -425,7 +392,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -441,19 +407,11 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
     rc = obmafs3_alloc_block(ctx, &new_root_lba);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
 
     /* Read old root to get its level */
     rc = obmafs3_block_read(ctx, left_lba, buf, bsz);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
     struct btree_node_header old_hdr;
     memcpy(&old_hdr, buf, sizeof(old_hdr));
 
@@ -476,7 +434,6 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     compute_node_checksum(buf);
 
     rc = obmafs3_block_write(ctx, new_root_lba, buf, bsz);
-    free(buf);
     if(rc != OBMAFS3_OK) return rc;
 
     hdr->root_node_lba = new_root_lba;
@@ -500,8 +457,7 @@ static int overflow_find_phys(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64
     struct btree_header *hdr = &ctx->overflow_hdr;
     if(hdr->root_node_lba == 0) return 0;
 
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return 0;
+    uint8_t *buf = ctx->node_buf;
 
     /* Traverse index levels to reach the leaf */
     uint64_t lba = hdr->root_node_lba;
@@ -509,19 +465,11 @@ static int overflow_find_phys(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64
     while(1)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return 0;
-        }
+        if(rc != OBMAFS3_OK) return 0;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return 0;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return 0;
 
         if(nhdr.level == 0) break; /* reached leaf */
 
@@ -537,11 +485,7 @@ static int overflow_find_phys(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64
     while(lba != 0)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return 0;
-        }
+        if(rc != OBMAFS3_OK) return 0;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
@@ -563,7 +507,6 @@ static int overflow_find_phys(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64
             if(logical_block >= ovf_block_count && logical_block < ovf_block_count + oe.block_count)
             {
                 *phys_lba = oe.start_block + (logical_block - ovf_block_count);
-                free(buf);
                 return 1;
             }
             ovf_block_count += oe.block_count;
@@ -573,7 +516,6 @@ static int overflow_find_phys(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64
         lba = nhdr.right_link;
     }
 
-    free(buf);
     return 0;
 }
 
@@ -585,8 +527,7 @@ static uint64_t overflow_count_blocks(struct obmafs3_ctx *ctx, uint64_t inode_id
     struct btree_header *hdr = &ctx->overflow_hdr;
     if(hdr->root_node_lba == 0) return 0;
 
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return 0;
+    uint8_t *buf = ctx->node_buf;
 
     /* Traverse index levels to reach the leaf */
     uint64_t lba = hdr->root_node_lba;
@@ -594,19 +535,11 @@ static uint64_t overflow_count_blocks(struct obmafs3_ctx *ctx, uint64_t inode_id
     while(1)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return 0;
-        }
+        if(rc != OBMAFS3_OK) return 0;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return 0;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return 0;
 
         if(nhdr.level == 0) break;
 
@@ -648,7 +581,6 @@ static uint64_t overflow_count_blocks(struct obmafs3_ctx *ctx, uint64_t inode_id
         lba = nhdr.right_link;
     }
 
-    free(buf);
     return total;
 }
 
@@ -683,14 +615,8 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
 
     if(offset + size > inode->file_size) size = (size_t)(inode->file_size - offset);
 
-    block_buf  = malloc((size_t)block_size);
-    decomp_buf = malloc((size_t)block_size);
-    if(!block_buf || !decomp_buf)
-    {
-        free(block_buf);
-        free(decomp_buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    block_buf  = ctx->io_buf;
+    decomp_buf = ctx->io_buf2;
 
     while(bytes_read < size)
     {
@@ -720,16 +646,12 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
 
         if(!found)
         {
-            free(block_buf);
-            free(decomp_buf);
             return OBMAFS3_ERR_IO;
         }
 
         int rc = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
         if(rc != OBMAFS3_OK)
         {
-            free(block_buf);
-            free(decomp_buf);
             return rc;
         }
 
@@ -755,8 +677,6 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
             obmafs3_checksum_block(block_buf + sizeof(bhdr), check_size, computed);
             if(memcmp(computed, bhdr.checksum, 32) != 0)
             {
-                free(block_buf);
-                free(decomp_buf);
                 return OBMAFS3_ERR_CHECKSUM;
             }
 
@@ -766,8 +686,6 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
                                         (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
-                    free(block_buf);
-                    free(decomp_buf);
                     return rc;
                 }
                 data_ptr = decomp_buf;
@@ -789,8 +707,6 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
         bytes_read += to_copy;
     }
 
-    free(block_buf);
-    free(decomp_buf);
     return OBMAFS3_OK;
 }
 
@@ -1238,8 +1154,8 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         if(rc != OBMAFS3_OK) return rc;
 
         /* Initialize new blocks with empty block headers */
-        uint8_t *zero_block = calloc(1, (size_t)block_size);
-        if(!zero_block) return OBMAFS3_ERR_NOMEM;
+        uint8_t *zero_block = ctx->io_buf;
+        memset(zero_block, 0, (size_t)block_size);
         struct block_header empty_hdr;
         memset(&empty_hdr, 0, sizeof(empty_hdr));
         empty_hdr.magic           = OBMAFS3_BLOCK_MAGIC;
@@ -1254,11 +1170,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
             rc = obmafs3_block_write(ctx, new_start + b, zero_block, (size_t)block_size);
             if(rc != OBMAFS3_OK)
             {
-                free(zero_block);
                 return rc;
             }
         }
-        free(zero_block);
 
         /* Add the new extent to the inode */
         int added = 0;
@@ -1292,14 +1206,8 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
     }
 
     /* Now write the data into the appropriate blocks */
-    uint8_t *block_buf = malloc((size_t)block_size);
-    uint8_t *work_buf  = malloc(data_capacity);
-    if(!block_buf || !work_buf)
-    {
-        free(block_buf);
-        free(work_buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    uint8_t *block_buf = ctx->io_buf;
+    uint8_t *work_buf  = ctx->io_buf2;
 
     while(bytes_written < size)
     {
@@ -1329,8 +1237,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
 
         if(!found)
         {
-            free(block_buf);
-            free(work_buf);
             return OBMAFS3_ERR_IO;
         }
 
@@ -1348,8 +1254,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                 rc = obmafs3_alloc_block(ctx, &new_lba);
                 if(rc != OBMAFS3_OK)
                 {
-                    free(block_buf);
-                    free(work_buf);
                     return rc;
                 }
                 if(i < 8)
@@ -1359,8 +1263,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     if(rc != OBMAFS3_OK)
                     {
                         obmafs3_free_block(ctx, new_lba);
-                        free(block_buf);
-                        free(work_buf);
                         return rc;
                     }
                 }
@@ -1376,8 +1278,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     if(rc != OBMAFS3_OK)
                     {
                         obmafs3_free_block(ctx, new_lba);
-                        free(block_buf);
-                        free(work_buf);
                         return rc;
                     }
 
@@ -1396,8 +1296,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     {
                         free(ovf_lbas);
                         obmafs3_free_block(ctx, new_lba);
-                        free(block_buf);
-                        free(work_buf);
                         return OBMAFS3_ERR_IO;
                     }
 
@@ -1405,8 +1303,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     if(rc != OBMAFS3_OK)
                     {
                         free(ovf_lbas);
-                        free(block_buf);
-                        free(work_buf);
                         return rc;
                     }
 
@@ -1415,8 +1311,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     if(!all_lbas)
                     {
                         free(ovf_lbas);
-                        free(block_buf);
-                        free(work_buf);
                         return OBMAFS3_ERR_NOMEM;
                     }
 
@@ -1431,8 +1325,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     free(all_lbas);
                     if(rc != OBMAFS3_OK)
                     {
-                        free(block_buf);
-                        free(work_buf);
                         return rc;
                     }
                 }
@@ -1445,8 +1337,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         rc = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
         if(rc != OBMAFS3_OK)
         {
-            free(block_buf);
-            free(work_buf);
             return rc;
         }
 
@@ -1464,8 +1354,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                                         work_buf, (size_t)existing_hdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
-                    free(block_buf);
-                    free(work_buf);
                     return rc;
                 }
             }
@@ -1540,16 +1428,12 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         free(comp_block);
         if(rc != OBMAFS3_OK)
         {
-            free(block_buf);
-            free(work_buf);
             return rc;
         }
 
         bytes_written += to_write;
     }
 
-    free(block_buf);
-    free(work_buf);
     return OBMAFS3_OK;
 }
 

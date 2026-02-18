@@ -108,26 +108,17 @@ static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx, const struct btree_heade
     uint64_t lba = hdr->root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     while(1)
     {
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(nhdr.level > 0)
         {
@@ -142,10 +133,8 @@ static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx, const struct btree_heade
             if(idx >= 0)
             {
                 memcpy(record, buf + sizeof(struct btree_node_header) + (size_t)idx * rec_sz, rec_sz);
-                free(buf);
                 return OBMAFS3_OK;
             }
-            free(buf);
             return OBMAFS3_ERR_NOTFOUND;
         }
     }
@@ -184,8 +173,8 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = calloc(1, bsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        uint8_t *buf = ctx->node_buf;
+        memset(buf, 0, bsz);
 
         struct btree_node_header nhdr;
         memset(&nhdr, 0, sizeof(nhdr));
@@ -199,7 +188,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, new_lba, buf, bsz);
-        free(buf);
         if(rc != OBMAFS3_OK) return rc;
 
         hdr->root_node_lba = new_lba;
@@ -208,8 +196,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     }
 
     /* ---- Traverse to leaf, recording path ---- */
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct cd_hash_btree_path path[CD_HASH_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -218,28 +205,16 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(nhdr.level == 0) break;
 
-        if(depth >= CD_HASH_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= CD_HASH_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = cd_hash_index_find(buf, nhdr.node_keys, hash);
         path[depth].lba  = lba;
@@ -262,7 +237,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         memcpy(buf + sizeof(struct btree_node_header) + (size_t)idx * rec_sz, record, rec_sz);
         compute_node_checksum(buf);
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
@@ -285,18 +259,13 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         compute_node_checksum(buf);
 
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
-        free(buf);
         return rc;
     }
 
     /* ---- Leaf full: split ---- */
     uint16_t total = max_leaf + 1;
     uint8_t *all   = calloc(total, rec_sz);
-    if(!all)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
+    if(!all) return OBMAFS3_ERR_NOMEM;
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -318,7 +287,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -331,7 +299,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -351,7 +318,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     if(rc != OBMAFS3_OK)
     {
         free(all);
-        free(buf);
         return rc;
     }
 
@@ -385,11 +351,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         uint16_t parent_slot = path[depth].slot;
 
         rc = obmafs3_block_read(ctx, parent_lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header phdr;
         memcpy(&phdr, buf, sizeof(phdr));
@@ -413,7 +375,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
             compute_node_checksum(buf);
 
             rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
-            free(buf);
             if(rc != OBMAFS3_OK) return rc;
             return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
         }
@@ -421,11 +382,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         /* Parent full — split index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie)
-        {
-            free(buf);
-            return OBMAFS3_ERR_NOMEM;
-        }
+        if(!aie) return OBMAFS3_ERR_NOMEM;
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -445,7 +402,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -454,7 +410,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -473,7 +428,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         if(rc != OBMAFS3_OK)
         {
             free(aie);
-            free(buf);
             return rc;
         }
 
@@ -492,18 +446,10 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
     rc = obmafs3_alloc_block(ctx, &new_root_lba);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
 
     rc = obmafs3_block_read(ctx, left_lba, buf, bsz);
-    if(rc != OBMAFS3_OK)
-    {
-        free(buf);
-        return rc;
-    }
+    if(rc != OBMAFS3_OK) return rc;
     struct btree_node_header old_hdr;
     memcpy(&old_hdr, buf, sizeof(old_hdr));
 
@@ -525,7 +471,6 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     compute_node_checksum(buf);
 
     rc = obmafs3_block_write(ctx, new_root_lba, buf, bsz);
-    free(buf);
     if(rc != OBMAFS3_OK) return rc;
 
     hdr->root_node_lba = new_root_lba;
@@ -558,8 +503,7 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    uint8_t *buf = ctx->node_buf;
 
     struct cd_hash_btree_path path[CD_HASH_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -568,28 +512,16 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
     while(1)
     {
         rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK)
-        {
-            free(buf);
-            return rc;
-        }
+        if(rc != OBMAFS3_OK) return rc;
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-        {
-            free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
-        }
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
         if(nhdr.level == 0) break;
 
-        if(depth >= CD_HASH_BTREE_MAX_DEPTH)
-        {
-            free(buf);
-            return OBMAFS3_ERR_INVAL;
-        }
+        if(depth >= CD_HASH_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
 
         uint16_t slot    = cd_hash_index_find(buf, nhdr.node_keys, hash);
         path[depth].lba  = lba;
@@ -605,11 +537,7 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
     memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
 
     int idx = cd_hash_leaf_find(buf, leaf_hdr.node_keys, hash, rec_sz);
-    if(idx < 0)
-    {
-        free(buf);
-        return OBMAFS3_ERR_NOTFOUND;
-    }
+    if(idx < 0) return OBMAFS3_ERR_NOTFOUND;
 
     leaf_hdr.node_keys--;
 
@@ -628,17 +556,12 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
             uint16_t pslot = path[depth - 1].slot;
 
             uint8_t *pbuf = calloc(1, bsz);
-            if(!pbuf)
-            {
-                free(buf);
-                return OBMAFS3_ERR_NOMEM;
-            }
+            if(!pbuf) return OBMAFS3_ERR_NOMEM;
 
             rc = obmafs3_block_read(ctx, plba, pbuf, bsz);
             if(rc != OBMAFS3_OK)
             {
                 free(pbuf);
-                free(buf);
                 return rc;
             }
 
@@ -704,7 +627,6 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
         rc = obmafs3_block_write(ctx, lba, buf, bsz);
     }
 
-    free(buf);
     return rc;
 }
 
