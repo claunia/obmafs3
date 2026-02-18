@@ -374,6 +374,16 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
 void obmafs3_close(struct obmafs3_ctx *ctx)
 {
     if(!ctx) return;
+
+    /* Persist the allocation bitmap and superblock on close (unmount).
+     * During normal operation these are deferred from the hot alloc/free
+     * paths to avoid per-operation I/O overhead. */
+    if(ctx->bitmap && ctx->fd >= 0)
+    {
+        obmafs3_bitmap_write(ctx);
+        obmafs3_sb_write(ctx->fd, &ctx->sb);
+    }
+
     if(ctx->bitmap) free(ctx->bitmap);
     if(ctx->fd >= 0) close(ctx->fd);
     free(ctx);

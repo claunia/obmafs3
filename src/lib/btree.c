@@ -128,17 +128,14 @@ int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *star
     int rc = obmafs3_bitmap_find_free(ctx, count, start_lba);
     if(rc != OBMAFS3_OK) return rc;
 
-    /* Mark them as allocated */
+    /* Mark them as allocated (in-memory only; bitmap is persisted on
+     * flush/release, superblock on unmount). */
     obmafs3_bitmap_set(ctx, *start_lba, count);
-
-    /* Persist the bitmap */
-    rc = obmafs3_bitmap_write(ctx);
-    if(rc != OBMAFS3_OK) return rc;
 
     /* Keep next_free_lba as a hint for future allocations */
     if(*start_lba + count > ctx->sb.next_free_lba) ctx->sb.next_free_lba = *start_lba + count;
 
-    return obmafs3_sb_write(ctx->fd, &ctx->sb);
+    return OBMAFS3_OK;
 }
 
 /**
@@ -154,6 +151,6 @@ uint64_t obmafs3_alloc_inode_id(struct obmafs3_ctx *ctx)
 {
     uint64_t id = ctx->sb.next_inode_id;
     ctx->sb.next_inode_id++;
-    obmafs3_sb_write(ctx->fd, &ctx->sb);
+    /* Superblock is persisted on unmount, not per inode allocation. */
     return id;
 }

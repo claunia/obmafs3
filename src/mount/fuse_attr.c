@@ -179,6 +179,12 @@ int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
         ffctx->inode_dirty = 0;
     }
 
+    /* Persist the allocation bitmap (deferred from alloc/free paths) */
+    {
+        int brc = obmafs3_bitmap_write(g_ctx);
+        if(rc == OBMAFS3_OK) rc = brc;
+    }
+
     return (rc == OBMAFS3_OK) ? 0 : -EIO;
 }
 
@@ -228,6 +234,12 @@ int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
     {
         int put_rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
         if(rc == OBMAFS3_OK) rc = put_rc;
+    }
+
+    /* Persist the allocation bitmap (deferred from alloc/free paths) */
+    {
+        int brc = obmafs3_bitmap_write(g_ctx);
+        if(rc == OBMAFS3_OK) rc = brc;
     }
 
     obmafs3_free_dedup_block_cache(&ffctx->db_cache);
