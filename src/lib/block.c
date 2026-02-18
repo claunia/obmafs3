@@ -1380,41 +1380,31 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         bhdr.original_size = block_data_end;
 
         /* Try to compress if enabled */
-        uint8_t *out_buf    = block_buf;
-        uint8_t *comp_block = NULL;
+        uint8_t *out_buf   = block_buf;
+        int      compressed = 0;
         if(ctx->compression && block_data_end > 0)
         {
-            size_t comp_bound    = ZSTD_compressBound((size_t)block_data_end);
-            size_t comp_buf_size = sizeof(struct block_header) + comp_bound;
-            if(comp_buf_size < (size_t)block_size) comp_buf_size = (size_t)block_size;
-            comp_block = calloc(1, comp_buf_size);
-            if(comp_block)
+            uint8_t *comp_block = ctx->comp_buf;
+            size_t   comp_size  = ctx->comp_buf_size - sizeof(struct block_header);
+            int crc = obmafs3_compress(work_buf, (size_t)block_data_end, comp_block + sizeof(struct block_header),
+                                       &comp_size, ctx->zstd_level);
+            if(crc == OBMAFS3_OK && comp_size < block_data_end)
             {
-                size_t comp_size = comp_bound;
-                int crc = obmafs3_compress(work_buf, (size_t)block_data_end, comp_block + sizeof(struct block_header),
-                                           &comp_size, ctx->zstd_level);
-                if(crc == OBMAFS3_OK && comp_size < block_data_end)
-                {
-                    /* Compression saved space — use compressed block */
-                    bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
-                    bhdr.compression_type = kCompressionZstd;
-                    bhdr.compressed_size  = comp_size;
-                    obmafs3_checksum_block(comp_block + sizeof(struct block_header), comp_size, bhdr.checksum);
-                    memcpy(comp_block, &bhdr, sizeof(bhdr));
-                    /* Zero-fill remainder of the block */
-                    size_t used = sizeof(struct block_header) + comp_size;
-                    if(used < (size_t)block_size) memset(comp_block + used, 0, (size_t)block_size - used);
-                    out_buf = comp_block;
-                }
-                else
-                {
-                    free(comp_block);
-                    comp_block = NULL;
-                }
+                /* Compression saved space — use compressed block */
+                compressed            = 1;
+                bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
+                bhdr.compression_type = kCompressionZstd;
+                bhdr.compressed_size  = comp_size;
+                obmafs3_checksum_block(comp_block + sizeof(struct block_header), comp_size, bhdr.checksum);
+                memcpy(comp_block, &bhdr, sizeof(bhdr));
+                /* Zero-fill remainder of the block */
+                size_t used = sizeof(struct block_header) + comp_size;
+                if(used < (size_t)block_size) memset(comp_block + used, 0, (size_t)block_size - used);
+                out_buf = comp_block;
             }
         }
 
-        if(!comp_block)
+        if(!compressed)
         {
             /* Store uncompressed — copy work_buf into block_buf */
             memcpy(block_buf + sizeof(struct block_header), work_buf, (size_t)block_data_end);
@@ -1425,7 +1415,6 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         }
 
         rc = obmafs3_block_write(ctx, write_lba, out_buf, (size_t)block_size);
-        free(comp_block);
         if(rc != OBMAFS3_OK)
         {
             return rc;

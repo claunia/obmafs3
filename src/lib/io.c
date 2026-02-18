@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <zstd.h>
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -139,12 +140,22 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     c->node_buf = malloc((size_t)c->sb.block_size);
     c->io_buf   = malloc((size_t)c->sb.block_size);
     c->io_buf2  = malloc((size_t)c->sb.block_size);
-    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2)
+
+    /* Pre-allocate a compression output buffer large enough for the
+     * worst-case ZSTD expansion of a full data block. */
+    size_t data_cap  = (size_t)c->sb.block_size - sizeof(struct block_header);
+    size_t comp_need = sizeof(struct block_header) + ZSTD_compressBound(data_cap);
+    if(comp_need < (size_t)c->sb.block_size) comp_need = (size_t)c->sb.block_size;
+    c->comp_buf      = malloc(comp_need);
+    c->comp_buf_size = comp_need;
+
+    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2 || !c->comp_buf)
     {
         free(c->hdr_buf);
         free(c->node_buf);
         free(c->io_buf);
         free(c->io_buf2);
+        free(c->comp_buf);
         close(fd);
         free(c);
         return OBMAFS3_ERR_NOMEM;
@@ -405,6 +416,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     free(ctx->node_buf);
     free(ctx->io_buf);
     free(ctx->io_buf2);
+    free(ctx->comp_buf);
     if(ctx->bitmap) free(ctx->bitmap);
     if(ctx->fd >= 0) close(ctx->fd);
     free(ctx);

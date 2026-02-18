@@ -47,6 +47,8 @@ struct obmafs3_ctx
     uint8_t            *node_buf;           ///< Reusable buffer for B+Tree node traversal
     uint8_t            *io_buf;             ///< Reusable buffer for data block I/O
     uint8_t            *io_buf2;            ///< Reusable second buffer for decompression / work
+    uint8_t            *comp_buf;           ///< Reusable buffer for compression output
+    size_t              comp_buf_size;      ///< Size of comp_buf in bytes
 };
 
 /* Open flags */
