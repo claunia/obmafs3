@@ -217,39 +217,26 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         uint64_t hash = obmafs3_checksum_xxh64(raw, CD_RAW_SECTOR_SIZE);
         sme.hash      = hash;
 
-        /* Dedup the 2352-byte audio sector */
-        struct btree_header dedup_hdr;
-        uint64_t            dedup_hdr_lba;
-        int                 rc = obmafs3_dedup_get_tree(g_ctx, CD_RAW_SECTOR_SIZE, &dedup_hdr, &dedup_hdr_lba);
-        if(rc != OBMAFS3_OK) return -EIO;
+        /* Bootstrap dedup block cache for 2352-byte sectors */
+        if(!ffctx->db_cache.initialized) ffctx->sector_size = CD_RAW_SECTOR_SIZE;
 
-        struct dedup_entry existing;
-        rc = obmafs3_dedup_lookup(g_ctx, &dedup_hdr, hash, &existing);
-        if(rc == OBMAFS3_ERR_NOTFOUND)
+        struct dedup_block_cache *dbc = &ffctx->db_cache;
+        if(!dbc->bg_compress)
         {
-            /* New sector — store via the write path */
-            if(!ffctx->db_cache.initialized)
-            {
-                /* Bootstrap dedup block cache for 2352-byte sectors */
-                ffctx->sector_size = CD_RAW_SECTOR_SIZE;
-            }
-            struct dedup_block_cache *dbc = &ffctx->db_cache;
-            if(!dbc->bg_compress)
-            {
-                int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-                if(brc != OBMAFS3_OK) return -EIO;
-            }
-
-            /* Write via the media image data path (handles dedup storage) */
-            uint64_t                offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
-            struct sector_map_cache dummy_cache; /* unused */
-            memset(&dummy_cache, 0, sizeof(dummy_cache));
-            rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
-                                                CD_RAW_SECTOR_SIZE, &dummy_cache, dbc);
-            obmafs3_free_sector_map_cache(&dummy_cache);
-            if(rc != OBMAFS3_OK) return -EIO;
+            int brc = obmafs3_bg_compress_start(g_ctx, dbc);
+            if(brc != OBMAFS3_OK) return -EIO;
         }
-        else if(rc != OBMAFS3_OK) { return -EIO; }
+
+        /* Write via the media image data path — dedup_upsert_find handles
+         * both hit (skip data) and miss (store + insert) in one traversal,
+         * avoiding the overhead of a separate dedup_get_tree + dedup_lookup. */
+        uint64_t                offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
+        struct sector_map_cache dummy_cache; /* unused */
+        memset(&dummy_cache, 0, sizeof(dummy_cache));
+        int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
+                                                CD_RAW_SECTOR_SIZE, &dummy_cache, dbc);
+        obmafs3_free_sector_map_cache(&dummy_cache);
+        if(rc != OBMAFS3_OK) return -EIO;
 
         goto cache_and_done;
     }
@@ -361,39 +348,31 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
 
     sme.sector_size = data_size;
 
-    /* Hash and dedup the data portion */
+    /* Hash the data portion (needed for cd_sector_map_entry) */
     uint64_t hash = obmafs3_checksum_xxh64(data_ptr, data_size);
     sme.hash      = hash;
 
     {
-        struct btree_header dedup_hdr;
-        uint64_t            dedup_hdr_lba;
-        int                 rc = obmafs3_dedup_get_tree(g_ctx, data_size, &dedup_hdr, &dedup_hdr_lba);
-        if(rc != OBMAFS3_OK) return -EIO;
+        /* Bootstrap dedup block cache */
+        if(!ffctx->db_cache.initialized) ffctx->sector_size = data_size;
 
-        struct dedup_entry existing;
-        rc = obmafs3_dedup_lookup(g_ctx, &dedup_hdr, hash, &existing);
-        if(rc == OBMAFS3_ERR_NOTFOUND)
+        struct dedup_block_cache *dbc = &ffctx->db_cache;
+        if(!dbc->bg_compress)
         {
-            /* New data — store via media image write path */
-            if(!ffctx->db_cache.initialized) ffctx->sector_size = data_size;
-
-            struct dedup_block_cache *dbc = &ffctx->db_cache;
-            if(!dbc->bg_compress)
-            {
-                int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-                if(brc != OBMAFS3_OK) return -EIO;
-            }
-
-            uint64_t                offset = (uint64_t)sector_lba * data_size;
-            struct sector_map_cache dummy_cache;
-            memset(&dummy_cache, 0, sizeof(dummy_cache));
-            rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size,
-                                                &dummy_cache, dbc);
-            obmafs3_free_sector_map_cache(&dummy_cache);
-            if(rc != OBMAFS3_OK) return -EIO;
+            int brc = obmafs3_bg_compress_start(g_ctx, dbc);
+            if(brc != OBMAFS3_OK) return -EIO;
         }
-        else if(rc != OBMAFS3_OK) { return -EIO; }
+
+        /* Write via the media image data path — dedup_upsert_find handles
+         * both hit (skip data) and miss (store + insert) in one traversal,
+         * avoiding the overhead of a separate dedup_get_tree + dedup_lookup. */
+        uint64_t                offset = (uint64_t)sector_lba * data_size;
+        struct sector_map_cache dummy_cache;
+        memset(&dummy_cache, 0, sizeof(dummy_cache));
+        int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size,
+                                                &dummy_cache, dbc);
+        obmafs3_free_sector_map_cache(&dummy_cache);
+        if(rc != OBMAFS3_OK) return -EIO;
     }
 
 cache_and_done:
