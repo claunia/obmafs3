@@ -14,21 +14,18 @@
  */
 int obmafs3_fuse_mkdir(const char *path, mode_t mode)
 {
-    uint64_t parent_id;
-    const char *name;
+    uint64_t              parent_id;
+    const char           *name;
     struct catalog_record cat_entry;
-    int rc;
+    int                   rc;
 
     rc = resolve_path(path, &parent_id, &name);
-    if (rc != 0)
-        return rc;
+    if(rc != 0) return rc;
 
     /* Check if the name already exists */
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if (rc == OBMAFS3_OK)
-        return -EEXIST;
-    if (rc != OBMAFS3_ERR_NOTFOUND)
-        return -EIO;
+    if(rc == OBMAFS3_OK) return -EEXIST;
+    if(rc != OBMAFS3_ERR_NOTFOUND) return -EIO;
 
     /* Allocate a new inode ID */
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
@@ -42,11 +39,10 @@ int obmafs3_fuse_mkdir(const char *path, mode_t mode)
     strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
 
     rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if(rc != OBMAFS3_OK) return -EIO;
 
     /* Create the inode */
-    uint64_t now = (uint64_t)time(NULL);
+    uint64_t             now  = (uint64_t)time(NULL);
     struct fuse_context *fctx = fuse_get_context();
 
     struct inode_record new_inode;
@@ -60,11 +56,10 @@ int obmafs3_fuse_mkdir(const char *path, mode_t mode)
     new_inode.access_time       = now;
     new_inode.file_size         = 0;
     new_inode.file_type         = kFileTypeDirectory;
-    new_inode.ref_count          = 1;
+    new_inode.ref_count         = 1;
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if(rc != OBMAFS3_OK) return -EIO;
 
     return 0;
 }
@@ -77,45 +72,36 @@ int obmafs3_fuse_mkdir(const char *path, mode_t mode)
  */
 int obmafs3_fuse_rmdir(const char *path)
 {
-    uint64_t parent_id;
-    const char *name;
+    uint64_t              parent_id;
+    const char           *name;
     struct catalog_record cat_entry;
-    int rc;
+    int                   rc;
 
     rc = resolve_path(path, &parent_id, &name);
-    if (rc != 0)
-        return rc;
+    if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if (rc == OBMAFS3_ERR_NOTFOUND)
-        return -ENOENT;
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
+    if(rc != OBMAFS3_OK) return -EIO;
 
-    if (!cat_entry.directory_flag)
-        return -ENOTDIR;
+    if(!cat_entry.directory_flag) return -ENOTDIR;
 
     /* Check that the directory is empty */
-    struct catalog_record *children = NULL;
-    uint32_t child_count = 0;
-    rc = obmafs3_catalog_list(g_ctx, cat_entry.inode_id,
-                              &children, &child_count);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    struct catalog_record *children    = NULL;
+    uint32_t               child_count = 0;
+    rc                                 = obmafs3_catalog_list(g_ctx, cat_entry.inode_id, &children, &child_count);
+    if(rc != OBMAFS3_OK) return -EIO;
     obmafs3_catalog_list_free(children);
 
-    if (child_count > 0)
-        return -ENOTEMPTY;
+    if(child_count > 0) return -ENOTEMPTY;
 
     /* Remove the catalog entry */
     rc = obmafs3_catalog_delete(g_ctx, parent_id, name);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if(rc != OBMAFS3_OK) return -EIO;
 
     /* Remove the inode */
     rc = obmafs3_inode_delete(g_ctx, cat_entry.inode_id);
-    if (rc != OBMAFS3_OK)
-        return -EIO;
+    if(rc != OBMAFS3_OK) return -EIO;
 
     return 0;
 }

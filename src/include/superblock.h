@@ -7,7 +7,8 @@
 #define OBMAFS3_SB_MAGIC 0x335F5346414D424FULL
 
 /// On-disk superblock occupying LBA 0.
-struct __attribute__((packed)) obmafs3_sb {
+struct __attribute__((packed)) obmafs3_sb
+{
     uint64_t magic;              ///< "OBMAFS_3"
     uint8_t  guid[16];           ///< Unique identifier for the filesystem instance
     uint64_t block_size;         ///< Size of each block for non-deduplicated data

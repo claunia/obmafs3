@@ -12,17 +12,18 @@
 #define OBMAFS3_MAX_DISK_IMAGE_MAPS 32
 
 /** Maps a file extension to a sector size for disk image handling */
-struct disk_image_mapping {
-    char     extension[32]; ///< File extension (without dot), e.g. "dsk"
-    uint16_t sector_size;   ///< Sector size in bytes, e.g. 512
+struct disk_image_mapping
+{
+    char     extension[32];  ///< File extension (without dot), e.g. "dsk"
+    uint16_t sector_size;    ///< Sector size in bytes, e.g. 512
 };
 
 extern struct fuse_operations obmafs3_fuse_ops;
-extern struct obmafs3_ctx *g_ctx;
+extern struct obmafs3_ctx    *g_ctx;
 
 /** Disk image extension-to-sector-size mappings */
 extern struct disk_image_mapping g_disk_image_maps[OBMAFS3_MAX_DISK_IMAGE_MAPS];
-extern int g_disk_image_map_count;
+extern int                       g_disk_image_map_count;
 
 /**
  * Parse a semicolon-separated disk_images specification string.

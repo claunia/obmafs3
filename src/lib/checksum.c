@@ -3,8 +3,8 @@
  */
 #include "obmafs.h"
 
-#include <xxhash.h>
 #include <string.h>
+#include <xxhash.h>
 
 /**
  * Compute an XXH64 hash of the given data.
@@ -13,10 +13,7 @@
  * @param size  Number of bytes to hash.
  * @return The 64-bit XXH64 hash value (seed 0).
  */
-uint64_t obmafs3_checksum_xxh64(const void *data, size_t size)
-{
-    return XXH64(data, size, 0);
-}
+uint64_t obmafs3_checksum_xxh64(const void *data, size_t size) { return XXH64(data, size, 0); }
 
 /**
  * Compute an XXH64 hash and store it in a 32-byte output buffer.

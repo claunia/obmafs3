@@ -16,8 +16,8 @@
  */
 static inline void compute_node_checksum(uint8_t *buf)
 {
-    struct btree_node_header *nhdr = (struct btree_node_header *)buf;
-    size_t data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
+    struct btree_node_header *nhdr      = (struct btree_node_header *)buf;
+    size_t                    data_size = sizeof(struct btree_node_header) + nhdr->keys_length;
     memset(nhdr->checksum, 0, sizeof(nhdr->checksum));
     obmafs3_checksum_block(buf, data_size, nhdr->checksum);
 }

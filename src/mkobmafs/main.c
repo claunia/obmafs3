@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 #ifdef __linux__
-#include <linux/fs.h>   /* BLKGETSIZE64 */
+#include <linux/fs.h> /* BLKGETSIZE64 */
 #endif
 
 /**
@@ -30,32 +30,29 @@
 static int parse_guid(const char *str, uint8_t *out)
 {
     /* Accept xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or 32 hex chars */
-    uint8_t tmp[16];
-    int idx = 0;
-    const char *p = str;
+    uint8_t     tmp[16];
+    int         idx = 0;
+    const char *p   = str;
 
-    while (*p && idx < 16) {
-        if (*p == '-') { p++; continue; }
-        if (!((p[0] >= '0' && p[0] <= '9') ||
-              (p[0] >= 'a' && p[0] <= 'f') ||
-              (p[0] >= 'A' && p[0] <= 'F')) ||
-            !p[1] ||
-            !((p[1] >= '0' && p[1] <= '9') ||
-              (p[1] >= 'a' && p[1] <= 'f') ||
-              (p[1] >= 'A' && p[1] <= 'F')))
+    while(*p && idx < 16)
+    {
+        if(*p == '-')
+        {
+            p++;
+            continue;
+        }
+        if(!((p[0] >= '0' && p[0] <= '9') || (p[0] >= 'a' && p[0] <= 'f') || (p[0] >= 'A' && p[0] <= 'F')) || !p[1] ||
+           !((p[1] >= '0' && p[1] <= '9') || (p[1] >= 'a' && p[1] <= 'f') || (p[1] >= 'A' && p[1] <= 'F')))
             return -1;
         unsigned int byte;
-        if (sscanf(p, "%2x", &byte) != 1)
-            return -1;
+        if(sscanf(p, "%2x", &byte) != 1) return -1;
         tmp[idx++] = (uint8_t)byte;
         p += 2;
     }
-    if (idx != 16)
-        return -1;
+    if(idx != 16) return -1;
     /* Skip trailing dashes */
-    while (*p == '-') p++;
-    if (*p != '\0')
-        return -1;
+    while(*p == '-') p++;
+    if(*p != '\0') return -1;
     memcpy(out, tmp, 16);
     return 0;
 }
@@ -68,16 +65,16 @@ static int parse_guid(const char *str, uint8_t *out)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [options] <device-or-file>\n"
-        "\n"
-        "Options:\n"
-        "  -s, --size <bytes>         Total filesystem size (default: file size, or 1 GiB)\n"
-        "  -b, --block-size <bytes>   Block size (default: 4096)\n"
-        "  -d, --dedup-size <bytes>   Dedup block size (default: 4194304)\n"
-        "  -l, --label <name>         Volume label (default: OBMAFS3)\n"
-        "  -g, --guid <uuid>          Filesystem GUID (default: random)\n"
-        "  -h, --help                 Show this help\n",
-        prog);
+            "Usage: %s [options] <device-or-file>\n"
+            "\n"
+            "Options:\n"
+            "  -s, --size <bytes>         Total filesystem size (default: file size, or 1 GiB)\n"
+            "  -b, --block-size <bytes>   Block size (default: 4096)\n"
+            "  -d, --dedup-size <bytes>   Dedup block size (default: 4194304)\n"
+            "  -l, --label <name>         Volume label (default: OBMAFS3)\n"
+            "  -g, --guid <uuid>          Filesystem GUID (default: random)\n"
+            "  -h, --help                 Show this help\n",
+            prog);
 }
 
 /**
@@ -90,47 +87,58 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
     static struct option long_opts[] = {
-        {"size",       required_argument, NULL, 's'},
+        {      "size", required_argument, NULL, 's'},
         {"block-size", required_argument, NULL, 'b'},
         {"dedup-size", required_argument, NULL, 'd'},
-        {"label",      required_argument, NULL, 'l'},
-        {"guid",       required_argument, NULL, 'g'},
-        {"help",       no_argument,       NULL, 'h'},
-        {NULL, 0, NULL, 0}
+        {     "label", required_argument, NULL, 'l'},
+        {      "guid", required_argument, NULL, 'g'},
+        {      "help",       no_argument, NULL, 'h'},
+        {        NULL,                 0, NULL,   0}
     };
 
-    uint64_t total_size      = 0;
-    uint64_t block_size      = OBMAFS3_DEFAULT_BLOCK_SIZE;
-    uint64_t dedup_block_size = OBMAFS3_DEFAULT_DEDUP_BLOCK_SIZE;
-    const char *label        = "OBMAFS3";
-    uint8_t guid[16];
-    int have_guid            = 0;
+    uint64_t    total_size       = 0;
+    uint64_t    block_size       = OBMAFS3_DEFAULT_BLOCK_SIZE;
+    uint64_t    dedup_block_size = OBMAFS3_DEFAULT_DEDUP_BLOCK_SIZE;
+    const char *label            = "OBMAFS3";
+    uint8_t     guid[16];
+    int         have_guid = 0;
     const char *path;
-    int opt;
+    int         opt;
 
-    while ((opt = getopt_long(argc, argv, "s:b:d:l:g:h",
-                              long_opts, NULL)) != -1) {
-        switch (opt) {
-        case 's': total_size      = strtoull(optarg, NULL, 0); break;
-        case 'b': block_size      = strtoull(optarg, NULL, 0); break;
-        case 'd': dedup_block_size = strtoull(optarg, NULL, 0); break;
-        case 'l': label           = optarg;                    break;
-        case 'g':
-            if (parse_guid(optarg, guid) != 0) {
-                fprintf(stderr, "Error: invalid GUID format: %s\n", optarg);
-                fprintf(stderr, "Expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n");
-                return 1;
-            }
-            have_guid = 1;
-            break;
-        case 'h':
-        default:
-            usage(argv[0]);
-            return opt == 'h' ? 0 : 1;
+    while((opt = getopt_long(argc, argv, "s:b:d:l:g:h", long_opts, NULL)) != -1)
+    {
+        switch(opt)
+        {
+            case 's':
+                total_size = strtoull(optarg, NULL, 0);
+                break;
+            case 'b':
+                block_size = strtoull(optarg, NULL, 0);
+                break;
+            case 'd':
+                dedup_block_size = strtoull(optarg, NULL, 0);
+                break;
+            case 'l':
+                label = optarg;
+                break;
+            case 'g':
+                if(parse_guid(optarg, guid) != 0)
+                {
+                    fprintf(stderr, "Error: invalid GUID format: %s\n", optarg);
+                    fprintf(stderr, "Expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n");
+                    return 1;
+                }
+                have_guid = 1;
+                break;
+            case 'h':
+            default:
+                usage(argv[0]);
+                return opt == 'h' ? 0 : 1;
         }
     }
 
-    if (optind >= argc) {
+    if(optind >= argc)
+    {
         fprintf(stderr, "Error: no device or file specified\n");
         usage(argv[0]);
         return 1;
@@ -139,38 +147,36 @@ int main(int argc, char *argv[])
     path = argv[optind];
 
     /* Determine size from existing file or device if not specified */
-    if (total_size == 0) {
+    if(total_size == 0)
+    {
         struct stat st;
-        if (stat(path, &st) == 0) {
-            if (S_ISREG(st.st_mode) && st.st_size > 0) {
-                total_size = (uint64_t)st.st_size;
-            } else if (S_ISBLK(st.st_mode)) {
+        if(stat(path, &st) == 0)
+        {
+            if(S_ISREG(st.st_mode) && st.st_size > 0) { total_size = (uint64_t)st.st_size; }
+            else if(S_ISBLK(st.st_mode))
+            {
 #ifdef BLKGETSIZE64
                 int fd = open(path, O_RDONLY);
-                if (fd >= 0) {
+                if(fd >= 0)
+                {
                     uint64_t dev_size = 0;
-                    if (ioctl(fd, BLKGETSIZE64, &dev_size) == 0 &&
-                        dev_size > 0)
-                        total_size = dev_size;
+                    if(ioctl(fd, BLKGETSIZE64, &dev_size) == 0 && dev_size > 0) total_size = dev_size;
                     close(fd);
                 }
 #endif
-                if (total_size == 0) {
-                    fprintf(stderr,
-                        "Error: cannot determine size of block device %s\n",
-                        path);
+                if(total_size == 0)
+                {
+                    fprintf(stderr, "Error: cannot determine size of block device %s\n", path);
                     return 1;
                 }
             }
         }
-        if (total_size == 0)
-            total_size = 1ULL * 1024 * 1024 * 1024;  /* 1 GiB */
+        if(total_size == 0) total_size = 1ULL * 1024 * 1024 * 1024; /* 1 GiB */
     }
 
-    int rc = obmafs3_create(path, total_size, block_size,
-                            dedup_block_size, label,
-                            have_guid ? guid : NULL);
-    if (rc != OBMAFS3_OK) {
+    int rc = obmafs3_create(path, total_size, block_size, dedup_block_size, label, have_guid ? guid : NULL);
+    if(rc != OBMAFS3_OK)
+    {
         fprintf(stderr, "Error: failed to create filesystem (rc=%d)\n", rc);
         return 1;
     }

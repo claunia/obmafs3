@@ -2,18 +2,21 @@
 #define OBMAFS3_ENUMS_H
 
 /// Supported compression algorithms.
-enum obmafs3_compression {
+enum obmafs3_compression
+{
     kCompressionNone = 0,
     kCompressionZstd = 1
 };
 
 /// Supported checksum algorithms.
-enum obmafs3_checksum_type {
+enum obmafs3_checksum_type
+{
     kChecksumTypeXXH64 = 0
 };
 
 /// Identifies which B+Tree a header belongs to.
-enum obmafs3_btree_type {
+enum obmafs3_btree_type
+{
     kBtreeTypeCatalog       = 0,
     kBtreeTypeInode         = 1,
     kBtreeTypeOverflow      = 2,
@@ -24,11 +27,12 @@ enum obmafs3_btree_type {
     kBtreeTypeCdSuffix      = 7,
     kBtreeTypeCdSubchannel  = 8,
     kBtreeTypeMetadataIndex = 9,
-    kBtreeTypeRefcount     = 10
+    kBtreeTypeRefcount      = 10
 };
 
 /// Identifies the record format stored in a B+Tree.
-enum obmafs3_btree_data_type {
+enum obmafs3_btree_data_type
+{
     kBtreeDataTypeFilename           = 0,
     kBtreeDataTypeInode              = 1,
     kBtreeDataTypeExtent             = 2,
@@ -39,23 +43,25 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeCdSuffixEntry      = 7,
     kBtreeDataTypeCdSubchannelEntry  = 8,
     kBtreeDataTypeMetadataIndexEntry = 9,
-    kBtreeDataTypeRefcountEntry     = 10
+    kBtreeDataTypeRefcountEntry      = 10
 };
 
 /// Inode file type stored in inode_record::file_type.
-enum obmafs3_file_type {
-    kFileTypeRegular    = 0,
-    kFileTypeDirectory  = 1,
-    kFileTypeMediaImage = 2,
-    kFileTypeSymlink    = 3,
+enum obmafs3_file_type
+{
+    kFileTypeRegular          = 0,
+    kFileTypeDirectory        = 1,
+    kFileTypeMediaImage       = 2,
+    kFileTypeSymlink          = 3,
     kFileTypeCompactDiscImage = 4
 };
 
 /// CD sector encoding mode.
-enum obmafs3_cd_sector_mode {
-    kCdSectorModeAudio = 0,
-    kCdSectorMode1 = 1,
-    kCdSectorMode2 = 2,
+enum obmafs3_cd_sector_mode
+{
+    kCdSectorModeAudio  = 0,
+    kCdSectorMode1      = 1,
+    kCdSectorMode2      = 2,
     kCdSectorMode2Form1 = 3,
     kCdSectorMode2Form2 = 4,
 };

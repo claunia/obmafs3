@@ -19,13 +19,11 @@
  * @return @c OBMAFS3_OK on success, @c OBMAFS3_ERR_CHECKSUM on bad
  *         checksum, or another error code on failure.
  */
-int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
-                              struct btree_header *hdr)
+int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr)
 {
     int cs_ok = 0;
-    int rc = obmafs3_btree_header_read_lenient(ctx, lba, hdr, &cs_ok);
-    if (rc != OBMAFS3_OK)
-        return rc;
+    int rc    = obmafs3_btree_header_read_lenient(ctx, lba, hdr, &cs_ok);
+    if(rc != OBMAFS3_OK) return rc;
     return cs_ok ? OBMAFS3_OK : OBMAFS3_ERR_CHECKSUM;
 }
 
@@ -42,16 +40,14 @@ int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba,
  * @param checksum_ok  Set to 1 if the checksum matches, 0 otherwise.
  * @return @c OBMAFS3_OK on success, or an error code on read/magic failure.
  */
-int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba,
-                                      struct btree_header *hdr,
-                                      int *checksum_ok)
+int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr, int *checksum_ok)
 {
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if (!buf)
-        return OBMAFS3_ERR_NOMEM;
+    if(!buf) return OBMAFS3_ERR_NOMEM;
 
     int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-    if (rc != OBMAFS3_OK) {
+    if(rc != OBMAFS3_OK)
+    {
         free(buf);
         return rc;
     }
@@ -59,8 +55,7 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba,
     memcpy(hdr, buf, sizeof(*hdr));
     free(buf);
 
-    if (hdr->magic != OBMAFS3_BTREE_HDR_MAGIC)
-        return OBMAFS3_ERR_BADMAGIC;
+    if(hdr->magic != OBMAFS3_BTREE_HDR_MAGIC) return OBMAFS3_ERR_BADMAGIC;
 
     /* Verify checksum: save stored checksum, zero field, recompute */
     uint8_t stored[32];
@@ -85,12 +80,10 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba,
  * @param hdr  Pointer to the header structure to write.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
-int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba,
-                               const struct btree_header *hdr)
+int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, const struct btree_header *hdr)
 {
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if (!buf)
-        return OBMAFS3_ERR_NOMEM;
+    if(!buf) return OBMAFS3_ERR_NOMEM;
 
     memcpy(buf, hdr, sizeof(*hdr));
 
@@ -115,10 +108,7 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba,
  * @param lba  Output LBA of the allocated block.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
-int obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba)
-{
-    return obmafs3_alloc_blocks(ctx, 1, lba);
-}
+int obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba) { return obmafs3_alloc_blocks(ctx, 1, lba); }
 
 /**
  * Allocate a contiguous range of blocks from the free-space bitmap.
@@ -132,25 +122,21 @@ int obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba)
  * @param start_lba  Output LBA of the first allocated block.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
-int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count,
-                         uint64_t *start_lba)
+int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *start_lba)
 {
     /* Find contiguous free blocks via the bitmap */
     int rc = obmafs3_bitmap_find_free(ctx, count, start_lba);
-    if (rc != OBMAFS3_OK)
-        return rc;
+    if(rc != OBMAFS3_OK) return rc;
 
     /* Mark them as allocated */
     obmafs3_bitmap_set(ctx, *start_lba, count);
 
     /* Persist the bitmap */
     rc = obmafs3_bitmap_write(ctx);
-    if (rc != OBMAFS3_OK)
-        return rc;
+    if(rc != OBMAFS3_OK) return rc;
 
     /* Keep next_free_lba as a hint for future allocations */
-    if (*start_lba + count > ctx->sb.next_free_lba)
-        ctx->sb.next_free_lba = *start_lba + count;
+    if(*start_lba + count > ctx->sb.next_free_lba) ctx->sb.next_free_lba = *start_lba + count;
 
     return obmafs3_sb_write(ctx->fd, &ctx->sb);
 }
