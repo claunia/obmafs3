@@ -178,6 +178,7 @@ struct fuse_operations obmafs3_fuse_ops = {
     .release  = obmafs3_fuse_release,
     .truncate = obmafs3_fuse_truncate,
     .unlink   = obmafs3_fuse_unlink,
+    .rename   = obmafs3_fuse_rename,
     .link     = obmafs3_fuse_link,
     .symlink  = obmafs3_fuse_symlink,
     .readlink = obmafs3_fuse_readlink,

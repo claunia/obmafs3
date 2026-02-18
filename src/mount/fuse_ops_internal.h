@@ -63,6 +63,8 @@ int obmafs3_fuse_link(const char *oldpath, const char *newpath);
 int obmafs3_fuse_symlink(const char *target, const char *linkpath);
 int obmafs3_fuse_readlink(const char *path, char *buf, size_t size);
 int obmafs3_fuse_unlink(const char *path);
+int obmafs3_fuse_rename(const char *oldpath, const char *newpath,
+                        unsigned int flags);
 
 int obmafs3_fuse_mkdir(const char *path, mode_t mode);
 int obmafs3_fuse_rmdir(const char *path);

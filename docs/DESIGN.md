@@ -550,6 +550,7 @@ Options:
 | `release` | Flush sector map cache, dedup block cache and dirty inode, free per-file context |
 | `truncate`| Truncate file to new size (free excess data and overflow blocks) |
 | `unlink`  | Remove file: delete catalog entry, free blocks (inline + overflow), delete inode |
+| `rename`  | Rename/move file or directory; supports `RENAME_NOREPLACE` and `RENAME_EXCHANGE` |
 | `link`    | Create a hard link (new catalog entry, increment inode `ref_count`) |
 | `symlink` | Create a symbolic link (stores target path as file data) |
 | `readlink` | Read the target of a symbolic link |
@@ -714,7 +715,7 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | `mount.obmafs` (FUSE mount) | Complete |
 | `obmafsck` (filesystem checker + scrub) | Complete |
 | Filesystem repair in `obmafsck` | Not implemented (check-only) |
-| Rename / move | Not implemented |
+| Rename / move | Complete |
 
 ---
 

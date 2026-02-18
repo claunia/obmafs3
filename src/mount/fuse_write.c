@@ -1,10 +1,11 @@
 /*
  * fuse_write.c - OBMAFS3 FUSE write operations
  *
- * Implements: create, write, truncate, link, symlink, readlink, unlink
+ * Implements: create, write, truncate, link, symlink, readlink, unlink, rename
  */
 
 #include "fuse_ops_internal.h"
+#include <linux/fs.h>   /* RENAME_NOREPLACE, RENAME_EXCHANGE */
 
 /**
  * FUSE callback: create a new file.
@@ -491,6 +492,265 @@ int obmafs3_fuse_unlink(const char *path)
         if (rc != OBMAFS3_OK)
             return -EIO;
     }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helper: unlink a destination file/directory to make room for       */
+/*          a rename that replaces an existing target.                 */
+/* ------------------------------------------------------------------ */
+static int replace_dest(const struct catalog_record *dst,
+                        uint64_t dst_parent, const char *dst_name)
+{
+    int rc;
+
+    if (dst->directory_flag) {
+        /* Destination directory must be empty */
+        struct catalog_record *children = NULL;
+        uint32_t child_count = 0;
+        rc = obmafs3_catalog_list(g_ctx, dst->inode_id,
+                                  &children, &child_count);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        obmafs3_catalog_list_free(children);
+        if (child_count > 0)
+            return -ENOTEMPTY;
+
+        rc = obmafs3_catalog_delete(g_ctx, dst_parent, dst_name);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        rc = obmafs3_inode_delete(g_ctx, dst->inode_id);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+    } else {
+        rc = obmafs3_catalog_delete(g_ctx, dst_parent, dst_name);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        struct inode_record inode;
+        rc = obmafs3_inode_get(g_ctx, dst->inode_id, &inode);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        if (inode.ref_count > 1) {
+            inode.ref_count--;
+            rc = obmafs3_inode_put(g_ctx, &inode);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        } else {
+            obmafs3_free_file_blocks(g_ctx, &inode);
+            if (inode.file_type == kFileTypeMediaImage)
+                obmafs3_media_tag_delete_all(g_ctx, dst->inode_id);
+            rc = obmafs3_inode_delete(g_ctx, dst->inode_id);
+            if (rc != OBMAFS3_OK)
+                return -EIO;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helper: check if @ancestor_id is an ancestor of @dir_id           */
+/*          in the catalog tree (to prevent moving a directory into    */
+/*          itself).  Returns 1 if ancestor, 0 if not, <0 on error.   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Find the parent inode ID of directory @p child_id by scanning the
+ * catalog tree.  Returns OBMAFS3_OK and sets *parent_out, or
+ * OBMAFS3_ERR_NOTFOUND if @p child_id is the root or not found.
+ */
+static int find_parent_of_dir(uint64_t child_id, uint64_t *parent_out)
+{
+    /*
+     * BFS from root.  For each directory, list its children and check
+     * if any child's inode_id == child_id.  Depth is typically small.
+     */
+    uint64_t queue[256];
+    int head = 0, tail = 0;
+    queue[tail++] = OBMAFS3_ROOT_INODE_ID;
+
+    while (head < tail) {
+        uint64_t pid = queue[head++];
+        struct catalog_record *children = NULL;
+        uint32_t count = 0;
+        int rc = obmafs3_catalog_list(g_ctx, pid, &children, &count);
+        if (rc != OBMAFS3_OK)
+            return rc;
+
+        for (uint32_t i = 0; i < count; i++) {
+            if (!children[i].directory_flag)
+                continue;
+            if (children[i].inode_id == child_id) {
+                *parent_out = pid;
+                obmafs3_catalog_list_free(children);
+                return OBMAFS3_OK;
+            }
+            if (tail < 256)
+                queue[tail++] = children[i].inode_id;
+        }
+        obmafs3_catalog_list_free(children);
+    }
+    return OBMAFS3_ERR_NOTFOUND;
+}
+
+static int is_ancestor(uint64_t ancestor_id, uint64_t dir_id)
+{
+    uint64_t current = dir_id;
+    for (int depth = 0; depth < 256; depth++) {
+        if (current == ancestor_id)
+            return 1;
+        if (current == OBMAFS3_ROOT_INODE_ID)
+            return 0;
+
+        uint64_t parent;
+        int rc = find_parent_of_dir(current, &parent);
+        if (rc == OBMAFS3_ERR_NOTFOUND)
+            return 0;
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        current = parent;
+    }
+    return 0;
+}
+
+/**
+ * FUSE callback: rename or move a file or directory.
+ *
+ * Supports three modes via @p flags:
+ *   - 0               : replace destination if it exists
+ *   - RENAME_NOREPLACE : fail with -EEXIST if destination exists
+ *   - RENAME_EXCHANGE  : atomically swap the two entries
+ *
+ * Cross-directory renames of a directory into its own subtree are
+ * rejected with -EINVAL.
+ */
+int obmafs3_fuse_rename(const char *oldpath, const char *newpath,
+                        unsigned int flags)
+{
+    uint64_t old_parent, new_parent;
+    const char *old_name, *new_name;
+    struct catalog_record src, dst;
+    int rc;
+
+    /* Reject unsupported flags */
+    if (flags & ~((unsigned int)RENAME_NOREPLACE | (unsigned int)RENAME_EXCHANGE))
+        return -EINVAL;
+
+    /* Resolve source */
+    rc = resolve_path(oldpath, &old_parent, &old_name);
+    if (rc != 0)
+        return rc;
+
+    rc = obmafs3_catalog_lookup(g_ctx, old_parent, old_name, &src);
+    if (rc == OBMAFS3_ERR_NOTFOUND)
+        return -ENOENT;
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Resolve destination */
+    rc = resolve_path(newpath, &new_parent, &new_name);
+    if (rc != 0)
+        return rc;
+
+    /* Check if destination already exists */
+    int dst_exists = 0;
+    rc = obmafs3_catalog_lookup(g_ctx, new_parent, new_name, &dst);
+    if (rc == OBMAFS3_OK)
+        dst_exists = 1;
+    else if (rc != OBMAFS3_ERR_NOTFOUND)
+        return -EIO;
+
+    /* ------ RENAME_EXCHANGE ------ */
+    if (flags & RENAME_EXCHANGE) {
+        if (!dst_exists)
+            return -ENOENT;
+
+        /* Cannot exchange a directory with a non-directory */
+        if (src.directory_flag != dst.directory_flag)
+            return -ENOTDIR;
+
+        /* Remove both old entries */
+        rc = obmafs3_catalog_delete(g_ctx, old_parent, old_name);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        rc = obmafs3_catalog_delete(g_ctx, new_parent, new_name);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        /* Insert swapped entries */
+        struct catalog_record new_src;
+        memset(&new_src, 0, sizeof(new_src));
+        new_src.inode_id       = dst.inode_id;
+        new_src.parent_id      = old_parent;
+        new_src.directory_flag = dst.directory_flag;
+        strncpy(new_src.name, old_name, sizeof(new_src.name) - 1);
+
+        struct catalog_record new_dst;
+        memset(&new_dst, 0, sizeof(new_dst));
+        new_dst.inode_id       = src.inode_id;
+        new_dst.parent_id      = new_parent;
+        new_dst.directory_flag = src.directory_flag;
+        strncpy(new_dst.name, new_name, sizeof(new_dst.name) - 1);
+
+        rc = obmafs3_catalog_insert(g_ctx, &new_src);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+        rc = obmafs3_catalog_insert(g_ctx, &new_dst);
+        if (rc != OBMAFS3_OK)
+            return -EIO;
+
+        return 0;
+    }
+
+    /* ------ RENAME_NOREPLACE ------ */
+    if ((flags & RENAME_NOREPLACE) && dst_exists)
+        return -EEXIST;
+
+    /* ------ Regular rename (flags == 0) ------ */
+
+    /* Cannot rename a file over a directory or vice versa */
+    if (dst_exists) {
+        if (src.directory_flag && !dst.directory_flag)
+            return -ENOTDIR;
+        if (!src.directory_flag && dst.directory_flag)
+            return -EISDIR;
+    }
+
+    /* Prevent moving a directory into its own subtree */
+    if (src.directory_flag && old_parent != new_parent) {
+        int anc = is_ancestor(src.inode_id, new_parent);
+        if (anc < 0)
+            return anc;  /* I/O error */
+        if (anc)
+            return -EINVAL;
+    }
+
+    /* If destination exists, remove it first */
+    if (dst_exists) {
+        rc = replace_dest(&dst, new_parent, new_name);
+        if (rc != 0)
+            return rc;
+    }
+
+    /* Remove old catalog entry */
+    rc = obmafs3_catalog_delete(g_ctx, old_parent, old_name);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
+
+    /* Insert new catalog entry with the same inode_id */
+    struct catalog_record new_cat;
+    memset(&new_cat, 0, sizeof(new_cat));
+    new_cat.inode_id       = src.inode_id;
+    new_cat.parent_id      = new_parent;
+    new_cat.directory_flag = src.directory_flag;
+    strncpy(new_cat.name, new_name, sizeof(new_cat.name) - 1);
+
+    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
+    if (rc != OBMAFS3_OK)
+        return -EIO;
 
     return 0;
 }
