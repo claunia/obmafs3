@@ -1147,6 +1147,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
     for(i = 0; i < 8; i++) existing_blocks += inode->extents[i].block_count;
     existing_blocks += overflow_count_blocks(ctx, inode->inode_id);
 
+    uint64_t fresh_start = 0; /* LBA range of freshly allocated blocks */
+    uint64_t fresh_end   = 0; /* (exclusive) — skip read-back for these */
+
     /* Allocate additional blocks if needed */
     if(total_blocks_needed > existing_blocks)
     {
@@ -1155,26 +1158,10 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         rc = obmafs3_alloc_blocks(ctx, new_blocks, &new_start);
         if(rc != OBMAFS3_OK) return rc;
 
-        /* Initialize new blocks with empty block headers */
-        uint8_t *zero_block = ctx->io_buf;
-        memset(zero_block, 0, (size_t)block_size);
-        struct block_header empty_hdr;
-        memset(&empty_hdr, 0, sizeof(empty_hdr));
-        empty_hdr.magic           = OBMAFS3_BLOCK_MAGIC;
-        empty_hdr.flags           = 0;
-        empty_hdr.original_size   = 0;
-        empty_hdr.compressed_size = 0;
-        /* Checksum of zero-length data */
-        obmafs3_checksum_block(zero_block + sizeof(empty_hdr), 0, empty_hdr.checksum);
-        memcpy(zero_block, &empty_hdr, sizeof(empty_hdr));
-        for(uint64_t b = 0; b < new_blocks; b++)
-        {
-            rc = obmafs3_block_write(ctx, new_start + b, zero_block, (size_t)block_size);
-            if(rc != OBMAFS3_OK)
-            {
-                return rc;
-            }
-        }
+        /* Remember the range so the write loop can skip the redundant
+         * read-back for blocks we know are uninitialised. */
+        fresh_start = new_start;
+        fresh_end   = new_start + new_blocks;
 
         /* Add the new extent to the inode */
         int added = 0;
@@ -1335,34 +1322,40 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
             }
         }
 
-        /* Read the existing block */
-        rc = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
-        if(rc != OBMAFS3_OK)
-        {
-            return rc;
-        }
-
-        /* Decompress existing block data into work_buf so we can
-         * safely modify it regardless of the on-disk format. */
-        struct block_header existing_hdr;
-        memcpy(&existing_hdr, block_buf, sizeof(existing_hdr));
+        /* Read the existing block (skip for freshly allocated blocks
+         * that have never been written — just zero the work buffer). */
+        int is_fresh = (write_lba >= fresh_start && write_lba < fresh_end);
 
         memset(work_buf, 0, data_capacity);
-        if(existing_hdr.magic == OBMAFS3_BLOCK_MAGIC && existing_hdr.original_size > 0)
+        if(!is_fresh)
         {
-            if(existing_hdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+            rc = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
+            if(rc != OBMAFS3_OK)
             {
-                rc = obmafs3_decompress(ctx->zstd_dctx, block_buf + sizeof(struct block_header),
-                                        (size_t)existing_hdr.compressed_size, work_buf,
-                                        (size_t)existing_hdr.original_size);
-                if(rc != OBMAFS3_OK)
-                {
-                    return rc;
-                }
+                return rc;
             }
-            else
+
+            /* Decompress existing block data into work_buf so we can
+             * safely modify it regardless of the on-disk format. */
+            struct block_header existing_hdr;
+            memcpy(&existing_hdr, block_buf, sizeof(existing_hdr));
+
+            if(existing_hdr.magic == OBMAFS3_BLOCK_MAGIC && existing_hdr.original_size > 0)
             {
-                memcpy(work_buf, block_buf + sizeof(struct block_header), (size_t)existing_hdr.original_size);
+                if(existing_hdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                {
+                    rc = obmafs3_decompress(ctx->zstd_dctx, block_buf + sizeof(struct block_header),
+                                            (size_t)existing_hdr.compressed_size, work_buf,
+                                            (size_t)existing_hdr.original_size);
+                    if(rc != OBMAFS3_OK)
+                    {
+                        return rc;
+                    }
+                }
+                else
+                {
+                    memcpy(work_buf, block_buf + sizeof(struct block_header), (size_t)existing_hdr.original_size);
+                }
             }
         }
 
@@ -1378,8 +1371,16 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         memset(&bhdr, 0, sizeof(bhdr));
         bhdr.magic              = OBMAFS3_BLOCK_MAGIC;
         uint64_t block_data_end = offset_in_block + to_write;
-        if(existing_hdr.magic == OBMAFS3_BLOCK_MAGIC && existing_hdr.original_size > block_data_end)
-            block_data_end = existing_hdr.original_size;
+        /* For existing blocks the payload may extend beyond what we're
+         * writing — preserve the larger extent.  Fresh blocks have no
+         * prior content so block_data_end is already correct. */
+        if(!is_fresh)
+        {
+            struct block_header prev_hdr;
+            memcpy(&prev_hdr, block_buf, sizeof(prev_hdr));
+            if(prev_hdr.magic == OBMAFS3_BLOCK_MAGIC && prev_hdr.original_size > block_data_end)
+                block_data_end = prev_hdr.original_size;
+        }
         bhdr.original_size = block_data_end;
 
         /* Try to compress if enabled */
