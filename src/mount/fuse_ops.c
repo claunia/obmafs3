@@ -165,10 +165,46 @@ int resolve_path(const char *path, uint64_t *parent_id, const char **name)
 }
 
 /* ------------------------------------------------------------------ */
+/*  FUSE init – negotiate kernel capabilities                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * FUSE init callback — negotiate larger write buffers and writeback cache.
+ *
+ * With larger max_write the kernel sends fewer, bigger WRITE requests,
+ * and with FUSE_CAP_WRITEBACK_CACHE the kernel can batch dirty pages
+ * before sending them.  Both are needed to give the parallel-compression
+ * engine enough groups per call to saturate multiple CPU cores.
+ */
+static void *obmafs3_fuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
+{
+    (void)cfg;
+
+    /* Request 1 MiB write buffers (default is 128 KiB). */
+    conn->max_write     = 1048576;
+    conn->max_readahead = 1048576;
+
+    /*
+     * NOTE: FUSE_CAP_WRITEBACK_CACHE is intentionally NOT enabled.
+     * With writeback cache the kernel dispatches WRITE requests out of
+     * order, which defeats the O(n) fast-append path in block.c.
+     * Without it, writes arrive in sequential order and the fast path
+     * is always taken.  The large max_write already gives us large
+     * per-call parallelism (up to 16 compression groups per write).
+     */
+
+    /* Allow parallel directory operations. */
+    if(conn->capable & FUSE_CAP_PARALLEL_DIROPS) conn->want |= FUSE_CAP_PARALLEL_DIROPS;
+
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /*  FUSE operations struct                                             */
 /* ------------------------------------------------------------------ */
 
 struct fuse_operations obmafs3_fuse_ops = {
+    .init            = obmafs3_fuse_init,
     .getattr         = obmafs3_fuse_getattr,
     .readdir         = obmafs3_fuse_readdir,
     .open            = obmafs3_fuse_open,

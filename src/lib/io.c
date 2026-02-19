@@ -465,6 +465,9 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         }
     }
 
+    /* Initialise the persistent compression thread pool. */
+    obmafs3_compress_pool_init(c);
+
     *ctx = c;
     return OBMAFS3_OK;
 }
@@ -480,6 +483,9 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
 void obmafs3_close(struct obmafs3_ctx *ctx)
 {
     if(!ctx) return;
+
+    /* Shut down the compression thread pool before anything else. */
+    obmafs3_compress_pool_destroy(ctx);
 
     /* Persist the allocation bitmap and superblock on close (unmount).
      * During normal operation these are deferred from the hot alloc/free

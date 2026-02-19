@@ -18,6 +18,9 @@
 struct ZSTD_CCtx_s;
 struct ZSTD_DCtx_s;
 
+/* Forward-declare the compression thread-pool (defined in block.c). */
+struct compress_pool;
+
 /**
  * Per-thread scratch buffers and ZSTD contexts.
  *
@@ -78,6 +81,7 @@ struct obmafs3_ctx
     uint64_t            rc_leaf_max;        ///< Largest key in the cached leaf
     uint16_t            rc_leaf_count;      ///< Number of keys in the cached leaf
     int                 rc_leaf_valid;      ///< Non-zero when the leaf cache is populated
+    struct compress_pool *compress_pool;    ///< Persistent compression thread pool
 };
 
 /* Open flags */
@@ -91,6 +95,10 @@ void obmafs3_close(struct obmafs3_ctx *ctx);
 
 /* --- Thread-local scratch buffers --- */
 struct obmafs3_thread_bufs *obmafs3_get_thread_bufs(struct obmafs3_ctx *ctx);
+
+/* --- Compression thread pool --- */
+int  obmafs3_compress_pool_init(struct obmafs3_ctx *ctx);
+void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx);
 
 /* --- Superblock operations --- */
 int obmafs3_sb_read(int fd, struct obmafs3_sb *sb);

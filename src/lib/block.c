@@ -4,9 +4,304 @@
 #include "obmafs.h"
 #include "debug.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <zstd.h>
+
+/* ------------------------------------------------------------------ */
+/*  Parallel compression infrastructure                                */
+/* ------------------------------------------------------------------ */
+
+/* Forward declarations for functions defined later in this file */
+static int compression_worthwhile(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t dst_cap,
+                                  int level);
+int obmafs3_compress(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size, int level);
+
+/** Per-group compression job – filled by the caller, executed by a worker. */
+struct compress_job
+{
+    /* Input — set by caller before launching workers */
+    const uint8_t *group_data;     ///< pointer to assembled group data
+    size_t         grp_bytes;      ///< input size in bytes
+    uint64_t       grp_count;      ///< logical blocks in this group
+    int            level;          ///< ZSTD compression level
+    uint64_t       block_size;     ///< filesystem block size
+
+    /* Per-job resources — allocated by caller */
+    uint8_t *comp_buf;             ///< output buffer (must be large enough)
+    size_t   comp_buf_size;        ///< capacity of comp_buf
+
+    /* Results — set by the worker */
+    int      use_compressed;       ///< non-zero if compressed output should be used
+    uint64_t phys_needed;          ///< number of physical blocks for compressed output
+    size_t   compressed_size;      ///< compressed data size (excl. header)
+};
+
+/** Shared batch context for the worker threads. */
+struct compress_batch
+{
+    struct compress_job *jobs;
+    int                  total;
+    atomic_int           next;     ///< next job index to claim
+    atomic_int           done;     ///< completed job count
+};
+
+/**
+ * Worker function – grabs jobs from the batch via atomic fetch-add,
+ * uses its own ZSTD contexts, and compresses until no jobs remain.
+ *
+ * Two separate ZSTD contexts are used: @p probe_cctx for the fast
+ * level-1 compressibility probe and @p cctx for the real compression.
+ * Sharing a single context between the two causes a stale-window
+ * assertion in ZSTD's btopt match finder (ZSTD debug builds).
+ */
+static int compress_worker_run(struct compress_batch *batch,
+                               ZSTD_CCtx *probe_cctx, ZSTD_CCtx *cctx)
+{
+    int idx, processed = 0;
+    while((idx = atomic_fetch_add(&batch->next, 1)) < batch->total)
+    {
+        struct compress_job *job = &batch->jobs[idx];
+        job->use_compressed      = 0;
+        processed++;  /* count every claimed job for batch completion tracking */
+
+        /* Skip groups that weren't set up for compression (e.g. partial tail groups) */
+        if(!job->comp_buf || job->grp_bytes == 0) continue;
+
+        /* Fast probe: skip expensive levels if data is incompressible */
+        int worth = compression_worthwhile(probe_cctx, job->group_data, job->grp_bytes,
+                                           job->comp_buf + sizeof(struct block_header),
+                                           job->comp_buf_size - sizeof(struct block_header), job->level);
+        if(!worth) continue;
+
+        size_t comp_size = job->comp_buf_size - sizeof(struct block_header);
+        int    rc        = obmafs3_compress(cctx, job->group_data, job->grp_bytes,
+                                            job->comp_buf + sizeof(struct block_header), &comp_size, job->level);
+        if(rc != OBMAFS3_OK) continue;
+
+        uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
+        uint64_t phys_needed   = (total_on_disk + job->block_size - 1) / job->block_size;
+        if(phys_needed >= job->grp_count) continue; /* not worth it */
+
+        /* Build the on-disk block header + padding */
+        struct block_header bhdr;
+        memset(&bhdr, 0, sizeof(bhdr));
+        bhdr.magic            = OBMAFS3_BLOCK_MAGIC;
+        bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
+        bhdr.compression_type = kCompressionZstd;
+        bhdr.original_size    = job->grp_bytes;
+        bhdr.compressed_size  = comp_size;
+        obmafs3_checksum_block(job->comp_buf + sizeof(bhdr), comp_size, bhdr.checksum);
+        memcpy(job->comp_buf, &bhdr, sizeof(bhdr));
+
+        size_t used            = sizeof(bhdr) + comp_size;
+        size_t total_phys_bytes = (size_t)(phys_needed * job->block_size);
+        if(used < total_phys_bytes) memset(job->comp_buf + used, 0, total_phys_bytes - used);
+
+        job->use_compressed = 1;
+        job->phys_needed    = phys_needed;
+        job->compressed_size = comp_size;
+    }
+    return processed;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Persistent compression thread pool                                 */
+/* ------------------------------------------------------------------ */
+
+struct compress_pool
+{
+    pthread_t      *threads;        ///< worker thread array
+    int             num_threads;    ///< number of worker threads
+    pthread_mutex_t mutex;          ///< protects batch, shutdown, generation
+    pthread_cond_t  work_avail;     ///< signalled when a new batch is ready
+    pthread_cond_t  batch_done;     ///< signalled when all jobs complete
+    struct compress_batch *batch;   ///< current batch (NULL when idle)
+    int             shutdown;       ///< non-zero → workers should exit
+    unsigned int    generation;     ///< incremented for each batch submission
+};
+
+/** Pool worker thread main loop. */
+static void *pool_worker_main(void *arg)
+{
+    struct compress_pool *pool = arg;
+    unsigned int my_gen = 0;
+
+    /* Persistent ZSTD contexts – created once per worker thread,
+     * reused across all batches, freed on pool shutdown. */
+    ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
+    ZSTD_CCtx *cctx       = ZSTD_createCCtx();
+
+    for(;;)
+    {
+        pthread_mutex_lock(&pool->mutex);
+        while(pool->generation == my_gen && !pool->shutdown)
+            pthread_cond_wait(&pool->work_avail, &pool->mutex);
+
+        if(pool->shutdown)
+        {
+            pthread_mutex_unlock(&pool->mutex);
+            break;
+        }
+
+        my_gen = pool->generation;
+        struct compress_batch *batch = pool->batch;
+        pthread_mutex_unlock(&pool->mutex);
+
+        int n = 0;
+        if(cctx && probe_cctx)
+            n = compress_worker_run(batch, probe_cctx, cctx);
+
+        /* Only participate in completion signalling if we did real work */
+        if(n > 0)
+        {
+            int total_done = atomic_fetch_add(&batch->done, n) + n;
+            if(total_done >= batch->total)
+            {
+                pthread_mutex_lock(&pool->mutex);
+                pthread_cond_signal(&pool->batch_done);
+                pthread_mutex_unlock(&pool->mutex);
+            }
+        }
+    }
+
+    if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
+    if(cctx)       ZSTD_freeCCtx(cctx);
+    return NULL;
+}
+
+/**
+ * Initialise the persistent compression thread pool.
+ * Creates min(nproc, 32) worker threads.
+ */
+int obmafs3_compress_pool_init(struct obmafs3_ctx *ctx)
+{
+    int ncpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int n     = ncpus;
+    if(n > 32) n = 32;
+    if(n < 1)  n = 1;
+
+    struct compress_pool *pool = calloc(1, sizeof(*pool));
+    if(!pool) return OBMAFS3_ERR_NOMEM;
+
+    pool->threads = malloc((size_t)n * sizeof(pthread_t));
+    if(!pool->threads) { free(pool); return OBMAFS3_ERR_NOMEM; }
+
+    pthread_mutex_init(&pool->mutex, NULL);
+    pthread_cond_init(&pool->work_avail, NULL);
+    pthread_cond_init(&pool->batch_done, NULL);
+    pool->num_threads = 0;
+    pool->batch       = NULL;
+    pool->shutdown    = 0;
+
+    for(int i = 0; i < n; i++)
+    {
+        if(pthread_create(&pool->threads[i], NULL, pool_worker_main, pool) == 0)
+            pool->num_threads++;
+        else
+            break;
+    }
+
+    if(pool->num_threads == 0)
+    {
+        /* No threads created — fall back to inline compression */
+        free(pool->threads);
+        pthread_mutex_destroy(&pool->mutex);
+        pthread_cond_destroy(&pool->work_avail);
+        pthread_cond_destroy(&pool->batch_done);
+        free(pool);
+        ctx->compress_pool = NULL;
+        return OBMAFS3_OK; /* not fatal */
+    }
+
+    ctx->compress_pool = pool;
+    return OBMAFS3_OK;
+}
+
+/**
+ * Shut down the compression thread pool and free resources.
+ */
+void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx)
+{
+    struct compress_pool *pool = ctx->compress_pool;
+    if(!pool) return;
+
+    pthread_mutex_lock(&pool->mutex);
+    pool->shutdown = 1;
+    pthread_cond_broadcast(&pool->work_avail);
+    pthread_mutex_unlock(&pool->mutex);
+
+    for(int i = 0; i < pool->num_threads; i++)
+        pthread_join(pool->threads[i], NULL);
+
+    free(pool->threads);
+    pthread_mutex_destroy(&pool->mutex);
+    pthread_cond_destroy(&pool->work_avail);
+    pthread_cond_destroy(&pool->batch_done);
+    free(pool);
+    ctx->compress_pool = NULL;
+}
+
+/**
+ * Submit a batch of compression jobs to the pool and wait for
+ * completion.  Falls back to inline compression if the pool is NULL.
+ */
+static void compress_pool_submit(struct compress_pool *pool, struct compress_batch *batch)
+{
+    if(!pool)
+    {
+        /* No pool — run inline with temporary contexts */
+        ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
+        ZSTD_CCtx *cctx       = ZSTD_createCCtx();
+        if(cctx)
+        {
+            compress_worker_run(batch, probe_cctx, cctx);
+        }
+        if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
+        if(cctx)       ZSTD_freeCCtx(cctx);
+        return;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+    pool->batch = batch;
+    pool->generation++;
+    pthread_cond_broadcast(&pool->work_avail);
+    pthread_mutex_unlock(&pool->mutex);
+
+    /* The submitter thread participates in compression too, so even if
+     * all pool workers are dead the batch still completes.  This also
+     * improves throughput by utilising the caller instead of blocking. */
+    {
+        ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
+        ZSTD_CCtx *cctx       = ZSTD_createCCtx();
+        if(cctx)
+        {
+            int n = compress_worker_run(batch, probe_cctx, cctx);
+            if(n > 0)
+            {
+                int total_done = atomic_fetch_add(&batch->done, n) + n;
+                if(total_done >= batch->total)
+                {
+                    pthread_mutex_lock(&pool->mutex);
+                    pthread_cond_signal(&pool->batch_done);
+                    pthread_mutex_unlock(&pool->mutex);
+                }
+            }
+        }
+        if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
+        if(cctx)       ZSTD_freeCCtx(cctx);
+    }
+
+    /* Wait for all jobs to complete (may already be done) */
+    pthread_mutex_lock(&pool->mutex);
+    while(atomic_load(&batch->done) < batch->total)
+        pthread_cond_wait(&pool->batch_done, &pool->mutex);
+
+    pool->batch = NULL;
+    pthread_mutex_unlock(&pool->mutex);
+}
 
 /**
  * Compress data using ZSTD.
@@ -848,20 +1143,56 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
 
         if(ext.logical_count == ext.phys_count)
         {
-            /* Uncompressed extent — direct per-block read */
-            uint64_t phys_lba  = ext.phys_start + (logical_blk - ext.logical_start);
-            uint8_t *block_buf = obmafs3_get_thread_bufs(ctx)->io_buf;
-            int      rc        = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
-            if(rc != OBMAFS3_OK) return rc;
+            /* Uncompressed extent — read as many blocks as we need in one pass */
+            uint64_t blk_in_ext   = logical_blk - ext.logical_start;
+            uint64_t blks_left    = ext.logical_count - blk_in_ext;
+            uint8_t *block_buf    = obmafs3_get_thread_bufs(ctx)->io_buf;
 
-            size_t avail   = (size_t)block_size - off_in_block;
-            size_t to_copy = (size - bytes_read < avail) ? size - bytes_read : avail;
-            memcpy((uint8_t *)buf + bytes_read, block_buf + off_in_block, to_copy);
-            bytes_read += to_copy;
+            /* How many bytes remain in this extent from the current read position */
+            size_t ext_avail   = (size_t)(blks_left * block_size) - off_in_block;
+            size_t want        = size - bytes_read;
+            size_t to_consume  = (want < ext_avail) ? want : ext_avail;
+
+            /* Read block by block and copy the relevant portion.
+             * For the first block, skip off_in_block bytes.  For internal
+             * blocks, copy whole blocks directly into the output buffer
+             * to avoid an extra memcpy.  For the last block, copy only
+             * the needed tail. */
+            size_t consumed = 0;
+            while(consumed < to_consume)
+            {
+                uint64_t cur_blk   = logical_blk + (off_in_block + consumed) / block_size;
+                /* Re-derive the per-block offset only matters for the very
+                 * first iteration when off_in_block != 0. */
+                size_t   blk_off   = (consumed == 0) ? off_in_block : 0;
+                size_t   blk_avail = (size_t)block_size - blk_off;
+                size_t   chunk     = to_consume - consumed;
+                if(chunk > blk_avail) chunk = blk_avail;
+
+                uint64_t phys_lba = ext.phys_start + (cur_blk - ext.logical_start);
+
+                if(blk_off == 0 && chunk == block_size)
+                {
+                    /* Full-block read directly into output buffer */
+                    int rc = obmafs3_block_read(ctx, phys_lba,
+                                                (uint8_t *)buf + bytes_read + consumed,
+                                                (size_t)block_size);
+                    if(rc != OBMAFS3_OK) return rc;
+                }
+                else
+                {
+                    /* Partial block — bounce through io_buf */
+                    int rc = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
+                    if(rc != OBMAFS3_OK) return rc;
+                    memcpy((uint8_t *)buf + bytes_read + consumed, block_buf + blk_off, chunk);
+                }
+                consumed += chunk;
+            }
+            bytes_read += to_consume;
         }
         else
         {
-            /* Compressed extent — decompress once, serve multiple blocks */
+            /* Compressed extent — decompress once, then serve all needed bytes */
             if(!cached_valid || cached_ext.phys_start != ext.phys_start)
             {
                 /* Read all physical blocks of the extent */
@@ -898,11 +1229,13 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
                 cached_valid = 1;
             }
 
-            /* Extract data from decompressed buffer */
-            uint64_t block_in_ext  = logical_blk - ext.logical_start;
-            size_t   decomp_offset = (size_t)(block_in_ext * block_size + off_in_block);
-            size_t   avail         = (size_t)block_size - off_in_block;
-            size_t   to_copy       = (size - bytes_read < avail) ? size - bytes_read : avail;
+            /* Copy as much data from this extent as needed in a single memcpy */
+            uint64_t blk_in_ext    = logical_blk - ext.logical_start;
+            size_t   decomp_offset = (size_t)(blk_in_ext * block_size + off_in_block);
+            size_t   decomp_total  = (size_t)(ext.logical_count * block_size);
+            size_t   ext_avail     = (decomp_offset < decomp_total) ? decomp_total - decomp_offset : 0;
+            size_t   want          = size - bytes_read;
+            size_t   to_copy       = (want < ext_avail) ? want : ext_avail;
             memcpy((uint8_t *)buf + bytes_read, decomp_buf + decomp_offset, to_copy);
             bytes_read += to_copy;
         }
@@ -1286,6 +1619,7 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
     uint64_t last_block  = (offset + size > 0) ? (offset + size - 1) / block_size : first_block;
     uint64_t first_group = first_block / group_size;
     uint64_t last_group  = last_block / group_size;
+    int      num_groups  = (int)(last_group - first_group + 1);
 
     /* Count used inline slots */
     int inline_used = 0;
@@ -1294,22 +1628,53 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
         if(inode->extents[i].block_count > 0 || inode->extents[i].logical_blocks > 0) inline_used++;
     }
 
-    /* Allocate group assembly buffer */
-    uint8_t *group_data = malloc((size_t)group_bytes);
-    if(!group_data) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    /* -------------------------------------------------------------- */
+    /*  Phase 1 — assemble all groups' input data                      */
+    /* -------------------------------------------------------------- */
 
-    for(uint64_t g = first_group; g <= last_group; g++)
+    /* Per-group metadata needed across phases */
+    uint64_t *grp_counts = calloc((size_t)num_groups, sizeof(uint64_t));
+    uint64_t *grp_starts = calloc((size_t)num_groups, sizeof(uint64_t)); /* logical start block */
+    size_t   *grp_sizes  = calloc((size_t)num_groups, sizeof(size_t));
+    uint8_t **grp_bufs   = calloc((size_t)num_groups, sizeof(uint8_t *));
+
+    if(!grp_counts || !grp_starts || !grp_sizes || !grp_bufs)
     {
+        free(grp_counts);
+        free(grp_starts);
+        free(grp_sizes);
+        free(grp_bufs);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    for(int gi = 0; gi < num_groups; gi++)
+    {
+        uint64_t g         = first_group + (uint64_t)gi;
         uint64_t grp_start = g * group_size;
         uint64_t grp_end   = (g + 1) * group_size;
         if(grp_end > total_logical) grp_end = total_logical;
         uint64_t grp_count = grp_end - grp_start;
-        size_t   grp_bytes = (size_t)(grp_count * block_size);
+        size_t   grp_bytes_i = (size_t)(grp_count * block_size);
+
+        grp_counts[gi] = grp_count;
+        grp_starts[gi] = grp_start;
+        grp_sizes[gi]  = grp_bytes_i;
+
+        grp_bufs[gi] = malloc(grp_bytes_i);
+        if(!grp_bufs[gi])
+        {
+            for(int j = 0; j < gi; j++) free(grp_bufs[j]);
+            free(grp_bufs);
+            free(grp_counts);
+            free(grp_starts);
+            free(grp_sizes);
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        }
 
         /* Zero-fill and overlay the write data */
-        memset(group_data, 0, grp_bytes);
+        memset(grp_bufs[gi], 0, grp_bytes_i);
         uint64_t grp_byte_start = grp_start * block_size;
-        uint64_t grp_byte_end   = grp_byte_start + grp_bytes;
+        uint64_t grp_byte_end   = grp_byte_start + grp_bytes_i;
         uint64_t write_start    = (offset > grp_byte_start) ? offset : grp_byte_start;
         uint64_t write_end      = (offset + size < grp_byte_end) ? offset + size : grp_byte_end;
         if(write_end > write_start)
@@ -1317,86 +1682,106 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
             size_t dest_off = (size_t)(write_start - grp_byte_start);
             size_t src_off  = (size_t)(write_start - offset);
             size_t nbytes   = (size_t)(write_end - write_start);
-            memcpy(group_data + dest_off, (const uint8_t *)buf + src_off, nbytes);
+            memcpy(grp_bufs[gi] + dest_off, (const uint8_t *)buf + src_off, nbytes);
         }
+    }
 
-        /* Compress and write the group */
-        uint64_t phys_start    = 0;
-        uint64_t phys_count    = 0;
-        int      use_compressed = 0;
+    /* -------------------------------------------------------------- */
+    /*  Phase 2 — compress groups in parallel                          */
+    /* -------------------------------------------------------------- */
 
-        if(ctx->compression && grp_count == group_size && grp_bytes > 0)
+    /* Compression output buffer size (one per group) */
+    size_t comp_buf_cap = ZSTD_compressBound((size_t)group_bytes) + sizeof(struct block_header);
+
+    struct compress_job *jobs = NULL;
+
+    /* Only attempt parallel compression when it's enabled and there
+     * is at least one full group. */
+    int any_compressible = 0;
+    if(ctx->compression)
+    {
+        jobs = calloc((size_t)num_groups, sizeof(struct compress_job));
+        if(jobs)
         {
-            uint8_t *comp_out  = obmafs3_get_thread_bufs(ctx)->comp_buf;
-            size_t   comp_cap  = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
-            size_t   comp_size = comp_cap;
-
-            /* Fast probe: skip expensive compression if data is incompressible */
-            int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
-                                               comp_out + sizeof(struct block_header), comp_cap, ctx->zstd_level);
-            rc = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
-                                          comp_out + sizeof(struct block_header), &comp_size, ctx->zstd_level)
-                       : OBMAFS3_ERR_IO;
-            if(rc == OBMAFS3_OK)
+            int all_ok = 1;
+            for(int gi = 0; gi < num_groups; gi++)
             {
-                uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
-                uint64_t phys_needed   = (total_on_disk + block_size - 1) / block_size;
-                if(phys_needed < grp_count)
+                if(grp_counts[gi] != group_size || grp_sizes[gi] == 0) continue;
+
+                jobs[gi].comp_buf = malloc(comp_buf_cap);
+                if(!jobs[gi].comp_buf)
                 {
-                    use_compressed = 1;
-                    rc             = obmafs3_alloc_blocks(ctx, phys_needed, &phys_start);
-                    if(rc != OBMAFS3_OK)
-                    {
-                        free(group_data);
-                        return rc;
-                    }
-
-                    struct block_header bhdr;
-                    memset(&bhdr, 0, sizeof(bhdr));
-                    bhdr.magic            = OBMAFS3_BLOCK_MAGIC;
-                    bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
-                    bhdr.compression_type = kCompressionZstd;
-                    bhdr.original_size    = grp_bytes;
-                    bhdr.compressed_size  = comp_size;
-                    obmafs3_checksum_block(comp_out + sizeof(bhdr), comp_size, bhdr.checksum);
-                    memcpy(comp_out, &bhdr, sizeof(bhdr));
-
-                    size_t used            = sizeof(bhdr) + comp_size;
-                    size_t total_phys_bytes = (size_t)(phys_needed * block_size);
-                    if(used < total_phys_bytes) memset(comp_out + used, 0, total_phys_bytes - used);
-
-                    for(uint64_t b = 0; b < phys_needed; b++)
-                    {
-                        rc = obmafs3_block_write(ctx, phys_start + b, comp_out + b * (size_t)block_size,
-                                                 (size_t)block_size);
-                        if(rc != OBMAFS3_OK)
-                        {
-                            free(group_data);
-                            return rc;
-                        }
-                    }
-                    phys_count = phys_needed;
+                    all_ok = 0;
+                    break;
                 }
+                jobs[gi].group_data    = grp_bufs[gi];
+                jobs[gi].grp_bytes     = grp_sizes[gi];
+                jobs[gi].grp_count     = grp_counts[gi];
+                jobs[gi].level         = ctx->zstd_level;
+                jobs[gi].block_size    = block_size;
+                jobs[gi].comp_buf_size = comp_buf_cap;
+                any_compressible       = 1;
+            }
+
+            if(!all_ok)
+            {
+                for(int gi = 0; gi < num_groups; gi++) free(jobs[gi].comp_buf);
+                free(jobs);
+                jobs             = NULL;
+                any_compressible = 0;
             }
         }
+    }
 
-        if(!use_compressed)
+    if(any_compressible && jobs)
+    {
+        struct compress_batch batch;
+        batch.jobs  = jobs;
+        batch.total = num_groups;
+        atomic_init(&batch.next, 0);
+        atomic_init(&batch.done, 0);
+
+        compress_pool_submit(ctx->compress_pool, &batch);
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  Phase 3 — allocate blocks, write data, record extents          */
+    /* -------------------------------------------------------------- */
+
+    rc = OBMAFS3_OK;
+
+    for(int gi = 0; gi < num_groups; gi++)
+    {
+        uint64_t grp_count = grp_counts[gi];
+        uint64_t phys_start = 0;
+        uint64_t phys_count = 0;
+
+        /* Check if compression succeeded for this group */
+        if(jobs && jobs[gi].use_compressed)
         {
-            rc = obmafs3_alloc_blocks(ctx, grp_count, &phys_start);
-            if(rc != OBMAFS3_OK)
+            uint64_t phys_needed = jobs[gi].phys_needed;
+            rc = obmafs3_alloc_blocks(ctx, phys_needed, &phys_start);
+            if(rc != OBMAFS3_OK) goto cleanup;
+
+            for(uint64_t b = 0; b < phys_needed; b++)
             {
-                free(group_data);
-                return rc;
+                rc = obmafs3_block_write(ctx, phys_start + b, jobs[gi].comp_buf + b * (size_t)block_size,
+                                         (size_t)block_size);
+                if(rc != OBMAFS3_OK) goto cleanup;
             }
+            phys_count = phys_needed;
+        }
+        else
+        {
+            /* Store uncompressed */
+            rc = obmafs3_alloc_blocks(ctx, grp_count, &phys_start);
+            if(rc != OBMAFS3_OK) goto cleanup;
 
             for(uint64_t b = 0; b < grp_count; b++)
             {
-                rc = obmafs3_block_write(ctx, phys_start + b, group_data + b * (size_t)block_size, (size_t)block_size);
-                if(rc != OBMAFS3_OK)
-                {
-                    free(group_data);
-                    return rc;
-                }
+                rc = obmafs3_block_write(ctx, phys_start + b, grp_bufs[gi] + b * (size_t)block_size,
+                                         (size_t)block_size);
+                if(rc != OBMAFS3_OK) goto cleanup;
             }
             phys_count = grp_count;
         }
@@ -1413,21 +1798,27 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
         {
             struct overflow_extent oe;
             oe.inode_id       = inode->inode_id;
-            oe.logical_offset = grp_start;
+            oe.logical_offset = grp_starts[gi];
             oe.start_block    = phys_start;
             oe.block_count    = phys_count;
             oe.logical_count  = grp_count;
             rc                = overflow_insert(ctx, &oe);
-            if(rc != OBMAFS3_OK)
-            {
-                free(group_data);
-                return rc;
-            }
+            if(rc != OBMAFS3_OK) goto cleanup;
         }
     }
 
-    free(group_data);
-    return OBMAFS3_OK;
+cleanup:
+    if(jobs)
+    {
+        for(int gi = 0; gi < num_groups; gi++) free(jobs[gi].comp_buf);
+        free(jobs);
+    }
+    for(int gi = 0; gi < num_groups; gi++) free(grp_bufs[gi]);
+    free(grp_bufs);
+    free(grp_counts);
+    free(grp_starts);
+    free(grp_sizes);
+    return rc;
 }
 
 /**
