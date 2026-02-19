@@ -2402,25 +2402,25 @@ int main(int argc, char *argv[])
     ctx->compression = 1;
     ctx->zstd_level  = 15;
 
-    size_t group_bytes = (size_t)sb.block_size * OBMAFS3_COMPRESS_GROUP_BLOCKS;
-    ctx->hdr_buf  = malloc((size_t)sb.block_size);
-    ctx->node_buf = malloc((size_t)sb.block_size);
-    ctx->io_buf   = malloc(group_bytes);
-    ctx->io_buf2  = malloc(group_bytes);
+    /* Initialise thread-local buffer key (obmafsck is single-threaded,
+     * but the library now uses TLS for its scratch buffers). */
+    if(pthread_key_create(&ctx->tls_key, NULL) != 0)
+    {
+        fprintf(stderr, "Error: pthread_key_create failed\n");
+        close(fd);
+        free(ctx);
+        return 1;
+    }
+    pthread_mutex_init(&ctx->write_lock, NULL);
 
-    size_t comp_need = sizeof(struct block_header) + ZSTD_compressBound(group_bytes);
-    if(comp_need < group_bytes) comp_need = group_bytes;
-    ctx->comp_buf      = malloc(comp_need);
-    ctx->comp_buf_size = comp_need;
-
-    ctx->zstd_cctx = ZSTD_createCCtx();
-    ctx->zstd_dctx = ZSTD_createDCtx();
+    /* Force lazy TLS allocation so the library has buffers to work with */
+    struct obmafs3_thread_bufs *tb = obmafs3_get_thread_bufs(ctx);
 
     ctx->rc_leaf_buf   = malloc((size_t)sb.block_size);
     ctx->rc_leaf_valid = 0;
 
-    if(!ctx->hdr_buf || !ctx->node_buf || !ctx->io_buf || !ctx->io_buf2 || !ctx->comp_buf || !ctx->zstd_cctx ||
-       !ctx->zstd_dctx || !ctx->rc_leaf_buf)
+    if(!tb || !tb->hdr_buf || !tb->node_buf || !tb->io_buf || !tb->io_buf2 ||
+       !tb->comp_buf || !tb->zstd_cctx || !tb->zstd_dctx || !ctx->rc_leaf_buf)
     {
         fprintf(stderr, "Error: out of memory allocating work buffers\n");
         obmafs3_close(ctx);

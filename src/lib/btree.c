@@ -6,6 +6,7 @@
  * metadata).
  */
 #include "btree_internal.h"
+#include "debug.h"
 
 /**
  * Read a B+Tree header block from disk (strict).
@@ -42,14 +43,14 @@ int obmafs3_btree_header_read(struct obmafs3_ctx *ctx, uint64_t lba, struct btre
  */
 int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr, int *checksum_ok)
 {
-    uint8_t *buf = ctx->hdr_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->hdr_buf;
 
     int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
     if(rc != OBMAFS3_OK) return rc;
 
     memcpy(hdr, buf, sizeof(*hdr));
 
-    if(hdr->magic != OBMAFS3_BTREE_HDR_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+    if(hdr->magic != OBMAFS3_BTREE_HDR_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
     /* Verify checksum: save stored checksum, zero field, recompute */
     uint8_t stored[32];
@@ -76,7 +77,7 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, str
  */
 int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr)
 {
-    uint8_t *buf = ctx->hdr_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->hdr_buf;
     memset(buf, 0, (size_t)ctx->sb.block_size);
 
     memcpy(buf, hdr, sizeof(*hdr));

@@ -6,6 +6,7 @@
 
 #include <linux/fs.h> /* RENAME_NOREPLACE, RENAME_EXCHANGE */
 #include "fuse_ops_internal.h"
+#include "debug.h"
 
 /**
  * FUSE callback: create a new file.
@@ -14,7 +15,7 @@
  * Detects media image files by extension and sets the file type
  * accordingly.
  */
-int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+static int obmafs3_fuse_create_impl(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -26,8 +27,8 @@ int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
 
     /* Check if the file already exists */
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if(rc == OBMAFS3_OK) return -EEXIST;
-    if(rc != OBMAFS3_ERR_NOTFOUND) return -EIO;
+    if(rc == OBMAFS3_OK) FUSE_RETURN(-EEXIST, "");
+    if(rc != OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-EIO, "");
 
     /* Allocate a new inode ID */
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
@@ -41,7 +42,7 @@ int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
     strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
 
     rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Create the inode */
     uint64_t             now  = (uint64_t)time(NULL);
@@ -67,10 +68,10 @@ int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
     if(ss > 0) new_inode.file_type = kFileTypeMediaImage;
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     struct fuse_file_ctx *ffctx = calloc(1, sizeof(*ffctx));
-    if(!ffctx) return -ENOMEM;
+    if(!ffctx) FUSE_RETURN(-ENOMEM, "");
     ffctx->inode_id    = new_inode_id;
     ffctx->sector_size = ss;
     ffctx->inode       = new_inode;
@@ -86,7 +87,7 @@ int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
  * files the write is dispatched through the dedup-aware media image
  * write path with background compression.
  */
-int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+static int obmafs3_fuse_write_impl(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct inode_record  inode;
     struct inode_record *ip;
@@ -103,9 +104,9 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
         rc = resolve_path(path, &parent_id, &name);
         if(rc != 0) return rc;
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         ip = &inode;
     }
 
@@ -120,7 +121,7 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
             if(rc != 0) return rc;
             ss = lookup_disk_image_sector_size(name);
         }
-        if(ss == 0) return -EINVAL;
+        if(ss == 0) FUSE_RETURN(-EINVAL, "");
 
         struct sector_map_cache  *cache = (ffctx && ffctx->sector_size) ? &ffctx->sme_cache : NULL;
         struct dedup_block_cache *dbc   = (ffctx && ffctx->sector_size) ? &ffctx->db_cache : NULL;
@@ -129,7 +130,7 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
         if(dbc && !dbc->bg_compress)
         {
             int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-            if(brc != OBMAFS3_OK) return -EIO;
+            if(brc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
 
         rc = obmafs3_write_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss, cache, dbc);
@@ -139,8 +140,8 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
         rc = obmafs3_write_file_data(g_ctx, ip, (uint64_t)offset, buf, size);
     }
 
-    if(rc == OBMAFS3_ERR_NOSPC) return -ENOSPC;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOSPC) FUSE_RETURN(-ENOSPC, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Defer inode persistence to flush/release.  The in-memory cached
      * copy in ffctx keeps our own reads consistent and flush/release
@@ -152,7 +153,7 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
     else
     {
         rc = obmafs3_inode_put(g_ctx, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
     return (int)size;
@@ -164,7 +165,7 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
  * Extends the file with zero-filled data or shrinks it by freeing
  * trailing extent blocks.
  */
-int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info *fi)
+static int obmafs3_fuse_truncate_impl(const char *path, off_t newsize, struct fuse_file_info *fi)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -179,13 +180,13 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info
     if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(ffctx) { ip = &ffctx->inode; }
     else
     {
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         ip = &inode;
     }
 
@@ -194,10 +195,10 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info
         /* Extending: write zeros to fill the gap */
         size_t gap   = (size_t)((uint64_t)newsize - ip->file_size);
         void  *zeros = calloc(1, gap);
-        if(!zeros) return -ENOMEM;
+        if(!zeros) FUSE_RETURN(-ENOMEM, "");
         rc = obmafs3_write_file_data(g_ctx, ip, ip->file_size, zeros, gap);
         free(zeros);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
     else
     {
@@ -210,7 +211,7 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info
         if(new_blocks_needed < old_blocks)
         {
             rc = obmafs3_truncate_file_blocks(g_ctx, ip, new_blocks_needed);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
 
         ip->file_size = (uint64_t)newsize;
@@ -218,7 +219,7 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info
 
     ip->modification_time = (uint64_t)time(NULL);
     rc                    = obmafs3_inode_put(g_ctx, ip);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(ffctx) ffctx->inode_dirty = 0;
 
@@ -231,7 +232,7 @@ int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info
  * Creates a new catalog entry pointing to the same inode as @p oldpath
  * and increments the reference count.
  */
-int obmafs3_fuse_link(const char *oldpath, const char *newpath)
+static int obmafs3_fuse_link_impl(const char *oldpath, const char *newpath)
 {
     uint64_t              old_parent_id, new_parent_id;
     const char           *old_name, *new_name;
@@ -243,11 +244,11 @@ int obmafs3_fuse_link(const char *oldpath, const char *newpath)
     if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, old_parent_id, old_name, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Hardlinks to directories are not allowed */
-    if(cat_entry.directory_flag) return -EPERM;
+    if(cat_entry.directory_flag) FUSE_RETURN(-EPERM, "");
 
     /* Resolve destination */
     rc = resolve_path(newpath, &new_parent_id, &new_name);
@@ -256,8 +257,8 @@ int obmafs3_fuse_link(const char *oldpath, const char *newpath)
     /* Check destination doesn't already exist */
     struct catalog_record tmp;
     rc = obmafs3_catalog_lookup(g_ctx, new_parent_id, new_name, &tmp);
-    if(rc == OBMAFS3_OK) return -EEXIST;
-    if(rc != OBMAFS3_ERR_NOTFOUND) return -EIO;
+    if(rc == OBMAFS3_OK) FUSE_RETURN(-EEXIST, "");
+    if(rc != OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-EIO, "");
 
     /* Create new catalog entry pointing to the same inode */
     struct catalog_record new_cat;
@@ -268,16 +269,16 @@ int obmafs3_fuse_link(const char *oldpath, const char *newpath)
     strncpy(new_cat.name, new_name, sizeof(new_cat.name) - 1);
 
     rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Increment the reference count */
     struct inode_record inode;
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     inode.ref_count++;
     rc = obmafs3_inode_put(g_ctx, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return 0;
 }
@@ -288,7 +289,7 @@ int obmafs3_fuse_link(const char *oldpath, const char *newpath)
  * Allocates a new inode of type @c kFileTypeSymlink, stores the
  * symlink target as file data, and inserts the catalog entry.
  */
-int obmafs3_fuse_symlink(const char *target, const char *linkpath)
+static int obmafs3_fuse_symlink_impl(const char *target, const char *linkpath)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -300,8 +301,8 @@ int obmafs3_fuse_symlink(const char *target, const char *linkpath)
 
     /* Check if the name already exists */
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if(rc == OBMAFS3_OK) return -EEXIST;
-    if(rc != OBMAFS3_ERR_NOTFOUND) return -EIO;
+    if(rc == OBMAFS3_OK) FUSE_RETURN(-EEXIST, "");
+    if(rc != OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-EIO, "");
 
     /* Allocate a new inode ID */
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
@@ -315,7 +316,7 @@ int obmafs3_fuse_symlink(const char *target, const char *linkpath)
     strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
 
     rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Create the inode */
     uint64_t             now  = (uint64_t)time(NULL);
@@ -337,10 +338,10 @@ int obmafs3_fuse_symlink(const char *target, const char *linkpath)
     /* Write the symlink target as file data in the first extent */
     size_t target_len = strlen(target);
     rc                = obmafs3_write_file_data(g_ctx, &new_inode, 0, target, target_len);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return 0;
 }
@@ -362,20 +363,20 @@ int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
     if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
-    if(inode.file_type != kFileTypeSymlink) return -EINVAL;
+    if(inode.file_type != kFileTypeSymlink) FUSE_RETURN(-EINVAL, "");
 
     /* Read the target from file data */
     size_t to_read = inode.file_size;
     if(to_read >= size) to_read = size - 1;
 
     rc = obmafs3_read_file_data(g_ctx, &inode, 0, buf, to_read);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     buf[to_read] = '\0';
     return 0;
@@ -388,7 +389,7 @@ int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
  * deletes the inode (along with its media tags) when the last reference
  * is removed.
  */
-int obmafs3_fuse_unlink(const char *path)
+static int obmafs3_fuse_unlink_impl(const char *path)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -399,25 +400,25 @@ int obmafs3_fuse_unlink(const char *path)
     if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
-    if(cat_entry.directory_flag) return -EISDIR;
+    if(cat_entry.directory_flag) FUSE_RETURN(-EISDIR, "");
 
     /* Remove the catalog entry */
     rc = obmafs3_catalog_delete(g_ctx, parent_id, name);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Decrement the reference count; delete inode only when it reaches 0 */
     struct inode_record inode;
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(inode.ref_count > 1)
     {
         inode.ref_count--;
         rc = obmafs3_inode_put(g_ctx, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
     else
     {
@@ -427,7 +428,7 @@ int obmafs3_fuse_unlink(const char *path)
         if(inode.file_type == kFileTypeMediaImage) obmafs3_media_tag_delete_all(g_ctx, cat_entry.inode_id);
 
         rc = obmafs3_inode_delete(g_ctx, cat_entry.inode_id);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
     return 0;
@@ -447,37 +448,37 @@ static int replace_dest(const struct catalog_record *dst, uint64_t dst_parent, c
         struct catalog_record *children    = NULL;
         uint32_t               child_count = 0;
         rc                                 = obmafs3_catalog_list(g_ctx, dst->inode_id, &children, &child_count);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         obmafs3_catalog_list_free(children);
-        if(child_count > 0) return -ENOTEMPTY;
+        if(child_count > 0) FUSE_RETURN(-ENOTEMPTY, "");
 
         rc = obmafs3_catalog_delete(g_ctx, dst_parent, dst_name);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         rc = obmafs3_inode_delete(g_ctx, dst->inode_id);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
     else
     {
         rc = obmafs3_catalog_delete(g_ctx, dst_parent, dst_name);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         struct inode_record inode;
         rc = obmafs3_inode_get(g_ctx, dst->inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         if(inode.ref_count > 1)
         {
             inode.ref_count--;
             rc = obmafs3_inode_put(g_ctx, &inode);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
         else
         {
             obmafs3_free_file_blocks(g_ctx, &inode);
             if(inode.file_type == kFileTypeMediaImage) obmafs3_media_tag_delete_all(g_ctx, dst->inode_id);
             rc = obmafs3_inode_delete(g_ctx, dst->inode_id);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
     }
     return 0;
@@ -539,7 +540,7 @@ static int is_ancestor(uint64_t ancestor_id, uint64_t dir_id)
         uint64_t parent;
         int      rc = find_parent_of_dir(current, &parent);
         if(rc == OBMAFS3_ERR_NOTFOUND) return 0;
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         current = parent;
     }
     return 0;
@@ -556,7 +557,7 @@ static int is_ancestor(uint64_t ancestor_id, uint64_t dir_id)
  * Cross-directory renames of a directory into its own subtree are
  * rejected with -EINVAL.
  */
-int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int flags)
+static int obmafs3_fuse_rename_impl(const char *oldpath, const char *newpath, unsigned int flags)
 {
     uint64_t              old_parent, new_parent;
     const char           *old_name, *new_name;
@@ -564,15 +565,15 @@ int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int f
     int                   rc;
 
     /* Reject unsupported flags */
-    if(flags & ~((unsigned int)RENAME_NOREPLACE | (unsigned int)RENAME_EXCHANGE)) return -EINVAL;
+    if(flags & ~((unsigned int)RENAME_NOREPLACE | (unsigned int)RENAME_EXCHANGE)) FUSE_RETURN(-EINVAL, "");
 
     /* Resolve source */
     rc = resolve_path(oldpath, &old_parent, &old_name);
     if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, old_parent, old_name, &src);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Resolve destination */
     rc = resolve_path(newpath, &new_parent, &new_name);
@@ -584,21 +585,21 @@ int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int f
     if(rc == OBMAFS3_OK)
         dst_exists = 1;
     else if(rc != OBMAFS3_ERR_NOTFOUND)
-        return -EIO;
+        FUSE_RETURN(-EIO, "");
 
     /* ------ RENAME_EXCHANGE ------ */
     if(flags & RENAME_EXCHANGE)
     {
-        if(!dst_exists) return -ENOENT;
+        if(!dst_exists) FUSE_RETURN(-ENOENT, "");
 
         /* Cannot exchange a directory with a non-directory */
-        if(src.directory_flag != dst.directory_flag) return -ENOTDIR;
+        if(src.directory_flag != dst.directory_flag) FUSE_RETURN(-ENOTDIR, "");
 
         /* Remove both old entries */
         rc = obmafs3_catalog_delete(g_ctx, old_parent, old_name);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         rc = obmafs3_catalog_delete(g_ctx, new_parent, new_name);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         /* Insert swapped entries */
         struct catalog_record new_src;
@@ -616,23 +617,23 @@ int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int f
         strncpy(new_dst.name, new_name, sizeof(new_dst.name) - 1);
 
         rc = obmafs3_catalog_insert(g_ctx, &new_src);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         rc = obmafs3_catalog_insert(g_ctx, &new_dst);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         return 0;
     }
 
     /* ------ RENAME_NOREPLACE ------ */
-    if((flags & RENAME_NOREPLACE) && dst_exists) return -EEXIST;
+    if((flags & RENAME_NOREPLACE) && dst_exists) FUSE_RETURN(-EEXIST, "");
 
     /* ------ Regular rename (flags == 0) ------ */
 
     /* Cannot rename a file over a directory or vice versa */
     if(dst_exists)
     {
-        if(src.directory_flag && !dst.directory_flag) return -ENOTDIR;
-        if(!src.directory_flag && dst.directory_flag) return -EISDIR;
+        if(src.directory_flag && !dst.directory_flag) FUSE_RETURN(-ENOTDIR, "");
+        if(!src.directory_flag && dst.directory_flag) FUSE_RETURN(-EISDIR, "");
     }
 
     /* Prevent moving a directory into its own subtree */
@@ -640,7 +641,7 @@ int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int f
     {
         int anc = is_ancestor(src.inode_id, new_parent);
         if(anc < 0) return anc; /* I/O error */
-        if(anc) return -EINVAL;
+        if(anc) FUSE_RETURN(-EINVAL, "");
     }
 
     /* If destination exists, remove it first */
@@ -652,7 +653,7 @@ int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int f
 
     /* Remove old catalog entry */
     rc = obmafs3_catalog_delete(g_ctx, old_parent, old_name);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     /* Insert new catalog entry with the same inode_id */
     struct catalog_record new_cat;
@@ -663,7 +664,67 @@ int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int f
     strncpy(new_cat.name, new_name, sizeof(new_cat.name) - 1);
 
     rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Thread-safe wrappers — serialise write-side callbacks              */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_create_impl(path, mode, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_write_impl(path, buf, size, offset, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_truncate_impl(path, newsize, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_link(const char *oldpath, const char *newpath)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_link_impl(oldpath, newpath);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_symlink(const char *target, const char *linkpath)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_symlink_impl(target, linkpath);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_unlink(const char *path)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_unlink_impl(path);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int flags)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_rename_impl(oldpath, newpath, flags);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
 }

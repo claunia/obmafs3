@@ -7,6 +7,7 @@
  */
 
 #include "fuse_ops_internal.h"
+#include "debug.h"
 
 struct obmafs3_ctx *g_ctx = NULL;
 
@@ -109,7 +110,7 @@ int resolve_path(const char *path, uint64_t *parent_id, const char **name)
     }
 
     const char *last_slash = strrchr(path, '/');
-    if(!last_slash) return -ENOENT;
+    if(!last_slash) FUSE_RETURN(-ENOENT, "");
 
     *name = last_slash + 1;
 
@@ -126,7 +127,7 @@ int resolve_path(const char *path, uint64_t *parent_id, const char **name)
      */
     size_t path_len    = (size_t)(last_slash - path);
     char  *parent_path = malloc(path_len + 1);
-    if(!parent_path) return -ENOMEM;
+    if(!parent_path) FUSE_RETURN(-ENOMEM, "");
     memcpy(parent_path, path, path_len);
     parent_path[path_len] = '\0';
 
@@ -142,17 +143,17 @@ int resolve_path(const char *path, uint64_t *parent_id, const char **name)
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             free(parent_path);
-            return -ENOENT;
+            FUSE_RETURN(-ENOENT, "");
         }
         if(rc != OBMAFS3_OK)
         {
             free(parent_path);
-            return -EIO;
+            FUSE_RETURN(-EIO, "");
         }
         if(!entry.directory_flag)
         {
             free(parent_path);
-            return -ENOTDIR;
+            FUSE_RETURN(-ENOTDIR, "");
         }
         current_id = entry.inode_id;
         component  = strtok_r(NULL, "/", &saveptr);

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "block.h"
 #include "btree.h"
@@ -16,6 +17,27 @@
  * without pulling <zstd.h> into the public header. */
 struct ZSTD_CCtx_s;
 struct ZSTD_DCtx_s;
+
+/**
+ * Per-thread scratch buffers and ZSTD contexts.
+ *
+ * Each FUSE worker thread gets its own set of scratch buffers so that
+ * concurrent B+Tree traversals, reads, and compressions do not stomp
+ * on each other's data.  Allocated lazily on first use via
+ * obmafs3_get_thread_bufs() and freed automatically when the thread
+ * exits (via pthread_key destructor).
+ */
+struct obmafs3_thread_bufs
+{
+    uint8_t            *hdr_buf;        ///< B+Tree header I/O (block_size bytes)
+    uint8_t            *node_buf;       ///< B+Tree node traversal (block_size bytes)
+    uint8_t            *io_buf;         ///< Data block I/O (group_bytes)
+    uint8_t            *io_buf2;        ///< Decompression work buffer (group_bytes)
+    uint8_t            *comp_buf;       ///< Compression output buffer
+    size_t              comp_buf_size;  ///< Size of comp_buf in bytes
+    struct ZSTD_CCtx_s *zstd_cctx;     ///< ZSTD compression context
+    struct ZSTD_DCtx_s *zstd_dctx;     ///< ZSTD decompression context
+};
 
 /* Error codes */
 #define OBMAFS3_OK           0
@@ -48,14 +70,8 @@ struct obmafs3_ctx
     uint64_t            next_free_lba;      ///< Allocation hint (persisted in bitmap header)
     int                 compression;        ///< Non-zero to compress data blocks on write
     int                 zstd_level;         ///< ZSTD compression level (1-15)
-    uint8_t            *hdr_buf;            ///< Reusable buffer for B+Tree header I/O
-    uint8_t            *node_buf;           ///< Reusable buffer for B+Tree node traversal
-    uint8_t            *io_buf;             ///< Reusable buffer for data block I/O
-    uint8_t            *io_buf2;            ///< Reusable second buffer for decompression / work
-    uint8_t            *comp_buf;           ///< Reusable buffer for compression output
-    size_t              comp_buf_size;      ///< Size of comp_buf in bytes
-    struct ZSTD_CCtx_s *zstd_cctx;          ///< Reusable ZSTD compression context
-    struct ZSTD_DCtx_s *zstd_dctx;          ///< Reusable ZSTD decompression context
+    pthread_key_t       tls_key;            ///< Thread-local scratch buffers (obmafs3_thread_bufs)
+    pthread_mutex_t     write_lock;         ///< Serialises all write-side FUSE callbacks
     uint8_t            *rc_leaf_buf;        ///< Cached refcount B+Tree leaf node
     uint64_t            rc_leaf_lba;        ///< LBA of the cached refcount leaf
     uint64_t            rc_leaf_min;        ///< Smallest key in the cached leaf
@@ -72,6 +88,9 @@ struct obmafs3_ctx
 int  obmafs3_open(const char *path, struct obmafs3_ctx **ctx);
 int  obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx);
 void obmafs3_close(struct obmafs3_ctx *ctx);
+
+/* --- Thread-local scratch buffers --- */
+struct obmafs3_thread_bufs *obmafs3_get_thread_bufs(struct obmafs3_ctx *ctx);
 
 /* --- Superblock operations --- */
 int obmafs3_sb_read(int fd, struct obmafs3_sb *sb);

@@ -7,6 +7,7 @@
  * inline; larger tags use separately allocated data blocks.
  */
 #include "btree_internal.h"
+#include "debug.h"
 
 /* ------------------------------------------------------------------ */
 /*  Media Tag B+Tree helpers                                           */
@@ -126,7 +127,7 @@ static int media_tag_tree_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
     uint64_t lba = ctx->media_tag_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     while(1)
     {
@@ -136,7 +137,7 @@ static int media_tag_tree_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level > 0)
         {
@@ -184,7 +185,7 @@ static int media_tag_write_external(struct obmafs3_ctx *ctx, const void *data, u
     if(!block_buf)
     {
         obmafs3_free_blocks(ctx, start_lba, blocks);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     const uint8_t *src       = (const uint8_t *)data;
@@ -271,7 +272,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = ctx->node_buf;
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
         memset(buf, 0, bsz);
 
         struct btree_node_header hdr;
@@ -294,7 +295,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct media_tag_btree_path path[MEDIA_TAG_BTREE_MAX_DEPTH];
     int                         depth = 0;
@@ -308,11 +309,11 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level == 0) break;
 
-        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = media_tag_index_find(buf, hdr.node_keys, rec->inode_id, rec->tag_type);
         path[depth].lba  = lba;
@@ -365,7 +366,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     /* ---- Leaf is full: split ---- */
     uint16_t                 total = max_leaf + 1;
     struct media_tag_record *all   = calloc(total, rec_sz);
-    if(!all) return OBMAFS3_ERR_NOMEM;
+    if(!all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -476,7 +477,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         /* Parent is full — split the index node */
         uint16_t                      idx_total = max_idx + 1;
         struct media_tag_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie) return OBMAFS3_ERR_NOMEM;
+        if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -596,7 +597,7 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct media_tag_btree_path path[MEDIA_TAG_BTREE_MAX_DEPTH];
     int                         depth = 0;
@@ -610,11 +611,11 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level == 0) break;
 
-        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= MEDIA_TAG_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = media_tag_index_find(buf, hdr.node_keys, inode_id, tag_type);
         path[depth].lba  = lba;
@@ -653,7 +654,7 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
             uint16_t pslot = path[depth - 1].slot;
 
             uint8_t *pbuf = calloc(1, bsz);
-            if(!pbuf) return OBMAFS3_ERR_NOMEM;
+            if(!pbuf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
             rc = obmafs3_block_read(ctx, plba, pbuf, bsz);
             if(rc != OBMAFS3_OK)
@@ -758,7 +759,7 @@ int obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t t
     if(rc != OBMAFS3_OK) return rc;
 
     uint8_t *buf = malloc(rec.data_length);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     if(rec.flags & MEDIA_TAG_FLAG_INLINE) { memcpy(buf, rec.inline_data, rec.data_length); }
     else
@@ -768,7 +769,7 @@ int obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t t
         if(!block_buf)
         {
             free(buf);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
 
         uint32_t remaining = rec.data_length;
@@ -821,7 +822,7 @@ void obmafs3_media_tag_data_free(void *data) { free(data); }
 int obmafs3_media_tag_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t tag_type, const void *data,
                           uint32_t data_length)
 {
-    if(ctx->sb.media_tag_lba == 0) return OBMAFS3_ERR_INVAL;
+    if(ctx->sb.media_tag_lba == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     /* If the record already exists, free old external data first */
     struct media_tag_record old_rec;
@@ -913,7 +914,7 @@ int obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t 
 
     size_t   bsz = (size_t)ctx->sb.block_size;
     uint8_t *buf = calloc(1, bsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Traverse to the leaf that would contain (inode_id, 0) */
     while(1)
@@ -931,7 +932,7 @@ int obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t 
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -948,7 +949,7 @@ int obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t 
     if(!types)
     {
         free(buf);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint32_t n = 0;
@@ -974,7 +975,7 @@ int obmafs3_media_tag_list(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t 
                     {
                         free(types);
                         free(buf);
-                        return OBMAFS3_ERR_NOMEM;
+                        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
                     types = tmp;
                 }

@@ -5,6 +5,7 @@
  */
 
 #include "fuse_ops_internal.h"
+#include "debug.h"
 
 /* ---- ioctl for media tags ---- */
 
@@ -172,13 +173,13 @@ static bool cd_prefix_is_generatable(const uint8_t *sector, int64_t lba, uint8_t
  */
 static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmafs3_ioctl_cd_write_arg *arg)
 {
-    if(!arg) return -EINVAL;
+    if(!arg) FUSE_RETURN(-EINVAL, "");
 
     uint32_t bufsz = arg->buffer_size;
-    if(bufsz != CD_RAW_SECTOR_SIZE && bufsz != CD_RAW_PLUS_SUB) return -EINVAL;
+    if(bufsz != CD_RAW_SECTOR_SIZE && bufsz != CD_RAW_PLUS_SUB) FUSE_RETURN(-EINVAL, "");
 
     uint8_t mode = arg->sector_mode;
-    if(mode > kCdSectorMode2Form2) return -EINVAL;
+    if(mode > kCdSectorMode2Form2) FUSE_RETURN(-EINVAL, "");
 
     const uint8_t *raw        = arg->buffer;
     int64_t        sector_lba = ffctx->cd_next_sector;
@@ -202,9 +203,9 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_subchannel_put(g_ctx, sub_hash, sub);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
-        else if(rc != OBMAFS3_OK) { return -EIO; }
+        else if(rc != OBMAFS3_OK) { FUSE_RETURN(-EIO, ""); }
     }
 
     /* --- Audio mode: entire 2352 bytes stored as data, no prefix/suffix --- */
@@ -224,7 +225,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(!dbc->bg_compress)
         {
             int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-            if(brc != OBMAFS3_OK) return -EIO;
+            if(brc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
 
         /* Write via the media image data path — dedup_upsert_find handles
@@ -234,7 +235,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         uint64_t offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
         int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
                                                 CD_RAW_SECTOR_SIZE, NULL, dbc);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         goto cache_and_done;
     }
@@ -245,7 +246,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
     if(!ffctx->ecc_ctx)
     {
         ffctx->ecc_ctx = ecc_cd_init();
-        if(!ffctx->ecc_ctx) return -ENOMEM;
+        if(!ffctx->ecc_ctx) FUSE_RETURN(-ENOMEM, "");
     }
 
     /* Check if prefix is generatable */
@@ -263,9 +264,9 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_prefix_put(g_ctx, pfx_hash, raw);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
-        else if(rc != OBMAFS3_OK) { return -EIO; }
+        else if(rc != OBMAFS3_OK) { FUSE_RETURN(-EIO, ""); }
     }
 
     /* Check if suffix is generatable (only for modes with ECC/EDC) */
@@ -302,9 +303,9 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_suffix_put(g_ctx, sfx_hash, suffix);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
-        else if(rc != OBMAFS3_OK) { return -EIO; }
+        else if(rc != OBMAFS3_OK) { FUSE_RETURN(-EIO, ""); }
     }
 
     /* Store subheader for Mode 2 variants (bytes 16-23) */
@@ -341,7 +342,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
             data_size = 2328;
             break;
         default:
-            return -EINVAL;
+            FUSE_RETURN(-EINVAL, "");
     }
 
     sme.sector_size = data_size;
@@ -358,7 +359,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(!dbc->bg_compress)
         {
             int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-            if(brc != OBMAFS3_OK) return -EIO;
+            if(brc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         }
 
         /* Write via the media image data path — dedup_upsert_find handles
@@ -368,7 +369,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         uint64_t offset = (uint64_t)sector_lba * data_size;
         int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size,
                                                 NULL, dbc);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
 cache_and_done:
@@ -383,7 +384,7 @@ cache_and_done:
             else
                 new_cap *= 2;
             struct cd_sector_map_entry *tmp = realloc(cache->entries, (size_t)(new_cap * sizeof(*tmp)));
-            if(!tmp) return -ENOMEM;
+            if(!tmp) FUSE_RETURN(-ENOMEM, "");
             cache->entries  = tmp;
             cache->capacity = new_cap;
         }
@@ -408,10 +409,10 @@ cache_and_done:
  */
 static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioctl_cd_read_arg *arg)
 {
-    if(!arg) return -EINVAL;
+    if(!arg) FUSE_RETURN(-EINVAL, "");
 
     int64_t sector_lba = arg->sector;
-    if(sector_lba < 0 || (uint64_t)sector_lba >= ffctx->inode.sector_count) return -EINVAL;
+    if(sector_lba < 0 || (uint64_t)sector_lba >= ffctx->inode.sector_count) FUSE_RETURN(-EINVAL, "");
 
     /* Read the cd_sector_map_entry for this sector from inode data */
     struct inode_record map_inode;
@@ -421,7 +422,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
     struct cd_sector_map_entry sme;
     uint64_t                   sme_offset = (uint64_t)sector_lba * sizeof(struct cd_sector_map_entry);
     int                        rc         = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset, &sme, sizeof(sme));
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     uint8_t *out = arg->buffer;
     memset(out, 0, CD_RAW_SECTOR_SIZE);
@@ -433,7 +434,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         struct btree_header dedup_hdr;
         uint64_t            dedup_hdr_lba;
         rc = obmafs3_dedup_get_tree(g_ctx, CD_RAW_SECTOR_SIZE, &dedup_hdr, &dedup_hdr_lba);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         rc = obmafs3_read_media_image_data(g_ctx, &ffctx->inode, (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE, out,
                                            CD_RAW_SECTOR_SIZE, CD_RAW_SECTOR_SIZE);
@@ -462,7 +463,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
             has_subheader = 1;
             break;
         default:
-            return -EINVAL;
+            FUSE_RETURN(-EINVAL, "");
     }
 
     /* 1. Reconstruct prefix (bytes 0-15) */
@@ -476,7 +477,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         /* Fetch stored prefix from the CD prefix tree */
         uint8_t pfx[CD_PREFIX_DATA_SIZE];
         rc = obmafs3_cd_prefix_get(g_ctx, sme.prefix_hash, pfx);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         memcpy(out, pfx, CD_PREFIX_SIZE);
     }
 
@@ -505,7 +506,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         /* The data was stored with offset = sector_lba * data_size */
         rc = obmafs3_read_media_image_data(g_ctx, &data_inode, (uint64_t)sector_lba * data_size,
                                            out + data_offset_in_sector, data_size, data_size);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
     /* 4. Reconstruct suffix (last 288 bytes, position 2064-2351) */
@@ -516,7 +517,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         if(!ffctx->ecc_ctx)
         {
             ffctx->ecc_ctx = ecc_cd_init();
-            if(!ffctx->ecc_ctx) return -ENOMEM;
+            if(!ffctx->ecc_ctx) FUSE_RETURN(-ENOMEM, "");
         }
         ecc_cd_reconstruct(ffctx->ecc_ctx, out, sme.sector_mode);
     }
@@ -525,7 +526,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         /* Fetch stored suffix from the CD suffix tree */
         uint8_t sfx[CD_SUFFIX_DATA_SIZE];
         rc = obmafs3_cd_suffix_get(g_ctx, sme.suffix_hash, sfx);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         memcpy(out + CD_RAW_SECTOR_SIZE - CD_SUFFIX_SIZE, sfx, CD_SUFFIX_SIZE);
     }
 
@@ -538,7 +539,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
  */
 static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx, struct obmafs3_ioctl_cd_read_full_arg *arg)
 {
-    if(!arg) return -EINVAL;
+    if(!arg) FUSE_RETURN(-EINVAL, "");
 
     /* Reuse the read-long handler for the first 2352 bytes */
     struct obmafs3_ioctl_cd_read_arg rd;
@@ -599,7 +600,7 @@ static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx, struct obmafs3_
  * @param data   Pointer to the ioctl data structure.
  * @return 0 on success, negative errno on failure.
  */
-int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi, unsigned int flags,
+static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi, unsigned int flags,
                        void *data)
 {
     (void)path;
@@ -607,7 +608,7 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
     (void)flags;
 
     struct fuse_file_ctx *ffctx = fi ? (struct fuse_file_ctx *)(uintptr_t)fi->fh : NULL;
-    if(!ffctx) return -EBADF;
+    if(!ffctx) FUSE_RETURN(-EBADF, "");
 
     switch(cmd)
     {
@@ -616,9 +617,9 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
 
         case OBMAFS3_IOC_SET_MEDIA_TAG:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage) return -ENOTTY;
+            if(ffctx->inode.file_type != kFileTypeMediaImage) FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_tag_arg *tag_arg = (struct obmafs3_ioctl_tag_arg *)data;
-            if(!tag_arg || tag_arg->data_length > OBMAFS3_IOC_MAX_TAG_DATA) return -EINVAL;
+            if(!tag_arg || tag_arg->data_length > OBMAFS3_IOC_MAX_TAG_DATA) FUSE_RETURN(-EINVAL, "");
             int rc =
                 obmafs3_media_tag_put(g_ctx, ffctx->inode_id, tag_arg->tag_type, tag_arg->data, tag_arg->data_length);
             return rc == OBMAFS3_OK ? 0 : -EIO;
@@ -626,18 +627,18 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
 
         case OBMAFS3_IOC_GET_MEDIA_TAG:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage) return -ENOTTY;
+            if(ffctx->inode.file_type != kFileTypeMediaImage) FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_tag_arg *tag_arg = (struct obmafs3_ioctl_tag_arg *)data;
-            if(!tag_arg) return -EINVAL;
+            if(!tag_arg) FUSE_RETURN(-EINVAL, "");
             void    *buf;
             uint32_t length;
             int      rc = obmafs3_media_tag_get(g_ctx, ffctx->inode_id, tag_arg->tag_type, &buf, &length);
-            if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
             if(length > OBMAFS3_IOC_MAX_TAG_DATA)
             {
                 obmafs3_media_tag_data_free(buf);
-                return -ERANGE;
+                FUSE_RETURN(-ERANGE, "");
             }
             tag_arg->data_length = length;
             memcpy(tag_arg->data, buf, length);
@@ -650,8 +651,8 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
         case OBMAFS3_IOC_SET_CD_IMAGE:
         {
             /* Only allow conversion of regular empty files */
-            if(ffctx->inode.file_type != kFileTypeRegular) return -ENOTTY;
-            if(ffctx->inode.file_size != 0) return -ENOTEMPTY;
+            if(ffctx->inode.file_type != kFileTypeRegular) FUSE_RETURN(-ENOTTY, "");
+            if(ffctx->inode.file_size != 0) FUSE_RETURN(-ENOTEMPTY, "");
 
             ffctx->inode.file_type       = kFileTypeCompactDiscImage;
             ffctx->inode.sector_count    = 0;
@@ -664,19 +665,19 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
 
         case OBMAFS3_IOC_CD_WRITE_LONG:
         {
-            if(ffctx->inode.file_type != kFileTypeCompactDiscImage) return -ENOTTY;
+            if(ffctx->inode.file_type != kFileTypeCompactDiscImage) FUSE_RETURN(-ENOTTY, "");
             return obmafs3_cd_write_long(ffctx, (const struct obmafs3_ioctl_cd_write_arg *)data);
         }
 
         case OBMAFS3_IOC_CD_READ_LONG:
         {
-            if(ffctx->inode.file_type != kFileTypeCompactDiscImage) return -ENOTTY;
+            if(ffctx->inode.file_type != kFileTypeCompactDiscImage) FUSE_RETURN(-ENOTTY, "");
             return obmafs3_cd_read_long(ffctx, (struct obmafs3_ioctl_cd_read_arg *)data);
         }
 
         case OBMAFS3_IOC_CD_READ_LONG_SUB:
         {
-            if(ffctx->inode.file_type != kFileTypeCompactDiscImage) return -ENOTTY;
+            if(ffctx->inode.file_type != kFileTypeCompactDiscImage) FUSE_RETURN(-ENOTTY, "");
             return obmafs3_cd_read_long_sub(ffctx, (struct obmafs3_ioctl_cd_read_full_arg *)data);
         }
 
@@ -685,7 +686,7 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
         case OBMAFS3_IOC_SET_METADATA:
         {
             if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
-                return -ENOTTY;
+                FUSE_RETURN(-ENOTTY, "");
             const struct obmafs3_ioctl_metadata_set_arg *sa = (const struct obmafs3_ioctl_metadata_set_arg *)data;
             int rc = obmafs3_metadata_put(g_ctx, ffctx->inode.inode_id, sa->key, sa->value);
             return rc == OBMAFS3_OK ? 0 : -EIO;
@@ -694,32 +695,32 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
         case OBMAFS3_IOC_GET_METADATA:
         {
             if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
-                return -ENOTTY;
+                FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_metadata_get_arg *ga = (struct obmafs3_ioctl_metadata_get_arg *)data;
             int rc = obmafs3_metadata_get(g_ctx, ffctx->inode.inode_id, ga->key, ga->value, METADATA_VALUE_MAX);
-            if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
+            if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
             return rc == OBMAFS3_OK ? 0 : -EIO;
         }
 
         case OBMAFS3_IOC_DELETE_METADATA:
         {
             if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
-                return -ENOTTY;
+                FUSE_RETURN(-ENOTTY, "");
             const struct obmafs3_ioctl_metadata_delete_arg *da = (const struct obmafs3_ioctl_metadata_delete_arg *)data;
             int rc = obmafs3_metadata_delete(g_ctx, ffctx->inode.inode_id, da->key);
-            if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
+            if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
             return rc == OBMAFS3_OK ? 0 : -EIO;
         }
 
         case OBMAFS3_IOC_LIST_METADATA:
         {
             if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
-                return -ENOTTY;
+                FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_metadata_list_arg *la = (struct obmafs3_ioctl_metadata_list_arg *)data;
             char                                  **keys;
             uint32_t                                total;
             int rc = obmafs3_metadata_list(g_ctx, ffctx->inode.inode_id, &keys, &total);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
             uint32_t start = la->offset;
             uint32_t n     = 0;
             memset(la->keys, 0, sizeof(la->keys));
@@ -736,7 +737,7 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
             char                                   **paths;
             uint32_t                                 total;
             int rc = obmafs3_metadata_query(g_ctx, qa->key, qa->value, &paths, &total);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
             uint32_t start = qa->offset;
             uint32_t n     = 0;
             memset(qa->paths, 0, sizeof(qa->paths));
@@ -748,6 +749,19 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
         }
 
         default:
-            return -ENOTTY;
+            FUSE_RETURN(-ENOTTY, "");
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Thread-safe wrapper — serialise ioctl callback                     */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi, unsigned int flags,
+                       void *data)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_ioctl_impl(path, cmd, arg, fi, flags, data);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
 }

@@ -6,6 +6,7 @@
  *   level >0 → index nodes storing sorted catalog_index_entry entries.
  */
 #include "btree_internal.h"
+#include "debug.h"
 
 /* ------------------------------------------------------------------ */
 /*  Catalog B+Tree helpers                                             */
@@ -121,7 +122,7 @@ int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
     uint64_t lba = ctx->catalog_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     while(1)
     {
@@ -131,7 +132,7 @@ int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level > 0)
         {
@@ -182,7 +183,7 @@ int obmafs3_catalog_list(struct obmafs3_ctx *ctx, uint64_t parent_id, struct cat
     if(lba == 0) return OBMAFS3_OK;
 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Descend to the leftmost leaf that could contain parent_id.
      * Use an empty name so we land at the first entry for this parent. */
@@ -201,7 +202,7 @@ int obmafs3_catalog_list(struct obmafs3_ctx *ctx, uint64_t parent_id, struct cat
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -241,7 +242,7 @@ int obmafs3_catalog_list(struct obmafs3_ctx *ctx, uint64_t parent_id, struct cat
                 {
                     free(buf);
                     free(result);
-                    return OBMAFS3_ERR_NOMEM;
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                 }
                 result = tmp;
             }
@@ -291,7 +292,7 @@ static int catalog_find_by_inode(struct obmafs3_ctx *ctx, uint64_t target_inode,
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Descend to leftmost leaf */
     while(1)
@@ -308,7 +309,7 @@ static int catalog_find_by_inode(struct obmafs3_ctx *ctx, uint64_t target_inode,
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
         if(hdr.level == 0) break;
 
@@ -367,7 +368,7 @@ static int catalog_find_by_inode(struct obmafs3_ctx *ctx, uint64_t target_inode,
  */
 int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char *path_buf, size_t path_buf_size)
 {
-    if(path_buf_size == 0) return OBMAFS3_ERR_NOMEM;
+    if(path_buf_size == 0) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     if(inode_id == OBMAFS3_ROOT_INODE_ID)
     {
@@ -379,7 +380,7 @@ int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char 
     /* Collect path components bottom-up (max depth 256) */
     const int MAX_DEPTH     = 256;
     char (*components)[256] = malloc((size_t)MAX_DEPTH * 256);
-    if(!components) return OBMAFS3_ERR_NOMEM;
+    if(!components) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     int      depth = 0;
     uint64_t cur   = inode_id;
@@ -406,7 +407,7 @@ int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char 
         if(pos + 1 + nlen + 1 > path_buf_size)
         {
             free(components);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
         path_buf[pos++] = '/';
         memcpy(path_buf + pos, components[i], nlen);
@@ -445,7 +446,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = ctx->node_buf;
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
         memset(buf, 0, bsz);
 
         struct btree_node_header hdr;
@@ -468,7 +469,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct catalog_btree_path path[CATALOG_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -482,11 +483,11 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level == 0) break; /* reached leaf; buf holds it at lba */
 
-        if(depth >= CATALOG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= CATALOG_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = catalog_index_find(buf, hdr.node_keys, entry->parent_id, entry->name);
         path[depth].lba  = lba;
@@ -541,7 +542,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
     /* ---- Leaf is full: split ---- */
     uint16_t               total = max_leaf + 1;
     struct catalog_record *all   = calloc(total, rec_sz);
-    if(!all) return OBMAFS3_ERR_NOMEM;
+    if(!all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -657,7 +658,7 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         /* Parent is full — split the index node */
         uint16_t                    idx_total = max_idx + 1;
         struct catalog_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie) return OBMAFS3_ERR_NOMEM;
+        if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -782,7 +783,7 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct catalog_btree_path path[CATALOG_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -797,11 +798,11 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level == 0) break;
 
-        if(depth >= CATALOG_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= CATALOG_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = catalog_index_find(buf, hdr.node_keys, parent_id, name);
         path[depth].lba  = lba;
@@ -843,7 +844,7 @@ int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const ch
             uint16_t pslot = path[depth - 1].slot;
 
             uint8_t *pbuf = calloc(1, bsz);
-            if(!pbuf) return OBMAFS3_ERR_NOMEM;
+            if(!pbuf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
             rc = obmafs3_block_read(ctx, plba, pbuf, bsz);
             if(rc != OBMAFS3_OK)

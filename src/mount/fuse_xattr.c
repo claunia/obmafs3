@@ -5,6 +5,7 @@
  */
 
 #include "fuse_ops_internal.h"
+#include "debug.h"
 #include "tags.h"
 
 /* ------------------------------------------------------------------ */
@@ -161,12 +162,12 @@ int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_
 
     struct catalog_record cat_entry;
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     struct inode_record inode;
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(!is_image_file_type(inode.file_type)) return -ENODATA;
 
@@ -178,8 +179,8 @@ int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_
         void    *data;
         uint32_t data_length;
         rc = obmafs3_media_tag_get(g_ctx, cat_entry.inode_id, (uint16_t)tag_type, &data, &data_length);
-        if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         if(size == 0)
         {
@@ -189,7 +190,7 @@ int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_
         if(size < data_length)
         {
             obmafs3_media_tag_data_free(data);
-            return -ERANGE;
+            FUSE_RETURN(-ERANGE, "");
         }
         memcpy(value, data, data_length);
         obmafs3_media_tag_data_free(data);
@@ -203,11 +204,11 @@ int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_
     char meta_value[METADATA_VALUE_MAX];
     rc = obmafs3_metadata_get(g_ctx, cat_entry.inode_id, meta_key, meta_value, sizeof(meta_value));
     if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     size_t vlen = strlen(meta_value);
     if(size == 0) return (int)vlen;
-    if(size < vlen) return -ERANGE;
+    if(size < vlen) FUSE_RETURN(-ERANGE, "");
     memcpy(value, meta_value, vlen);
     return (int)vlen;
 }
@@ -219,7 +220,7 @@ int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_
  * files.  Returns @c -ENOTSUP for non-image files or unrecognised
  * attribute namespaces.
  */
-int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
+static int obmafs3_fuse_setxattr_impl(const char *path, const char *name, const char *value, size_t size, int flags)
 {
     (void)flags;
 
@@ -237,12 +238,12 @@ int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value,
 
     struct catalog_record cat_entry;
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     struct inode_record inode;
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(!is_image_file_type(inode.file_type)) return -ENOTSUP;
 
@@ -252,15 +253,15 @@ int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value,
         if(tag_type < 0) return -ENOTSUP;
 
         rc = obmafs3_media_tag_put(g_ctx, cat_entry.inode_id, (uint16_t)tag_type, value, (uint32_t)size);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         return 0;
     }
 
     /* user.metadata.<key> */
     const char *meta_key = name + METADATA_XATTR_PREFIX_LEN;
     if(*meta_key == '\0') return -ENOTSUP;
-    if(strlen(meta_key) >= METADATA_KEY_MAX) return -ENAMETOOLONG;
-    if(size >= METADATA_VALUE_MAX) return -ERANGE;
+    if(strlen(meta_key) >= METADATA_KEY_MAX) FUSE_RETURN(-ENAMETOOLONG, "");
+    if(size >= METADATA_VALUE_MAX) FUSE_RETURN(-ERANGE, "");
 
     /* Ensure NUL-terminated value */
     char meta_value[METADATA_VALUE_MAX];
@@ -268,7 +269,7 @@ int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value,
     meta_value[size] = '\0';
 
     rc = obmafs3_metadata_put(g_ctx, cat_entry.inode_id, meta_key, meta_value);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     return 0;
 }
 
@@ -290,12 +291,12 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
 
     struct catalog_record cat_entry;
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     struct inode_record inode;
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(!is_image_file_type(inode.file_type)) return 0;
 
@@ -303,7 +304,7 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
     uint16_t *tag_types = NULL;
     uint32_t  tag_count = 0;
     rc                  = obmafs3_media_tag_list(g_ctx, cat_entry.inode_id, &tag_types, &tag_count);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     size_t total = 0;
     for(uint32_t i = 0; i < tag_count; i++)
@@ -321,7 +322,7 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
     if(rc != OBMAFS3_OK)
     {
         obmafs3_media_tag_list_free(tag_types);
-        return -EIO;
+        FUSE_RETURN(-EIO, "");
     }
 
     for(uint32_t i = 0; i < meta_count; i++) total += METADATA_XATTR_PREFIX_LEN + strlen(meta_keys[i]) + 1;
@@ -337,7 +338,7 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
     {
         obmafs3_media_tag_list_free(tag_types);
         obmafs3_metadata_list_free(meta_keys, meta_count);
-        return -ERANGE;
+        FUSE_RETURN(-ERANGE, "");
     }
 
     char *p = list;
@@ -367,7 +368,7 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
  * Deletes a media tag or metadata entry.  Returns @c -ENODATA if the
  * attribute does not exist.
  */
-int obmafs3_fuse_removexattr(const char *path, const char *name)
+static int obmafs3_fuse_removexattr_impl(const char *path, const char *name)
 {
     int want_mediatag = is_mediatag_xattr(name);
     int want_metadata = is_metadata_xattr(name);
@@ -383,12 +384,12 @@ int obmafs3_fuse_removexattr(const char *path, const char *name)
 
     struct catalog_record cat_entry;
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, fname, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     struct inode_record inode;
     rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(!is_image_file_type(inode.file_type)) return -ENOTSUP;
 
@@ -399,7 +400,7 @@ int obmafs3_fuse_removexattr(const char *path, const char *name)
 
         rc = obmafs3_media_tag_delete(g_ctx, cat_entry.inode_id, (uint16_t)tag_type);
         if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         return 0;
     }
 
@@ -409,6 +410,26 @@ int obmafs3_fuse_removexattr(const char *path, const char *name)
 
     rc = obmafs3_metadata_delete(g_ctx, cat_entry.inode_id, meta_key);
     if(rc == OBMAFS3_ERR_NOTFOUND) return -ENODATA;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Thread-safe wrappers — serialise write-side callbacks              */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_setxattr_impl(path, name, value, size, flags);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_removexattr(const char *path, const char *name)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_removexattr_impl(path, name);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
 }

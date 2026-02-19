@@ -2,6 +2,7 @@
  * io.c - OBMAFS3 context management, block I/O, creation, and checking
  */
 #include "obmafs.h"
+#include "debug.h"
 
 #include <fcntl.h>
 #include <inttypes.h>
@@ -12,6 +13,72 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+
+/* Global debug flag (default off; set OBMAFS3_DEBUG=1 to enable). */
+int obmafs3_debug = 0;
+
+/* ------------------------------------------------------------------ */
+/*  Thread-local scratch buffers                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Destructor for per-thread scratch buffers.
+ * Called automatically by pthreads when a thread exits.
+ */
+static void thread_bufs_destroy(void *ptr)
+{
+    struct obmafs3_thread_bufs *tb = (struct obmafs3_thread_bufs *)ptr;
+    if(!tb) return;
+    free(tb->hdr_buf);
+    free(tb->node_buf);
+    free(tb->io_buf);
+    free(tb->io_buf2);
+    free(tb->comp_buf);
+    if(tb->zstd_cctx) ZSTD_freeCCtx(tb->zstd_cctx);
+    if(tb->zstd_dctx) ZSTD_freeDCtx(tb->zstd_dctx);
+    free(tb);
+}
+
+/**
+ * Get (or lazily allocate) the calling thread's scratch buffers.
+ *
+ * Each thread gets its own hdr_buf, node_buf, io_buf, io_buf2,
+ * comp_buf, and ZSTD contexts so that concurrent FUSE callbacks do not
+ * stomp on each other.  Buffers are freed automatically when the thread
+ * exits (via the pthread_key destructor).
+ */
+struct obmafs3_thread_bufs *obmafs3_get_thread_bufs(struct obmafs3_ctx *ctx)
+{
+    struct obmafs3_thread_bufs *tb = (struct obmafs3_thread_bufs *)pthread_getspecific(ctx->tls_key);
+    if(tb) return tb;
+
+    tb = calloc(1, sizeof(*tb));
+    if(!tb) return NULL;
+
+    size_t bs          = (size_t)ctx->sb.block_size;
+    size_t group_bytes = bs * OBMAFS3_COMPRESS_GROUP_BLOCKS;
+    size_t comp_need   = sizeof(struct block_header) + ZSTD_compressBound(group_bytes);
+    if(comp_need < group_bytes) comp_need = group_bytes;
+
+    tb->hdr_buf       = malloc(bs);
+    tb->node_buf      = malloc(bs);
+    tb->io_buf        = malloc(group_bytes);
+    tb->io_buf2       = malloc(group_bytes);
+    tb->comp_buf      = malloc(comp_need);
+    tb->comp_buf_size = comp_need;
+    tb->zstd_cctx     = ZSTD_createCCtx();
+    tb->zstd_dctx     = ZSTD_createDCtx();
+
+    if(!tb->hdr_buf || !tb->node_buf || !tb->io_buf || !tb->io_buf2 || !tb->comp_buf || !tb->zstd_cctx ||
+       !tb->zstd_dctx)
+    {
+        thread_bufs_destroy(tb);
+        return NULL;
+    }
+
+    pthread_setspecific(ctx->tls_key, tb);
+    return tb;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -52,7 +119,10 @@ int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t 
 {
     off_t   offset = (off_t)(lba * ctx->sb.block_size);
     ssize_t n      = pread(ctx->fd, buf, size, offset);
-    if(n < 0 || (size_t)n != size) return OBMAFS3_ERR_IO;
+    if(n < 0 || (size_t)n != size)
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
+                         "pread lba=%" PRIu64 " offset=%" PRId64 " size=%zu got=%zd",
+                         lba, (int64_t)offset, size, n);
     return OBMAFS3_OK;
 }
 
@@ -69,7 +139,10 @@ int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba, const void *buf, 
 {
     off_t   offset = (off_t)(lba * ctx->sb.block_size);
     ssize_t n      = pwrite(ctx->fd, buf, size, offset);
-    if(n < 0 || (size_t)n != size) return OBMAFS3_ERR_IO;
+    if(n < 0 || (size_t)n != size)
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
+                         "pwrite lba=%" PRIu64 " offset=%" PRId64 " size=%zu got=%zd",
+                         lba, (int64_t)offset, size, n);
     return OBMAFS3_OK;
 }
 
@@ -104,14 +177,17 @@ int obmafs3_open(const char *path, struct obmafs3_ctx **ctx) { return obmafs3_op
  */
 int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
 {
+    obmafs3_debug_init();
+
     int fd = open(path, O_RDWR);
-    if(fd < 0) return OBMAFS3_ERR_IO;
+    if(fd < 0)
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "open(\"%s\", O_RDWR) failed", path);
 
     struct obmafs3_ctx *c = calloc(1, sizeof(*c));
     if(!c)
     {
         close(fd);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "calloc ctx");
     }
 
     c->fd          = fd;
@@ -134,45 +210,33 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         return rc;
     }
 
-    /* Pre-allocate reusable work buffers — avoids per-call malloc/free
-     * on every B+Tree traversal and data I/O operation. */
-    size_t group_bytes = (size_t)c->sb.block_size * OBMAFS3_COMPRESS_GROUP_BLOCKS;
-    c->hdr_buf  = malloc((size_t)c->sb.block_size);
-    c->node_buf = malloc((size_t)c->sb.block_size);
-    c->io_buf   = malloc(group_bytes); /* full compression group */
-    c->io_buf2  = malloc(group_bytes); /* decompressed work buffer */
+    /* Initialise thread-local storage key for per-thread scratch buffers
+     * and the write serialisation mutex.  Scratch buffers (hdr_buf,
+     * node_buf, io_buf, io_buf2, comp_buf, ZSTD contexts) are allocated
+     * lazily in obmafs3_get_thread_bufs() the first time a thread needs
+     * them, and freed automatically when the thread exits. */
+    if(pthread_key_create(&c->tls_key, thread_bufs_destroy) != 0)
+    {
+        close(fd);
+        free(c);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "pthread_key_create");
+    }
+    pthread_mutex_init(&c->write_lock, NULL);
 
-    /* Pre-allocate a compression output buffer large enough for the
-     * worst-case ZSTD expansion of a full compression group. */
-    size_t comp_need = sizeof(struct block_header) + ZSTD_compressBound(group_bytes);
-    if(comp_need < group_bytes) comp_need = group_bytes;
-    c->comp_buf      = malloc(comp_need);
-    c->comp_buf_size = comp_need;
-
-    /* Pre-allocate reusable ZSTD compression / decompression contexts
-     * so every compress/decompress call avoids internal alloc+free. */
-    c->zstd_cctx = ZSTD_createCCtx();
-    c->zstd_dctx = ZSTD_createDCtx();
-
-    /* Refcount leaf cache buffer (separate from node_buf so lookups
-     * don't clobber the shared traversal buffer). */
+    /* Refcount leaf cache buffer (separate from per-thread node_buf so
+     * lookups don't clobber the traversal buffer; protected by
+     * write_lock since refcount ops are write-side only). */
     c->rc_leaf_buf   = malloc((size_t)c->sb.block_size);
     c->rc_leaf_valid = 0;
 
-    if(!c->hdr_buf || !c->node_buf || !c->io_buf || !c->io_buf2 || !c->comp_buf || !c->zstd_cctx || !c->zstd_dctx ||
-       !c->rc_leaf_buf)
+    if(!c->rc_leaf_buf)
     {
-        free(c->hdr_buf);
-        free(c->node_buf);
-        free(c->io_buf);
-        free(c->io_buf2);
-        free(c->comp_buf);
         free(c->rc_leaf_buf);
-        ZSTD_freeCCtx(c->zstd_cctx);
-        ZSTD_freeDCtx(c->zstd_dctx);
+        pthread_key_delete(c->tls_key);
+        pthread_mutex_destroy(&c->write_lock);
         close(fd);
         free(c);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     if(flags & OBMAFS3_OPEN_LENIENT)
@@ -426,14 +490,22 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
         obmafs3_sb_write(ctx->fd, &ctx->sb);
     }
 
-    free(ctx->hdr_buf);
-    free(ctx->node_buf);
-    free(ctx->io_buf);
-    free(ctx->io_buf2);
-    free(ctx->comp_buf);
+    /* Free the calling thread's TLS buffers (the destructor won't fire
+     * for the thread that calls close, since the key is about to be
+     * deleted).  Other threads' buffers are freed by the pthreads
+     * destructor when those threads exit. */
+    {
+        struct obmafs3_thread_bufs *tb = (struct obmafs3_thread_bufs *)pthread_getspecific(ctx->tls_key);
+        if(tb)
+        {
+            pthread_setspecific(ctx->tls_key, NULL);
+            thread_bufs_destroy(tb);
+        }
+    }
+    pthread_key_delete(ctx->tls_key);
+    pthread_mutex_destroy(&ctx->write_lock);
+
     free(ctx->rc_leaf_buf);
-    ZSTD_freeCCtx(ctx->zstd_cctx);
-    ZSTD_freeDCtx(ctx->zstd_dctx);
     if(ctx->bitmap) free(ctx->bitmap);
     if(ctx->fd >= 0) close(ctx->fd);
     free(ctx);
@@ -459,7 +531,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
 static int write_block(int fd, uint64_t block_size, uint64_t lba, const void *data, size_t data_size)
 {
     uint8_t *block = calloc(1, (size_t)block_size);
-    if(!block) return OBMAFS3_ERR_NOMEM;
+    if(!block) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     if(data_size > (size_t)block_size) data_size = (size_t)block_size;
     memcpy(block, data, data_size);
@@ -468,7 +540,7 @@ static int write_block(int fd, uint64_t block_size, uint64_t lba, const void *da
     ssize_t n      = pwrite(fd, block, (size_t)block_size, offset);
     free(block);
 
-    if(n < 0 || (size_t)n != (size_t)block_size) return OBMAFS3_ERR_IO;
+    if(n < 0 || (size_t)n != (size_t)block_size) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
     return OBMAFS3_OK;
 }
 
@@ -503,12 +575,12 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     {
         fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     }
-    if(fd < 0) return OBMAFS3_ERR_IO;
+    if(fd < 0) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
 
     if(!is_blkdev && ftruncate(fd, (off_t)total_size) < 0)
     {
         close(fd);
-        return OBMAFS3_ERR_IO;
+        DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
     }
 
     int rc;
@@ -586,7 +658,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     if(!cat_buf)
     {
         close(fd);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     struct btree_node_header cat_node_hdr;
@@ -646,7 +718,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     if(!ino_buf)
     {
         close(fd);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     struct btree_node_header ino_node_hdr;
@@ -838,7 +910,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
         if(!bitmap)
         {
             close(fd);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
 
         /* Mark blocks 0 through (14 + bitmap_blks - 1) as allocated */
@@ -859,7 +931,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
         {
             free(bitmap);
             close(fd);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
 
         uint64_t data_offset    = 0;
@@ -903,7 +975,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     if(fsync(fd) < 0)
     {
         close(fd);
-        return OBMAFS3_ERR_IO;
+        DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
     }
 
     close(fd);

@@ -5,6 +5,7 @@
  */
 
 #include "fuse_ops_internal.h"
+#include "debug.h"
 
 /**
  * FUSE callback: set file access and modification times.
@@ -12,7 +13,7 @@
  * Updates the access and modification timestamps stored in the
  * inode to the values specified in @p ts.
  */
-int obmafs3_fuse_utimens(const char *path, const struct timespec ts[2], struct fuse_file_info *fi)
+static int obmafs3_fuse_utimens_impl(const char *path, const struct timespec ts[2], struct fuse_file_info *fi)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -25,7 +26,7 @@ int obmafs3_fuse_utimens(const char *path, const struct timespec ts[2], struct f
     if(strcmp(path, "/") == 0)
     {
         rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
     else
     {
@@ -33,17 +34,17 @@ int obmafs3_fuse_utimens(const char *path, const struct timespec ts[2], struct f
         if(rc != 0) return rc;
 
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
     inode.access_time       = (uint64_t)ts[0].tv_sec;
     inode.modification_time = (uint64_t)ts[1].tv_sec;
 
     rc = obmafs3_inode_put(g_ctx, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return 0;
 }
@@ -54,7 +55,7 @@ int obmafs3_fuse_utimens(const char *path, const struct timespec ts[2], struct f
  * Updates the inode's permission mode to @p mode (masked to the
  * lower 12 bits).
  */
-int obmafs3_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
+static int obmafs3_fuse_chmod_impl(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -67,7 +68,7 @@ int obmafs3_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
     if(strcmp(path, "/") == 0)
     {
         rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
     else
     {
@@ -75,16 +76,16 @@ int obmafs3_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
         if(rc != 0) return rc;
 
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
     inode.mode = mode & 07777;
 
     rc = obmafs3_inode_put(g_ctx, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return 0;
 }
@@ -95,7 +96,7 @@ int obmafs3_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
  * Updates the inode's UID and/or GID.  A value of @c (uid_t)-1 or
  * @c (gid_t)-1 leaves the corresponding field unchanged.
  */
-int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi)
+static int obmafs3_fuse_chown_impl(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -108,7 +109,7 @@ int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_
     if(strcmp(path, "/") == 0)
     {
         rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
     else
     {
@@ -116,17 +117,17 @@ int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_
         if(rc != 0) return rc;
 
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
     if(uid != (uid_t)-1) inode.uid = uid;
     if(gid != (gid_t)-1) inode.gid = gid;
 
     rc = obmafs3_inode_put(g_ctx, &inode);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return 0;
 }
@@ -138,7 +139,7 @@ int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_
  * that a subsequent open() (possibly by another process) sees the
  * up-to-date on-disk state.
  */
-int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
+static int obmafs3_fuse_flush_impl(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
 
@@ -196,7 +197,7 @@ int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
  * map), writes the inode back if dirty, and frees the per-file
  * context.
  */
-int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
+static int obmafs3_fuse_release_impl(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
 
@@ -250,6 +251,50 @@ int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
     fi->fh = 0;
 
     return (rc == OBMAFS3_OK) ? 0 : -EIO;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Thread-safe wrappers — serialise write-side callbacks              */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_fuse_utimens(const char *path, const struct timespec ts[2], struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_utimens_impl(path, ts, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_chmod_impl(path, mode, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_chown_impl(path, uid, gid, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_flush_impl(path, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
+}
+
+int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
+{
+    pthread_mutex_lock(&g_ctx->write_lock);
+    int rc = obmafs3_fuse_release_impl(path, fi);
+    pthread_mutex_unlock(&g_ctx->write_lock);
+    return rc;
 }
 
 /**
@@ -307,7 +352,7 @@ int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxb
     if(strcmp(path, "/") == 0)
     {
         rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         ip     = &inode;
         is_dir = 1;
     }
@@ -320,14 +365,14 @@ int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxb
 
         struct catalog_record cat_entry;
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         if(ffctx) { ip = &ffctx->inode; }
         else
         {
             rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-            if(rc != OBMAFS3_OK) return -EIO;
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
             ip = &inode;
         }
         is_dir = cat_entry.directory_flag || ip->file_type == kFileTypeDirectory;

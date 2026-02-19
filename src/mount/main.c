@@ -3,6 +3,7 @@
  */
 
 #include "fuse_ops.h"
+#include "debug.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +57,8 @@ static void show_help(const char *progname)
  */
 int main(int argc, char *argv[])
 {
+    obmafs3_debug_init(); /* Enable debug output if OBMAFS3_DEBUG is set */
+
     struct fuse_args       args = FUSE_ARGS_INIT(argc, argv);
     struct obmafs3_options opts;
     int                    rc;

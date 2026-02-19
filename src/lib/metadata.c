@@ -15,6 +15,7 @@
  * each = 32768 bytes with default 4096-byte block size).
  */
 #include "btree_internal.h"
+#include "debug.h"
 
 #define METADATA_BTREE_MAX_DEPTH 16
 
@@ -149,7 +150,7 @@ static int meta_tree_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
 
     size_t   nsz = meta_node_size(ctx);
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     while(1)
     {
@@ -165,7 +166,7 @@ static int meta_tree_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level > 0)
@@ -216,7 +217,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = calloc(1, nsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         struct btree_node_header hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -240,7 +241,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
 
     /* Traverse from root to leaf, recording path */
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
     int                    depth = 0;
@@ -260,7 +261,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -268,7 +269,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         if(depth >= METADATA_BTREE_MAX_DEPTH)
         {
             free(buf);
-            return OBMAFS3_ERR_INVAL;
+            DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
         }
 
         uint16_t slot    = meta_index_find(buf, hdr.node_keys, rec->inode_id, rec->key);
@@ -324,7 +325,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
     if(!all)
     {
         free(buf);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
@@ -440,7 +441,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         if(!aie)
         {
             free(buf);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
@@ -573,7 +574,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
     int                    depth = 0;
@@ -593,7 +594,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -601,7 +602,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
         if(depth >= METADATA_BTREE_MAX_DEPTH)
         {
             free(buf);
-            return OBMAFS3_ERR_INVAL;
+            DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
         }
 
         uint16_t slot    = meta_index_find(buf, hdr.node_keys, inode_id, key);
@@ -645,7 +646,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
             if(!pbuf)
             {
                 free(buf);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
 
             rc = meta_node_read(ctx, plba, pbuf);
@@ -825,7 +826,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = calloc(1, nsz);
-        if(!buf) return OBMAFS3_ERR_NOMEM;
+        if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         struct btree_node_header hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -848,7 +849,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
     }
 
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
     int                    depth = 0;
@@ -868,7 +869,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -876,7 +877,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         if(depth >= METADATA_BTREE_MAX_DEPTH)
         {
             free(buf);
-            return OBMAFS3_ERR_INVAL;
+            DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
         }
 
         uint16_t slot    = midx_index_find(buf, hdr.node_keys, rec->key, rec->value, rec->inode_id);
@@ -931,7 +932,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
     if(!all)
     {
         free(buf);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
@@ -1049,7 +1050,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         if(!aie)
         {
             free(buf);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
@@ -1182,7 +1183,7 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     struct meta_btree_path path[METADATA_BTREE_MAX_DEPTH];
     int                    depth = 0;
@@ -1202,7 +1203,7 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -1210,7 +1211,7 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
         if(depth >= METADATA_BTREE_MAX_DEPTH)
         {
             free(buf);
-            return OBMAFS3_ERR_INVAL;
+            DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
         }
 
         uint16_t slot    = midx_index_find(buf, hdr.node_keys, key, value, inode_id);
@@ -1254,7 +1255,7 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
             if(!pbuf)
             {
                 free(buf);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
 
             rc = meta_node_read(ctx, plba, pbuf);
@@ -1370,9 +1371,9 @@ int obmafs3_metadata_get(struct obmafs3_ctx *ctx, uint64_t inode_id, const char 
  */
 int obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id, const char *key, const char *value)
 {
-    if(ctx->sb.metadata_lba == 0 || ctx->sb.metadata_idx_lba == 0) return OBMAFS3_ERR_INVAL;
-    if(!key || strlen(key) == 0 || strlen(key) > 255) return OBMAFS3_ERR_INVAL;
-    if(!value || strlen(value) > 1024) return OBMAFS3_ERR_INVAL;
+    if(ctx->sb.metadata_lba == 0 || ctx->sb.metadata_idx_lba == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
+    if(!key || strlen(key) == 0 || strlen(key) > 255) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
+    if(!value || strlen(value) > 1024) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     /* If key already exists, remove old index entry first */
     struct metadata_record old_rec;
@@ -1495,7 +1496,7 @@ int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id, char ***ke
 
     size_t   nsz = meta_node_size(ctx);
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Traverse to the leaf that would contain (inode_id, "") */
     while(1)
@@ -1512,7 +1513,7 @@ int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id, char ***ke
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -1529,7 +1530,7 @@ int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id, char ***ke
     if(!kl)
     {
         free(buf);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint32_t n = 0;
@@ -1556,7 +1557,7 @@ int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id, char ***ke
                         for(uint32_t j = 0; j < n; j++) free(kl[j]);
                         free(kl);
                         free(buf);
-                        return OBMAFS3_ERR_NOMEM;
+                        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
                     kl = tmp;
                 }
@@ -1566,7 +1567,7 @@ int obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id, char ***ke
                     for(uint32_t j = 0; j < n; j++) free(kl[j]);
                     free(kl);
                     free(buf);
-                    return OBMAFS3_ERR_NOMEM;
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                 }
                 n++;
             }
@@ -1631,7 +1632,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
 
     size_t   nsz = meta_node_size(ctx);
     uint8_t *buf = calloc(1, nsz);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Traverse to the leaf that would contain (key, value, 0) */
     while(1)
@@ -1648,7 +1649,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
             free(buf);
-            return OBMAFS3_ERR_BADMAGIC;
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
         }
 
         if(hdr.level == 0) break;
@@ -1665,7 +1666,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
     if(!result)
     {
         free(buf);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint32_t n = 0;
@@ -1703,7 +1704,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
                     for(uint32_t j = 0; j < n; j++) free(result[j]);
                     free(result);
                     free(buf);
-                    return OBMAFS3_ERR_NOMEM;
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                 }
                 result = tmp;
             }
@@ -1713,7 +1714,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
                 for(uint32_t j = 0; j < n; j++) free(result[j]);
                 free(result);
                 free(buf);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
             n++;
         }

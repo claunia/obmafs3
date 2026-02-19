@@ -10,6 +10,7 @@
  * means the block has a refcount of 1 (or is unallocated).
  */
 #include "btree_internal.h"
+#include "debug.h"
 
 /* ------------------------------------------------------------------ */
 /*  Refcount B+Tree helpers                                            */
@@ -133,7 +134,7 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
         return OBMAFS3_OK;
     }
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     uint64_t cur = root;
 
@@ -145,7 +146,7 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level > 0)
         {
@@ -225,7 +226,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         size_t   bsz = (size_t)ctx->sb.block_size;
         uint64_t cur = ctx->refcount_hdr.root_node_lba;
 
-        uint8_t *buf = ctx->node_buf;
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
         while(1)
         {
@@ -284,7 +285,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = ctx->node_buf;
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
         memset(buf, 0, bsz);
 
         struct btree_node_header hdr;
@@ -307,7 +308,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct refcount_btree_path path[REFCOUNT_BTREE_MAX_DEPTH];
     int                        depth   = 0;
@@ -321,11 +322,11 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
 
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(hdr.level == 0) break; /* reached leaf; buf holds it at cur_lba */
 
-        if(depth >= REFCOUNT_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= REFCOUNT_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = refcount_index_find(buf, hdr.node_keys, lba);
         path[depth].lba  = cur_lba;
@@ -379,7 +380,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     /* ---- Leaf is full: split ---- */
     uint16_t                total = max_leaf + 1;
     struct refcount_record *all   = calloc(total, rec_sz);
-    if(!all) return OBMAFS3_ERR_NOMEM;
+    if(!all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -489,7 +490,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         /* Parent is full — split the index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie) return OBMAFS3_ERR_NOMEM;
+        if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);

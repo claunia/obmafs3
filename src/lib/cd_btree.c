@@ -8,6 +8,7 @@
  * Index nodes use struct btree_index_entry (hash + child_lba).
  */
 #include "btree_internal.h"
+#include "debug.h"
 
 /* ------------------------------------------------------------------ */
 /*  Generic CD hash B+Tree helpers                                     */
@@ -108,7 +109,7 @@ static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx, const struct btree_heade
     uint64_t lba = hdr->root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     while(1)
     {
@@ -118,7 +119,7 @@ static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx, const struct btree_heade
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(nhdr.level > 0)
         {
@@ -173,7 +174,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         rc = obmafs3_alloc_block(ctx, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = ctx->node_buf;
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
         memset(buf, 0, bsz);
 
         struct btree_node_header nhdr;
@@ -196,7 +197,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     }
 
     /* ---- Traverse to leaf, recording path ---- */
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct cd_hash_btree_path path[CD_HASH_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -210,11 +211,11 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(nhdr.level == 0) break;
 
-        if(depth >= CD_HASH_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= CD_HASH_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = cd_hash_index_find(buf, nhdr.node_keys, hash);
         path[depth].lba  = lba;
@@ -265,7 +266,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     /* ---- Leaf full: split ---- */
     uint16_t total = max_leaf + 1;
     uint8_t *all   = calloc(total, rec_sz);
-    if(!all) return OBMAFS3_ERR_NOMEM;
+    if(!all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -382,7 +383,7 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         /* Parent full — split index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie) return OBMAFS3_ERR_NOMEM;
+        if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -503,7 +504,7 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct cd_hash_btree_path path[CD_HASH_BTREE_MAX_DEPTH];
     int                       depth = 0;
@@ -517,11 +518,11 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(nhdr.level == 0) break;
 
-        if(depth >= CD_HASH_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= CD_HASH_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = cd_hash_index_find(buf, nhdr.node_keys, hash);
         path[depth].lba  = lba;
@@ -556,7 +557,7 @@ static int cd_hash_tree_delete(struct obmafs3_ctx *ctx, struct btree_header *hdr
             uint16_t pslot = path[depth - 1].slot;
 
             uint8_t *pbuf = calloc(1, bsz);
-            if(!pbuf) return OBMAFS3_ERR_NOMEM;
+            if(!pbuf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
             rc = obmafs3_block_read(ctx, plba, pbuf, bsz);
             if(rc != OBMAFS3_OK)
@@ -666,7 +667,7 @@ int obmafs3_cd_prefix_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[C
  */
 int obmafs3_cd_prefix_put(struct obmafs3_ctx *ctx, uint64_t hash, const uint8_t data[CD_PREFIX_DATA_SIZE])
 {
-    if(ctx->sb.cd_prefix_lba == 0) return OBMAFS3_ERR_INVAL;
+    if(ctx->sb.cd_prefix_lba == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     struct cd_prefix_record rec;
     rec.hash = hash;
@@ -722,7 +723,7 @@ int obmafs3_cd_suffix_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[C
  */
 int obmafs3_cd_suffix_put(struct obmafs3_ctx *ctx, uint64_t hash, const uint8_t data[CD_SUFFIX_DATA_SIZE])
 {
-    if(ctx->sb.cd_suffix_lba == 0) return OBMAFS3_ERR_INVAL;
+    if(ctx->sb.cd_suffix_lba == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     struct cd_suffix_record rec;
     rec.hash = hash;
@@ -778,7 +779,7 @@ int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t da
  */
 int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash, const uint8_t data[CD_SUBCHANNEL_DATA_SIZE])
 {
-    if(ctx->sb.cd_subchannel_lba == 0) return OBMAFS3_ERR_INVAL;
+    if(ctx->sb.cd_subchannel_lba == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     struct cd_subchannel_record rec;
     rec.hash = hash;

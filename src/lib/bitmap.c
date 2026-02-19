@@ -10,6 +10,7 @@
  * followed by bitmap data. Subsequent blocks contain only bitmap data.
  */
 #include "obmafs.h"
+#include "debug.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +44,7 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
     }
 
     ctx->bitmap = calloc(1, (size_t)bitmap_bytes);
-    if(!ctx->bitmap) return OBMAFS3_ERR_NOMEM;
+    if(!ctx->bitmap) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     ctx->bitmap_size = bitmap_bytes;
 
     uint8_t *block_buf = malloc((size_t)block_size);
@@ -51,7 +52,7 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
     {
         free(ctx->bitmap);
         ctx->bitmap = NULL;
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint64_t bytes_remaining = bitmap_bytes;
@@ -79,7 +80,7 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
                 free(block_buf);
                 free(ctx->bitmap);
                 ctx->bitmap = NULL;
-                return OBMAFS3_ERR_BADMAGIC;
+                DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
             }
 
             ctx->next_free_lba = bhdr.next_free_lba;
@@ -114,7 +115,7 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
                 free(block_buf);
                 free(ctx->bitmap);
                 ctx->bitmap = NULL;
-                return OBMAFS3_ERR_CHECKSUM;
+                DBG_RETURN(OBMAFS3_ERR_CHECKSUM, "checksum mismatch");
             }
         }
     }
@@ -134,12 +135,12 @@ int obmafs3_bitmap_read(struct obmafs3_ctx *ctx)
  */
 int obmafs3_bitmap_write(struct obmafs3_ctx *ctx)
 {
-    if(!ctx->bitmap) return OBMAFS3_ERR_INVAL;
+    if(!ctx->bitmap) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     uint64_t block_size = ctx->sb.block_size;
     size_t   hdr_size   = sizeof(struct bitmap_header);
     uint8_t *block_buf  = calloc(1, (size_t)block_size);
-    if(!block_buf) return OBMAFS3_ERR_NOMEM;
+    if(!block_buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Build header with fresh checksum */
     struct bitmap_header bhdr;
@@ -256,10 +257,10 @@ int obmafs3_bitmap_is_set(struct obmafs3_ctx *ctx, uint64_t lba)
  */
 int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *start_lba)
 {
-    if(!ctx->bitmap) return OBMAFS3_ERR_INVAL;
+    if(!ctx->bitmap) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
-    if(total_blocks == 0) return OBMAFS3_ERR_NOSPC;
+    if(total_blocks == 0) DBG_RETURN(OBMAFS3_ERR_NOSPC, "no space");
 
     /* Clamp the hint so it stays inside the volume */
     uint64_t hint = ctx->next_free_lba;
@@ -353,7 +354,7 @@ int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *
         }
     }
 
-    return OBMAFS3_ERR_NOSPC;
+    DBG_RETURN(OBMAFS3_ERR_NOSPC, "no space");
 }
 
 /* ------------------------------------------------------------------ */

@@ -2,6 +2,7 @@
  * block.c - OBMAFS3 block I/O, compression, and file data reading/writing
  */
 #include "obmafs.h"
+#include "debug.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,7 @@
 int obmafs3_compress(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size, int level)
 {
     size_t result = ZSTD_compressCCtx(cctx, dst, *dst_size, src, src_size, level);
-    if(ZSTD_isError(result)) return OBMAFS3_ERR_IO;
+    if(ZSTD_isError(result)) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
     *dst_size = result;
     return OBMAFS3_OK;
 }
@@ -39,7 +40,7 @@ int obmafs3_compress(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *ds
 int obmafs3_decompress(ZSTD_DCtx *dctx, const void *src, size_t src_size, void *dst, size_t dst_size)
 {
     size_t result = ZSTD_decompressDCtx(dctx, dst, dst_size, src, src_size);
-    if(ZSTD_isError(result)) return OBMAFS3_ERR_IO;
+    if(ZSTD_isError(result)) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
     return OBMAFS3_OK;
 }
 
@@ -151,7 +152,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         rc = obmafs3_alloc_block(ctx, &root_lba);
         if(rc != OBMAFS3_OK) return rc;
 
-        uint8_t *buf = ctx->node_buf;
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
         memset(buf, 0, bsz);
 
         struct btree_node_header nhdr;
@@ -174,7 +175,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     }
 
     /* ---- Traverse from root to leaf, recording path ---- */
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     struct overflow_btree_path path[OVERFLOW_BTREE_MAX_DEPTH];
     int                        depth = 0;
@@ -188,11 +189,11 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(nhdr.level == 0) break; /* reached leaf */
 
-        if(depth >= OVERFLOW_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+        if(depth >= OVERFLOW_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
         uint16_t slot    = overflow_index_find(buf, nhdr.node_keys, entry->inode_id);
         path[depth].lba  = lba;
@@ -235,7 +236,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     /* ---- Leaf is full: split ---- */
     uint16_t                total = max_leaf + 1;
     struct overflow_extent *all   = calloc(total, rec_sz);
-    if(!all) return OBMAFS3_ERR_NOMEM;
+    if(!all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint8_t *leaf_data = buf + sizeof(struct btree_node_header);
 
@@ -346,7 +347,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         /* Parent is full — split the index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie) return OBMAFS3_ERR_NOMEM;
+        if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
@@ -483,7 +484,7 @@ static int overflow_find_extent(struct obmafs3_ctx *ctx, uint64_t inode_id, uint
     struct btree_header *hdr = &ctx->overflow_hdr;
     if(hdr->root_node_lba == 0) return 0;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
     uint64_t lba = hdr->root_node_lba;
 
     /* Traverse index levels to reach the leaf */
@@ -551,7 +552,7 @@ static uint64_t overflow_count_logical(struct obmafs3_ctx *ctx, uint64_t inode_i
     struct btree_header *hdr = &ctx->overflow_hdr;
     if(hdr->root_node_lba == 0) return 0;
 
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
     uint64_t lba = hdr->root_node_lba;
 
     while(1)
@@ -672,7 +673,7 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
     else
     {
         /* Compressed extent: read all physical blocks into io_buf */
-        uint8_t *phys_buf = ctx->io_buf;
+        uint8_t *phys_buf = obmafs3_get_thread_bufs(ctx)->io_buf;
         for(uint64_t b = 0; b < ext->phys_count; b++)
         {
             int rc =
@@ -683,21 +684,21 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
         /* Parse block_header at the start */
         struct block_header bhdr;
         memcpy(&bhdr, phys_buf, sizeof(bhdr));
-        if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         /* Verify checksum */
         size_t  check_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? (size_t)bhdr.compressed_size
                                                                           : (size_t)bhdr.original_size;
         uint8_t computed[32];
         obmafs3_checksum_block(phys_buf + sizeof(bhdr), check_size, computed);
-        if(memcmp(computed, bhdr.checksum, 32) != 0) return OBMAFS3_ERR_CHECKSUM;
+        if(memcmp(computed, bhdr.checksum, 32) != 0) DBG_RETURN(OBMAFS3_ERR_CHECKSUM, "checksum mismatch");
 
         if(offset_in_ext == 0 && logical_count == ext->logical_count)
         {
             /* Full extent read → decompress directly into out_buf */
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                int rc = obmafs3_decompress(ctx->zstd_dctx, phys_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
+                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
                                             out_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) return rc;
             }
@@ -709,10 +710,10 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
         else
         {
             /* Partial read → decompress into io_buf2, copy the portion */
-            uint8_t *decomp = ctx->io_buf2;
+            uint8_t *decomp = obmafs3_get_thread_bufs(ctx)->io_buf2;
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                int rc = obmafs3_decompress(ctx->zstd_dctx, phys_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
+                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
                                             decomp, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) return rc;
             }
@@ -769,7 +770,7 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
     struct extent_descriptor cached_ext;
     memset(&cached_ext, 0, sizeof(cached_ext));
     int      cached_valid = 0;
-    uint8_t *decomp_buf   = ctx->io_buf2;
+    uint8_t *decomp_buf   = obmafs3_get_thread_bufs(ctx)->io_buf2;
 
     while(bytes_read < size)
     {
@@ -778,13 +779,13 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
         size_t   off_in_block = (size_t)(read_pos % block_size);
 
         struct extent_descriptor ext;
-        if(!find_extent(ctx, inode, logical_blk, &ext)) return OBMAFS3_ERR_IO;
+        if(!find_extent(ctx, inode, logical_blk, &ext)) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
 
         if(ext.logical_count == ext.phys_count)
         {
             /* Uncompressed extent — direct per-block read */
             uint64_t phys_lba  = ext.phys_start + (logical_blk - ext.logical_start);
-            uint8_t *block_buf = ctx->io_buf;
+            uint8_t *block_buf = obmafs3_get_thread_bufs(ctx)->io_buf;
             int      rc        = obmafs3_block_read(ctx, phys_lba, block_buf, (size_t)block_size);
             if(rc != OBMAFS3_OK) return rc;
 
@@ -799,7 +800,7 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
             if(!cached_valid || cached_ext.phys_start != ext.phys_start)
             {
                 /* Read all physical blocks of the extent */
-                uint8_t *phys_buf = ctx->io_buf;
+                uint8_t *phys_buf = obmafs3_get_thread_bufs(ctx)->io_buf;
                 for(uint64_t b = 0; b < ext.phys_count; b++)
                 {
                     int rc = obmafs3_block_read(ctx, ext.phys_start + b, phys_buf + b * (size_t)block_size,
@@ -809,17 +810,17 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
 
                 struct block_header bhdr;
                 memcpy(&bhdr, phys_buf, sizeof(bhdr));
-                if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+                if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
                 size_t  check_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? (size_t)bhdr.compressed_size
                                                                                   : (size_t)bhdr.original_size;
                 uint8_t computed[32];
                 obmafs3_checksum_block(phys_buf + sizeof(bhdr), check_size, computed);
-                if(memcmp(computed, bhdr.checksum, 32) != 0) return OBMAFS3_ERR_CHECKSUM;
+                if(memcmp(computed, bhdr.checksum, 32) != 0) DBG_RETURN(OBMAFS3_ERR_CHECKSUM, "checksum mismatch");
 
                 if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
                 {
-                    int rc = obmafs3_decompress(ctx->zstd_dctx, phys_buf + sizeof(bhdr),
+                    int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
                                                 (size_t)bhdr.compressed_size, decomp_buf,
                                                 (size_t)bhdr.original_size);
                     if(rc != OBMAFS3_OK) return rc;
@@ -863,7 +864,7 @@ static int overflow_collect_extents(struct obmafs3_ctx *ctx, uint64_t inode_id, 
     if(hdr->root_node_lba == 0) return OBMAFS3_OK;
 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     struct extent_descriptor *exts = NULL;
     uint64_t                  count = 0, cap = 0;
@@ -917,7 +918,7 @@ static int overflow_collect_extents(struct obmafs3_ctx *ctx, uint64_t inode_id, 
                 {
                     free(exts);
                     free(buf);
-                    return OBMAFS3_ERR_NOMEM;
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                 }
                 exts = tmp;
             }
@@ -955,7 +956,7 @@ static int overflow_clear_inode(struct obmafs3_ctx *ctx, uint64_t inode_id)
     if(hdr->root_node_lba == 0) return OBMAFS3_OK;
 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Navigate to the first leaf that may contain this inode */
     uint64_t lba = hdr->root_node_lba;
@@ -1063,7 +1064,7 @@ static int collect_all_extents(struct obmafs3_ctx *ctx, const struct inode_recor
     if(!list)
     {
         free(ovf_exts);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     /* Add inline extents */
@@ -1132,7 +1133,7 @@ static int write_extent_list(struct obmafs3_ctx *ctx, struct inode_record *inode
 
     /* Coalesce adjacent uncompressed extents */
     struct extent_descriptor *merged = calloc((size_t)count, sizeof(*merged));
-    if(!merged) return OBMAFS3_ERR_NOMEM;
+    if(!merged) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint64_t mc = 0;
     merged[0]   = list[0];
@@ -1241,7 +1242,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         if(!tmp)
         {
             free(ext_list);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
         ext_list = tmp;
     }
@@ -1253,7 +1254,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
     if(!group_data)
     {
         free(ext_list);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     for(uint64_t g = first_group; g <= last_group; g++)
@@ -1375,7 +1376,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     {
                         free(group_data);
                         free(ext_list);
-                        return OBMAFS3_ERR_NOMEM;
+                        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
                     ext_list = tmp2;
                     e        = &ext_list[ei]; /* pointer may have moved */
@@ -1405,11 +1406,11 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         /* Only attempt compression for full groups */
         if(ctx->compression && grp_count == group_size && grp_bytes > 0)
         {
-            uint8_t *comp_out     = ctx->comp_buf;
-            size_t   comp_cap     = ctx->comp_buf_size - sizeof(struct block_header);
+            uint8_t *comp_out     = obmafs3_get_thread_bufs(ctx)->comp_buf;
+            size_t   comp_cap     = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
             size_t   comp_size    = comp_cap;
 
-            rc = obmafs3_compress(ctx->zstd_cctx, group_data, grp_bytes, comp_out + sizeof(struct block_header),
+            rc = obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes, comp_out + sizeof(struct block_header),
                                   &comp_size, ctx->zstd_level);
             if(rc == OBMAFS3_OK)
             {
@@ -1494,7 +1495,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
             {
                 free(group_data);
                 free(ext_list);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
             ext_list = tmp2;
         }
@@ -1633,7 +1634,7 @@ int obmafs3_truncate_file_blocks(struct obmafs3_ctx *ctx, struct inode_record *i
             if(!temp)
             {
                 free(list);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
 
             rc = read_extent_blocks(ctx, &list[i], logical_pos, keep_logical, temp);
@@ -1717,9 +1718,9 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
 
     /* Validate alignment to block_size (no per-block header any more) */
     if(src_offset % block_size || dst_offset % block_size || length % block_size || length == 0)
-        return OBMAFS3_ERR_INVAL;
+        DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
-    if(src_inode->inode_id == dst_inode->inode_id) return OBMAFS3_ERR_INVAL;
+    if(src_inode->inode_id == dst_inode->inode_id) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
     uint64_t num_logical   = length / block_size;
     uint64_t src_log_start = src_offset / block_size;
@@ -1749,7 +1750,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
     {
         free(src_exts);
         free(dst_exts);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     uint64_t src_range_end = src_log_start + num_logical;
@@ -1777,7 +1778,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
                 free(clone_exts);
                 free(src_exts);
                 free(dst_exts);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
             clone_exts = tmp;
         }
@@ -1835,7 +1836,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
                 free(clone_exts);
                 free(src_exts);
                 free(dst_exts);
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
 
             rc = read_extent_blocks(ctx, se, overlap_start, overlap_count, temp);
@@ -1915,7 +1916,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
     {
         free(clone_exts);
         free(dst_exts);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
     uint64_t new_count = 0;
 

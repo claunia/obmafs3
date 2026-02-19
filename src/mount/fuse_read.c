@@ -5,6 +5,7 @@
  */
 
 #include "fuse_ops_internal.h"
+#include "debug.h"
 
 /**
  * FUSE callback: get file/directory attributes.
@@ -25,7 +26,7 @@ int obmafs3_fuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
     if(strcmp(path, "/") == 0)
     {
         rc = obmafs3_inode_get(g_ctx, OBMAFS3_ROOT_INODE_ID, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         stbuf->st_ino     = inode.inode_id;
         stbuf->st_mode    = S_IFDIR | inode.mode;
@@ -49,13 +50,13 @@ int obmafs3_fuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
     struct catalog_record cat_entry;
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
     if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     if(ffctx) { ip = &ffctx->inode; }
     else
     {
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         ip = &inode;
     }
 
@@ -108,9 +109,9 @@ int obmafs3_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
         if(rc != 0) return rc;
 
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc != OBMAFS3_OK) return -ENOENT;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-ENOENT, "");
 
-        if(!cat_entry.directory_flag) return -ENOTDIR;
+        if(!cat_entry.directory_flag) FUSE_RETURN(-ENOTDIR, "");
 
         dir_inode_id = cat_entry.inode_id;
     }
@@ -119,7 +120,7 @@ int obmafs3_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
     filler(buf, "..", NULL, 0, 0);
 
     rc = obmafs3_catalog_list(g_ctx, dir_inode_id, &entries, &count);
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     for(i = 0; i < count; i++)
     {
@@ -150,13 +151,13 @@ int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
     if(rc != 0) return rc;
 
     rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-    if(rc == OBMAFS3_ERR_NOTFOUND) return -ENOENT;
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENOENT, "");
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
-    if(cat_entry.directory_flag) return -EISDIR;
+    if(cat_entry.directory_flag) FUSE_RETURN(-EISDIR, "");
 
     struct fuse_file_ctx *fctx = calloc(1, sizeof(*fctx));
-    if(!fctx) return -ENOMEM;
+    if(!fctx) FUSE_RETURN(-ENOMEM, "");
 
     fctx->inode_id = cat_entry.inode_id;
 
@@ -164,7 +165,7 @@ int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
     if(rc != OBMAFS3_OK)
     {
         free(fctx);
-        return -EIO;
+        FUSE_RETURN(-EIO, "");
     }
 
     if(fctx->inode.file_type == kFileTypeMediaImage) fctx->sector_size = lookup_disk_image_sector_size(name);
@@ -196,9 +197,9 @@ int obmafs3_fuse_read(const char *path, char *buf, size_t size, off_t offset, st
         rc = resolve_path(path, &parent_id, &name);
         if(rc != 0) return rc;
         rc = obmafs3_catalog_lookup(g_ctx, parent_id, name, &cat_entry);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-        if(rc != OBMAFS3_OK) return -EIO;
+        if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
         ip = &inode;
     }
 
@@ -217,7 +218,7 @@ int obmafs3_fuse_read(const char *path, char *buf, size_t size, off_t offset, st
             if(rc != 0) return rc;
             ss = lookup_disk_image_sector_size(name);
         }
-        if(ss == 0) return -EINVAL;
+        if(ss == 0) FUSE_RETURN(-EINVAL, "");
         rc = obmafs3_read_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss);
     }
     else
@@ -225,7 +226,7 @@ int obmafs3_fuse_read(const char *path, char *buf, size_t size, off_t offset, st
         rc = obmafs3_read_file_data(g_ctx, ip, (uint64_t)offset, buf, size);
     }
 
-    if(rc != OBMAFS3_OK) return -EIO;
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return (int)size;
 }

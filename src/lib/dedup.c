@@ -6,11 +6,13 @@
  * splits incoming data into sectors for deduplication.
  */
 #include "obmafs.h"
+#include "debug.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <zstd.h>
 
 /* ------------------------------------------------------------------ */
@@ -38,17 +40,34 @@ struct bg_compress_ctx
     uint64_t offset;    /**< Byte offset (end of payload) */
     uint64_t capacity;  /**< Full dedup block size */
 
+    /* Deferred block free — the worker records trailing blocks that
+     * can be freed, but the actual bitmap modification is performed
+     * by the main thread after bg_compress_wait() to avoid a data
+     * race on the shared allocation bitmap. */
+    uint64_t free_lba;   /**< First LBA to free (0 = nothing to free) */
+    uint64_t free_count; /**< Number of contiguous blocks to free */
+
     /* Read-only references (safe for concurrent access) */
     struct obmafs3_ctx *ctx;
+
+    /* Worker-private ZSTD compression context.  ZSTD_CCtx is NOT
+     * thread-safe, so the worker uses its own private cctx. */
+    ZSTD_CCtx *cctx;
 };
 
 /**
  * Compress and write a full dedup data block to disk.
  * Called by the background worker thread (or synchronously as a helper).
  * The caller retains ownership of @data — it is NOT freed here.
+ *
+ * When @out_free_lba and @out_free_count are non-NULL, the function
+ * records the trailing unused standard blocks that can be freed.
+ * The caller is responsible for actually freeing them (on the main
+ * thread) to avoid a data race on the shared allocation bitmap.
  */
-static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, uint8_t *data, uint64_t block_lba, uint64_t offset,
-                                    uint64_t capacity)
+static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, ZSTD_CCtx *cctx, uint8_t *data, uint64_t block_lba,
+                                    uint64_t offset, uint64_t capacity, uint64_t *out_free_lba,
+                                    uint64_t *out_free_count)
 {
     struct block_header bhdr;
     memset(&bhdr, 0, sizeof(bhdr));
@@ -67,7 +86,7 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, uint8_t *data, uint
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc       = obmafs3_compress(ctx->zstd_cctx, data + sizeof(bhdr), (size_t)bhdr.original_size,
+            int    crc       = obmafs3_compress(cctx, data + sizeof(bhdr), (size_t)bhdr.original_size,
                                                 comp_buf, &comp_size, ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
@@ -108,9 +127,20 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, uint8_t *data, uint
     int         rc        = obmafs3_block_write(ctx, block_lba, write_src, (size_t)(needed_std * bs));
     free(disk_buf);
 
-    /* Free trailing unused standard blocks */
-    if(rc == OBMAFS3_OK && needed_std < total_std)
-        obmafs3_free_blocks(ctx, block_lba + needed_std, total_std - needed_std);
+    /* Report trailing unused blocks to the caller for deferred freeing */
+    if(out_free_lba && out_free_count)
+    {
+        if(rc == OBMAFS3_OK && needed_std < total_std)
+        {
+            *out_free_lba   = block_lba + needed_std;
+            *out_free_count = total_std - needed_std;
+        }
+        else
+        {
+            *out_free_lba   = 0;
+            *out_free_count = 0;
+        }
+    }
 
     return rc;
 }
@@ -138,10 +168,15 @@ static void *bg_compress_worker(void *arg)
         /* Release the lock while doing heavy compression + I/O */
         pthread_mutex_unlock(&bc->mutex);
 
-        int result = bg_do_compress_and_write(ctx, data, block_lba, offset, capacity);
+        uint64_t defer_free_lba   = 0;
+        uint64_t defer_free_count = 0;
+        int result = bg_do_compress_and_write(ctx, bc->cctx, data, block_lba, offset, capacity,
+                                              &defer_free_lba, &defer_free_count);
         free(data); /* we own this buffer */
 
         pthread_mutex_lock(&bc->mutex);
+        bc->free_lba   = defer_free_lba;
+        bc->free_count = defer_free_count;
         bc->result = result;
         bc->data   = NULL;
         bc->busy   = 0;
@@ -151,15 +186,30 @@ static void *bg_compress_worker(void *arg)
     return NULL;
 }
 
-/** Wait for any pending background compression to finish. */
+/**
+ * Wait for any pending background compression to finish.
+ * After the worker completes, any trailing blocks that the worker
+ * determined can be freed are released here on the calling (main)
+ * thread, avoiding a data race on the shared allocation bitmap.
+ */
 static int bg_compress_wait(struct bg_compress_ctx *bc)
 {
     if(!bc) return OBMAFS3_OK;
 
     pthread_mutex_lock(&bc->mutex);
     while(bc->busy) pthread_cond_wait(&bc->cond_done, &bc->mutex);
-    int result = bc->result;
+    int      result     = bc->result;
+    uint64_t free_lba   = bc->free_lba;
+    uint64_t free_count = bc->free_count;
+    bc->free_lba   = 0;
+    bc->free_count = 0;
     pthread_mutex_unlock(&bc->mutex);
+
+    /* Free trailing unused blocks on the main thread (bitmap is not
+     * thread-safe, so this must not happen in the worker). */
+    if(free_count > 0)
+        obmafs3_free_blocks(bc->ctx, free_lba, free_count);
+
     return result;
 }
 
@@ -172,12 +222,14 @@ static void bg_compress_submit(struct bg_compress_ctx *bc, uint8_t *data, uint64
                                uint64_t capacity)
 {
     pthread_mutex_lock(&bc->mutex);
-    bc->data      = data;
-    bc->block_lba = block_lba;
-    bc->offset    = offset;
-    bc->capacity  = capacity;
-    bc->result    = OBMAFS3_OK;
-    bc->busy      = 1;
+    bc->data       = data;
+    bc->block_lba  = block_lba;
+    bc->offset     = offset;
+    bc->capacity   = capacity;
+    bc->result     = OBMAFS3_OK;
+    bc->free_lba   = 0;
+    bc->free_count = 0;
+    bc->busy       = 1;
     pthread_cond_signal(&bc->cond_work);
     pthread_mutex_unlock(&bc->mutex);
 }
@@ -269,7 +321,7 @@ static int cache_grow(struct dedup_node_cache *nc)
 {
     uint32_t                 new_cap = nc->capacity * 2;
     struct dedup_cache_slot *ns      = calloc(new_cap, sizeof(struct dedup_cache_slot));
-    if(!ns) return OBMAFS3_ERR_NOMEM;
+    if(!ns) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint32_t new_mask = new_cap - 1;
     for(uint32_t i = 0; i < nc->capacity; i++)
@@ -373,14 +425,14 @@ static int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
         {
             nc->slots[slot].lba = lba;
             nc->slots[slot].buf = malloc(nc->block_size);
-            if(!nc->slots[slot].buf) return OBMAFS3_ERR_NOMEM;
+            if(!nc->slots[slot].buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             memcpy(nc->slots[slot].buf, buf, nc->block_size);
             nc->slots[slot].dirty = 1;
             nc->count++;
             return OBMAFS3_OK;
         }
     }
-    return OBMAFS3_ERR_NOMEM; /* table full (shouldn't happen) */
+    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); /* table full (shouldn't happen) */
 }
 
 /** Flush all dirty entries to disk, clear dirty flags. */
@@ -437,7 +489,7 @@ static int dedup_tree_list_read(struct obmafs3_ctx *ctx, struct tree_list_header
                                 uint64_t *count)
 {
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     int rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, buf, (size_t)ctx->sb.block_size);
     if(rc != OBMAFS3_OK)
@@ -450,7 +502,7 @@ static int dedup_tree_list_read(struct obmafs3_ctx *ctx, struct tree_list_header
     if(hdr->magic != OBMAFS3_TREELIST_MAGIC)
     {
         free(buf);
-        return OBMAFS3_ERR_BADMAGIC;
+        DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
     }
 
     *count = hdr->tree_count;
@@ -465,7 +517,7 @@ static int dedup_tree_list_read(struct obmafs3_ctx *ctx, struct tree_list_header
     if(!*entries)
     {
         free(buf);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     memcpy(*entries, buf + sizeof(struct tree_list_header), (size_t)(hdr->tree_count * sizeof(struct tree_list_entry)));
@@ -480,7 +532,7 @@ static int dedup_tree_list_read(struct obmafs3_ctx *ctx, struct tree_list_header
 static int dedup_tree_list_write(struct obmafs3_ctx *ctx, struct tree_list_entry *entries, uint64_t count)
 {
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
-    if(!buf) return OBMAFS3_ERR_NOMEM;
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     struct tree_list_header hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -552,7 +604,7 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
     if(!node_buf)
     {
         free(entries);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
     struct btree_node_header root_hdr;
@@ -596,7 +648,7 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
     if(!new_entries)
     {
         free(entries);
-        return OBMAFS3_ERR_NOMEM;
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
     entries                    = new_entries;
     entries[count].sector_size = sector_size;
@@ -626,7 +678,7 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
 int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t hash,
                          struct dedup_entry *entry)
 {
-    uint8_t *buf = ctx->node_buf;
+    uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     uint64_t lba = hdr->root_node_lba;
 
@@ -638,7 +690,7 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         if(nhdr.level > 0)
         {
@@ -759,12 +811,15 @@ static int dedup_upsert_find(struct obmafs3_ctx *ctx, const struct btree_header 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return OBMAFS3_ERR_BADMAGIC;
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC,
+                       "lba=%" PRIu64 " got=0x%" PRIx64 " expected=0x%" PRIx64,
+                       lba, nhdr.magic, (uint64_t)OBMAFS3_BTREE_NODE_MAGIC);
 
         if(nhdr.level > 0)
         {
             /* Index node */
-            if(uctx->depth >= DEDUP_BTREE_MAX_DEPTH) return OBMAFS3_ERR_INVAL;
+            if(uctx->depth >= DEDUP_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
             const uint8_t *data = buf + sizeof(struct btree_node_header);
             uint16_t       slot = 0;
@@ -863,7 +918,7 @@ static int dedup_upsert_insert(struct obmafs3_ctx *ctx, struct btree_header *hdr
     /* ---- Leaf is full: split ---- */
     uint16_t            total = max_leaf + 1;
     struct dedup_entry *all   = calloc(total, rec_sz);
-    if(!all) return OBMAFS3_ERR_NOMEM;
+    if(!all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint8_t *ld = buf + sizeof(struct btree_node_header);
 
@@ -982,7 +1037,7 @@ static int dedup_upsert_insert(struct obmafs3_ctx *ctx, struct btree_header *hdr
         /* Parent is full — split the index node */
         uint16_t                  idx_total = max_idx + 1;
         struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
-        if(!aie) return OBMAFS3_ERR_NOMEM;
+        if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
 
@@ -1119,7 +1174,7 @@ static int dedup_block_init(struct obmafs3_ctx *ctx, const struct btree_header *
     db->dirty      = 0;
 
     db->data = calloc(1, (size_t)db->capacity);
-    if(!db->data) return OBMAFS3_ERR_NOMEM;
+    if(!db->data) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     if(hdr->last_block_lba != 0)
     {
@@ -1147,9 +1202,9 @@ static int dedup_block_init(struct obmafs3_ctx *ctx, const struct btree_header *
             {
                 free(db->data);
                 db->data = NULL;
-                return OBMAFS3_ERR_NOMEM;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
-            rc = obmafs3_decompress(ctx->zstd_dctx, db->data + sizeof(bhdr), (size_t)bhdr.compressed_size, temp,
+            rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, db->data + sizeof(bhdr), (size_t)bhdr.compressed_size, temp,
                                     (size_t)bhdr.original_size);
             if(rc != OBMAFS3_OK)
             {
@@ -1205,7 +1260,7 @@ static int dedup_block_flush(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc = obmafs3_compress(ctx->zstd_cctx, db->data + sizeof(bhdr), (size_t)bhdr.original_size,
+            int    crc = obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, db->data + sizeof(bhdr), (size_t)bhdr.original_size,
                                           comp_buf, &comp_size, ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
@@ -1314,7 +1369,7 @@ static int dedup_block_store(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db
             bg_compress_submit(bg, db->data, db->block_lba, db->offset, db->capacity);
             /* Allocate a fresh buffer and new LBA */
             db->data = calloc(1, (size_t)db->capacity);
-            if(!db->data) return OBMAFS3_ERR_NOMEM;
+            if(!db->data) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             db->dirty = 0;
             uint64_t start_lba;
             rc = obmafs3_alloc_blocks(ctx, db->std_blocks, &start_lba);
@@ -1507,13 +1562,12 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         if(!sme_buf)
         {
             if(!db_is_cached) dedup_block_free(db);
-            return OBMAFS3_ERR_NOMEM;
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
     }
 
-    /* Reuse the pre-allocated node buffer for dedup tree traversal,
-     * avoiding per-sector malloc/free overhead. */
-    uint8_t *tree_buf = ctx->node_buf;
+    /* Use the thread-local node buffer for dedup tree traversal. */
+    uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
     /* Create the dedup B+Tree node cache if the caller provides a
      * persistent dedup block cache (i.e. across FUSE write calls). */
@@ -1859,9 +1913,15 @@ int obmafs3_bg_compress_start(struct obmafs3_ctx *ctx, struct dedup_block_cache 
     if(!db_cache || db_cache->bg_compress) return OBMAFS3_OK; /* already started or nothing to do */
 
     struct bg_compress_ctx *bc = calloc(1, sizeof(*bc));
-    if(!bc) return OBMAFS3_ERR_NOMEM;
+    if(!bc) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
-    bc->ctx = ctx;
+    bc->ctx  = ctx;
+    bc->cctx = ZSTD_createCCtx();
+    if(!bc->cctx)
+    {
+        free(bc);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
     pthread_mutex_init(&bc->mutex, NULL);
     pthread_cond_init(&bc->cond_work, NULL);
     pthread_cond_init(&bc->cond_done, NULL);
@@ -1872,8 +1932,9 @@ int obmafs3_bg_compress_start(struct obmafs3_ctx *ctx, struct dedup_block_cache 
         pthread_cond_destroy(&bc->cond_done);
         pthread_cond_destroy(&bc->cond_work);
         pthread_mutex_destroy(&bc->mutex);
+        ZSTD_freeCCtx(bc->cctx);
         free(bc);
-        return OBMAFS3_ERR_IO;
+        DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
     }
 
     db_cache->bg_compress = bc;
@@ -1905,6 +1966,7 @@ void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache)
     pthread_cond_destroy(&bc->cond_done);
     pthread_cond_destroy(&bc->cond_work);
     pthread_mutex_destroy(&bc->mutex);
+    ZSTD_freeCCtx(bc->cctx);
     free(bc);
     db_cache->bg_compress = NULL;
 }
@@ -1983,7 +2045,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
     /* Buffer for reading the dedup data block (dedup_block_size bytes) */
     uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
-    if(!dedup_buf) return OBMAFS3_ERR_NOMEM;
+    if(!dedup_buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     /* Decompressed payload buffer (allocated on first compressed block) */
     uint8_t *decomp_buf = NULL;
@@ -2081,10 +2143,10 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     if(!decomp_buf)
                     {
                         free(dedup_buf);
-                        return OBMAFS3_ERR_NOMEM;
+                        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
                 }
-                rc = obmafs3_decompress(ctx->zstd_dctx, dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
+                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
                                         decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
