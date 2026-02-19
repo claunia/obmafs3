@@ -44,6 +44,33 @@ int obmafs3_decompress(ZSTD_DCtx *dctx, const void *src, size_t src_size, void *
     return OBMAFS3_OK;
 }
 
+/**
+ * Fast compressibility probe.
+ *
+ * When a high ZSTD level (> 3) is configured, attempting compression on
+ * incompressible data wastes significant CPU time.  This function does
+ * a quick ZSTD level-1 probe on the data; if level 1 cannot achieve at
+ * least 10 % size reduction, the data is almost certainly incompressible
+ * at any level so the caller should skip the expensive attempt.
+ *
+ * @param cctx      Reusable ZSTD compression context.
+ * @param src       Data to test.
+ * @param src_size  Size of data in bytes.
+ * @param dst       Scratch buffer (at least ZSTD_compressBound(src_size)).
+ * @param dst_cap   Cap of @p dst.
+ * @param level     Configured ZSTD level.
+ * @return Non-zero if compression is worth attempting at the full level.
+ */
+static int compression_worthwhile(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t dst_cap,
+                                  int level)
+{
+    if(level <= 3) return 1; /* levels 1-3 are already fast enough */
+    size_t result = ZSTD_compressCCtx(cctx, dst, dst_cap, src, src_size, 1);
+    if(ZSTD_isError(result)) return 0;
+    /* If level-1 can't reduce size by at least 10%, skip the expensive attempt */
+    return result < (src_size * 9 / 10);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Overflow extent B+Tree helpers                                     */
 /* ------------------------------------------------------------------ */
@@ -1229,6 +1256,181 @@ static int write_extent_list(struct obmafs3_ctx *ctx, struct inode_record *inode
 /* ------------------------------------------------------------------ */
 
 /**
+ * Fast path for appending data past the end of a file.
+ *
+ * When the write begins at or after the current file_size AND the
+ * first affected compression group does not overlap any existing
+ * group, we can skip collecting all existing extents and the
+ * expensive clear+rebuild of the overflow B+Tree.  Instead, each new
+ * compression group is written directly and its extent is inserted
+ * into an inline slot or directly into the overflow tree.
+ *
+ * This turns sequential file writes from O(n²) to O(n).
+ */
+static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *inode, uint64_t offset,
+                                  const void *buf, size_t size)
+{
+    uint64_t block_size  = ctx->sb.block_size;
+    uint64_t group_size  = OBMAFS3_COMPRESS_GROUP_BLOCKS;
+    uint64_t group_bytes = block_size * group_size;
+    int      rc;
+
+    /* Update file size */
+    uint64_t new_end = offset + size;
+    if(new_end > inode->file_size) inode->file_size = new_end;
+
+    uint64_t total_logical = (inode->file_size + block_size - 1) / block_size;
+
+    /* Determine affected groups */
+    uint64_t first_block = offset / block_size;
+    uint64_t last_block  = (offset + size > 0) ? (offset + size - 1) / block_size : first_block;
+    uint64_t first_group = first_block / group_size;
+    uint64_t last_group  = last_block / group_size;
+
+    /* Count used inline slots */
+    int inline_used = 0;
+    for(int i = 0; i < 8; i++)
+    {
+        if(inode->extents[i].block_count > 0 || inode->extents[i].logical_blocks > 0) inline_used++;
+    }
+
+    /* Allocate group assembly buffer */
+    uint8_t *group_data = malloc((size_t)group_bytes);
+    if(!group_data) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    for(uint64_t g = first_group; g <= last_group; g++)
+    {
+        uint64_t grp_start = g * group_size;
+        uint64_t grp_end   = (g + 1) * group_size;
+        if(grp_end > total_logical) grp_end = total_logical;
+        uint64_t grp_count = grp_end - grp_start;
+        size_t   grp_bytes = (size_t)(grp_count * block_size);
+
+        /* Zero-fill and overlay the write data */
+        memset(group_data, 0, grp_bytes);
+        uint64_t grp_byte_start = grp_start * block_size;
+        uint64_t grp_byte_end   = grp_byte_start + grp_bytes;
+        uint64_t write_start    = (offset > grp_byte_start) ? offset : grp_byte_start;
+        uint64_t write_end      = (offset + size < grp_byte_end) ? offset + size : grp_byte_end;
+        if(write_end > write_start)
+        {
+            size_t dest_off = (size_t)(write_start - grp_byte_start);
+            size_t src_off  = (size_t)(write_start - offset);
+            size_t nbytes   = (size_t)(write_end - write_start);
+            memcpy(group_data + dest_off, (const uint8_t *)buf + src_off, nbytes);
+        }
+
+        /* Compress and write the group */
+        uint64_t phys_start    = 0;
+        uint64_t phys_count    = 0;
+        int      use_compressed = 0;
+
+        if(ctx->compression && grp_count == group_size && grp_bytes > 0)
+        {
+            uint8_t *comp_out  = obmafs3_get_thread_bufs(ctx)->comp_buf;
+            size_t   comp_cap  = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
+            size_t   comp_size = comp_cap;
+
+            /* Fast probe: skip expensive compression if data is incompressible */
+            int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
+                                               comp_out + sizeof(struct block_header), comp_cap, ctx->zstd_level);
+            rc = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
+                                          comp_out + sizeof(struct block_header), &comp_size, ctx->zstd_level)
+                       : OBMAFS3_ERR_IO;
+            if(rc == OBMAFS3_OK)
+            {
+                uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
+                uint64_t phys_needed   = (total_on_disk + block_size - 1) / block_size;
+                if(phys_needed < grp_count)
+                {
+                    use_compressed = 1;
+                    rc             = obmafs3_alloc_blocks(ctx, phys_needed, &phys_start);
+                    if(rc != OBMAFS3_OK)
+                    {
+                        free(group_data);
+                        return rc;
+                    }
+
+                    struct block_header bhdr;
+                    memset(&bhdr, 0, sizeof(bhdr));
+                    bhdr.magic            = OBMAFS3_BLOCK_MAGIC;
+                    bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
+                    bhdr.compression_type = kCompressionZstd;
+                    bhdr.original_size    = grp_bytes;
+                    bhdr.compressed_size  = comp_size;
+                    obmafs3_checksum_block(comp_out + sizeof(bhdr), comp_size, bhdr.checksum);
+                    memcpy(comp_out, &bhdr, sizeof(bhdr));
+
+                    size_t used            = sizeof(bhdr) + comp_size;
+                    size_t total_phys_bytes = (size_t)(phys_needed * block_size);
+                    if(used < total_phys_bytes) memset(comp_out + used, 0, total_phys_bytes - used);
+
+                    for(uint64_t b = 0; b < phys_needed; b++)
+                    {
+                        rc = obmafs3_block_write(ctx, phys_start + b, comp_out + b * (size_t)block_size,
+                                                 (size_t)block_size);
+                        if(rc != OBMAFS3_OK)
+                        {
+                            free(group_data);
+                            return rc;
+                        }
+                    }
+                    phys_count = phys_needed;
+                }
+            }
+        }
+
+        if(!use_compressed)
+        {
+            rc = obmafs3_alloc_blocks(ctx, grp_count, &phys_start);
+            if(rc != OBMAFS3_OK)
+            {
+                free(group_data);
+                return rc;
+            }
+
+            for(uint64_t b = 0; b < grp_count; b++)
+            {
+                rc = obmafs3_block_write(ctx, phys_start + b, group_data + b * (size_t)block_size, (size_t)block_size);
+                if(rc != OBMAFS3_OK)
+                {
+                    free(group_data);
+                    return rc;
+                }
+            }
+            phys_count = grp_count;
+        }
+
+        /* Add extent directly: inline slot if room, else overflow */
+        if(inline_used < 8)
+        {
+            inode->extents[inline_used].start_block    = phys_start;
+            inode->extents[inline_used].block_count    = phys_count;
+            inode->extents[inline_used].logical_blocks = grp_count;
+            inline_used++;
+        }
+        else
+        {
+            struct overflow_extent oe;
+            oe.inode_id       = inode->inode_id;
+            oe.logical_offset = grp_start;
+            oe.start_block    = phys_start;
+            oe.block_count    = phys_count;
+            oe.logical_count  = grp_count;
+            rc                = overflow_insert(ctx, &oe);
+            if(rc != OBMAFS3_OK)
+            {
+                free(group_data);
+                return rc;
+            }
+        }
+    }
+
+    free(group_data);
+    return OBMAFS3_OK;
+}
+
+/**
  * Write file data to the filesystem.
  *
  * Data is organized into compression groups of
@@ -1252,6 +1454,22 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
     uint64_t group_size  = OBMAFS3_COMPRESS_GROUP_BLOCKS;
     uint64_t group_bytes = block_size * group_size;
     int      rc;
+
+    /* ---- Fast path: pure append (no overlap with existing data) ---- */
+    {
+        uint64_t old_file_size    = inode->file_size;
+        uint64_t old_total_blocks = (old_file_size + block_size - 1) / block_size;
+        uint64_t old_groups       = (old_total_blocks + group_size - 1) / group_size;
+        uint64_t first_block_     = offset / block_size;
+        uint64_t first_group_     = first_block_ / group_size;
+
+        /* Use the fast path when the write starts at or past the file end
+         * AND the first affected group does not overlap any existing group. */
+        if(offset >= old_file_size && (old_total_blocks == 0 || first_group_ >= old_groups))
+        {
+            return write_file_data_append(ctx, inode, offset, buf, size);
+        }
+    }
 
     /* Update file size */
     uint64_t new_end = offset + size;
@@ -1448,8 +1666,12 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
             size_t   comp_cap     = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
             size_t   comp_size    = comp_cap;
 
-            rc = obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes, comp_out + sizeof(struct block_header),
-                                  &comp_size, ctx->zstd_level);
+            /* Fast probe: skip expensive compression if data is incompressible */
+            int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
+                                               comp_out + sizeof(struct block_header), comp_cap, ctx->zstd_level);
+            rc = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes, comp_out + sizeof(struct block_header),
+                                          &comp_size, ctx->zstd_level)
+                       : OBMAFS3_ERR_IO;
             if(rc == OBMAFS3_OK)
             {
                 uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
