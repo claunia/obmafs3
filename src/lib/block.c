@@ -126,6 +126,43 @@ static uint16_t overflow_index_find(const uint8_t *buf, uint16_t node_keys, uint
     return result;
 }
 
+/**
+ * Binary search in an overflow index node for the LEFTMOST child
+ * whose subtree may contain entries for @p inode_id.
+ *
+ * Because a leaf split can place entries for the same inode_id in
+ * both the old (left) and new (right) sibling while pushing the
+ * inode_id up as a separator key, we must start scanning from the
+ * child that PRECEDES the first exact-match slot.  This is achieved
+ * by using strict less-than: we return the rightmost slot whose key
+ * is < inode_id (not <=).  The right-link scan will then visit any
+ * subsequent leaves that also hold entries for the inode.
+ */
+static uint16_t overflow_index_find_left(const uint8_t *buf, uint16_t node_keys, uint64_t inode_id)
+{
+    const uint8_t *data = buf + sizeof(struct btree_node_header);
+    int            lo = 0, hi = (int)node_keys - 1;
+    uint16_t       result = 0;
+
+    while(lo <= hi)
+    {
+        int      mid = lo + (hi - lo) / 2;
+        uint64_t mid_key;
+        memcpy(&mid_key, data + (size_t)mid * sizeof(struct btree_index_entry), sizeof(mid_key));
+        if(mid_key < inode_id)
+        {
+            result = (uint16_t)mid;
+            lo     = mid + 1;
+        }
+        else
+        {
+            hi = mid - 1;
+        }
+    }
+
+    return result;
+}
+
 #define OVERFLOW_BTREE_MAX_DEPTH 8
 
 struct overflow_btree_path
@@ -498,7 +535,7 @@ static int overflow_find_extent(struct obmafs3_ctx *ctx, uint64_t inode_id, uint
         if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return 0;
         if(nhdr.level == 0) break;
 
-        uint16_t                 slot = overflow_index_find(buf, nhdr.node_keys, inode_id);
+        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
         struct btree_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
@@ -565,7 +602,7 @@ static uint64_t overflow_count_logical(struct obmafs3_ctx *ctx, uint64_t inode_i
         if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return 0;
         if(nhdr.level == 0) break;
 
-        uint16_t                 slot = overflow_index_find(buf, nhdr.node_keys, inode_id);
+        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
         struct btree_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
@@ -779,7 +816,8 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
         size_t   off_in_block = (size_t)(read_pos % block_size);
 
         struct extent_descriptor ext;
-        if(!find_extent(ctx, inode, logical_blk, &ext)) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
+        if(!find_extent(ctx, inode, logical_blk, &ext))
+            DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
 
         if(ext.logical_count == ext.phys_count)
         {
@@ -882,7 +920,7 @@ static int overflow_collect_extents(struct obmafs3_ctx *ctx, uint64_t inode_id, 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
         if(nhdr.level == 0) break;
-        uint16_t                 slot = overflow_index_find(buf, nhdr.node_keys, inode_id);
+        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
         struct btree_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
@@ -971,7 +1009,7 @@ static int overflow_clear_inode(struct obmafs3_ctx *ctx, uint64_t inode_id)
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
         if(nhdr.level == 0) break;
-        uint16_t                 slot = overflow_index_find(buf, nhdr.node_keys, inode_id);
+        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
         struct btree_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
