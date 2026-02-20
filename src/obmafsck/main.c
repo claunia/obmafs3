@@ -1133,8 +1133,15 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, ui
                         }
                     }
 
-                    /* Mark only the actually-used standard blocks */
-                    for(uint64_t s = 0; s < used_std; s++) PUSH_LBA(de.block_lba + s);
+                    /* The last (partial) block of each dedup tree keeps all
+                     * std_per_dedup blocks allocated — dedup_block_flush
+                     * intentionally does not free trailing blocks so the
+                     * block can be resumed on next mount.  Account for
+                     * that here so the expected bitmap matches. */
+                    uint64_t mark_std = (de.block_lba == thdr.last_block_lba)
+                                            ? std_per_dedup
+                                            : used_std;
+                    for(uint64_t s = 0; s < mark_std; s++) PUSH_LBA(de.block_lba + s);
                 }
             }
         }
