@@ -320,6 +320,14 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
 
     for(uint64_t n = 0; n < node_count; n++)
     {
+        if(node_count > 10)
+        {
+            fprintf(stderr,
+                    "\r  Verifying %s nodes... %" PRIu64 "/%" PRIu64 "   ",
+                    tree_name, n + 1, node_count);
+            fflush(stderr);
+        }
+
         uint64_t lba = node_lbas[n];
 
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
@@ -334,7 +342,7 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
 
         if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
-            fprintf(stderr, "  %s node at LBA %" PRIu64 ": bad magic\n", tree_name, lba);
+            fprintf(stderr, "\n  %s node at LBA %" PRIu64 ": bad magic\n", tree_name, lba);
             bad++;
             continue;
         }
@@ -349,9 +357,15 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
 
         if(memcmp(stored, computed, 32) != 0)
         {
-            fprintf(stderr, "  %s node at LBA %" PRIu64 ": checksum mismatch\n", tree_name, lba);
+            fprintf(stderr, "\n  %s node at LBA %" PRIu64 ": checksum mismatch\n", tree_name, lba);
             bad++;
         }
+    }
+
+    if(node_count > 10)
+    {
+        fprintf(stderr, "\r%80s\r", "");
+        fflush(stderr);
     }
 
     free(buf);
@@ -1031,12 +1045,21 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, ui
 
         stk[stk_size++] = thdr.root_node_lba;
 
+        uint64_t nodes_visited = 0;
+
         while(stk_size > 0)
         {
             uint64_t lba = stk[--stk_size];
 
             /* Mark the node block */
             PUSH_LBA(lba);
+
+            nodes_visited++;
+            fprintf(stderr,
+                    "\r  Collecting dedup blocks... [tree %" PRIu64 "/%" PRIu64
+                    "] %" PRIu64 "/%" PRIu32 " nodes   ",
+                    t + 1, tree_count, nodes_visited, thdr.total_nodes);
+            fflush(stderr);
 
             rc = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK) break;
@@ -1153,6 +1176,10 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, ui
     free(entries);
     free(unique_bases);
 #undef PUSH_LBA
+
+    /* Clear progress line */
+    fprintf(stderr, "\r%80s\r", "");
+    fflush(stderr);
 
     *out_lbas  = lbas;
     *out_count = count;
@@ -2024,9 +2051,20 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
         }
 
         stk[stk_sz++] = thdr.root_node_lba;
+
+        uint64_t nodes_visited = 0;
+
         while(stk_sz > 0)
         {
             uint64_t lba = stk[--stk_sz];
+
+            nodes_visited++;
+            fprintf(stderr,
+                    "\r  Dedup stats... [tree %" PRIu64 "/%" PRIu64
+                    "] %" PRIu64 "/%" PRIu32 " nodes   ",
+                    t + 1, tree_count, nodes_visited, thdr.total_nodes);
+            fflush(stderr);
+
             rc           = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK) break;
 
@@ -2102,6 +2140,12 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
             {
                 for(uint64_t b = 0; b < base_count; b++)
                 {
+                    fprintf(stderr,
+                            "\r  Dedup stats... [tree %" PRIu64 "/%" PRIu64
+                            "] %" PRIu64 "/%" PRIu64 " data blocks   ",
+                            t + 1, tree_count, b + 1, base_count);
+                    fflush(stderr);
+
                     rc = obmafs3_block_read(ctx, bases[b], hdr_buf, (size_t)ctx->sb.block_size);
                     if(rc != OBMAFS3_OK) continue;
 
@@ -2137,6 +2181,10 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
 
         free(bases);
     }
+
+    /* Clear progress line */
+    fprintf(stderr, "\r%80s\r", "");
+    fflush(stderr);
 
     /* ---- Print report ---- */
     printf("\nDedup statistics:\n");

@@ -118,7 +118,8 @@ struct compress_pool
     pthread_mutex_t mutex;          ///< protects batch, shutdown, generation, async_queue
     pthread_cond_t  work_avail;     ///< signalled when a new batch or async job is ready
     pthread_cond_t  batch_done;     ///< signalled when all jobs complete
-    struct compress_batch *batch;   ///< current batch (NULL when idle)
+    struct compress_batch  batch_data;  ///< embedded batch (lives as long as the pool)
+    int             batch_active;   ///< non-zero when a batch is in progress
     int             shutdown;       ///< non-zero → workers should exit
     unsigned int    generation;     ///< incremented for each batch submission
     struct pool_async_job *async_queue; ///< FIFO of pending async jobs
@@ -170,11 +171,12 @@ static void *pool_worker_main(void *arg)
         }
 
         my_gen = pool->generation;
-        struct compress_batch *batch = pool->batch;
+        int has_batch = pool->batch_active;
+        struct compress_batch *batch = has_batch ? &pool->batch_data : NULL;
         pthread_mutex_unlock(&pool->mutex);
 
         /* The submitter may have already completed the batch and set
-         * pool->batch = NULL before this worker woke up.  Skip. */
+         * batch_active = 0 before this worker woke up.  Skip. */
         if(!batch) continue;
 
         int n = 0;
@@ -220,7 +222,7 @@ int obmafs3_compress_pool_init(struct obmafs3_ctx *ctx)
     pthread_cond_init(&pool->work_avail, NULL);
     pthread_cond_init(&pool->batch_done, NULL);
     pool->num_threads = 0;
-    pool->batch       = NULL;
+    pool->batch_active = 0;
     pool->shutdown    = 0;
 
     for(int i = 0; i < n; i++)
@@ -298,27 +300,43 @@ void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx)
 }
 
 /**
- * Submit a batch of compression jobs to the pool and wait for
- * completion.  Falls back to inline compression if the pool is NULL.
+ * Submit compression jobs to the pool and wait for completion.
+ * Falls back to inline compression if the pool is NULL.
+ *
+ * The batch is stored inside the pool (pool->batch_data) so that
+ * late-waking worker threads never access freed stack memory.
  */
-static void compress_pool_submit(struct compress_pool *pool, struct compress_batch *batch)
+static void compress_pool_submit(struct compress_pool *pool,
+                                 struct compress_job *jobs, int total)
 {
     if(!pool)
     {
         /* No pool — run inline with temporary contexts */
+        struct compress_batch batch;
+        batch.jobs  = jobs;
+        batch.total = total;
+        atomic_init(&batch.next, 0);
+        atomic_init(&batch.done, 0);
         ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
         ZSTD_CCtx *cctx       = ZSTD_createCCtx();
         if(cctx && probe_cctx)
         {
-            compress_worker_run(batch, probe_cctx, cctx);
+            compress_worker_run(&batch, probe_cctx, cctx);
         }
         if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
         if(cctx)       ZSTD_freeCCtx(cctx);
         return;
     }
 
+    /* Fill the pool-owned batch so workers always reference valid memory */
+    struct compress_batch *batch = &pool->batch_data;
+    batch->jobs  = jobs;
+    batch->total = total;
+    atomic_init(&batch->next, 0);
+    atomic_init(&batch->done, 0);
+
     pthread_mutex_lock(&pool->mutex);
-    pool->batch = batch;
+    pool->batch_active = 1;
     pool->generation++;
     pthread_cond_broadcast(&pool->work_avail);
     pthread_mutex_unlock(&pool->mutex);
@@ -352,7 +370,7 @@ static void compress_pool_submit(struct compress_pool *pool, struct compress_bat
     while(atomic_load(&batch->done) < batch->total)
         pthread_cond_wait(&pool->batch_done, &pool->mutex);
 
-    pool->batch = NULL;
+    pool->batch_active = 0;
     pthread_mutex_unlock(&pool->mutex);
 }
 
@@ -1874,13 +1892,7 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
 
     if(any_compressible && jobs)
     {
-        struct compress_batch batch;
-        batch.jobs  = jobs;
-        batch.total = num_groups;
-        atomic_init(&batch.next, 0);
-        atomic_init(&batch.done, 0);
-
-        compress_pool_submit(ctx->compress_pool, &batch);
+        compress_pool_submit(ctx->compress_pool, jobs, num_groups);
     }
 
     /* -------------------------------------------------------------- */
