@@ -6607,6 +6607,74 @@ int main(int argc, char *argv[])
     if(ctx->catalog_hdr.root_node_lba != 0 && ctx->inode_hdr.root_node_lba != 0)
         cross_check_inodes_catalog(ctx, auto_yes, auto_no, &errors);
 
+    /* ---- next_inode_id validation ---- */
+    if(ctx->inode_hdr.root_node_lba != 0)
+    {
+        uint64_t *all_ino_ids = NULL;
+        uint64_t  all_ino_cnt = 0;
+        int       ino_rc      = collect_inode_ids(ctx, &all_ino_ids, &all_ino_cnt);
+
+        printf("\nnext_inode_id validation:\n");
+
+        if(ino_rc != OBMAFS3_OK)
+        {
+            printf("  Error: could not walk inode tree (%d)\n", ino_rc);
+            errors++;
+        }
+        else if(all_ino_cnt == 0)
+        {
+            printf("  No inodes found.\n");
+        }
+        else
+        {
+            /* Find the maximum inode ID in use */
+            uint64_t max_id = 0;
+            for(uint64_t i = 0; i < all_ino_cnt; i++)
+            {
+                if(all_ino_ids[i] > max_id) max_id = all_ino_ids[i];
+            }
+
+            printf("  Highest inode ID: %" PRIu64 "\n", max_id);
+            printf("  next_inode_id:    %" PRIu64 "\n", ctx->sb.next_inode_id);
+
+            if(ctx->sb.next_inode_id <= max_id)
+            {
+                printf("  ERROR: next_inode_id %" PRIu64 " <= highest inode %" PRIu64
+                       " (would cause ID collisions)\n",
+                       ctx->sb.next_inode_id, max_id);
+                errors++;
+
+                uint64_t correct = max_id + 1;
+                char prompt[128];
+                snprintf(prompt, sizeof(prompt),
+                         "  Set next_inode_id to %" PRIu64 "?", correct);
+
+                if(ask_fix(auto_yes, auto_no, prompt))
+                {
+                    ctx->sb.next_inode_id = correct;
+
+                    /* Recompute superblock checksum and write */
+                    memset(ctx->sb.checksum, 0, sizeof(ctx->sb.checksum));
+                    obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), ctx->sb.checksum);
+                    ssize_t nn = pwrite(fd, &ctx->sb, sizeof(ctx->sb), 0);
+                    if(nn < 0 || (size_t)nn != sizeof(ctx->sb))
+                        fprintf(stderr, "  Error: could not write superblock fix\n");
+                    else
+                    {
+                        printf("  next_inode_id fixed to %" PRIu64 ".\n", correct);
+                        errors--;
+                    }
+                }
+            }
+            else
+            {
+                printf("  Status:           OK\n");
+            }
+        }
+
+        free(all_ino_ids);
+    }
+
     /* ---- Extent validation ---- */
     if(ctx->inode_hdr.root_node_lba != 0)
         check_extent_validity(ctx, auto_yes, auto_no, &errors);
