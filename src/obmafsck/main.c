@@ -629,6 +629,48 @@ static int fix_node_ordering(struct obmafs3_ctx *ctx, uint8_t *buf, size_t buf_s
 }
 
 /**
+ * Compare the header's total_nodes with the actual walked count and
+ * optionally repair the header if they disagree.
+ *
+ * @param ctx        Filesystem context.
+ * @param hdr        Pointer to the btree_header (will be modified on fix).
+ * @param hdr_lba    LBA of the header block on disk.
+ * @param actual     Actual number of nodes discovered by the walk.
+ * @param tree_name  Human-readable tree name for messages.
+ * @param auto_yes   If non-zero, always repair without asking.
+ * @param auto_no    If non-zero, never repair.
+ * @param errors     Pointer to the cumulative error counter.
+ */
+static void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
+                                   uint64_t actual, const char *tree_name, const char *indent, int auto_yes,
+                                   int auto_no, int *errors)
+{
+    if((uint64_t)hdr->total_nodes == actual)
+    {
+        printf("%sTotal nodes:      %u (OK)\n", indent, hdr->total_nodes);
+        return;
+    }
+
+    printf("%sTotal nodes:      MISMATCH (header %u, walked %" PRIu64 ")\n", indent, hdr->total_nodes, actual);
+    (*errors)++;
+
+    if(ask_fix(auto_yes, auto_no, "Fix total_nodes in header?"))
+    {
+        hdr->total_nodes = (uint32_t)actual;
+        int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+        if(rc == OBMAFS3_OK)
+        {
+            printf("%sTotal nodes:      FIXED -> %" PRIu64 "\n", indent, actual);
+            (*errors)--;
+        }
+        else
+        {
+            fprintf(stderr, "%sError writing %s header: %d\n", indent, tree_name, rc);
+        }
+    }
+}
+
+/**
  * Verify that keys within every node of a single-block B+Tree are
  * strictly ascending (leaf) or non-decreasing (index).
  * Optionally repairs misordered nodes by sorting records in-place.
@@ -3111,7 +3153,6 @@ int main(int argc, char *argv[])
         if(!cat_hdr_cs_ok) errors++;
     }
     printf("  Root node LBA:    %" PRIu64 "\n", ctx->catalog_hdr.root_node_lba);
-    printf("  Total nodes:      %u\n", ctx->catalog_hdr.total_nodes);
 
     if(ctx->catalog_hdr.root_node_lba != 0)
     {
@@ -3147,6 +3188,8 @@ int main(int argc, char *argv[])
             {
                 printf("  Key ordering:     OK\n");
             }
+            verify_fix_total_nodes(ctx, &ctx->catalog_hdr, ctx->sb.catalog_lba, cat_node_count, "Catalog", "  ",
+                                   auto_yes, auto_no, &errors);
         }
         else
         {
@@ -3166,7 +3209,6 @@ int main(int argc, char *argv[])
         if(!ino_hdr_cs_ok) errors++;
     }
     printf("  Root node LBA:    %" PRIu64 "\n", ctx->inode_hdr.root_node_lba);
-    printf("  Total nodes:      %u\n", ctx->inode_hdr.total_nodes);
 
     if(ctx->inode_hdr.root_node_lba != 0)
     {
@@ -3202,6 +3244,8 @@ int main(int argc, char *argv[])
             {
                 printf("  Key ordering:     OK\n");
             }
+            verify_fix_total_nodes(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, ino_node_count, "Inode", "  ",
+                                   auto_yes, auto_no, &errors);
         }
         else
         {
@@ -3257,6 +3301,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->overflow_hdr, ctx->sb.overflow_lba, ovf_node_count, "Overflow",
+                                       "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3326,8 +3372,6 @@ int main(int argc, char *argv[])
                             printf("    Header checksum:%s\n", thdr_cs_ok ? " OK" : " BAD");
                             if(!thdr_cs_ok) errors++;
 
-                            printf("    Total nodes:    %u\n", thdr.total_nodes);
-
                             if(thdr.root_node_lba != 0)
                             {
                                 uint64_t *dd_nodes = NULL;
@@ -3368,6 +3412,8 @@ int main(int argc, char *argv[])
                                         printf("    Key ordering:  "
                                                " OK\n");
                                     }
+                                    verify_fix_total_nodes(ctx, &thdr, tl_entries[t].tree_lba, dd_count, "Dedup",
+                                                           "    ", auto_yes, auto_no, &errors);
                                 }
                                 else
                                 {
@@ -3443,6 +3489,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, mt_node_count, "Media tag",
+                                       "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3499,6 +3547,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->cd_prefix_hdr, ctx->sb.cd_prefix_lba, node_count, "CD prefix",
+                                       "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3555,6 +3605,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->cd_suffix_hdr, ctx->sb.cd_suffix_lba, node_count, "CD suffix",
+                                       "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3611,6 +3663,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->cd_subchannel_hdr, ctx->sb.cd_subchannel_lba, node_count,
+                                       "CD subchannel", "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3667,6 +3721,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, node_count, "Metadata",
+                                       "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3725,6 +3781,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, node_count,
+                                       "Metadata index", "  ", auto_yes, auto_no, &errors);
             }
             else
             {
@@ -3781,6 +3839,8 @@ int main(int argc, char *argv[])
                 {
                     printf("  Key ordering:     OK\n");
                 }
+                verify_fix_total_nodes(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, node_count, "Refcount",
+                                       "  ", auto_yes, auto_no, &errors);
             }
             else
             {
