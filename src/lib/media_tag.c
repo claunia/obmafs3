@@ -411,6 +411,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     nh.level       = 0;
     nh.node_keys   = right_count;
     nh.keys_length = (uint16_t)(right_count * rec_sz);
+    nh.left_link   = lba;
     nh.right_link  = old_right;
     memcpy(buf, &nh, sizeof(nh));
     memcpy(buf + sizeof(nh), &all[left_count], (size_t)right_count * rec_sz);
@@ -436,6 +437,21 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
 
     free(all);
     ctx->media_tag_hdr.total_nodes++;
+
+    /* Update old right neighbor's left_link */
+    if(old_right != 0)
+    {
+        rc = obmafs3_block_read(ctx, old_right, buf, bsz);
+        if(rc == OBMAFS3_OK)
+        {
+            struct btree_node_header rnh;
+            memcpy(&rnh, buf, sizeof(rnh));
+            rnh.left_link = new_leaf_lba;
+            memcpy(buf, &rnh, sizeof(rnh));
+            compute_node_checksum(buf);
+            obmafs3_block_write(ctx, old_right, buf, bsz);
+        }
+    }
 
     /* ---- Propagate split upward through index nodes ---- */
     while(depth > 0)
@@ -487,21 +503,24 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         uint16_t il = idx_total / 2;
         uint16_t ir = idx_total - il;
 
-        memset(id, 0, bsz - sizeof(struct btree_node_header));
-        memcpy(id, aie, (size_t)il * ie_sz);
-        phdr.node_keys   = il;
-        phdr.keys_length = (uint16_t)(il * ie_sz);
-        memcpy(buf, &phdr, sizeof(phdr));
-        compute_node_checksum(buf);
-        rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
+        /* Allocate new index node before writing so we can set sibling links */
+        uint64_t idx_old_right = phdr.right_link;
+        uint64_t new_idx_lba;
+        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
             return rc;
         }
 
-        uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        memset(id, 0, bsz - sizeof(struct btree_node_header));
+        memcpy(id, aie, (size_t)il * ie_sz);
+        phdr.node_keys   = il;
+        phdr.keys_length = (uint16_t)(il * ie_sz);
+        phdr.right_link  = new_idx_lba;
+        memcpy(buf, &phdr, sizeof(phdr));
+        compute_node_checksum(buf);
+        rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -516,6 +535,8 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         nih.level       = phdr.level;
         nih.node_keys   = ir;
         nih.keys_length = (uint16_t)(ir * ie_sz);
+        nih.left_link   = parent_lba;
+        nih.right_link  = idx_old_right;
         memcpy(buf, &nih, sizeof(nih));
         memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
         compute_node_checksum(buf);
@@ -538,6 +559,21 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
 
         free(aie);
         ctx->media_tag_hdr.total_nodes++;
+
+        /* Update old right neighbor's left_link */
+        if(idx_old_right != 0)
+        {
+            rc = obmafs3_block_read(ctx, idx_old_right, buf, bsz);
+            if(rc == OBMAFS3_OK)
+            {
+                struct btree_node_header rnh;
+                memcpy(&rnh, buf, sizeof(rnh));
+                rnh.left_link = new_idx_lba;
+                memcpy(buf, &rnh, sizeof(rnh));
+                compute_node_checksum(buf);
+                obmafs3_block_write(ctx, idx_old_right, buf, bsz);
+            }
+        }
     }
 
     /* ---- Create new root ---- */
@@ -650,6 +686,34 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
         }
         else
         {
+            /* Update sibling links around freed leaf */
+            if(leaf_hdr.left_link != 0)
+            {
+                rc = obmafs3_block_read(ctx, leaf_hdr.left_link, buf, bsz);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct btree_node_header lnh;
+                    memcpy(&lnh, buf, sizeof(lnh));
+                    lnh.right_link = leaf_hdr.right_link;
+                    memcpy(buf, &lnh, sizeof(lnh));
+                    compute_node_checksum(buf);
+                    obmafs3_block_write(ctx, leaf_hdr.left_link, buf, bsz);
+                }
+            }
+            if(leaf_hdr.right_link != 0)
+            {
+                rc = obmafs3_block_read(ctx, leaf_hdr.right_link, buf, bsz);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct btree_node_header rnh;
+                    memcpy(&rnh, buf, sizeof(rnh));
+                    rnh.left_link = leaf_hdr.left_link;
+                    memcpy(buf, &rnh, sizeof(rnh));
+                    compute_node_checksum(buf);
+                    obmafs3_block_write(ctx, leaf_hdr.right_link, buf, bsz);
+                }
+            }
+
             uint64_t plba  = path[depth - 1].lba;
             uint16_t pslot = path[depth - 1].slot;
 

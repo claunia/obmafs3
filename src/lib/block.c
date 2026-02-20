@@ -800,6 +800,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     nh.level       = 0;
     nh.node_keys   = right_count;
     nh.keys_length = (uint16_t)(right_count * rec_sz);
+    nh.left_link   = lba;
     nh.right_link  = old_right;
     memcpy(buf, &nh, sizeof(nh));
     memcpy(buf + sizeof(nh), &all[left_count], (size_t)right_count * rec_sz);
@@ -818,6 +819,21 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
 
     free(all);
     hdr->total_nodes++;
+
+    /* Update old right neighbor's left_link */
+    if(old_right != 0)
+    {
+        rc = obmafs3_block_read(ctx, old_right, buf, bsz);
+        if(rc == OBMAFS3_OK)
+        {
+            struct btree_node_header rnh;
+            memcpy(&rnh, buf, sizeof(rnh));
+            rnh.left_link = new_leaf_lba;
+            memcpy(buf, &rnh, sizeof(rnh));
+            compute_node_checksum(buf);
+            obmafs3_block_write(ctx, old_right, buf, bsz);
+        }
+    }
 
     /* ---- Propagate split upward through index nodes ---- */
     while(depth > 0)
@@ -874,22 +890,25 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         uint16_t il = idx_total / 2;
         uint16_t ir = idx_total - il;
 
-        /* Rewrite old index with left half */
-        memset(id, 0, bsz - sizeof(struct btree_node_header));
-        memcpy(id, aie, (size_t)il * ie_sz);
-        phdr.node_keys   = il;
-        phdr.keys_length = (uint16_t)(il * ie_sz);
-        memcpy(buf, &phdr, sizeof(phdr));
-        compute_node_checksum(buf);
-        rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
+        /* Allocate new index node before writing so we can set sibling links */
+        uint64_t idx_old_right = phdr.right_link;
+        uint64_t new_idx_lba;
+        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
             return rc;
         }
 
-        uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        /* Rewrite old index with left half */
+        memset(id, 0, bsz - sizeof(struct btree_node_header));
+        memcpy(id, aie, (size_t)il * ie_sz);
+        phdr.node_keys   = il;
+        phdr.keys_length = (uint16_t)(il * ie_sz);
+        phdr.right_link  = new_idx_lba;
+        memcpy(buf, &phdr, sizeof(phdr));
+        compute_node_checksum(buf);
+        rc = obmafs3_block_write(ctx, parent_lba, buf, bsz);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -904,6 +923,8 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         nih.level       = phdr.level;
         nih.node_keys   = ir;
         nih.keys_length = (uint16_t)(ir * ie_sz);
+        nih.left_link   = parent_lba;
+        nih.right_link  = idx_old_right;
         memcpy(buf, &nih, sizeof(nih));
         memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
         compute_node_checksum(buf);
@@ -921,6 +942,21 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
 
         free(aie);
         hdr->total_nodes++;
+
+        /* Update old right neighbor's left_link */
+        if(idx_old_right != 0)
+        {
+            rc = obmafs3_block_read(ctx, idx_old_right, buf, bsz);
+            if(rc == OBMAFS3_OK)
+            {
+                struct btree_node_header rnh;
+                memcpy(&rnh, buf, sizeof(rnh));
+                rnh.left_link = new_idx_lba;
+                memcpy(buf, &rnh, sizeof(rnh));
+                compute_node_checksum(buf);
+                obmafs3_block_write(ctx, idx_old_right, buf, bsz);
+            }
+        }
     }
 
     /* ---- Create new root ---- */

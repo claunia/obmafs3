@@ -371,6 +371,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
     nh.level       = 0;
     nh.node_keys   = right_count;
     nh.keys_length = (uint16_t)(right_count * rec_sz);
+    nh.left_link   = lba;
     nh.right_link  = old_right;
     memcpy(buf, &nh, sizeof(nh));
     memcpy(buf + sizeof(nh), &all[left_count], (size_t)right_count * rec_sz);
@@ -396,6 +397,21 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
     uint64_t left_lba = lba;
     free(all);
     ctx->metadata_hdr.total_nodes++;
+
+    /* Update old right neighbor's left_link */
+    if(old_right != 0)
+    {
+        rc = meta_node_read(ctx, old_right, buf);
+        if(rc == OBMAFS3_OK)
+        {
+            struct btree_node_header rnh;
+            memcpy(&rnh, buf, sizeof(rnh));
+            rnh.left_link = new_leaf_lba;
+            memcpy(buf, &rnh, sizeof(rnh));
+            compute_node_checksum(buf);
+            meta_node_write(ctx, old_right, buf);
+        }
+    }
 
     /* Propagate split upward */
     while(depth > 0)
@@ -452,13 +468,10 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         uint16_t il = idx_total / 2;
         uint16_t ir = idx_total - il;
 
-        memset(id, 0, nsz - sizeof(struct btree_node_header));
-        memcpy(id, aie, (size_t)il * ie_sz);
-        phdr.node_keys   = il;
-        phdr.keys_length = (uint16_t)(il * ie_sz);
-        memcpy(buf, &phdr, sizeof(phdr));
-        compute_node_checksum(buf);
-        rc = meta_node_write(ctx, parent_lba, buf);
+        /* Allocate new index node before writing so we can set sibling links */
+        uint64_t idx_old_right = phdr.right_link;
+        uint64_t new_idx_lba;
+        rc = meta_alloc_node(ctx, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -466,8 +479,14 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
             return rc;
         }
 
-        uint64_t new_idx_lba;
-        rc = meta_alloc_node(ctx, &new_idx_lba);
+        memset(id, 0, nsz - sizeof(struct btree_node_header));
+        memcpy(id, aie, (size_t)il * ie_sz);
+        phdr.node_keys   = il;
+        phdr.keys_length = (uint16_t)(il * ie_sz);
+        phdr.right_link  = new_idx_lba;
+        memcpy(buf, &phdr, sizeof(phdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, parent_lba, buf);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -483,6 +502,8 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         nih.level       = phdr.level;
         nih.node_keys   = ir;
         nih.keys_length = (uint16_t)(ir * ie_sz);
+        nih.left_link   = parent_lba;
+        nih.right_link  = idx_old_right;
         memcpy(buf, &nih, sizeof(nih));
         memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
         compute_node_checksum(buf);
@@ -505,6 +526,21 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         left_lba = parent_lba;
         free(aie);
         ctx->metadata_hdr.total_nodes++;
+
+        /* Update old right neighbor's left_link */
+        if(idx_old_right != 0)
+        {
+            rc = meta_node_read(ctx, idx_old_right, buf);
+            if(rc == OBMAFS3_OK)
+            {
+                struct btree_node_header rnh;
+                memcpy(&rnh, buf, sizeof(rnh));
+                rnh.left_link = new_idx_lba;
+                memcpy(buf, &rnh, sizeof(rnh));
+                compute_node_checksum(buf);
+                meta_node_write(ctx, idx_old_right, buf);
+            }
+        }
     }
 
     /* Create new root */
@@ -639,6 +675,34 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
         }
         else
         {
+            /* Update sibling links around freed leaf */
+            if(leaf_hdr.left_link != 0)
+            {
+                rc = meta_node_read(ctx, leaf_hdr.left_link, buf);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct btree_node_header lnh;
+                    memcpy(&lnh, buf, sizeof(lnh));
+                    lnh.right_link = leaf_hdr.right_link;
+                    memcpy(buf, &lnh, sizeof(lnh));
+                    compute_node_checksum(buf);
+                    meta_node_write(ctx, leaf_hdr.left_link, buf);
+                }
+            }
+            if(leaf_hdr.right_link != 0)
+            {
+                rc = meta_node_read(ctx, leaf_hdr.right_link, buf);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct btree_node_header rnh;
+                    memcpy(&rnh, buf, sizeof(rnh));
+                    rnh.left_link = leaf_hdr.left_link;
+                    memcpy(buf, &rnh, sizeof(rnh));
+                    compute_node_checksum(buf);
+                    meta_node_write(ctx, leaf_hdr.right_link, buf);
+                }
+            }
+
             uint64_t plba  = path[depth - 1].lba;
             uint16_t pslot = path[depth - 1].slot;
 
@@ -978,6 +1042,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
     nh.level       = 0;
     nh.node_keys   = right_count;
     nh.keys_length = (uint16_t)(right_count * rec_sz);
+    nh.left_link   = lba;
     nh.right_link  = old_right;
     memcpy(buf, &nh, sizeof(nh));
     memcpy(buf + sizeof(nh), &all[left_count], (size_t)right_count * rec_sz);
@@ -1005,6 +1070,21 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
     uint64_t left_lba = lba;
     free(all);
     ctx->metadata_idx_hdr.total_nodes++;
+
+    /* Update old right neighbor's left_link */
+    if(old_right != 0)
+    {
+        rc = meta_node_read(ctx, old_right, buf);
+        if(rc == OBMAFS3_OK)
+        {
+            struct btree_node_header rnh;
+            memcpy(&rnh, buf, sizeof(rnh));
+            rnh.left_link = new_leaf_lba;
+            memcpy(buf, &rnh, sizeof(rnh));
+            compute_node_checksum(buf);
+            meta_node_write(ctx, old_right, buf);
+        }
+    }
 
     /* Propagate split upward */
     while(depth > 0)
@@ -1061,13 +1141,10 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         uint16_t il = idx_total / 2;
         uint16_t ir = idx_total - il;
 
-        memset(id, 0, nsz - sizeof(struct btree_node_header));
-        memcpy(id, aie, (size_t)il * ie_sz);
-        phdr.node_keys   = il;
-        phdr.keys_length = (uint16_t)(il * ie_sz);
-        memcpy(buf, &phdr, sizeof(phdr));
-        compute_node_checksum(buf);
-        rc = meta_node_write(ctx, parent_lba, buf);
+        /* Allocate new index node before writing so we can set sibling links */
+        uint64_t idx_old_right = phdr.right_link;
+        uint64_t new_idx_lba;
+        rc = meta_alloc_node(ctx, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -1075,8 +1152,14 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
             return rc;
         }
 
-        uint64_t new_idx_lba;
-        rc = meta_alloc_node(ctx, &new_idx_lba);
+        memset(id, 0, nsz - sizeof(struct btree_node_header));
+        memcpy(id, aie, (size_t)il * ie_sz);
+        phdr.node_keys   = il;
+        phdr.keys_length = (uint16_t)(il * ie_sz);
+        phdr.right_link  = new_idx_lba;
+        memcpy(buf, &phdr, sizeof(phdr));
+        compute_node_checksum(buf);
+        rc = meta_node_write(ctx, parent_lba, buf);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -1092,6 +1175,8 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         nih.level       = phdr.level;
         nih.node_keys   = ir;
         nih.keys_length = (uint16_t)(ir * ie_sz);
+        nih.left_link   = parent_lba;
+        nih.right_link  = idx_old_right;
         memcpy(buf, &nih, sizeof(nih));
         memcpy(buf + sizeof(nih), &aie[il], (size_t)ir * ie_sz);
         compute_node_checksum(buf);
@@ -1116,6 +1201,21 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         left_lba = parent_lba;
         free(aie);
         ctx->metadata_idx_hdr.total_nodes++;
+
+        /* Update old right neighbor's left_link */
+        if(idx_old_right != 0)
+        {
+            rc = meta_node_read(ctx, idx_old_right, buf);
+            if(rc == OBMAFS3_OK)
+            {
+                struct btree_node_header rnh;
+                memcpy(&rnh, buf, sizeof(rnh));
+                rnh.left_link = new_idx_lba;
+                memcpy(buf, &rnh, sizeof(rnh));
+                compute_node_checksum(buf);
+                meta_node_write(ctx, idx_old_right, buf);
+            }
+        }
     }
 
     /* Create new root */
@@ -1248,6 +1348,34 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
         }
         else
         {
+            /* Update sibling links around freed leaf */
+            if(leaf_hdr.left_link != 0)
+            {
+                rc = meta_node_read(ctx, leaf_hdr.left_link, buf);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct btree_node_header lnh;
+                    memcpy(&lnh, buf, sizeof(lnh));
+                    lnh.right_link = leaf_hdr.right_link;
+                    memcpy(buf, &lnh, sizeof(lnh));
+                    compute_node_checksum(buf);
+                    meta_node_write(ctx, leaf_hdr.left_link, buf);
+                }
+            }
+            if(leaf_hdr.right_link != 0)
+            {
+                rc = meta_node_read(ctx, leaf_hdr.right_link, buf);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct btree_node_header rnh;
+                    memcpy(&rnh, buf, sizeof(rnh));
+                    rnh.left_link = leaf_hdr.left_link;
+                    memcpy(buf, &rnh, sizeof(rnh));
+                    compute_node_checksum(buf);
+                    meta_node_write(ctx, leaf_hdr.right_link, buf);
+                }
+            }
+
             uint64_t plba  = path[depth - 1].lba;
             uint16_t pslot = path[depth - 1].slot;
 
