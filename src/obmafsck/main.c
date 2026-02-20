@@ -64,6 +64,301 @@ static int ask_fix(int auto_yes, int auto_no, const char *prompt)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Superblock field range checks                                      */
+/* ------------------------------------------------------------------ */
+
+/** Return 1 if @p v is a power of two. */
+static int is_power_of_two(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
+
+/**
+ * Validate superblock field ranges and internal consistency.
+ *
+ * Checks block_size, dedup_block_size, total_bytes, checksum_type,
+ * next_inode_id, bitmap parameters, LBA fields (in-range, unique),
+ * volume_label NUL-termination, and creation_time plausibility.
+ *
+ * When a fixable mismatch is detected the user is prompted (unless
+ * auto_yes / auto_no is set).  Fixes are written back via the
+ * superblock write path.
+ *
+ * @param sb          Pointer to the in-memory superblock (modified on fix).
+ * @param fd          File descriptor to write fixes.
+ * @param file_size   Actual size of the backing file/device (from fstat).
+ * @param auto_yes    If non-zero, always repair.
+ * @param auto_no     If non-zero, never repair.
+ * @param errors      In/out: incremented for each unfixed error.
+ */
+static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_size,
+                                       int auto_yes, int auto_no, int *errors)
+{
+    int bad = 0, fixed = 0;
+    uint64_t total_blocks = sb->total_bytes / sb->block_size;
+
+    /* ---- block_size ---- */
+    if(!is_power_of_two(sb->block_size))
+    {
+        printf("    block_size %" PRIu64 " is not a power of 2\n", sb->block_size);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set block_size to 4096?"))
+        {
+            sb->block_size = 4096;
+            total_blocks = sb->total_bytes / sb->block_size;
+            fixed++;
+        }
+    }
+    else if(sb->block_size < 4096)
+    {
+        printf("    block_size %" PRIu64 " is below minimum (4096)\n", sb->block_size);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set block_size to 4096?"))
+        {
+            sb->block_size = 4096;
+            total_blocks = sb->total_bytes / sb->block_size;
+            fixed++;
+        }
+    }
+
+    /* ---- dedup_block_size ---- */
+    if(!is_power_of_two(sb->dedup_block_size))
+    {
+        printf("    dedup_block_size %" PRIu64 " is not a power of 2\n", sb->dedup_block_size);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set dedup_block_size to 4194304?"))
+        {
+            sb->dedup_block_size = 4194304;
+            fixed++;
+        }
+    }
+    else if(sb->dedup_block_size < sb->block_size)
+    {
+        printf("    dedup_block_size %" PRIu64 " is smaller than block_size %" PRIu64 "\n",
+               sb->dedup_block_size, sb->block_size);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set dedup_block_size to 4194304?"))
+        {
+            sb->dedup_block_size = 4194304;
+            fixed++;
+        }
+    }
+    else if(sb->dedup_block_size % sb->block_size != 0)
+    {
+        printf("    dedup_block_size %" PRIu64 " is not a multiple of block_size %" PRIu64 "\n",
+               sb->dedup_block_size, sb->block_size);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set dedup_block_size to 4194304?"))
+        {
+            sb->dedup_block_size = 4194304;
+            fixed++;
+        }
+    }
+
+    /* ---- total_bytes ---- */
+    if(sb->total_bytes % sb->block_size != 0)
+    {
+        printf("    total_bytes %" PRIu64 " is not a multiple of block_size %" PRIu64 "\n",
+               sb->total_bytes, sb->block_size);
+        bad++;
+        uint64_t aligned = (sb->total_bytes / sb->block_size) * sb->block_size;
+        printf("    (nearest aligned value: %" PRIu64 ")\n", aligned);
+        if(ask_fix(auto_yes, auto_no, "    Round total_bytes down to block boundary?"))
+        {
+            sb->total_bytes = aligned;
+            total_blocks = sb->total_bytes / sb->block_size;
+            fixed++;
+        }
+    }
+
+    if(file_size > 0 && sb->total_bytes != file_size)
+    {
+        printf("    total_bytes %" PRIu64 " does not match actual file size %" PRIu64 "\n",
+               sb->total_bytes, file_size);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set total_bytes to match file size?"))
+        {
+            sb->total_bytes = file_size;
+            total_blocks = sb->total_bytes / sb->block_size;
+            fixed++;
+        }
+    }
+
+    /* ---- checksum_type ---- */
+    if(sb->checksum_type != kChecksumTypeXXH64)
+    {
+        printf("    checksum_type %" PRIu16 " is not supported (expected %d)\n",
+               sb->checksum_type, kChecksumTypeXXH64);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set checksum_type to XXH64 (0)?"))
+        {
+            sb->checksum_type = kChecksumTypeXXH64;
+            fixed++;
+        }
+    }
+
+    /* ---- next_inode_id ---- */
+    if(sb->next_inode_id < 3)
+    {
+        printf("    next_inode_id %" PRIu64 " is below minimum (3)\n", sb->next_inode_id);
+        bad++;
+        if(ask_fix(auto_yes, auto_no, "    Set next_inode_id to 3?"))
+        {
+            sb->next_inode_id = 3;
+            fixed++;
+        }
+    }
+
+    /* ---- bitmap_lba ---- */
+    if(sb->bitmap_lba == 0)
+    {
+        printf("    bitmap_lba is 0 (no allocation bitmap)\n");
+        bad++;
+    }
+    else if(sb->bitmap_lba >= total_blocks)
+    {
+        printf("    bitmap_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
+               sb->bitmap_lba, total_blocks);
+        bad++;
+    }
+
+    /* ---- bitmap_blocks ---- */
+    if(sb->bitmap_lba > 0 && sb->bitmap_blocks > 0)
+    {
+        uint64_t bitmap_bytes         = (total_blocks + 7) / 8;
+        size_t   hdr_size             = sizeof(struct bitmap_header);
+        uint64_t first_block_capacity = sb->block_size - hdr_size;
+        uint64_t expected_bitmap_blks;
+        if(bitmap_bytes <= first_block_capacity)
+            expected_bitmap_blks = 1;
+        else
+            expected_bitmap_blks = 1 + (bitmap_bytes - first_block_capacity + sb->block_size - 1) / sb->block_size;
+
+        if(sb->bitmap_blocks != expected_bitmap_blks)
+        {
+            printf("    bitmap_blocks %" PRIu64 " does not match expected %" PRIu64 "\n",
+                   sb->bitmap_blocks, expected_bitmap_blks);
+            bad++;
+            if(ask_fix(auto_yes, auto_no, "    Fix bitmap_blocks?"))
+            {
+                sb->bitmap_blocks = expected_bitmap_blks;
+                fixed++;
+            }
+        }
+
+        if(sb->bitmap_lba + sb->bitmap_blocks > total_blocks)
+        {
+            printf("    bitmap extends beyond filesystem (LBA %" PRIu64 " + %" PRIu64 " blocks > %" PRIu64 ")\n",
+                   sb->bitmap_lba, sb->bitmap_blocks, total_blocks);
+            bad++;
+        }
+    }
+
+    /* ---- LBA range checks ---- */
+    struct { const char *name; uint64_t lba; } lba_fields[] = {
+        { "catalog_lba",       sb->catalog_lba       },
+        { "inode_lba",         sb->inode_lba         },
+        { "overflow_lba",      sb->overflow_lba      },
+        { "dedup_lba",         sb->dedup_lba         },
+        { "metadata_lba",      sb->metadata_lba      },
+        { "media_tag_lba",     sb->media_tag_lba     },
+        { "cd_prefix_lba",     sb->cd_prefix_lba     },
+        { "cd_suffix_lba",     sb->cd_suffix_lba     },
+        { "cd_subchannel_lba", sb->cd_subchannel_lba },
+        { "metadata_idx_lba",  sb->metadata_idx_lba  },
+        { "refcount_lba",      sb->refcount_lba      },
+    };
+    int lba_count = (int)(sizeof(lba_fields) / sizeof(lba_fields[0]));
+
+    for(int i = 0; i < lba_count; i++)
+    {
+        if(lba_fields[i].lba == 0) continue; /* optional field */
+        if(lba_fields[i].lba >= total_blocks)
+        {
+            printf("    %s %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
+                   lba_fields[i].name, lba_fields[i].lba, total_blocks);
+            bad++;
+        }
+    }
+
+    /* ---- LBA uniqueness ---- */
+    for(int i = 0; i < lba_count; i++)
+    {
+        if(lba_fields[i].lba == 0) continue;
+        for(int j = i + 1; j < lba_count; j++)
+        {
+            if(lba_fields[j].lba == 0) continue;
+            if(lba_fields[i].lba == lba_fields[j].lba)
+            {
+                printf("    %s and %s share the same LBA %" PRIu64 "\n",
+                       lba_fields[i].name, lba_fields[j].name, lba_fields[i].lba);
+                bad++;
+            }
+        }
+    }
+
+    /* ---- volume_label NUL-termination ---- */
+    {
+        int has_nul = 0;
+        for(size_t i = 0; i < sizeof(sb->volume_label); i++)
+        {
+            if(sb->volume_label[i] == '\0')
+            {
+                has_nul = 1;
+                break;
+            }
+        }
+        if(!has_nul)
+        {
+            printf("    volume_label is not NUL-terminated\n");
+            bad++;
+            if(ask_fix(auto_yes, auto_no, "    NUL-terminate volume_label?"))
+            {
+                sb->volume_label[sizeof(sb->volume_label) - 1] = '\0';
+                fixed++;
+            }
+        }
+    }
+
+    /* ---- creation_time ---- */
+    if(sb->creation_time == 0)
+    {
+        printf("    creation_time is 0 (not set)\n");
+        bad++;
+    }
+    else
+    {
+        uint64_t now = (uint64_t)time(NULL);
+        if(sb->creation_time > now)
+        {
+            printf("    creation_time %" PRIu64 " is in the future (now %" PRIu64 ")\n",
+                   sb->creation_time, now);
+            bad++;
+        }
+    }
+
+    /* ---- Write fixes if any ---- */
+    if(fixed > 0)
+    {
+        ssize_t n = pwrite(fd, sb, sizeof(*sb), 0);
+        if(n < 0 || (size_t)n != sizeof(*sb))
+            fprintf(stderr, "    Error: could not write superblock fix\n");
+        else
+            printf("    Superblock updated (%d field(s) fixed).\n", fixed);
+    }
+
+    /* ---- Summary ---- */
+    if(bad == 0)
+    {
+        printf("  Field checks:     OK\n");
+    }
+    else
+    {
+        printf("  Field checks:     %d error(s)", bad);
+        if(fixed > 0) printf(" (%d fixed)", fixed);
+        printf("\n");
+        *errors += (bad - fixed);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Progress bar helper                                                */
 /* ------------------------------------------------------------------ */
 
@@ -5331,6 +5626,8 @@ int main(int argc, char *argv[])
     printf("  Volume label:     %s\n", ctx->sb.volume_label);
 
     if(ctx->sb.magic != OBMAFS3_SB_MAGIC) errors++;
+
+    validate_superblock_fields(&ctx->sb, fd, (uint64_t)file_stat.st_size, auto_yes, auto_no, &errors);
 
     /* ---- Catalog tree ---- */
     printf("\nCatalog tree:\n");
