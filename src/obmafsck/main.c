@@ -195,6 +195,7 @@ static void usage(const char *prog)
             "  -n              Assume 'no' to all repair questions\n"
             "  -s, --scrub     Verify checksums of all data blocks\n"
             "  -d, --dedup-stats  Show deduplication and compression statistics\n"
+            "  -D, --dedup-stats-only  Show dedup stats without integrity checks\n"
             "  -v, --verify-hashes  Verify dedup and CD hashes against stored data\n"
             "  -h, --help      Show this help message\n",
             prog);
@@ -5996,18 +5997,20 @@ int main(int argc, char *argv[])
     int auto_no           = 0;
     int do_scrub          = 0;
     int do_dedup_stats    = 0;
+    int dedup_stats_only  = 0;
     int do_verify_hashes  = 0;
 
     static struct option long_opts[] = {
         {          "help", no_argument, NULL, 'h'},
         {         "scrub", no_argument, NULL, 's'},
         {   "dedup-stats", no_argument, NULL, 'd'},
+        {"dedup-stats-only", no_argument, NULL, 'D'},
         {"verify-hashes", no_argument, NULL, 'v'},
         {           NULL,           0, NULL,   0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "ynsdvh", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "ynsdDvh", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -6022,6 +6025,10 @@ int main(int argc, char *argv[])
                 break;
             case 'd':
                 do_dedup_stats = 1;
+                break;
+            case 'D':
+                dedup_stats_only = 1;
+                do_dedup_stats   = 1;
                 break;
             case 'v':
                 do_verify_hashes = 1;
@@ -6298,6 +6305,28 @@ int main(int argc, char *argv[])
     }
 
     int errors = 0;
+
+    /* ---- Dedup-stats-only fast path: skip all integrity checks ---- */
+    if(dedup_stats_only)
+    {
+        phase_begin("Dedup statistics");
+        rc = compute_dedup_stats(ctx);
+        if(rc != OBMAFS3_OK) fprintf(stderr, "Warning: could not compute dedup stats: %d\n", rc);
+        phase_end();
+
+        /* Summary */
+        {
+            char            total_dur[32];
+            struct timespec now;
+            timer_now(&now);
+            fmt_duration(timer_elapsed(&g_start_time, &now), total_dur, sizeof(total_dur));
+            printf("\n%s── Summary%s\n", CLR_BOLD, CLR_RESET);
+            printf("  %sCompleted in %s%s\n", CLR_DIM, total_dur, CLR_RESET);
+        }
+
+        obmafs3_close(ctx);
+        return 0;
+    }
 
     /* ---- Superblock ---- */
     phase_begin("Superblock");
