@@ -26,6 +26,7 @@ All multi-byte values are stored **little-endian**. All on-disk structures use `
 | 13                  | Refcount B+Tree header               | `BTREEHDR` |
 | 14 .. 14+N-1        | Allocation bitmap                    | `OBMABMAP` (0x50414D42414D424F) |
 | 14+N ..             | Data blocks, B+Tree nodes, dedup data| `OBMABLCK` / `BTREENDE` |
+| total_blocks − 1    | Backup superblock                    | `OBMAFS_3` (0x335F5346414D424F) |
 
 The block size for regular data (catalog, inode, overflow, file data) defaults to **4096 bytes**.
 The block size for deduplicated data defaults to **4 194 304 bytes** (4 MiB = 1024 standard blocks).
@@ -58,10 +59,13 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t bitmap_lba;         /* LBA of the first allocation bitmap block (block 14) */
     uint64_t bitmap_blocks;      /* Number of blocks used by the allocation bitmap */
     uint8_t  volume_label[256];  /* Volume label, UTF-8, NUL-terminated */
+    uint8_t  checksum[32];       /* Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed) */
 };
 ```
 
 The superblock identifies the filesystem, stores global parameters, and provides the LBAs for all top-level structures. The root inode ID is always 2 (`OBMAFS3_ROOT_INODE_ID`), and `next_inode_id` starts at 3 after creation.
+
+A byte-identical **backup copy** of the superblock is stored at the last block of the filesystem (`LBA = total_blocks − 1`). The backup is written every time the primary superblock is updated. If the primary superblock is unreadable or has invalid magic, `obmafs3_open()` and `obmafsck` automatically fall back to the backup, probing 8 candidate block sizes (4096, 512, 1024, 2048, 8192, 16384, 32768, 65536) since the block size is stored inside the superblock itself. The backup block is marked as allocated in the allocation bitmap.
 
 **Field descriptions:**
 
@@ -135,9 +139,10 @@ The `last_block_lba` / `last_block_offset` fields are only meaningful for dedupl
 ### B+Tree Node Header
 
 ```c
-struct btree_node_header {                   /* packed, 69 bytes */
+struct btree_node_header {                   /* packed, 70 bytes */
     uint64_t magic;          /* "BTREENDE" (0x45444E4545525442) */
     uint8_t  record_type;    /* Type of records in this node */
+    uint8_t  level;          /* 0 = leaf node, >0 = index node (B+Tree depth) */
     uint64_t left_link;      /* LBA of left sibling node */
     uint64_t right_link;     /* LBA of right sibling node */
     uint64_t overflow_link;  /* LBA of overflow node (when capacity exceeded) */
@@ -159,6 +164,10 @@ enum obmafs3_btree_type {
     kBtreeTypeDeduplication = 3,
     kBtreeTypeMetadata      = 4,
     kBtreeTypeMediaTag      = 5,
+    kBtreeTypeCdPrefix      = 6,
+    kBtreeTypeCdSuffix      = 7,
+    kBtreeTypeCdSubchannel  = 8,
+    kBtreeTypeMetadataIndex = 9,
     kBtreeTypeRefcount      = 10
 };
 
@@ -169,17 +178,42 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeDeduplicationEntry = 3,
     kBtreeDataTypeMetadataEntry      = 4,
     kBtreeDataTypeMediaTagEntry      = 5,
+    kBtreeDataTypeCdPrefixEntry      = 6,
+    kBtreeDataTypeCdSuffixEntry      = 7,
+    kBtreeDataTypeCdSubchannelEntry  = 8,
+    kBtreeDataTypeMetadataIndexEntry = 9,
     kBtreeDataTypeRefcountEntry      = 10
 };
 
 enum obmafs3_file_type {
-    kFileTypeRegular    = 0,
-    kFileTypeDirectory  = 1,
-    kFileTypeMediaImage = 2
+    kFileTypeRegular          = 0,
+    kFileTypeDirectory        = 1,
+    kFileTypeMediaImage       = 2,
+    kFileTypeSymlink          = 3,
+    kFileTypeCompactDiscImage = 4
+};
+
+enum obmafs3_compression {
+    kCompressionNone = 0,
+    kCompressionZstd = 1
+};
+
+enum obmafs3_checksum_type {
+    kChecksumTypeXXH64 = 0
+};
+
+enum obmafs3_cd_sector_mode {
+    kCdSectorModeAudio  = 0,
+    kCdSectorMode1      = 1,
+    kCdSectorMode2      = 2,
+    kCdSectorMode2Form1 = 3,
+    kCdSectorMode2Form2 = 4
 };
 ```
 
 ### Catalog Tree (directory entries)
+
+The catalog tree maps `(parent_id, name)` pairs to inode IDs. `btree_node_filename` wraps a single record for lookup results; leaf nodes store packed `catalog_record` entries. Index nodes use `catalog_index_entry` with the full composite key.
 
 ```c
 struct btree_node_filename {                 /* packed */
@@ -189,14 +223,27 @@ struct btree_node_filename {                 /* packed */
     uint8_t  directory_flag; /* 1 if directory, 0 if file */
     char     name[256];      /* Name in UTF-8, NUL-terminated */
 };
+
+struct catalog_record {                      /* packed, leaf payload */
+    uint64_t inode_id;       /* Unique identifier for the file or directory */
+    uint64_t parent_id;      /* Identifier of the parent directory */
+    uint8_t  directory_flag; /* 1 if directory, 0 if file */
+    char     name[256];      /* Name in UTF-8, NUL-terminated */
+};
+
+struct catalog_index_entry {                 /* packed, index payload */
+    uint64_t parent_id;  /* Smallest parent_id reachable through child */
+    char     name[256];  /* Smallest name reachable through child */
+    uint64_t child_lba;  /* LBA of the child node */
+};
 ```
 
 ### Inode Tree (file metadata)
 
-The inode tree is a proper B+Tree: leaf nodes (level 0) store packed `inode_record` entries sorted by `inode_id`, and index nodes (level > 0) store `btree_index_entry` entries pointing to child nodes. Each leaf node can hold up to `(block_size - sizeof(btree_node_header)) / sizeof(inode_record)` records (20 records for a 4096-byte block).
+The inode tree is a proper B+Tree: leaf nodes (level 0) store packed `inode_record` entries sorted by `inode_id`, and index nodes (level > 0) store `btree_index_entry` entries pointing to child nodes. Each leaf node can hold up to `(block_size - sizeof(btree_node_header)) / sizeof(inode_record)` records (15 records for a 4096-byte block).
 
 ```c
-struct inode_record {                        /* packed, 201 bytes */
+struct inode_record {                        /* packed, 265 bytes */
     uint64_t inode_id;
     uint32_t uid;
     uint32_t gid;
@@ -206,7 +253,7 @@ struct inode_record {                        /* packed, 201 bytes */
     uint64_t access_time;
     uint64_t file_size;          /* File size in bytes */
     struct extent_run extents[8];/* Up to 8 inline extent runs */
-    uint8_t  file_type;          /* 0=regular, 1=directory, 2=media image */
+    uint8_t  file_type;          /* 0=regular, 1=dir, 2=media image, 3=symlink, 4=CD image */
     uint64_t sector_count;       /* Media images: total number of sectors */
     uint64_t sector_map_size;    /* Media images: number of sector_map_entries written */
     uint32_t ref_count;          /* Number of hardlinks (catalog entries) pointing to this inode */
@@ -222,10 +269,14 @@ Files support hardlinks: multiple catalog entries can point to the same inode. T
 Directories do not support hardlinks. A directory's inode is deleted only when the directory is empty (no children in the catalog) and its single catalog entry is removed.
 
 ```c
-struct extent_run {                          /* packed, 16 bytes */
-    uint64_t start_block;    /* Starting block of the extent */
-    uint64_t block_count;    /* Number of contiguous blocks */
+struct extent_run {                          /* packed, 24 bytes */
+    uint64_t start_block;    /* Starting physical LBA of the extent run */
+    uint64_t block_count;    /* Number of physical blocks */
+    uint64_t logical_blocks; /* Number of logical blocks this extent covers */
 };
+```
+
+When `logical_blocks == block_count` the data is stored uncompressed (one physical block per logical block). When `logical_blocks > block_count` the physical blocks contain a `block_header` followed by ZSTD-compressed data covering `logical_blocks × block_size` bytes.
 ```
 
 If a file requires more than 8 extents, additional extents are stored in the Overflow Tree.
@@ -235,14 +286,16 @@ If a file requires more than 8 extents, additional extents are stored in the Ove
 The Overflow Tree is a B+Tree that stores additional extent runs for files that exceed the 8 inline extents available in the inode. Leaf nodes contain sorted `overflow_extent` records; index nodes use `btree_index_entry` to route lookups by `inode_id`.
 
 ```c
-struct overflow_extent {                     /* packed, 24 bytes */
+struct overflow_extent {                     /* packed, 40 bytes */
     uint64_t inode_id;       /* Inode this extent belongs to */
-    uint64_t start_block;    /* Starting block of the extent run */
-    uint64_t block_count;    /* Number of blocks in the extent run */
+    uint64_t logical_offset; /* First logical block covered (sort key) */
+    uint64_t start_block;    /* Starting physical LBA of the extent run */
+    uint64_t block_count;    /* Number of physical blocks in the extent run */
+    uint64_t logical_count;  /* Number of logical blocks this extent covers */
 };
 ```
 
-Overflow entries are sorted by the composite key `(inode_id, start_block)`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 24 = **167 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
+Overflow entries are sorted by the composite key `(inode_id, logical_offset)`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 40 = **100 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
 
 When reading file data, the system first uses the 8 inline extents from the inode, then traverses the overflow B+Tree to find any additional extents for that inode. The `level` field in the node header distinguishes index nodes (`level > 0`) from leaf nodes (`level == 0`).
 
@@ -260,6 +313,8 @@ struct refcount_record {                     /* packed, 12 bytes */
 Entries are sorted by `lba`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 12 = **335 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
 
 When a block range is cloned from one file to another, the refcount for each shared block is incremented (creating a new entry with refcount 2 if none existed). When a file is truncated or deleted, blocks with refcount > 1 have their refcount decremented instead of being freed; blocks whose refcount drops to 1 have their entry removed from the tree. The write path checks the refcount before modifying a shared block and performs copy-on-write (allocating a new block) when the refcount is greater than 1.
+
+At runtime, the `obmafs3_ctx` maintains a **single-leaf refcount cache** (`rc_leaf_buf`, `rc_leaf_lba`, `rc_leaf_min`, `rc_leaf_max`, `rc_leaf_count`, `rc_leaf_valid`) that avoids repeated B+Tree traversals when incrementing or decrementing refcounts for blocks within the same leaf node. The cache is protected by the write lock.
 
 ### Deduplication Tree (sector hash lookup)
 
@@ -282,17 +337,27 @@ Lookups traverse from root through index nodes (binary search on `hash` key) to 
 The Media Tag Tree is a B+Tree that stores media-specific binary tags associated with disk images (e.g., CD TOC, DVD PFI, Blu-ray disc info). Leaf nodes contain sorted `media_tag_record` entries; index nodes use `media_tag_index_entry` to route lookups by the composite key `(inode_id, tag_type)`.
 
 ```c
+#define MEDIA_TAG_INLINE_MAX  512
+#define MEDIA_TAG_FLAG_INLINE 0x01
+
 struct media_tag_record {                    /* packed */
-    uint64_t inode_id;       /* Inode this tag belongs to */
-    uint16_t tag_type;       /* MediaTagType enum value */
-    uint32_t data_length;    /* Length of tag data in bytes */
-    uint64_t data_lba;       /* LBA of the first data block (for large tags) */
-    uint16_t data_blocks;    /* Number of blocks used by data (0 = inline) */
-    /* If data_blocks == 0, data follows inline after the header */
+    uint64_t inode_id;                           /* Inode this tag belongs to */
+    uint16_t tag_type;                           /* MediaTagType enum value */
+    uint32_t data_length;                        /* Total length of tag data in bytes */
+    uint8_t  flags;                              /* MEDIA_TAG_FLAG_INLINE if data is inline */
+    uint64_t data_lba;                           /* LBA of external data blocks (0 if inline) */
+    uint64_t data_blocks;                        /* Number of external blocks (0 if inline) */
+    uint8_t  inline_data[MEDIA_TAG_INLINE_MAX];  /* Inline data storage (512 bytes) */
+};
+
+struct media_tag_index_entry {               /* packed, index payload */
+    uint64_t inode_id;   /* Smallest inode_id reachable through child */
+    uint16_t tag_type;   /* Smallest tag_type reachable through child */
+    uint64_t child_lba;  /* LBA of the child node */
 };
 ```
 
-Small tags are stored inline within the leaf record. Large tags that exceed inline capacity are stored in separate data blocks referenced by `data_lba`.
+Tags up to `MEDIA_TAG_INLINE_MAX` (512) bytes are stored inline (indicated by `flags & MEDIA_TAG_FLAG_INLINE`). Larger tags are stored in separately allocated blocks referenced by `data_lba` and `data_blocks`.
 
 Tag types include: CD TOC, CD session info, CD full TOC, CD PMA, CD ATIP, CD-TEXT, CD MCN, DVD PFI, DVD CMI, DVD disc key, DVD BCA, DVD DMI, and many others.
 
@@ -301,10 +366,20 @@ Tag types include: CD TOC, CD session info, CD full TOC, CD PMA, CD ATIP, CD-TEX
 The Metadata B+Tree stores arbitrary key-value string pairs associated with disk images (e.g., dumper name, dump date, serial number). Uses 8-block nodes (`METADATA_NODE_BLOCKS = 8`) because records are large.
 
 ```c
+#define METADATA_KEY_MAX     256  /* 255 chars + NUL */
+#define METADATA_VALUE_MAX   1025 /* 1024 chars + NUL */
+#define METADATA_NODE_BLOCKS 8    /* Blocks per metadata tree node */
+
 struct metadata_record {                     /* packed */
     uint64_t inode_id;                   /* Inode this entry belongs to */
     char     key[256];                   /* Metadata key (NUL-terminated, max 255 chars) */
     char     value[1025];                /* Metadata value (NUL-terminated, max 1024 chars) */
+};
+
+struct metadata_index_entry {                /* packed, index payload */
+    uint64_t inode_id;               /* Smallest inode_id reachable through child */
+    char     key[256];               /* Smallest key reachable through child */
+    uint64_t child_lba;              /* LBA of the child node */
 };
 ```
 
@@ -318,6 +393,13 @@ struct metadata_idx_record {                 /* packed */
     char     value[1025];                /* Metadata value */
     uint64_t inode_id;                   /* Disk image inode */
 };
+
+struct metadata_idx_index_entry {            /* packed, index payload */
+    char     key[256];               /* Smallest key reachable through child */
+    char     value[1025];            /* Smallest value reachable through child */
+    uint64_t inode_id;               /* Smallest inode_id reachable through child */
+    uint64_t child_lba;              /* LBA of the child node */
+};
 ```
 
 Both metadata trees use 8-block nodes and support full CRUD operations plus paginated key listing and reverse queries.
@@ -327,6 +409,10 @@ Both metadata trees use 8-block nodes and support full CRUD operations plus pagi
 Three B+Trees store deduplicated CD raw sector components. All three share identical logic: a `uint64_t` hash key with fixed-size inline data.
 
 ```c
+#define CD_PREFIX_DATA_SIZE     16
+#define CD_SUFFIX_DATA_SIZE     288
+#define CD_SUBCHANNEL_DATA_SIZE 96
+
 struct cd_prefix_record {                    /* packed, 24 bytes */
     uint64_t hash;           /* XXH64 hash of the 16-byte prefix */
     uint8_t  data[16];       /* CD sector prefix data */
@@ -676,7 +762,7 @@ On read, if a dedup block has the `COMPRESSED` flag set, the payload is decompre
 The only supported checksum algorithm is **XXH64** (xxHash, 64-bit). All checksums are stored in 32-byte fields (only the first 8 bytes are used; the remainder is zeroed). Checksums are computed with the checksum field itself zeroed out.
 
 Checksums are applied to:
-- The superblock (not stored in-band; validated by magic and field consistency)
+- The superblock (`obmafs3_sb.checksum`)
 - B+Tree headers (`btree_header.checksum`)
 - B+Tree nodes (`btree_node_header.checksum`)
 - Data blocks (`block_header.checksum`)
@@ -689,7 +775,7 @@ Checksums are applied to:
 
 The only supported compression algorithm is **ZSTD** (Zstandard). The compression level is configurable (default: 15). Compression is applied to:
 
-- Regular file data block groups (when `--compress` is used on mount) — see [Block Group Compression](#block-group-compression)
+- Regular file data block groups (when `--compression=1` is used on mount) — see [Block Group Compression](#block-group-compression)
 - Dedup data blocks (when compression is enabled) — see [Compression Pool](#compression-pool)
 
 Compression is transparent: the read path checks the `flags` field of each `block_header` and decompresses when needed.
@@ -704,9 +790,18 @@ Compression is performed by a shared, persistent thread pool rather than per-fil
 
 Creates a new empty OBMAFS v3 filesystem.
 
-Usage: `mkobmafs -s <size_bytes> -l <label> <path>`
+Usage: `mkobmafs [options] <device-or-file>`
 
-Writes: superblock, catalog tree (header + root node with root directory entry), inode tree (header + root inode), overflow tree (header, empty), dedup tree list (header, empty), media tag tree (header, empty), CD prefix/suffix/subchannel trees (headers, empty), metadata tree (header, empty), metadata index tree (header, empty), refcount tree (header, empty), and allocation bitmap.
+Options:
+- `-s, --size <bytes>` — Total filesystem size (default: file/device size, or 1 GiB)
+- `-b, --block-size <bytes>` — Block size (default: 4096)
+- `-d, --dedup-size <bytes>` — Dedup block size (default: 4194304)
+- `-l, --label <name>` — Volume label (default: OBMAFS3)
+- `-g, --guid <uuid>` — Filesystem GUID (default: random)
+
+The target can be a regular file or a Linux block device (uses `BLKGETSIZE64` to determine size).
+
+Writes: superblock + backup superblock, catalog tree (header + root node with root directory entry), inode tree (header + root inode), overflow tree (header, empty), dedup tree list (header, empty), media tag tree (header, empty), CD prefix/suffix/subchannel trees (headers, empty), metadata tree (header, empty), metadata index tree (header, empty), refcount tree (header, empty), and allocation bitmap.
 
 ### `mount.obmafs` — FUSE mount
 
@@ -715,13 +810,15 @@ Mounts an OBMAFS v3 filesystem via FUSE 3.
 Usage: `mount.obmafs --device=<path> <mountpoint> [options]`
 
 Options:
-- `--compress` — Enable ZSTD compression for writes
-- `--zstd-level=N` — Set ZSTD compression level (default: 15)
+- `--compression=<0|1>` — Enable (1) or disable (0) ZSTD compression for writes (default: 1)
+- `--zstd-level=<1-15>` — ZSTD compression level (default: 15)
+- `--disk-images=<spec>` — Semicolon-separated `ext=sector_size` pairs for disk image detection (default: `dsk=512;iso=2048`)
 - `-f` — Run in foreground (skip daemonisation/fork)
 
 **Supported FUSE operations:**
 | Operation | Description |
 |-----------|-------------|
+| `init`    | Reinit compression pool after fork; set `max_write` and `max_readahead` to 1 MiB; enable `FUSE_CAP_PARALLEL_DIROPS`; intentionally disable `FUSE_CAP_WRITEBACK_CACHE` to preserve sequential write optimisation |
 | `getattr` | Return file/directory attributes from inode |
 | `readdir` | List directory entries from catalog tree |
 | `open`    | Allocate per-file context, detect sector size for media images |
@@ -783,38 +880,48 @@ Options:
 | `OBMAFS3_IOC_DELETE_METADATA` | Delete a metadata entry by key |
 | `OBMAFS3_IOC_LIST_METADATA` | List metadata keys for an image (paginated) |
 
-**Media image detection**: Files with recognized disk image extensions (`.iso`, `.img`, `.bin`, `.raw`, etc.) are automatically created as `kFileTypeMediaImage`. The sector size is auto-detected from the file extension (e.g., 2048 for `.iso`, 512 for `.img`).
+**Media image detection**: The extension-to-sector-size mapping is configurable via `--disk-images`. Up to 32 mappings are supported (`OBMAFS3_MAX_DISK_IMAGE_MAPS`). Each mapping associates a file extension with a sector size. The default mapping (`dsk=512;iso=2048`) creates files with `.dsk` as `kFileTypeMediaImage` with 512-byte sectors, and `.iso` as `kFileTypeMediaImage` with 2048-byte sectors. CD images (`kFileTypeCompactDiscImage`) use the CD sector map format with prefix/suffix/subchannel splitting and ECC/EDC reconstruction.
 
 ### `obmafsck` — Filesystem checker
 
 Checks and verifies OBMAFS v3 filesystem integrity.
 
-Usage: `obmafsck [-n] [-s] <path>`
+Usage: `obmafsck [-y] [-n] [-s] [-d] [-v] <path>`
 
 Options:
-- `-n` — No-fix mode (report errors only, do not modify)
+- `-y` — Assume 'yes' to all repair questions
+- `-n` — Assume 'no' to all repair questions (report errors only, do not modify)
 - `-s` — Run data block scrub (verify all block checksums)
+- `-d` — Show deduplication and compression statistics
+- `-v` — Verify dedup and CD hashes against stored data
 
 **Checks performed:**
 
 | Check | Description |
 |-------|-------------|
-| Superblock validation | Magic, block sizes, LBA consistency |
+| Superblock validation | Magic, checksum, block sizes, LBA consistency |
+| Superblock field range checks | Validate block_size, dedup_block_size, total_bytes, checksum_type, next_inode_id, bitmap_lba/blocks, tree LBAs (bounds + uniqueness), volume_label NUL-termination, creation_time; offer to fix each invalid field |
+| Backup superblock | Read backup at last block, verify magic/checksum/consistency against primary; restore primary from backup when primary is unreadable; overwrite backup from primary on mismatch |
 | Allocation bitmap | Load and verify bitmap checksum |
 | Catalog tree | Traverse all nodes, verify magic and checksums |
 | Inode tree | Traverse all nodes, verify magic and checksums |
 | Overflow tree | Traverse all nodes, verify magic and checksums |
 | Refcount tree | Traverse all nodes, verify magic and checksums |
+| Refcount validation | Walk all inode extents, count per-block references, compare against refcount tree entries, fix mismatches |
 | Media tag tree | Traverse all nodes, verify magic and checksums |
 | Metadata tree | Traverse all nodes, verify magic and checksums |
 | Metadata index tree | Traverse all nodes, verify magic and checksums |
+| Metadata bidirectional consistency | Walk both metadata and metadata index tree leaves, verify every entry in one tree has a matching entry in the other; re-insert missing entries |
 | CD prefix/suffix/subchannel trees | Traverse all nodes, verify magic and checksums |
 | Dedup tree list | Verify list header, traverse all per-sector-size trees |
 | Cross-reference | Verify all catalog entries have valid inodes |
+| Free node chain | Verify `free_node_lba` and `free_nodes` are zero in every B+Tree header (the runtime never uses the free node chain); reset to zero on mismatch |
 | Block allocation | Reconstruct expected bitmap from all on-disk structures and compare against on-disk bitmap |
 | Last-block handling | The last dedup data block of each tree marks all `std_per_dedup` blocks as expected (see [Partial block handling](#dedup-block-lifecycle)) |
 | Data block scrub | Read every data block, verify magic and checksum (handles compressed blocks) |
 | Dedup data block scrub | Read every unique dedup data block, verify magic and checksum (handles compressed blocks) |
+| Dedup hash verification | Walk all dedup trees, read sector data from data blocks, recompute XXH64 hash, compare against stored hash (optional, `-v`) |
+| CD hash verification | Walk CD prefix/suffix/subchannel trees, recompute XXH64 from inline data, compare against stored hash (optional, `-v`) |
 
 The scrub functions correctly handle both compressed and uncompressed blocks by checking the `OBMAFS3_BLOCK_FLAG_COMPRESSED` flag to determine whether to checksum `compressed_size` or `original_size` bytes.
 
@@ -824,11 +931,13 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 
 **API categories:**
 - Context management: `obmafs3_open`, `obmafs3_open_flags`, `obmafs3_close`
-- Superblock: `obmafs3_sb_read`, `obmafs3_sb_write`, `obmafs3_sb_validate`
+- Superblock: `obmafs3_sb_read`, `obmafs3_sb_read_lenient`, `obmafs3_sb_write`, `obmafs3_sb_validate`, `obmafs3_sb_read_backup`, `obmafs3_sb_read_backup_lenient`
 - Block I/O: `obmafs3_block_read`, `obmafs3_block_write`
-- B+Tree: header read/write, catalog lookup/list/insert/delete, inode get/put/delete
+- B+Tree: `obmafs3_btree_header_read`, `obmafs3_btree_header_read_lenient`, `obmafs3_btree_header_write`, catalog lookup/list/insert/delete, inode get/put/delete
 - Allocation: `obmafs3_alloc_block`, `obmafs3_alloc_blocks`, `obmafs3_free_block`, `obmafs3_free_blocks`, `obmafs3_alloc_inode_id`
-- Bitmap: read/write/set/clear/is_set/find_free
+- Bitmap: `obmafs3_bitmap_read`, `obmafs3_bitmap_write`, `obmafs3_bitmap_set`, `obmafs3_bitmap_clear`, `obmafs3_bitmap_is_set`, `obmafs3_bitmap_find_free`
+- Catalog: `obmafs3_catalog_lookup`, `obmafs3_catalog_list`, `obmafs3_catalog_list_free`, `obmafs3_catalog_insert`, `obmafs3_catalog_delete`
+- Inode: `obmafs3_inode_get`, `obmafs3_inode_put`, `obmafs3_inode_delete`
 - File data: `obmafs3_read_file_data`, `obmafs3_write_file_data`
 - Clone/reflink: `obmafs3_clone_file_range`, `obmafs3_free_file_blocks`, `obmafs3_truncate_file_blocks`
 - Refcount: `obmafs3_refcount_get`, `obmafs3_refcount_set`, `obmafs3_refcount_inc`, `obmafs3_refcount_dec`
@@ -839,18 +948,55 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Thread-local buffers: `obmafs3_get_thread_bufs`
 - Sector map cache: `obmafs3_flush_sector_map_cache`, `obmafs3_free_sector_map_cache`
 - CD sector map cache: `obmafs3_flush_cd_sector_map_cache`, `obmafs3_free_cd_sector_map_cache`
-- Media tags: `obmafs3_media_tag_get`, `obmafs3_media_tag_put`, `obmafs3_media_tag_delete`, `obmafs3_media_tag_delete_all`, `obmafs3_media_tag_list`
-- Image metadata: `obmafs3_metadata_get`, `obmafs3_metadata_put`, `obmafs3_metadata_delete`, `obmafs3_metadata_delete_all`, `obmafs3_metadata_list`, `obmafs3_metadata_query`
+- Media tags: `obmafs3_media_tag_get`, `obmafs3_media_tag_data_free`, `obmafs3_media_tag_put`, `obmafs3_media_tag_delete`, `obmafs3_media_tag_delete_all`, `obmafs3_media_tag_list`, `obmafs3_media_tag_list_free`
+- Image metadata: `obmafs3_metadata_get`, `obmafs3_metadata_put`, `obmafs3_metadata_delete`, `obmafs3_metadata_delete_all`, `obmafs3_metadata_list`, `obmafs3_metadata_list_free`, `obmafs3_metadata_query`, `obmafs3_metadata_query_free`
 - CD B+Trees: `obmafs3_cd_prefix_get/put/delete`, `obmafs3_cd_suffix_get/put/delete`, `obmafs3_cd_subchannel_get/put/delete`
-- ECC/EDC: `ecc_cd_init`, `ecc_cd_free`, `ecc_cd_is_suffix_correct`, `ecc_cd_reconstruct`
+- ECC/EDC: `ecc_cd_init`, `ecc_cd_free`, `ecc_cd_is_suffix_correct`, `ecc_cd_is_suffix_correct_mode2`, `ecc_cd_reconstruct`, `ecc_cd_reconstruct_prefix`, `cd_lba_to_msf`
 - Checksum: `obmafs3_checksum_xxh64`, `obmafs3_checksum_block`
 - Compression: `obmafs3_compress`, `obmafs3_decompress`
 - Filesystem creation: `obmafs3_create`
+- Filesystem checking: `obmafs3_check`
 - Path resolution: `obmafs3_resolve_inode_path`
 
 Open flags:
 - `OBMAFS3_OPEN_SKIP_BITMAP` — Do not load/validate bitmap (for quick header-only checks)
 - `OBMAFS3_OPEN_LENIENT` — Tolerate checksum errors (used by fsck)
+
+---
+
+## Error Codes
+
+All library functions return integer error codes:
+
+```c
+#define OBMAFS3_OK           0   /* Success */
+#define OBMAFS3_ERR_IO       -1  /* I/O error (read/write/seek failed) */
+#define OBMAFS3_ERR_NOMEM    -2  /* Out of memory */
+#define OBMAFS3_ERR_BADMAGIC -3  /* Invalid magic number */
+#define OBMAFS3_ERR_CHECKSUM -4  /* Checksum verification failed */
+#define OBMAFS3_ERR_NOTFOUND -5  /* Entry not found */
+#define OBMAFS3_ERR_INVAL    -6  /* Invalid argument */
+#define OBMAFS3_ERR_EXISTS   -7  /* Entry already exists */
+#define OBMAFS3_ERR_NOSPC    -8  /* No space left on device */
+```
+
+---
+
+## Debug Logging
+
+Debug output is controlled by the `OBMAFS3_DEBUG` environment variable. When set to any non-empty, non-`"0"` value, every error return site emits a line to stderr with file, line number, function name, and a brief message.
+
+The following macros are provided in `debug.h`:
+
+| Macro | Purpose |
+|-------|---------|
+| `OBMAFS3_DBG(fmt, ...)` | Debug message (only when debug is enabled) |
+| `DBG_RETURN(err, fmt, ...)` | Log error and return `err` from library function |
+| `DBG_RETURN_ERRNO(err, fmt, ...)` | Same as above, also captures and prints `errno` |
+| `FUSE_RETURN(err, fmt, ...)` | Log error and return negative errno from FUSE callback |
+| `DBG_PROPAGATE(rc)` | Propagate a non-OK return code, logging the call-site |
+
+Initialised by calling `obmafs3_debug_init()` at startup (done automatically by `mount.obmafs` and `obmafsck`).
 
 ---
 
@@ -905,7 +1051,7 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | `mkobmafs` (create filesystem) | Complete |
 | `mount.obmafs` (FUSE mount) | Complete |
 | `obmafsck` (filesystem checker + scrub) | Complete |
-| Filesystem repair in `obmafsck` | Not implemented (check-only) |
+| Filesystem repair in `obmafsck` | Partial (superblock + backup, superblock fields, B+Tree ordering/siblings/checksums/free-node-chain, bitmap, refcounts, orphan inodes) |
 | Rename / move | Complete |
 
 ---
