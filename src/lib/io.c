@@ -197,19 +197,39 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     c->zstd_level  = 15; /* ZSTD level 15 by default */
 
     int rc = obmafs3_sb_read(fd, &c->sb);
-    if(rc != OBMAFS3_OK)
+    if(rc != OBMAFS3_OK || obmafs3_sb_validate(&c->sb) != OBMAFS3_OK)
     {
-        close(fd);
-        free(c);
-        return rc;
-    }
-
-    rc = obmafs3_sb_validate(&c->sb);
-    if(rc != OBMAFS3_OK)
-    {
-        close(fd);
-        free(c);
-        return rc;
+        /* Primary superblock unreadable or invalid — try the backup.
+         * We need the file size to locate the backup at the last block. */
+        off_t file_size = lseek(fd, 0, SEEK_END);
+        int   recovered = 0;
+        if(file_size > 0)
+        {
+            /* Try reading the backup with default block size 4096 first,
+             * then fall back to 512 .. 65536 in case a non-default
+             * block size was used. */
+            static const uint64_t try_bs[] = {4096, 512, 1024, 2048, 8192, 16384, 32768, 65536};
+            for(int i = 0; i < (int)(sizeof(try_bs) / sizeof(try_bs[0])); i++)
+            {
+                uint64_t bs = try_bs[i];
+                if((uint64_t)file_size < 2 * bs) continue; /* need at least 2 blocks */
+                struct obmafs3_sb backup;
+                if(obmafs3_sb_read_backup(fd, bs, (uint64_t)file_size, &backup) == OBMAFS3_OK &&
+                   obmafs3_sb_validate(&backup) == OBMAFS3_OK && backup.block_size == bs &&
+                   backup.total_bytes == (uint64_t)file_size)
+                {
+                    c->sb     = backup;
+                    recovered = 1;
+                    break;
+                }
+            }
+        }
+        if(!recovered)
+        {
+            close(fd);
+            free(c);
+            return (rc != OBMAFS3_OK) ? rc : OBMAFS3_ERR_BADMAGIC;
+        }
     }
 
     /* Initialise thread-local storage key for per-thread scratch buffers
@@ -928,6 +948,10 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
         uint64_t reserved = 14 + bitmap_blks;
         for(uint64_t b = 0; b < reserved; b++) bitmap[b / 8] |= (1u << (b % 8));
 
+        /* Mark the last block (backup superblock) as allocated */
+        uint64_t backup_lba = total_blocks - 1;
+        if(backup_lba >= reserved) bitmap[backup_lba / 8] |= (1u << (backup_lba % 8));
+
         /* Build the bitmap header with checksum over bitmap data */
         struct bitmap_header bhdr;
         memset(&bhdr, 0, sizeof(bhdr));
@@ -980,6 +1004,14 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
         }
         free(blk);
         free(bitmap);
+    }
+
+    /* --- Last block: Backup superblock --- */
+    rc = write_block(fd, block_size, total_blocks - 1, &sb, sizeof(sb));
+    if(rc != OBMAFS3_OK)
+    {
+        close(fd);
+        return rc;
     }
 
     /* Flush and close */

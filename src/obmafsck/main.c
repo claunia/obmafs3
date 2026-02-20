@@ -345,7 +345,16 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
         if(n < 0 || (size_t)n != sizeof(*sb))
             fprintf(stderr, "    Error: could not write superblock fix\n");
         else
+        {
             printf("    Superblock updated (%d field(s) fixed).\n", fixed);
+            /* Also update the backup superblock */
+            if(sb->total_bytes > 0 && sb->block_size > 0)
+            {
+                uint64_t blba = OBMAFS3_BACKUP_SB_LBA(sb->total_bytes, sb->block_size);
+                if(blba > 0)
+                    pwrite(fd, sb, sizeof(*sb), (off_t)(blba * sb->block_size));
+            }
+        }
     }
 
     /* ---- Summary ---- */
@@ -2680,6 +2689,9 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     /* Bitmap blocks */
     PROGRESS("bitmap blocks");
     for(uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++) MARK(ctx->sb.bitmap_lba + i);
+
+    /* Backup superblock at the last block */
+    MARK(total_blocks - 1);
 
     /* File data blocks from inode extents */
     PROGRESS("inode data blocks");
@@ -5865,12 +5877,46 @@ int main(int argc, char *argv[])
     if(sb.magic != OBMAFS3_SB_MAGIC)
     {
         fprintf(stderr,
-                "Error: '%s' does not contain an OBMAFS3 filesystem\n"
-                "  Expected magic: 0x%016" PRIx64 "\n"
-                "  Found magic:    0x%016" PRIx64 "\n",
-                path, (uint64_t)OBMAFS3_SB_MAGIC, sb.magic);
-        close(fd);
-        return 1;
+                "Warning: primary superblock has bad magic (expected 0x%016" PRIx64 ", found 0x%016" PRIx64 ")\n",
+                (uint64_t)OBMAFS3_SB_MAGIC, sb.magic);
+
+        /* Try to recover from the backup superblock at the last block. */
+        off_t                 fsize    = (S_ISREG(file_stat.st_mode)) ? file_stat.st_size : lseek(fd, 0, SEEK_END);
+        int                   recovered = 0;
+        static const uint64_t try_bs[]  = {4096, 512, 1024, 2048, 8192, 16384, 32768, 65536};
+        if(fsize > 0)
+        {
+            for(int i = 0; i < (int)(sizeof(try_bs) / sizeof(try_bs[0])); i++)
+            {
+                uint64_t          bs = try_bs[i];
+                if((uint64_t)fsize < 2 * bs) continue;
+                struct obmafs3_sb backup;
+                if(obmafs3_sb_read_backup(fd, bs, (uint64_t)fsize, &backup) == OBMAFS3_OK &&
+                   obmafs3_sb_validate(&backup) == OBMAFS3_OK && backup.block_size == bs &&
+                   backup.total_bytes == (uint64_t)fsize)
+                {
+                    fprintf(stderr, "  Recovered superblock from backup (block_size=%" PRIu64 ")\n", bs);
+                    sb        = backup;
+                    recovered = 1;
+
+                    /* Restore primary from the backup */
+                    if(pwrite(fd, &sb, sizeof(sb), 0) == sizeof(sb))
+                        fprintf(stderr, "  Primary superblock restored from backup.\n");
+                    else
+                        fprintf(stderr, "  Warning: could not restore primary superblock.\n");
+                    break;
+                }
+            }
+        }
+        if(!recovered)
+        {
+            fprintf(stderr,
+                    "Error: '%s' does not contain an OBMAFS3 filesystem\n"
+                    "  (primary magic bad and no valid backup found)\n",
+                    path);
+            close(fd);
+            return 1;
+        }
     }
 
     if(sb.block_size == 0)
@@ -6053,6 +6099,13 @@ int main(int argc, char *argv[])
                 {
                     printf("  Superblock checksum fixed.\n");
                     errors--;
+                    /* Also update the backup superblock */
+                    if(ctx->sb.total_bytes > 0 && ctx->sb.block_size > 0)
+                    {
+                        uint64_t blba = OBMAFS3_BACKUP_SB_LBA(ctx->sb.total_bytes, ctx->sb.block_size);
+                        if(blba > 0)
+                            pwrite(fd, &ctx->sb, sizeof(ctx->sb), (off_t)(blba * ctx->sb.block_size));
+                    }
                 }
             }
         }
@@ -6066,6 +6119,105 @@ int main(int argc, char *argv[])
     if(ctx->sb.magic != OBMAFS3_SB_MAGIC) errors++;
 
     validate_superblock_fields(&ctx->sb, fd, (uint64_t)file_stat.st_size, auto_yes, auto_no, &errors);
+
+    /* ---- Backup superblock ---- */
+    if(ctx->sb.total_bytes > 0 && ctx->sb.block_size > 0)
+    {
+        uint64_t          backup_lba = OBMAFS3_BACKUP_SB_LBA(ctx->sb.total_bytes, ctx->sb.block_size);
+        struct obmafs3_sb backup_sb;
+        int               backup_cs_ok = 0;
+        int backup_rc = obmafs3_sb_read_backup_lenient(fd, ctx->sb.block_size, ctx->sb.total_bytes, &backup_sb,
+                                                       &backup_cs_ok);
+
+        printf("\nBackup superblock (LBA %" PRIu64 "):\n", backup_lba);
+
+        if(backup_rc != OBMAFS3_OK)
+        {
+            printf("  Read:             FAILED (rc=%d)\n", backup_rc);
+            errors++;
+            if(ask_fix(auto_yes, auto_no, "  Write backup superblock from primary?"))
+            {
+                /* Recompute checksum on the primary and write as backup */
+                struct obmafs3_sb tmp = ctx->sb;
+                memset(tmp.checksum, 0, sizeof(tmp.checksum));
+                obmafs3_checksum_block(&tmp, sizeof(tmp), tmp.checksum);
+                off_t   boff = (off_t)(backup_lba * ctx->sb.block_size);
+                ssize_t nn   = pwrite(fd, &tmp, sizeof(tmp), boff);
+                if(nn >= 0 && (size_t)nn == sizeof(tmp))
+                {
+                    printf("  Backup superblock written from primary.\n");
+                    errors--;
+                }
+                else
+                {
+                    fprintf(stderr, "  Error: could not write backup superblock\n");
+                }
+            }
+        }
+        else
+        {
+            printf("  Magic:            0x%016" PRIx64 " (%s)\n", backup_sb.magic,
+                   backup_sb.magic == OBMAFS3_SB_MAGIC ? "OK" : "BAD");
+            printf("  Checksum:         %s\n", backup_cs_ok ? "OK" : "BAD");
+
+            if(backup_sb.magic != OBMAFS3_SB_MAGIC || !backup_cs_ok)
+            {
+                errors++;
+                if(ask_fix(auto_yes, auto_no, "  Overwrite backup superblock from primary?"))
+                {
+                    struct obmafs3_sb tmp = ctx->sb;
+                    memset(tmp.checksum, 0, sizeof(tmp.checksum));
+                    obmafs3_checksum_block(&tmp, sizeof(tmp), tmp.checksum);
+                    off_t   boff = (off_t)(backup_lba * ctx->sb.block_size);
+                    ssize_t nn   = pwrite(fd, &tmp, sizeof(tmp), boff);
+                    if(nn >= 0 && (size_t)nn == sizeof(tmp))
+                    {
+                        printf("  Backup superblock fixed from primary.\n");
+                        errors--;
+                    }
+                    else
+                    {
+                        fprintf(stderr, "  Error: could not write backup superblock\n");
+                    }
+                }
+            }
+            else
+            {
+                /* Both readable — compare contents (excluding checksum which may differ) */
+                struct obmafs3_sb primary_cmp = ctx->sb;
+                struct obmafs3_sb backup_cmp  = backup_sb;
+                memset(primary_cmp.checksum, 0, sizeof(primary_cmp.checksum));
+                memset(backup_cmp.checksum, 0, sizeof(backup_cmp.checksum));
+
+                if(memcmp(&primary_cmp, &backup_cmp, sizeof(struct obmafs3_sb)) == 0)
+                {
+                    printf("  Consistency:      OK\n");
+                }
+                else
+                {
+                    printf("  Consistency:      MISMATCH (backup differs from primary)\n");
+                    errors++;
+                    if(ask_fix(auto_yes, auto_no, "  Overwrite backup superblock from primary?"))
+                    {
+                        struct obmafs3_sb tmp = ctx->sb;
+                        memset(tmp.checksum, 0, sizeof(tmp.checksum));
+                        obmafs3_checksum_block(&tmp, sizeof(tmp), tmp.checksum);
+                        off_t   boff = (off_t)(backup_lba * ctx->sb.block_size);
+                        ssize_t nn   = pwrite(fd, &tmp, sizeof(tmp), boff);
+                        if(nn >= 0 && (size_t)nn == sizeof(tmp))
+                        {
+                            printf("  Backup superblock synced from primary.\n");
+                            errors--;
+                        }
+                        else
+                        {
+                            fprintf(stderr, "  Error: could not write backup superblock\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /* ---- Catalog tree ---- */
     printf("\nCatalog tree:\n");
@@ -7097,6 +7249,14 @@ int main(int argc, char *argv[])
                     {
                         printf("  next_inode_id fixed to %" PRIu64 ".\n", correct);
                         errors--;
+                        /* Also update the backup superblock */
+                        if(ctx->sb.total_bytes > 0 && ctx->sb.block_size > 0)
+                        {
+                            uint64_t blba = OBMAFS3_BACKUP_SB_LBA(ctx->sb.total_bytes, ctx->sb.block_size);
+                            if(blba > 0)
+                                pwrite(fd, &ctx->sb, sizeof(ctx->sb),
+                                       (off_t)(blba * ctx->sb.block_size));
+                        }
                     }
                 }
             }

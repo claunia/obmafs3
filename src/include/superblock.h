@@ -6,6 +6,13 @@
 /* "OBMAFS_3" as little-endian uint64 */
 #define OBMAFS3_SB_MAGIC 0x335F5346414D424FULL
 
+/**
+ * Compute the LBA of the backup superblock from total_bytes and block_size.
+ * The backup always occupies the last block of the filesystem.
+ */
+#define OBMAFS3_BACKUP_SB_LBA(total_bytes, block_size) \
+    (((total_bytes) / (block_size)) - 1)
+
 /// On-disk superblock occupying LBA 0.
 struct __attribute__((packed)) obmafs3_sb
 {

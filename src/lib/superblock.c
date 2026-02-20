@@ -45,10 +45,27 @@ int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb)
     memset(tmp.checksum, 0, sizeof(tmp.checksum));
     obmafs3_checksum_block(&tmp, sizeof(tmp), tmp.checksum);
 
+    /* Write the primary superblock at LBA 0 */
     ssize_t n = pwrite(fd, &tmp, sizeof(tmp), 0);
     if(n < 0 || (size_t)n != sizeof(tmp))
         DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
                          "sb pwrite expected=%zu got=%zd", sizeof(tmp), n);
+
+    /* Write the backup superblock at the last block */
+    if(tmp.total_bytes > 0 && tmp.block_size > 0)
+    {
+        uint64_t backup_lba = OBMAFS3_BACKUP_SB_LBA(tmp.total_bytes, tmp.block_size);
+        if(backup_lba > 0)
+        {
+            off_t   backup_off = (off_t)(backup_lba * tmp.block_size);
+            ssize_t nb         = pwrite(fd, &tmp, sizeof(tmp), backup_off);
+            if(nb < 0 || (size_t)nb != sizeof(tmp))
+                DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
+                                 "backup sb pwrite lba=%" PRIu64 " expected=%zu got=%zd",
+                                 backup_lba, sizeof(tmp), nb);
+        }
+    }
+
     return OBMAFS3_OK;
 }
 
@@ -105,5 +122,67 @@ int obmafs3_sb_validate(const struct obmafs3_sb *sb)
         DBG_RETURN(OBMAFS3_ERR_INVAL,
                    "catalog_lba=%" PRIu64 " inode_lba=%" PRIu64,
                    sb->catalog_lba, sb->inode_lba);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Read the backup superblock from disk.
+ *
+ * The backup superblock is stored at the last block of the filesystem.
+ * The caller must supply @p block_size and @p total_bytes so the
+ * backup LBA can be computed.
+ *
+ * @param fd          Open file descriptor for the filesystem image.
+ * @param block_size  Block size in bytes.
+ * @param total_bytes Total filesystem size in bytes.
+ * @param sb          Output superblock structure.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on failure.
+ */
+int obmafs3_sb_read_backup(int fd, uint64_t block_size, uint64_t total_bytes, struct obmafs3_sb *sb)
+{
+    if(block_size == 0 || total_bytes == 0)
+        DBG_RETURN(OBMAFS3_ERR_INVAL, "block_size or total_bytes is 0");
+
+    uint64_t backup_lba = OBMAFS3_BACKUP_SB_LBA(total_bytes, block_size);
+    if(backup_lba == 0)
+        DBG_RETURN(OBMAFS3_ERR_INVAL, "backup lba would be 0");
+
+    off_t   offset = (off_t)(backup_lba * block_size);
+    ssize_t n      = pread(fd, sb, sizeof(*sb), offset);
+    if(n < 0 || (size_t)n != sizeof(*sb))
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
+                         "backup sb pread lba=%" PRIu64 " expected=%zu got=%zd",
+                         backup_lba, sizeof(*sb), n);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Read the backup superblock from disk (lenient).
+ *
+ * Like @c obmafs3_sb_read_backup but verifies the checksum and reports
+ * the result via @p checksum_ok rather than failing.
+ *
+ * @param fd          Open file descriptor for the filesystem image.
+ * @param block_size  Block size in bytes.
+ * @param total_bytes Total filesystem size in bytes.
+ * @param sb          Output superblock structure.
+ * @param checksum_ok Set to 1 if the checksum matches, 0 otherwise.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on failure.
+ */
+int obmafs3_sb_read_backup_lenient(int fd, uint64_t block_size, uint64_t total_bytes, struct obmafs3_sb *sb,
+                                   int *checksum_ok)
+{
+    int rc = obmafs3_sb_read_backup(fd, block_size, total_bytes, sb);
+    if(rc != OBMAFS3_OK) return rc;
+
+    /* Verify checksum: save stored, zero field, recompute, compare */
+    uint8_t stored[32];
+    memcpy(stored, sb->checksum, 32);
+    memset(sb->checksum, 0, 32);
+    uint8_t computed[32];
+    obmafs3_checksum_block(sb, sizeof(*sb), computed);
+    memcpy(sb->checksum, stored, 32);
+    *checksum_ok = (memcmp(stored, computed, 32) == 0);
+
     return OBMAFS3_OK;
 }

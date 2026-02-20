@@ -134,6 +134,9 @@ int obmafs3_sb_read(int fd, struct obmafs3_sb *sb);
 int obmafs3_sb_read_lenient(int fd, struct obmafs3_sb *sb, int *checksum_ok);
 int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb);
 int obmafs3_sb_validate(const struct obmafs3_sb *sb);
+int obmafs3_sb_read_backup(int fd, uint64_t block_size, uint64_t total_bytes, struct obmafs3_sb *sb);
+int obmafs3_sb_read_backup_lenient(int fd, uint64_t block_size, uint64_t total_bytes, struct obmafs3_sb *sb,
+                                   int *checksum_ok);
 
 /* --- Block I/O --- */
 int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t size);
