@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,166 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+
+/* ------------------------------------------------------------------ */
+/*  Terminal colour & symbol helpers                                    */
+/* ------------------------------------------------------------------ */
+
+static int g_use_color = 0; /* set to 1 when stderr+stdout are ttys */
+
+/* ANSI SGR codes — only emitted when g_use_color is set */
+#define CLR_RESET     (g_use_color ? "\033[0m"    : "")
+#define CLR_BOLD      (g_use_color ? "\033[1m"    : "")
+#define CLR_DIM       (g_use_color ? "\033[2m"    : "")
+#define CLR_RED       (g_use_color ? "\033[31m"   : "")
+#define CLR_GREEN     (g_use_color ? "\033[32m"   : "")
+#define CLR_YELLOW    (g_use_color ? "\033[33m"   : "")
+#define CLR_BLUE      (g_use_color ? "\033[34m"   : "")
+#define CLR_CYAN      (g_use_color ? "\033[36m"   : "")
+#define CLR_BOLD_RED  (g_use_color ? "\033[1;31m" : "")
+#define CLR_BOLD_GRN  (g_use_color ? "\033[1;32m" : "")
+#define CLR_BOLD_YLW  (g_use_color ? "\033[1;33m" : "")
+#define CLR_BOLD_CYAN (g_use_color ? "\033[1;36m" : "")
+
+/* Unicode status symbols (with colour) for structured output */
+#define SYM_OK      (g_use_color ? "\033[32m\u2714\033[0m" : "OK")      /* ✔ green  */
+#define SYM_BAD     (g_use_color ? "\033[31m\u2718\033[0m" : "BAD")     /* ✘ red    */
+#define SYM_WARN    (g_use_color ? "\033[33m\u26A0\033[0m" : "WARNING") /* ⚠ yellow */
+#define SYM_FIXED   (g_use_color ? "\033[34m\u2726\033[0m" : "FIXED")   /* ✦ blue   */
+#define SYM_SKIP    (g_use_color ? "\033[2m\u2500\033[0m"  : "-")       /* ─ dim    */
+
+/* Initialise colour support (call once early in main) */
+static void init_color(void)
+{
+    /* Respect NO_COLOR convention (https://no-color.org/) */
+    if(getenv("NO_COLOR")) return;
+
+    /* Only enable when both stdout and stderr are terminals */
+    if(isatty(STDOUT_FILENO) && isatty(STDERR_FILENO))
+        g_use_color = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Timing helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+static struct timespec g_start_time; /* set at programme start   */
+static int             g_phase_num;  /* current phase number     */
+
+/** Store the current monotonic time in @p ts. */
+static void timer_now(struct timespec *ts) { clock_gettime(CLOCK_MONOTONIC, ts); }
+
+/** Return elapsed seconds between @p start and @p end. */
+static double timer_elapsed(const struct timespec *start, const struct timespec *end)
+{
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_nsec - start->tv_nsec) / 1e9;
+}
+
+/** Format a duration in seconds to a human-readable string. */
+static void fmt_duration(double secs, char *buf, size_t len)
+{
+    if(secs < 0.001)
+        snprintf(buf, len, "<1ms");
+    else if(secs < 1.0)
+        snprintf(buf, len, "%.0fms", secs * 1000.0);
+    else if(secs < 60.0)
+        snprintf(buf, len, "%.1fs", secs);
+    else
+    {
+        int m = (int)(secs / 60.0);
+        snprintf(buf, len, "%dm%04.1fs", m, secs - m * 60.0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Phase header helper                                                */
+/* ------------------------------------------------------------------ */
+
+static struct timespec g_phase_start;
+
+/**
+ * Print a numbered phase header.
+ *
+ * Output: "Phase N: Title"  (bold when colour is enabled)
+ */
+static void phase_begin(const char *title)
+{
+    g_phase_num++;
+    timer_now(&g_phase_start);
+    printf("\n%s── Phase %d: %s%s\n", CLR_BOLD, g_phase_num, title, CLR_RESET);
+}
+
+/**
+ * Print the elapsed time for the current phase (right-aligned, dim).
+ */
+static void phase_end(void)
+{
+    struct timespec now;
+    timer_now(&now);
+    char dur[32];
+    fmt_duration(timer_elapsed(&g_phase_start, &now), dur, sizeof(dur));
+    printf("  %s(%s)%s\n", CLR_DIM, dur, CLR_RESET);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Formatted-result helpers                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Print a successful check result:  "  Label:  ✔ value"
+ */
+static void result_ok(const char *label, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void result_ok(const char *label, const char *fmt, ...)
+{
+    printf("  %-20s %s ", label, SYM_OK);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
+
+/**
+ * Print a failed check result:  "  Label:  ✘ value"
+ */
+static void result_bad(const char *label, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void result_bad(const char *label, const char *fmt, ...)
+{
+    printf("  %-20s %s ", label, SYM_BAD);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
+
+/**
+ * Print a fixed/repaired result:  "  Label:  ✦ value"
+ */
+static void result_fixed(const char *label, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void result_fixed(const char *label, const char *fmt, ...)
+{
+    printf("  %-20s %s ", label, SYM_FIXED);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
+
+/**
+ * Print a simple labelled value (no status symbol).
+ */
+static void result_info(const char *label, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void result_info(const char *label, const char *fmt, ...)
+{
+    printf("  %-20s ", label);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
 
 /* ------------------------------------------------------------------ */
 /*  Options                                                            */
@@ -53,7 +214,7 @@ static int ask_fix(int auto_yes, int auto_no, const char *prompt)
     if(auto_yes) return 1;
     if(auto_no) return 0;
 
-    fprintf(stdout, "%s [y/n] ", prompt);
+    printf("  %s%s%s [y/n] ", CLR_BOLD_YLW, prompt, CLR_RESET);
     fflush(stdout);
 
     int ch = fgetc(stdin);
@@ -360,13 +521,14 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
     /* ---- Summary ---- */
     if(bad == 0)
     {
-        printf("  Field checks:     OK\n");
+        result_ok("Field checks:", "");
     }
     else
     {
-        printf("  Field checks:     %d error(s)", bad);
-        if(fixed > 0) printf(" (%d fixed)", fixed);
-        printf("\n");
+        if(fixed > 0)
+            result_fixed("Field checks:", "%d error(s), %d fixed", bad, fixed);
+        else
+            result_bad("Field checks:", "%d error(s)", bad);
         *errors += (bad - fixed);
     }
 }
@@ -375,11 +537,21 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
 /*  Progress bar helper                                                */
 /* ------------------------------------------------------------------ */
 
+/** Clear the current progress line on stderr. */
+static void bar_clear(void)
+{
+    fprintf(stderr, "\r\033[K");
+    fflush(stderr);
+}
+
 /**
- * Print a visual progress bar on stderr.
+ * Print a unified progress bar on stderr.
  *
- * Renders something like:
- *   \r  Walking Dedup tree [==================>           ] 768/27058 nodes
+ * Renders:
+ *   \r  Walking Dedup tree  ████████░░░░░░░  53% · 768/1450
+ *
+ * Uses Unicode block-drawing characters when colour is enabled,
+ * falling back to [===>   ] when it is not.
  *
  * @param prefix  Label text (e.g. "Walking Dedup tree").
  * @param done    Number of items completed.
@@ -390,19 +562,43 @@ static void print_bar(const char *prefix, uint64_t done, uint64_t total)
     const int bar_width = 30;
     double    frac      = total > 0 ? (double)done / (double)total : 1.0;
     if(frac > 1.0) frac = 1.0;
-    int filled = (int)(frac * bar_width);
+    int pct = (int)(frac * 100.0);
 
-    fprintf(stderr, "\r  %s [" , prefix);
-    for(int i = 0; i < bar_width; i++)
+    if(g_use_color)
     {
-        if(i < filled)
-            fputc('=', stderr);
-        else if(i == filled)
-            fputc('>', stderr);
-        else
-            fputc(' ', stderr);
+        /* Unicode block-drawing progress bar */
+        /* Each cell can show 8 sub-positions via block chars ▏▎▍▌▋▊▉█ */
+        static const char *blocks[] = { " ", "\u258F", "\u258E", "\u258D",
+                                        "\u258C", "\u258B", "\u258A", "\u2589", "\u2588" };
+        double filled_f = frac * bar_width;
+        int    filled_i = (int)filled_f;
+        int    sub      = (int)((filled_f - filled_i) * 8.0);
+
+        fprintf(stderr, "\r  \033[36m%-24s\033[0m ", prefix);
+        for(int i = 0; i < bar_width; i++)
+        {
+            if(i < filled_i)
+                fprintf(stderr, "\033[36m\u2588\033[0m");
+            else if(i == filled_i)
+                fprintf(stderr, "\033[36m%s\033[0m", blocks[sub]);
+            else
+                fprintf(stderr, "\033[2m\u2591\033[0m");
+        }
+        fprintf(stderr, " %3d%% \033[2m\u00B7\033[0m %" PRIu64 "/%" PRIu64 "  ", pct, done, total);
     }
-    fprintf(stderr, "] %" PRIu64 "/" "%" PRIu64 "   ", done, total);
+    else
+    {
+        /* ASCII fallback */
+        int filled = (int)(frac * bar_width);
+        fprintf(stderr, "\r  %-24s [", prefix);
+        for(int i = 0; i < bar_width; i++)
+        {
+            if(i < filled)       fputc('=', stderr);
+            else if(i == filled) fputc('>', stderr);
+            else                 fputc(' ', stderr);
+        }
+        fprintf(stderr, "] %3d%% %" PRIu64 "/%" PRIu64 "   ", pct, done, total);
+    }
     fflush(stderr);
 }
 
@@ -542,8 +738,7 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, si
 
     if(show_progress)
     {
-        fprintf(stderr, "\r%80s\r", "");
-        fflush(stderr);
+        bar_clear();
     }
 
     *out_lbas  = lbas;
@@ -758,8 +953,7 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
 
     if(node_count > 10)
     {
-        fprintf(stderr, "\r%80s\r", "");
-        fflush(stderr);
+        bar_clear();
     }
 
     /* Offer to fix */
@@ -1011,11 +1205,11 @@ static void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header 
 {
     if((uint64_t)hdr->total_nodes == actual)
     {
-        printf("%sTotal nodes:      %u (OK)\n", indent, hdr->total_nodes);
+        result_ok("Total nodes:", "%u", hdr->total_nodes);
         return;
     }
 
-    printf("%sTotal nodes:      MISMATCH (header %u, walked %" PRIu64 ")\n", indent, hdr->total_nodes, actual);
+    result_bad("Total nodes:", "MISMATCH (header %u, walked %" PRIu64 ")", hdr->total_nodes, actual);
     (*errors)++;
 
     if(ask_fix(auto_yes, auto_no, "Fix total_nodes in header?"))
@@ -1024,7 +1218,7 @@ static void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header 
         int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
         if(rc == OBMAFS3_OK)
         {
-            printf("%sTotal nodes:      FIXED -> %" PRIu64 "\n", indent, actual);
+            result_fixed("Total nodes:", "%" PRIu64, actual);
             (*errors)--;
         }
         else
@@ -1061,12 +1255,12 @@ static void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *
 {
     if(hdr->free_node_lba == 0 && hdr->free_nodes == 0)
     {
-        printf("%sFree node chain:  OK\n", indent);
+        result_ok("Free node chain:", "");
         return;
     }
 
-    printf("%sFree node chain:  BAD (free_node_lba=%" PRIu64 ", free_nodes=%u)\n", indent, hdr->free_node_lba,
-           hdr->free_nodes);
+    result_bad("Free node chain:", "free_node_lba=%" PRIu64 ", free_nodes=%u", hdr->free_node_lba,
+              hdr->free_nodes);
     (*errors)++;
 
     if(ask_fix(auto_yes, auto_no, "Reset free node chain in header?"))
@@ -1076,7 +1270,7 @@ static void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *
         int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
         if(rc == OBMAFS3_OK)
         {
-            printf("%sFree node chain:  FIXED -> 0\n", indent);
+            result_fixed("Free node chain:", "reset to 0");
             (*errors)--;
         }
         else
@@ -1447,8 +1641,7 @@ static int verify_btree_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_l
 
     if(node_count > 10)
     {
-        fprintf(stderr, "\r%80s\r", "");
-        fflush(stderr);
+        bar_clear();
     }
 
     free(buf);
@@ -1570,8 +1763,7 @@ static int verify_meta_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lb
 
     if(node_count > 10)
     {
-        fprintf(stderr, "\r%80s\r", "");
-        fflush(stderr);
+        bar_clear();
     }
 
     free(buf);
@@ -2436,8 +2628,7 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, ui
 #undef PUSH_LBA
 
     /* Clear progress line */
-    fprintf(stderr, "\r%80s\r", "");
-    fflush(stderr);
+    bar_clear();
 
     *out_lbas  = lbas;
     *out_count = count;
@@ -2481,9 +2672,10 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     do                                                                         \
     {                                                                          \
         step++;                                                                \
-        fprintf(stderr, "\r  Building expected bitmap... [%2d/%d] %-30s",      \
-                step, total_steps, (desc));                                     \
-        fflush(stderr);                                                        \
+        char _p_pfx[64];                                                       \
+        snprintf(_p_pfx, sizeof(_p_pfx), "Bitmap [%2d/%d] %s",                \
+                 step, total_steps, (desc));                                    \
+        print_bar(_p_pfx, (uint64_t)step, (uint64_t)total_steps);             \
     } while(0)
 
 /* Helper to set a bit */
@@ -2765,8 +2957,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
 #undef MARK
 
     /* Clear the progress line */
-    fprintf(stderr, "\r%80s\r", "");
-    fflush(stderr);
+    bar_clear();
 
 #undef PROGRESS
 
@@ -2779,32 +2970,60 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
 /* ------------------------------------------------------------------ */
 
 /**
- * Print a progress bar to stderr.
+ * Print a progress bar (with error count) to stderr.
  *
+ * Uses the same visual style as print_bar but appends an error counter.
+ *
+ * @param label  Activity label (e.g. "Scrubbing data blocks").
  * @param done   Number of items processed so far.
  * @param total  Total number of items.
  * @param bad    Number of errors detected so far.
  */
-static void print_progress(uint64_t done, uint64_t total, uint64_t bad)
+static void print_progress(const char *label, uint64_t done, uint64_t total, uint64_t bad)
 {
-    int    bar_width = 40;
-    double frac      = total > 0 ? (double)done / (double)total : 1.0;
-    int    filled    = (int)(frac * bar_width);
+    const int bar_width = 30;
+    double    frac      = total > 0 ? (double)done / (double)total : 1.0;
+    if(frac > 1.0) frac = 1.0;
+    int pct = (int)(frac * 100.0);
 
-    fprintf(stderr, "\r  [");
-    for(int i = 0; i < bar_width; i++)
+    if(g_use_color)
     {
-        if(i < filled)
-            fputc('=', stderr);
-        else if(i == filled)
-            fputc('>', stderr);
-        else
-            fputc(' ', stderr);
+        static const char *blocks[] = { " ", "\u258F", "\u258E", "\u258D",
+                                        "\u258C", "\u258B", "\u258A", "\u2589", "\u2588" };
+        double filled_f = frac * bar_width;
+        int    filled_i = (int)filled_f;
+        int    sub      = (int)((filled_f - filled_i) * 8.0);
+
+        fprintf(stderr, "\r  \033[36m%-24s\033[0m ", label);
+        for(int i = 0; i < bar_width; i++)
+        {
+            if(i < filled_i)
+                fprintf(stderr, "\033[36m\u2588\033[0m");
+            else if(i == filled_i)
+                fprintf(stderr, "\033[36m%s\033[0m", blocks[sub]);
+            else
+                fprintf(stderr, "\033[2m\u2591\033[0m");
+        }
+        fprintf(stderr, " %3d%% \033[2m\u00B7\033[0m %" PRIu64 "/%" PRIu64, pct, done, total);
+        if(bad > 0)
+            fprintf(stderr, " \033[31m\u00B7 %" PRIu64 " error%s\033[0m", bad, bad == 1 ? "" : "s");
+        fprintf(stderr, "  ");
     }
-    fprintf(stderr,
-            "] %3d%% | %" PRIu64 "/"
-            "%" PRIu64 " blocks | %" PRIu64 " error%s",
-            (int)(frac * 100), done, total, bad, bad == 1 ? "" : "s");
+    else
+    {
+        int filled = (int)(frac * bar_width);
+        fprintf(stderr, "\r  %-24s [", label);
+        for(int i = 0; i < bar_width; i++)
+        {
+            if(i < filled)       fputc('=', stderr);
+            else if(i == filled) fputc('>', stderr);
+            else                 fputc(' ', stderr);
+        }
+        fprintf(stderr, "] %3d%% %" PRIu64 "/%" PRIu64, pct, done, total);
+        if(bad > 0)
+            fprintf(stderr, " | %" PRIu64 " error%s", bad, bad == 1 ? "" : "s");
+        fprintf(stderr, "   ");
+    }
     fflush(stderr);
 }
 
@@ -2823,8 +3042,8 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
     /* Collect all data block LBAs from inode extents */
     if(ctx->inode_hdr.root_node_lba == 0)
     {
-        printf("\nData block scrub:\n");
-        printf("  No data blocks to scrub.\n");
+        printf("\n  %sData block scrub%s\n", CLR_BOLD, CLR_RESET);
+        result_info("Status:", "no data blocks to scrub");
         return 0;
     }
 
@@ -2865,8 +3084,8 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
         return 0;
     }
 
-    printf("\nData block scrub:\n");
-    printf("  Blocks to verify: %" PRIu64 "\n", data_count);
+    printf("\n  %sData block scrub%s\n", CLR_BOLD, CLR_RESET);
+    result_info("Blocks to verify:", "%" PRIu64, data_count);
 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if(!buf)
@@ -2886,7 +3105,7 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
      * be read successfully. */
     for(uint64_t i = 0; i < data_count; i++)
     {
-        if(i % 64 == 0 || i == data_count - 1) print_progress(i + 1, data_count, bad);
+        if(i % 64 == 0 || i == data_count - 1) print_progress("Data blocks", i + 1, data_count, bad);
 
         rc = obmafs3_block_read(ctx, data_lbas[i], buf, (size_t)ctx->sb.block_size);
         if(rc != OBMAFS3_OK)
@@ -2896,13 +3115,13 @@ static uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx)
         }
     }
 
-    print_progress(data_count, data_count, bad);
-    fprintf(stderr, "\n");
+    print_progress("Data blocks", data_count, data_count, bad);
+    bar_clear();
 
-    if(bad == 0) { printf("  Result:           OK\n"); }
+    if(bad == 0) { result_ok("Result:", ""); }
     else
     {
-        printf("  Result:           %" PRIu64 " error(s)\n", bad);
+        result_bad("Result:", "%" PRIu64 " error(s)", bad);
         if(read_errors > 0) printf("    Read errors:    %" PRIu64 "\n", read_errors);
     }
 
@@ -2920,8 +3139,8 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
 {
     if(ctx->sb.dedup_lba == 0)
     {
-        printf("\nDedup data block scrub:\n");
-        printf("  No dedup data blocks to scrub.\n");
+        printf("\n  %sDedup data block scrub%s\n", CLR_BOLD, CLR_RESET);
+        result_info("Status:", "no dedup blocks to scrub");
         return 0;
     }
 
@@ -2946,8 +3165,8 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
     if(list_hdr.magic != OBMAFS3_TREELIST_MAGIC || list_hdr.tree_count == 0)
     {
         free(list_buf);
-        printf("\nDedup data block scrub:\n");
-        printf("  No dedup data blocks to scrub.\n");
+        printf("\n  %sDedup data block scrub%s\n", CLR_BOLD, CLR_RESET);
+        result_info("Status:", "no dedup blocks to scrub");
         return 0;
     }
 
@@ -3040,8 +3259,8 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
         return 0;
     }
 
-    printf("\nDedup data block scrub:\n");
-    printf("  Blocks to verify: %" PRIu64 "\n", base_count);
+    printf("\n  %sDedup data block scrub%s\n", CLR_BOLD, CLR_RESET);
+    result_info("Blocks to verify:", "%" PRIu64, base_count);
 
     size_t   dedup_size = (size_t)ctx->sb.dedup_block_size;
     uint8_t *buf        = calloc(1, dedup_size);
@@ -3059,7 +3278,7 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
 
     for(uint64_t i = 0; i < base_count; i++)
     {
-        if(i % 4 == 0 || i == base_count - 1) print_progress(i + 1, base_count, bad);
+        if(i % 4 == 0 || i == base_count - 1) print_progress("Dedup blocks", i + 1, base_count, bad);
 
         /* Read first standard block to get the header */
         rc = obmafs3_block_read(ctx, bases[i], buf, (size_t)ctx->sb.block_size);
@@ -3110,13 +3329,13 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
         }
     }
 
-    print_progress(base_count, base_count, bad);
-    fprintf(stderr, "\n");
+    print_progress("Dedup blocks", base_count, base_count, bad);
+    bar_clear();
 
-    if(bad == 0) { printf("  Result:           OK\n"); }
+    if(bad == 0) { result_ok("Result:", ""); }
     else
     {
-        printf("  Result:           %" PRIu64 " error(s)\n", bad);
+        result_bad("Result:", "%" PRIu64 " error(s)", bad);
         if(read_errors > 0) printf("    Read errors:    %" PRIu64 "\n", read_errors);
         if(bad_magic > 0) printf("    Bad magic:      %" PRIu64 "\n", bad_magic);
         if(bad_checksum > 0) printf("    Bad checksum:   %" PRIu64 "\n", bad_checksum);
@@ -3148,11 +3367,11 @@ static uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
 static uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btree_header *hdr, const char *label,
                                       size_t rec_size, size_t data_size)
 {
-    printf("\n%s hash verification:\n", label);
+    printf("\n  %s%s hash verification%s\n", CLR_BOLD, label, CLR_RESET);
 
     if(hdr->root_node_lba == 0)
     {
-        printf("  No entries to verify.\n");
+        result_info("Status:", "no entries to verify");
         return 0;
     }
 
@@ -3203,12 +3422,12 @@ static uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btre
 
     if(total_entries == 0)
     {
-        printf("  No entries to verify.\n");
+        result_info("Status:", "no entries to verify");
         free(node_buf);
         return 0;
     }
 
-    printf("  Entries to verify: %" PRIu64 "\n", total_entries);
+    result_info("Entries to verify:", "%" PRIu64, total_entries);
 
     /* Second pass: verify hashes */
     uint64_t checked   = 0;
@@ -3252,7 +3471,7 @@ static uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btre
                     if(computed != stored_hash) bad++;
 
                     checked++;
-                    if(checked % 256 == 0 || checked == total_entries) print_progress(checked, total_entries, bad);
+                    if(checked % 256 == 0 || checked == total_entries) print_progress("CD hash verify", checked, total_entries, bad);
                 }
 
                 lba = nhdr.right_link;
@@ -3261,13 +3480,13 @@ static uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btre
         }
     }
 
-    print_progress(total_entries, total_entries, bad);
-    fprintf(stderr, "\n");
+    print_progress("CD hash verify", total_entries, total_entries, bad);
+    bar_clear();
 
     if(bad == 0)
-        printf("  Result:           OK\n");
+        result_ok("Result:", "");
     else
-        printf("  Result:           %" PRIu64 " hash mismatch(es)\n", bad);
+        result_bad("Result:", "%" PRIu64 " hash mismatch(es)", bad);
 
     free(node_buf);
     return bad;
@@ -3286,11 +3505,11 @@ static uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btre
  */
 static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
 {
-    printf("\nDedup hash verification:\n");
+    printf("\n  %sDedup hash verification%s\n", CLR_BOLD, CLR_RESET);
 
     if(ctx->sb.dedup_lba == 0)
     {
-        printf("  No dedup entries to verify.\n");
+        result_info("Status:", "no dedup entries to verify");
         return 0;
     }
 
@@ -3315,7 +3534,7 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
     if(list_hdr.magic != OBMAFS3_TREELIST_MAGIC || list_hdr.tree_count == 0)
     {
         free(list_buf);
-        printf("  No dedup entries to verify.\n");
+        result_info("Status:", "no dedup entries to verify");
         return 0;
     }
 
@@ -3380,13 +3599,13 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
 
     if(total_entries == 0)
     {
-        printf("  No dedup entries to verify.\n");
+        result_info("Status:", "no dedup entries to verify");
         free(node_buf);
         free(entries);
         return 0;
     }
 
-    printf("  Entries to verify: %" PRIu64 "\n", total_entries);
+    result_info("Entries to verify:", "%" PRIu64, total_entries);
 
     /* Allocate buffers for reading dedup data blocks */
     size_t   dedup_size = (size_t)ctx->sb.dedup_block_size;
@@ -3464,7 +3683,7 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                                 bad++;
                                 checked++;
                                 cached_dedup_lba = 0;
-                                if(checked % 256 == 0 || checked == total_entries) print_progress(checked, total_entries, bad);
+                                if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
                                 continue;
                             }
 
@@ -3490,7 +3709,7 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                                     bad++;
                                     checked++;
                                     cached_dedup_lba = 0;
-                                    if(checked % 256 == 0 || checked == total_entries) print_progress(checked, total_entries, bad);
+                                    if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
                                     continue;
                                 }
                             }
@@ -3526,7 +3745,7 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                                     bad++;
                                     checked++;
                                     cached_dedup_lba = 0;
-                                    if(checked % 256 == 0 || checked == total_entries) print_progress(checked, total_entries, bad);
+                                    if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
                                     continue;
                                 }
                                 cached_compressed = 1;
@@ -3553,7 +3772,7 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                         if(computed != de.hash) bad++;
 
                         checked++;
-                        if(checked % 256 == 0 || checked == total_entries) print_progress(checked, total_entries, bad);
+                        if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
                     }
 
                     lba = nhdr.right_link;
@@ -3564,14 +3783,14 @@ static uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
     }
 
 done:
-    print_progress(total_entries, total_entries, bad);
-    fprintf(stderr, "\n");
+    print_progress("Dedup hash verify", total_entries, total_entries, bad);
+    bar_clear();
 
     if(bad == 0)
-        printf("  Result:           OK\n");
+        result_ok("Result:", "");
     else
     {
-        printf("  Result:           %" PRIu64 " error(s)\n", bad);
+        result_bad("Result:", "%" PRIu64 " error(s)", bad);
         if(read_errors > 0) printf("    Read/decomp errors: %" PRIu64 "\n", read_errors);
         uint64_t hash_bad = bad - read_errors;
         if(hash_bad > 0) printf("    Hash mismatches:    %" PRIu64 "\n", hash_bad);
@@ -3634,8 +3853,8 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
 {
     if(ctx->sb.dedup_lba == 0)
     {
-        printf("\nDedup statistics:\n");
-        printf("  No dedup trees found.\n");
+        printf("\n  %sDedup statistics%s\n", CLR_BOLD, CLR_RESET);
+        result_info("Status:", "no dedup trees found");
         return 0;
     }
 
@@ -3655,8 +3874,8 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
     if(tlhdr.magic != OBMAFS3_TREELIST_MAGIC || tlhdr.tree_count == 0)
     {
         free(list_buf);
-        printf("\nDedup statistics:\n");
-        printf("  No dedup trees found.\n");
+        printf("\n  %sDedup statistics%s\n", CLR_BOLD, CLR_RESET);
+        result_info("Status:", "no dedup trees found");
         return 0;
     }
 
@@ -3903,11 +4122,10 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
     }
 
     /* Clear progress line */
-    fprintf(stderr, "\r%80s\r", "");
-    fflush(stderr);
+    bar_clear();
 
     /* ---- Print report ---- */
-    printf("\nDedup statistics:\n");
+    printf("\n  %sDedup statistics%s\n", CLR_BOLD, CLR_RESET);
     printf("  Media image files:        %" PRIu64 "\n", total_media_files);
     printf("  Total logical size:       ");
     print_human_size(total_media_file_size);
@@ -4276,12 +4494,12 @@ static void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, 
     struct meta_triple *meta_recs = NULL, *idx_recs = NULL;
     uint64_t meta_count = 0, idx_count = 0;
 
-    printf("\nMetadata bidirectional consistency:\n");
+    printf("\n  %sMetadata consistency%s\n", CLR_BOLD, CLR_RESET);
 
     int rc = collect_metadata_records(ctx, &meta_recs, &meta_count);
     if(rc != OBMAFS3_OK)
     {
-        printf("  Error: could not walk metadata tree (%d)\n", rc);
+        result_bad("Metadata tree:", "could not walk (%d)", rc);
         (*errors)++;
         return;
     }
@@ -4289,7 +4507,7 @@ static void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, 
     rc = collect_metadata_idx_records(ctx, &idx_recs, &idx_count);
     if(rc != OBMAFS3_OK)
     {
-        printf("  Error: could not walk metadata index tree (%d)\n", rc);
+        result_bad("Metadata index:", "could not walk (%d)", rc);
         free(meta_recs);
         (*errors)++;
         return;
@@ -4309,7 +4527,7 @@ static void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, 
 
     if(missing_from_idx > 0)
     {
-        printf("  Missing from index: %" PRIu64 " record(s)\n", missing_from_idx);
+        result_bad("Missing from index:", "%" PRIu64 " record(s)", missing_from_idx);
         (*errors)++;
 
         if(ask_fix(auto_yes, auto_no, "  Re-insert missing entries into metadata index?"))
@@ -4329,13 +4547,13 @@ static void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, 
             }
             if(fixed_idx == missing_from_idx)
             {
-                printf("  Fixed %" PRIu64 " missing index entries.\n", fixed_idx);
+                result_fixed("Index entries:", "%" PRIu64 " fixed", fixed_idx);
                 (*errors)--;
             }
             else
             {
-                printf("  Fixed %" PRIu64 " of %" PRIu64 " missing index entries.\n",
-                       fixed_idx, missing_from_idx);
+                result_fixed("Index entries:", "%" PRIu64 " of %" PRIu64 " fixed",
+                             fixed_idx, missing_from_idx);
             }
         }
     }
@@ -4350,7 +4568,7 @@ static void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, 
 
     if(missing_from_meta > 0)
     {
-        printf("  Missing from metadata: %" PRIu64 " record(s)\n", missing_from_meta);
+        result_bad("Missing from meta:", "%" PRIu64 " record(s)", missing_from_meta);
         (*errors)++;
 
         if(ask_fix(auto_yes, auto_no, "  Re-insert missing entries into metadata tree?"))
@@ -4370,20 +4588,20 @@ static void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, 
             }
             if(fixed_meta == missing_from_meta)
             {
-                printf("  Fixed %" PRIu64 " missing metadata entries.\n", fixed_meta);
+                result_fixed("Meta entries:", "%" PRIu64 " fixed", fixed_meta);
                 (*errors)--;
             }
             else
             {
-                printf("  Fixed %" PRIu64 " of %" PRIu64 " missing metadata entries.\n",
-                       fixed_meta, missing_from_meta);
+                result_fixed("Meta entries:", "%" PRIu64 " of %" PRIu64 " fixed",
+                             fixed_meta, missing_from_meta);
             }
         }
     }
 
     /* ---- Summary ---- */
     if(missing_from_idx == 0 && missing_from_meta == 0)
-        printf("  Status:             OK (%" PRIu64 " record(s))\n", meta_count);
+        result_ok("Status:", "%" PRIu64 " record(s)", meta_count);
 
     free(meta_recs);
     free(idx_recs);
@@ -4623,12 +4841,12 @@ static void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, in
     uint64_t            cat_count = 0, ino_count = 0;
     int                 rc;
 
-    printf("\nInode / Catalog cross-reference:\n");
+    printf("\n  %sInode / Catalog cross-reference%s\n", CLR_BOLD, CLR_RESET);
 
     rc = collect_catalog_refs(ctx, &cat_refs, &cat_count);
     if(rc != OBMAFS3_OK)
     {
-        printf("  Error: could not walk catalog tree (%d)\n", rc);
+        result_bad("Catalog tree:", "could not walk (%d)", rc);
         (*errors)++;
         return;
     }
@@ -4636,7 +4854,7 @@ static void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, in
     rc = collect_inode_ids(ctx, &inode_ids, &ino_count);
     if(rc != OBMAFS3_OK)
     {
-        printf("  Error: could not walk inode tree (%d)\n", rc);
+        result_bad("Inode tree:", "could not walk (%d)", rc);
         free(cat_refs);
         (*errors)++;
         return;
@@ -4682,11 +4900,11 @@ static void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, in
 
     if(orphan_count == 0)
     {
-        printf("  Orphan inodes:          OK\n");
+        result_ok("Orphan inodes:", "");
     }
     else
     {
-        printf("  Orphan inodes:          %" PRIu64 " found\n", orphan_count);
+        result_bad("Orphan inodes:", "%" PRIu64 " found", orphan_count);
         (*errors)++;
 
         if(ask_fix(auto_yes, auto_no, "  Re-link orphan inodes into lost+found?"))
@@ -4796,11 +5014,11 @@ skip_orphan_fix:
 
     if(dangling_count == 0)
     {
-        printf("  Dangling catalog refs:  OK\n");
+        result_ok("Dangling catalog:", "");
     }
     else
     {
-        printf("  Dangling catalog refs:  %" PRIu64 " found\n", dangling_count);
+        result_bad("Dangling catalog:", "%" PRIu64 " found", dangling_count);
         (*errors)++;
 
         if(ask_fix(auto_yes, auto_no, "  Delete dangling catalog entries?"))
@@ -5707,7 +5925,7 @@ static void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int aut
 {
     uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
 
-    printf("\nExtent validation:\n");
+    printf("\n  %sExtent validation%s\n", CLR_BOLD, CLR_RESET);
 
     /* Inline extents */
     uint64_t inline_bad = 0, inline_fixed = 0;
@@ -5715,13 +5933,14 @@ static void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int aut
 
     if(inline_bad == 0)
     {
-        printf("  Inline extents:   OK\n");
+        result_ok("Inline extents:", "");
     }
     else
     {
-        printf("  Inline extents:   %" PRIu64 " bad", inline_bad);
-        if(inline_fixed > 0) printf(" (%" PRIu64 " cleared)", inline_fixed);
-        printf("\n");
+        if(inline_fixed > 0)
+            result_fixed("Inline extents:", "%" PRIu64 " bad, %" PRIu64 " cleared", inline_bad, inline_fixed);
+        else
+            result_bad("Inline extents:", "%" PRIu64 " bad", inline_bad);
         *errors += (int)(inline_bad - inline_fixed);
     }
 
@@ -5731,11 +5950,11 @@ static void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int aut
 
     if(overflow_bad == 0)
     {
-        printf("  Overflow extents: OK\n");
+        result_ok("Overflow extents:", "");
     }
     else
     {
-        printf("  Overflow extents: %" PRIu64 " bad\n", overflow_bad);
+        result_bad("Overflow extents:", "%" PRIu64 " bad", overflow_bad);
         *errors += (int)overflow_bad;
     }
 
@@ -5745,13 +5964,14 @@ static void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int aut
 
     if(sz_bad == 0)
     {
-        printf("  File size check:  OK\n");
+        result_ok("File size check:", "");
     }
     else
     {
-        printf("  File size check:  %" PRIu64 " mismatch", sz_bad);
-        if(sz_fixed > 0) printf(" (%" PRIu64 " fixed)", sz_fixed);
-        printf("\n");
+        if(sz_fixed > 0)
+            result_fixed("File size check:", "%" PRIu64 " mismatch, %" PRIu64 " fixed", sz_bad, sz_fixed);
+        else
+            result_bad("File size check:", "%" PRIu64 " mismatch", sz_bad);
         *errors += (int)(sz_bad - sz_fixed);
     }
 }
@@ -5828,6 +6048,14 @@ int main(int argc, char *argv[])
     }
 
     const char *path = argv[optind];
+
+    /* Initialise colour support and timing */
+    init_color();
+    timer_now(&g_start_time);
+    g_phase_num = 0;
+
+    printf("%sobmafsck%s — OBMAFS v3 filesystem checker\n", CLR_BOLD, CLR_RESET);
+    printf("%sChecking %s%s\n", CLR_DIM, path, CLR_RESET);
 
     /* ---- Open the filesystem with raw I/O and detailed error reporting ---- */
     int fd = open(path, O_RDWR);
@@ -6072,9 +6300,11 @@ int main(int argc, char *argv[])
     int errors = 0;
 
     /* ---- Superblock ---- */
-    printf("Superblock:\n");
-    printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->sb.magic,
-           ctx->sb.magic == OBMAFS3_SB_MAGIC ? "OK" : "BAD");
+    phase_begin("Superblock");
+    if(ctx->sb.magic == OBMAFS3_SB_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->sb.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->sb.magic);
 
     /* Verify superblock checksum */
     {
@@ -6084,20 +6314,22 @@ int main(int argc, char *argv[])
         obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), computed);
         memcpy(ctx->sb.checksum, stored, 32);
         int sb_cs_ok = (memcmp(stored, computed, 32) == 0);
-        printf("  Checksum:         %s\n", sb_cs_ok ? "OK" : "BAD");
-        if(!sb_cs_ok)
+        if(sb_cs_ok)
+            result_ok("Checksum:", "");
+        else
         {
+            result_bad("Checksum:", "mismatch");
             errors++;
-            if(ask_fix(auto_yes, auto_no, "  Recompute superblock checksum?"))
+            if(ask_fix(auto_yes, auto_no, "Recompute superblock checksum?"))
             {
                 memset(ctx->sb.checksum, 0, 32);
                 obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), ctx->sb.checksum);
                 ssize_t nn = pwrite(fd, &ctx->sb, sizeof(ctx->sb), 0);
                 if(nn < 0 || (size_t)nn != sizeof(ctx->sb))
-                    fprintf(stderr, "  Error: could not write superblock checksum fix\n");
+                    fprintf(stderr, "  %sError: could not write superblock checksum fix%s\n", CLR_RED, CLR_RESET);
                 else
                 {
-                    printf("  Superblock checksum fixed.\n");
+                    result_fixed("Checksum:", "recomputed");
                     errors--;
                     /* Also update the backup superblock */
                     if(ctx->sb.total_bytes > 0 && ctx->sb.block_size > 0)
@@ -6111,10 +6343,10 @@ int main(int argc, char *argv[])
         }
     }
 
-    printf("  Block size:       %" PRIu64 "\n", ctx->sb.block_size);
-    printf("  Dedup block size: %" PRIu64 "\n", ctx->sb.dedup_block_size);
-    printf("  Total bytes:      %" PRIu64 "\n", ctx->sb.total_bytes);
-    printf("  Volume label:     %s\n", ctx->sb.volume_label);
+    result_info("Block size:", "%" PRIu64, ctx->sb.block_size);
+    result_info("Dedup block size:", "%" PRIu64, ctx->sb.dedup_block_size);
+    result_info("Total bytes:", "%" PRIu64, ctx->sb.total_bytes);
+    result_info("Volume label:", "%s", ctx->sb.volume_label);
 
     if(ctx->sb.magic != OBMAFS3_SB_MAGIC) errors++;
 
@@ -6129,13 +6361,13 @@ int main(int argc, char *argv[])
         int backup_rc = obmafs3_sb_read_backup_lenient(fd, ctx->sb.block_size, ctx->sb.total_bytes, &backup_sb,
                                                        &backup_cs_ok);
 
-        printf("\nBackup superblock (LBA %" PRIu64 "):\n", backup_lba);
+        printf("  %sBackup (LBA %" PRIu64 "):%s\n", CLR_DIM, backup_lba, CLR_RESET);
 
         if(backup_rc != OBMAFS3_OK)
         {
-            printf("  Read:             FAILED (rc=%d)\n", backup_rc);
+            result_bad("Read:", "failed (rc=%d)", backup_rc);
             errors++;
-            if(ask_fix(auto_yes, auto_no, "  Write backup superblock from primary?"))
+            if(ask_fix(auto_yes, auto_no, "Write backup superblock from primary?"))
             {
                 /* Recompute checksum on the primary and write as backup */
                 struct obmafs3_sb tmp = ctx->sb;
@@ -6145,25 +6377,30 @@ int main(int argc, char *argv[])
                 ssize_t nn   = pwrite(fd, &tmp, sizeof(tmp), boff);
                 if(nn >= 0 && (size_t)nn == sizeof(tmp))
                 {
-                    printf("  Backup superblock written from primary.\n");
+                    result_fixed("Backup:", "written from primary");
                     errors--;
                 }
                 else
                 {
-                    fprintf(stderr, "  Error: could not write backup superblock\n");
+                    fprintf(stderr, "  %sError: could not write backup superblock%s\n", CLR_RED, CLR_RESET);
                 }
             }
         }
         else
         {
-            printf("  Magic:            0x%016" PRIx64 " (%s)\n", backup_sb.magic,
-                   backup_sb.magic == OBMAFS3_SB_MAGIC ? "OK" : "BAD");
-            printf("  Checksum:         %s\n", backup_cs_ok ? "OK" : "BAD");
+            if(backup_sb.magic == OBMAFS3_SB_MAGIC)
+                result_ok("Magic:", "0x%016" PRIx64, backup_sb.magic);
+            else
+                result_bad("Magic:", "0x%016" PRIx64, backup_sb.magic);
+            if(backup_cs_ok)
+                result_ok("Checksum:", "");
+            else
+                result_bad("Checksum:", "mismatch");
 
             if(backup_sb.magic != OBMAFS3_SB_MAGIC || !backup_cs_ok)
             {
                 errors++;
-                if(ask_fix(auto_yes, auto_no, "  Overwrite backup superblock from primary?"))
+                if(ask_fix(auto_yes, auto_no, "Overwrite backup superblock from primary?"))
                 {
                     struct obmafs3_sb tmp = ctx->sb;
                     memset(tmp.checksum, 0, sizeof(tmp.checksum));
@@ -6172,12 +6409,12 @@ int main(int argc, char *argv[])
                     ssize_t nn   = pwrite(fd, &tmp, sizeof(tmp), boff);
                     if(nn >= 0 && (size_t)nn == sizeof(tmp))
                     {
-                        printf("  Backup superblock fixed from primary.\n");
+                        result_fixed("Backup:", "overwritten from primary");
                         errors--;
                     }
                     else
                     {
-                        fprintf(stderr, "  Error: could not write backup superblock\n");
+                        fprintf(stderr, "  %sError: could not write backup superblock%s\n", CLR_RED, CLR_RESET);
                     }
                 }
             }
@@ -6191,13 +6428,13 @@ int main(int argc, char *argv[])
 
                 if(memcmp(&primary_cmp, &backup_cmp, sizeof(struct obmafs3_sb)) == 0)
                 {
-                    printf("  Consistency:      OK\n");
+                    result_ok("Consistency:", "");
                 }
                 else
                 {
-                    printf("  Consistency:      MISMATCH (backup differs from primary)\n");
+                    result_bad("Consistency:", "backup differs from primary");
                     errors++;
-                    if(ask_fix(auto_yes, auto_no, "  Overwrite backup superblock from primary?"))
+                    if(ask_fix(auto_yes, auto_no, "Overwrite backup superblock from primary?"))
                     {
                         struct obmafs3_sb tmp = ctx->sb;
                         memset(tmp.checksum, 0, sizeof(tmp.checksum));
@@ -6206,30 +6443,37 @@ int main(int argc, char *argv[])
                         ssize_t nn   = pwrite(fd, &tmp, sizeof(tmp), boff);
                         if(nn >= 0 && (size_t)nn == sizeof(tmp))
                         {
-                            printf("  Backup superblock synced from primary.\n");
+                            result_fixed("Backup:", "synced from primary");
                             errors--;
                         }
                         else
                         {
-                            fprintf(stderr, "  Error: could not write backup superblock\n");
+                            fprintf(stderr, "  %sError: could not write backup superblock%s\n", CLR_RED, CLR_RESET);
                         }
                     }
                 }
             }
         }
     }
+    phase_end();
 
     /* ---- Catalog tree ---- */
-    printf("\nCatalog tree:\n");
-    printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->catalog_hdr.magic,
-           ctx->catalog_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+    phase_begin("B+Tree structures");  /* catalog is first */
+    printf("\n  %sCatalog tree%s\n", CLR_BOLD, CLR_RESET);
+    if(ctx->catalog_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->catalog_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->catalog_hdr.magic);
     {
         int cat_hdr_cs_ok = 0;
         obmafs3_btree_header_read_lenient(ctx, ctx->sb.catalog_lba, &ctx->catalog_hdr, &cat_hdr_cs_ok);
-        printf("  Header checksum:  %s\n", cat_hdr_cs_ok ? "OK" : "BAD");
+        if(cat_hdr_cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
         if(!cat_hdr_cs_ok) errors++;
     }
-    printf("  Root node LBA:    %" PRIu64 "\n", ctx->catalog_hdr.root_node_lba);
+    result_info("Root node LBA:", "%" PRIu64, ctx->catalog_hdr.root_node_lba);
 
     if(ctx->catalog_hdr.root_node_lba != 0)
     {
@@ -6248,25 +6492,27 @@ int main(int argc, char *argv[])
             free(cat_nodes);
             if(cat_bad > 0)
             {
-                printf("  Node checksums:   %" PRIu64 " BAD", cat_bad);
-                if(cat_cs_fix > 0) printf(" (%" PRIu64 " fixed)", cat_cs_fix);
-                printf("\n");
+                if(cat_cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", cat_bad, cat_cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", cat_bad);
                 errors += (int)(cat_bad - cat_cs_fix);
             }
             else
             {
-                printf("  Node checksums:   OK\n");
+                result_ok("Node checksums:", "");
             }
             if(cat_ord > 0)
             {
-                printf("  Key ordering:     %" PRIu64 " BAD", cat_ord);
-                if(cat_fix > 0) printf(" (%" PRIu64 " fixed)", cat_fix);
-                printf("\n");
+                if(cat_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", cat_ord, cat_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", cat_ord);
                 errors += (int)(cat_ord - cat_fix);
             }
             else
             {
-                printf("  Key ordering:     OK\n");
+                result_ok("Key ordering:", "");
             }
             verify_fix_total_nodes(ctx, &ctx->catalog_hdr, ctx->sb.catalog_lba, cat_node_count, "Catalog", "  ",
                                    auto_yes, auto_no, &errors);
@@ -6280,35 +6526,41 @@ int main(int argc, char *argv[])
                                          "Catalog", auto_yes, auto_no, &sib_bad, &sib_fix);
                 if(sib_bad > 0)
                 {
-                    printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                    if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                    printf("\n");
+                    if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                     errors += (int)(sib_bad - sib_fix);
                 }
                 else
                 {
-                    printf("  Sibling links:    OK\n");
+                    result_ok("Sibling links:", "");
                 }
             }
         }
         else
         {
-            printf("  Node checksums:   WALK FAILED\n");
+            result_bad("Node checksums:", "walk failed");
             errors++;
         }
     }
 
     /* ---- Inode tree ---- */
-    printf("\nInode tree:\n");
-    printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->inode_hdr.magic,
-           ctx->inode_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+    printf("\n  %sInode tree%s\n", CLR_BOLD, CLR_RESET);
+    if(ctx->inode_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->inode_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->inode_hdr.magic);
     {
         int ino_hdr_cs_ok = 0;
         obmafs3_btree_header_read_lenient(ctx, ctx->sb.inode_lba, &ctx->inode_hdr, &ino_hdr_cs_ok);
-        printf("  Header checksum:  %s\n", ino_hdr_cs_ok ? "OK" : "BAD");
+        if(ino_hdr_cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
         if(!ino_hdr_cs_ok) errors++;
     }
-    printf("  Root node LBA:    %" PRIu64 "\n", ctx->inode_hdr.root_node_lba);
+    result_info("Root node LBA:", "%" PRIu64, ctx->inode_hdr.root_node_lba);
 
     if(ctx->inode_hdr.root_node_lba != 0)
     {
@@ -6327,25 +6579,27 @@ int main(int argc, char *argv[])
             free(ino_nodes);
             if(ino_bad > 0)
             {
-                printf("  Node checksums:   %" PRIu64 " BAD", ino_bad);
-                if(ino_cs_fix > 0) printf(" (%" PRIu64 " fixed)", ino_cs_fix);
-                printf("\n");
+                if(ino_cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", ino_bad, ino_cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", ino_bad);
                 errors += (int)(ino_bad - ino_cs_fix);
             }
             else
             {
-                printf("  Node checksums:   OK\n");
+                result_ok("Node checksums:", "");
             }
             if(ino_ord > 0)
             {
-                printf("  Key ordering:     %" PRIu64 " BAD", ino_ord);
-                if(ino_fix > 0) printf(" (%" PRIu64 " fixed)", ino_fix);
-                printf("\n");
+                if(ino_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ino_ord, ino_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ino_ord);
                 errors += (int)(ino_ord - ino_fix);
             }
             else
             {
-                printf("  Key ordering:     OK\n");
+                result_ok("Key ordering:", "");
             }
             verify_fix_total_nodes(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, ino_node_count, "Inode", "  ",
                                    auto_yes, auto_no, &errors);
@@ -6359,20 +6613,21 @@ int main(int argc, char *argv[])
                                          "Inode", auto_yes, auto_no, &sib_bad, &sib_fix);
                 if(sib_bad > 0)
                 {
-                    printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                    if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                    printf("\n");
+                    if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                     errors += (int)(sib_bad - sib_fix);
                 }
                 else
                 {
-                    printf("  Sibling links:    OK\n");
+                    result_ok("Sibling links:", "");
                 }
             }
         }
         else
         {
-            printf("  Node checksums:   could not walk tree\n");
+            result_bad("Node checksums:", "could not walk tree");
             errors++;
         }
     }
@@ -6380,13 +6635,18 @@ int main(int argc, char *argv[])
     /* ---- Overflow tree ---- */
     if(ctx->sb.overflow_lba != 0)
     {
-        printf("\nOverflow tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->overflow_hdr.magic,
-               ctx->overflow_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sOverflow tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->overflow_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->overflow_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->overflow_hdr.magic);
         {
             int ovf_hdr_cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.overflow_lba, &ctx->overflow_hdr, &ovf_hdr_cs_ok);
-            printf("  Header checksum:  %s\n", ovf_hdr_cs_ok ? "OK" : "BAD");
+            if(ovf_hdr_cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!ovf_hdr_cs_ok) errors++;
         }
 
@@ -6407,25 +6667,27 @@ int main(int argc, char *argv[])
                 free(ovf_nodes);
                 if(ovf_bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", ovf_bad);
-                    if(ovf_cs_fix > 0) printf(" (%" PRIu64 " fixed)", ovf_cs_fix);
-                    printf("\n");
+                    if(ovf_cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", ovf_bad, ovf_cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", ovf_bad);
                     errors += (int)(ovf_bad - ovf_cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ovf_ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", ovf_ord);
-                    if(ovf_fix > 0) printf(" (%" PRIu64 " fixed)", ovf_fix);
-                    printf("\n");
+                    if(ovf_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ovf_ord, ovf_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ovf_ord);
                     errors += (int)(ovf_ord - ovf_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->overflow_hdr, ctx->sb.overflow_lba, ovf_node_count, "Overflow",
                                        "  ", auto_yes, auto_no, &errors);
@@ -6439,20 +6701,21 @@ int main(int argc, char *argv[])
                                              "Overflow", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -6461,7 +6724,7 @@ int main(int argc, char *argv[])
     /* ---- Dedup tree list ---- */
     if(ctx->sb.dedup_lba != 0)
     {
-        printf("\nDedup tree list:\n");
+        printf("\n  %sDedup tree list%s\n", CLR_BOLD, CLR_RESET);
 
         uint8_t *list_buf = calloc(1, (size_t)ctx->sb.block_size);
         if(list_buf)
@@ -6471,8 +6734,10 @@ int main(int argc, char *argv[])
             {
                 struct tree_list_header list_hdr;
                 memcpy(&list_hdr, list_buf, sizeof(list_hdr));
-                printf("  Magic:            0x%016" PRIx64 " (%s)\n", list_hdr.magic,
-                       list_hdr.magic == OBMAFS3_TREELIST_MAGIC ? "OK" : "BAD");
+                if(list_hdr.magic == OBMAFS3_TREELIST_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, list_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, list_hdr.magic);
                 if(list_hdr.magic != OBMAFS3_TREELIST_MAGIC) errors++;
 
                 /* Verify list header checksum */
@@ -6486,7 +6751,10 @@ int main(int argc, char *argv[])
                                     (size_t)(list_hdr.tree_count * sizeof(struct tree_list_entry));
                     obmafs3_checksum_block(list_buf, cs_len, computed_cs);
                     int cs_ok = (memcmp(stored_cs, computed_cs, 32) == 0);
-                    printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+                    if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
                     if(!cs_ok) errors++;
 
                     printf("  Trees:            %" PRIu64 "\n", list_hdr.tree_count);
@@ -6614,13 +6882,18 @@ int main(int argc, char *argv[])
     /* ---- Media tag tree ---- */
     if(ctx->sb.media_tag_lba != 0)
     {
-        printf("\nMedia tag tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->media_tag_hdr.magic,
-               ctx->media_tag_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sMedia tag tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->media_tag_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->media_tag_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->media_tag_hdr.magic);
         {
             int mt_hdr_cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.media_tag_lba, &ctx->media_tag_hdr, &mt_hdr_cs_ok);
-            printf("  Header checksum:  %s\n", mt_hdr_cs_ok ? "OK" : "BAD");
+            if(mt_hdr_cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!mt_hdr_cs_ok) errors++;
         }
 
@@ -6641,25 +6914,27 @@ int main(int argc, char *argv[])
                 free(mt_nodes);
                 if(mt_bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", mt_bad);
-                    if(mt_cs_fix > 0) printf(" (%" PRIu64 " fixed)", mt_cs_fix);
-                    printf("\n");
+                    if(mt_cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", mt_bad, mt_cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", mt_bad);
                     errors += (int)(mt_bad - mt_cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(mt_ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", mt_ord);
-                    if(mt_fix > 0) printf(" (%" PRIu64 " fixed)", mt_fix);
-                    printf("\n");
+                    if(mt_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", mt_ord, mt_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", mt_ord);
                     errors += (int)(mt_ord - mt_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, mt_node_count, "Media tag",
                                        "  ", auto_yes, auto_no, &errors);
@@ -6673,20 +6948,21 @@ int main(int argc, char *argv[])
                                              "Media tag", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -6695,13 +6971,18 @@ int main(int argc, char *argv[])
     /* ---- CD prefix tree ---- */
     if(ctx->sb.cd_prefix_lba != 0)
     {
-        printf("\nCD prefix tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->cd_prefix_hdr.magic,
-               ctx->cd_prefix_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sCD prefix tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->cd_prefix_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->cd_prefix_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->cd_prefix_hdr.magic);
         {
             int cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.cd_prefix_lba, &ctx->cd_prefix_hdr, &cs_ok);
-            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!cs_ok) errors++;
         }
 
@@ -6722,25 +7003,27 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
-                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
-                    printf("\n");
+                    if(cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", bad);
                     errors += (int)(bad - cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
-                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
-                    printf("\n");
+                    if(ord_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ord, ord_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ord);
                     errors += (int)(ord - ord_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_prefix_hdr, ctx->sb.cd_prefix_lba, node_count, "CD prefix",
                                        "  ", auto_yes, auto_no, &errors);
@@ -6754,20 +7037,21 @@ int main(int argc, char *argv[])
                                              "CD prefix", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -6776,13 +7060,18 @@ int main(int argc, char *argv[])
     /* ---- CD suffix tree ---- */
     if(ctx->sb.cd_suffix_lba != 0)
     {
-        printf("\nCD suffix tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->cd_suffix_hdr.magic,
-               ctx->cd_suffix_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sCD suffix tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->cd_suffix_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->cd_suffix_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->cd_suffix_hdr.magic);
         {
             int cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.cd_suffix_lba, &ctx->cd_suffix_hdr, &cs_ok);
-            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!cs_ok) errors++;
         }
 
@@ -6803,25 +7092,27 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
-                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
-                    printf("\n");
+                    if(cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", bad);
                     errors += (int)(bad - cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
-                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
-                    printf("\n");
+                    if(ord_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ord, ord_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ord);
                     errors += (int)(ord - ord_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_suffix_hdr, ctx->sb.cd_suffix_lba, node_count, "CD suffix",
                                        "  ", auto_yes, auto_no, &errors);
@@ -6835,20 +7126,21 @@ int main(int argc, char *argv[])
                                              "CD suffix", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -6857,13 +7149,18 @@ int main(int argc, char *argv[])
     /* ---- CD subchannel tree ---- */
     if(ctx->sb.cd_subchannel_lba != 0)
     {
-        printf("\nCD subchannel tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->cd_subchannel_hdr.magic,
-               ctx->cd_subchannel_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sCD subchannel tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->cd_subchannel_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->cd_subchannel_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->cd_subchannel_hdr.magic);
         {
             int cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.cd_subchannel_lba, &ctx->cd_subchannel_hdr, &cs_ok);
-            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!cs_ok) errors++;
         }
 
@@ -6884,25 +7181,27 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
-                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
-                    printf("\n");
+                    if(cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", bad);
                     errors += (int)(bad - cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
-                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
-                    printf("\n");
+                    if(ord_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ord, ord_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ord);
                     errors += (int)(ord - ord_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_subchannel_hdr, ctx->sb.cd_subchannel_lba, node_count,
                                        "CD subchannel", "  ", auto_yes, auto_no, &errors);
@@ -6916,20 +7215,21 @@ int main(int argc, char *argv[])
                                              "CD subchannel", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -6938,13 +7238,18 @@ int main(int argc, char *argv[])
     /* ---- Metadata tree (per-image key=value) ---- */
     if(ctx->sb.metadata_lba != 0)
     {
-        printf("\nMetadata tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->metadata_hdr.magic,
-               ctx->metadata_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sMetadata tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->metadata_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->metadata_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->metadata_hdr.magic);
         {
             int cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.metadata_lba, &ctx->metadata_hdr, &cs_ok);
-            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!cs_ok) errors++;
         }
 
@@ -6967,23 +7272,24 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
-                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
-                    printf("\n");
+                    if(cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", bad);
                     errors += (int)(bad - cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD\n", ord);
+                    result_bad("Key ordering:", "%" PRIu64 " bad", ord);
                     errors++;
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, node_count, "Metadata",
                                        "  ", auto_yes, auto_no, &errors);
@@ -6998,20 +7304,21 @@ int main(int argc, char *argv[])
                                              "Metadata", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -7020,13 +7327,18 @@ int main(int argc, char *argv[])
     /* ---- Metadata index tree (reverse key+value→inode) ---- */
     if(ctx->sb.metadata_idx_lba != 0)
     {
-        printf("\nMetadata index tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->metadata_idx_hdr.magic,
-               ctx->metadata_idx_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sMetadata index tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->metadata_idx_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->metadata_idx_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->metadata_idx_hdr.magic);
         {
             int cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr, &cs_ok);
-            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!cs_ok) errors++;
         }
 
@@ -7049,25 +7361,27 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
-                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
-                    printf("\n");
+                    if(cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", bad);
                     errors += (int)(bad - cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
-                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
-                    printf("\n");
+                    if(ord_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ord, ord_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ord);
                     errors += (int)(ord - ord_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, node_count,
                                        "Metadata index", "  ", auto_yes, auto_no, &errors);
@@ -7082,20 +7396,21 @@ int main(int argc, char *argv[])
                                              "Metadata index", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
@@ -7111,13 +7426,18 @@ int main(int argc, char *argv[])
     /* ---- Refcount tree ---- */
     if(ctx->sb.refcount_lba != 0)
     {
-        printf("\nRefcount tree:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->refcount_hdr.magic,
-               ctx->refcount_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC ? "OK" : "BAD");
+        printf("\n  %sRefcount tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->refcount_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+        result_ok("Magic:", "0x%016" PRIx64, ctx->refcount_hdr.magic);
+    else
+        result_bad("Magic:", "0x%016" PRIx64, ctx->refcount_hdr.magic);
         {
             int cs_ok = 0;
             obmafs3_btree_header_read_lenient(ctx, ctx->sb.refcount_lba, &ctx->refcount_hdr, &cs_ok);
-            printf("  Header checksum:  %s\n", cs_ok ? "OK" : "BAD");
+            if(cs_ok)
+            result_ok("Header checksum:", "");
+        else
+            result_bad("Header checksum:", "mismatch");
             if(!cs_ok) errors++;
         }
 
@@ -7138,25 +7458,27 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
-                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
-                    printf("\n");
+                    if(cs_fix > 0)
+                result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+            else
+                result_bad("Node checksums:", "%" PRIu64 " bad", bad);
                     errors += (int)(bad - cs_fix);
                 }
                 else
                 {
-                    printf("  Node checksums:   OK\n");
+                    result_ok("Node checksums:", "");
                 }
                 if(ord > 0)
                 {
-                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
-                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
-                    printf("\n");
+                    if(ord_fix > 0)
+                result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ord, ord_fix);
+            else
+                result_bad("Key ordering:", "%" PRIu64 " bad", ord);
                     errors += (int)(ord - ord_fix);
                 }
                 else
                 {
-                    printf("  Key ordering:     OK\n");
+                    result_ok("Key ordering:", "");
                 }
                 verify_fix_total_nodes(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, node_count, "Refcount",
                                        "  ", auto_yes, auto_no, &errors);
@@ -7170,24 +7492,30 @@ int main(int argc, char *argv[])
                                              "Refcount", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
-                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
-                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
-                        printf("\n");
+                        if(sib_fix > 0)
+                    result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                else
+                    result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
                         errors += (int)(sib_bad - sib_fix);
                     }
                     else
                     {
-                        printf("  Sibling links:    OK\n");
+                        result_ok("Sibling links:", "");
                     }
                 }
             }
             else
             {
-                printf("  Node checksums:   could not walk tree\n");
+                result_bad("Node checksums:", "could not walk tree");
                 errors++;
             }
         }
     }
+
+    phase_end();
+
+    /* ---- Phase 3: Cross-references & consistency ---- */
+    phase_begin("Cross-references & consistency");
 
     /* ---- Inode / Catalog cross-reference ---- */
     if(ctx->catalog_hdr.root_node_lba != 0 && ctx->inode_hdr.root_node_lba != 0)
@@ -7200,16 +7528,16 @@ int main(int argc, char *argv[])
         uint64_t  all_ino_cnt = 0;
         int       ino_rc      = collect_inode_ids(ctx, &all_ino_ids, &all_ino_cnt);
 
-        printf("\nnext_inode_id validation:\n");
+        printf("\n  %snext_inode_id validation%s\n", CLR_BOLD, CLR_RESET);
 
         if(ino_rc != OBMAFS3_OK)
         {
-            printf("  Error: could not walk inode tree (%d)\n", ino_rc);
+            result_bad("Inode tree:", "could not walk (%d)", ino_rc);
             errors++;
         }
         else if(all_ino_cnt == 0)
         {
-            printf("  No inodes found.\n");
+            result_info("Inodes:", "none found");
         }
         else
         {
@@ -7220,8 +7548,8 @@ int main(int argc, char *argv[])
                 if(all_ino_ids[i] > max_id) max_id = all_ino_ids[i];
             }
 
-            printf("  Highest inode ID: %" PRIu64 "\n", max_id);
-            printf("  next_inode_id:    %" PRIu64 "\n", ctx->sb.next_inode_id);
+            result_info("Highest inode ID:", "%" PRIu64, max_id);
+            result_info("next_inode_id:", "%" PRIu64, ctx->sb.next_inode_id);
 
             if(ctx->sb.next_inode_id <= max_id)
             {
@@ -7262,7 +7590,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-                printf("  Status:           OK\n");
+                result_ok("Status:", "");
             }
         }
 
@@ -7276,23 +7604,27 @@ int main(int argc, char *argv[])
     /* ---- Refcount data validation ---- */
     if(ctx->inode_hdr.root_node_lba != 0)
     {
-        printf("\nRefcount validation:\n");
+        printf("\n  %sRefcount validation%s\n", CLR_BOLD, CLR_RESET);
         uint64_t rc_bad = 0, rc_fix = 0;
         verify_refcount_tree(ctx, auto_yes, auto_no, &rc_bad, &rc_fix);
         if(rc_bad == 0)
         {
-            printf("  Refcounts:        OK\n");
+            result_ok("Refcounts:", "");
         }
         else
         {
-            printf("  Refcounts:        %" PRIu64 " mismatch", rc_bad);
-            if(rc_fix > 0) printf(" (%" PRIu64 " fixed)", rc_fix);
-            printf("\n");
+            if(rc_fix > 0)
+                result_fixed("Refcounts:", "%" PRIu64 " mismatch, %" PRIu64 " fixed", rc_bad, rc_fix);
+            else
+                result_bad("Refcounts:", "%" PRIu64 " mismatch", rc_bad);
             errors += (int)(rc_bad - rc_fix);
         }
     }
 
-    /* ---- Allocation bitmap ---- */
+    phase_end();
+
+    /* ---- Phase 4: Allocation bitmap ---- */
+    phase_begin("Allocation bitmap");
     uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
 
     if(ctx->sb.bitmap_lba != 0 && ctx->sb.bitmap_blocks != 0)
@@ -7371,19 +7703,23 @@ int main(int argc, char *argv[])
             }
         }
 
-        printf("\nAllocation bitmap:\n");
-        printf("  Magic:            0x%016" PRIx64 " (%s)\n", bhdr.magic,
-               bhdr.magic == OBMAFS3_BITMAP_MAGIC ? "OK" : "BAD");
-        if(!bhdr_ok || !bitmap_read_ok)
-            printf("  Checksum:         UNREADABLE\n");
+        printf("\n  %sAllocation bitmap%s\n", CLR_BOLD, CLR_RESET);
+        if(bhdr.magic == OBMAFS3_BITMAP_MAGIC)
+            result_ok("Magic:", "0x%016" PRIx64, bhdr.magic);
         else
-            printf("  Checksum:         %s\n", checksum_ok ? "OK" : "BAD");
+            result_bad("Magic:", "0x%016" PRIx64, bhdr.magic);
+        if(!bhdr_ok || !bitmap_read_ok)
+            result_bad("Checksum:", "unreadable");
+        else if(checksum_ok)
+            result_ok("Checksum:", "");
+        else
+            result_bad("Checksum:", "mismatch");
         if(!checksum_ok && bitmap_read_ok) errors++;
-        printf("  Bitmap LBA:       %" PRIu64 "\n", ctx->sb.bitmap_lba);
-        printf("  Bitmap blocks:    %" PRIu64 "\n", ctx->sb.bitmap_blocks);
-        printf("  Total blocks:     %" PRIu64 "\n", total_blocks);
-        printf("  Allocated blocks: %" PRIu64 "\n", allocated);
-        printf("  Free blocks:      %" PRIu64 "\n", total_blocks - allocated);
+        result_info("Bitmap LBA:", "%" PRIu64, ctx->sb.bitmap_lba);
+        result_info("Bitmap blocks:", "%" PRIu64, ctx->sb.bitmap_blocks);
+        result_info("Total blocks:", "%" PRIu64, total_blocks);
+        result_info("Allocated:", "%" PRIu64, allocated);
+        result_info("Free:", "%" PRIu64, total_blocks - allocated);
 
         /* ---- Build expected bitmap and compare ---- */
         if(bitmap_read_ok)
@@ -7419,10 +7755,10 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                if(missing == 0 && extra == 0) { printf("  Consistency:      OK\n"); }
+                if(missing == 0 && extra == 0) { result_ok("Consistency:", ""); }
                 else
                 {
-                    printf("  Consistency:      MISMATCH\n");
+                    result_bad("Consistency:", "MISMATCH");
                     errors++;
 
                     if(missing > 0)
@@ -7479,19 +7815,24 @@ int main(int argc, char *argv[])
         }
     }
 
+    phase_end();
+
     /* ---- Data block scrub ---- */
     if(do_scrub)
     {
+        phase_begin("Data block scrub");
         uint64_t scrub_bad = scrub_data_blocks(ctx);
         if(scrub_bad > 0) errors += (int)scrub_bad;
 
         uint64_t dedup_bad = scrub_dedup_data_blocks(ctx);
         if(dedup_bad > 0) errors += (int)dedup_bad;
+        phase_end();
     }
 
     /* ---- Hash verification (dedup + CD) ---- */
     if(do_verify_hashes)
     {
+        phase_begin("Hash verification");
         uint64_t dedup_hash_bad = verify_dedup_hashes(ctx);
         if(dedup_hash_bad > 0) errors += (int)dedup_hash_bad;
 
@@ -7515,21 +7856,35 @@ int main(int argc, char *argv[])
                                                     sizeof(struct cd_subchannel_record), CD_SUBCHANNEL_DATA_SIZE);
             if(cd_bad > 0) errors += (int)cd_bad;
         }
+        phase_end();
     }
 
     /* ---- Dedup statistics ---- */
     if(do_dedup_stats)
     {
+        phase_begin("Dedup statistics");
         rc = compute_dedup_stats(ctx);
         if(rc != OBMAFS3_OK) fprintf(stderr, "Warning: could not compute dedup stats: %d\n", rc);
+        phase_end();
     }
 
     /* ---- Summary ---- */
-    printf("\n");
-    if(errors > 0)
-        printf("Filesystem check completed with %d error(s).\n", errors);
-    else
-        printf("Filesystem check passed.\n");
+    {
+        char total_dur[32];
+        struct timespec now;
+        timer_now(&now);
+        fmt_duration(timer_elapsed(&g_start_time, &now), total_dur, sizeof(total_dur));
+        printf("\n%s── Summary%s\n", CLR_BOLD, CLR_RESET);
+        if(errors > 0)
+        {
+            printf("  %s %s%d error(s)%s found.\n", SYM_BAD, CLR_BOLD_RED, errors, CLR_RESET);
+        }
+        else
+        {
+            printf("  %s %sFilesystem is clean.%s\n", SYM_OK, CLR_BOLD_GRN, CLR_RESET);
+        }
+        printf("  %sCompleted in %s%s\n", CLR_DIM, total_dur, CLR_RESET);
+    }
 
     obmafs3_close(ctx);
     return errors > 0 ? 1 : 0;
