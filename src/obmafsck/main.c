@@ -1188,6 +1188,19 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         return NULL;
     }
 
+    /* Progress reporting — 17 discrete steps */
+    int         step       = 0;
+    const int   total_steps = 17;
+
+#define PROGRESS(desc)                                                         \
+    do                                                                         \
+    {                                                                          \
+        step++;                                                                \
+        fprintf(stderr, "\r  Building expected bitmap... [%2d/%d] %-30s",      \
+                step, total_steps, (desc));                                     \
+        fflush(stderr);                                                        \
+    } while(0)
+
 /* Helper to set a bit */
 #define MARK(blk)                                                            \
     do                                                                       \
@@ -1196,9 +1209,11 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     } while(0)
 
     /* Block 0: superblock */
+    PROGRESS("superblock");
     MARK(0);
 
     /* Catalog tree: header + nodes (B+Tree: DFS walk) */
+    PROGRESS("catalog tree");
     MARK(ctx->sb.catalog_lba);
     {
         uint64_t *cat_nodes = NULL;
@@ -1216,6 +1231,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Inode tree: header + nodes (B+Tree: DFS walk) */
+    PROGRESS("inode tree");
     MARK(ctx->sb.inode_lba);
     {
         uint64_t *ino_nodes = NULL;
@@ -1233,6 +1249,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Overflow tree header (if present) */
+    PROGRESS("overflow tree");
     if(ctx->sb.overflow_lba != 0)
     {
         MARK(ctx->sb.overflow_lba);
@@ -1250,9 +1267,11 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Dedup tree list header */
+    PROGRESS("dedup tree list");
     if(ctx->sb.dedup_lba != 0) MARK(ctx->sb.dedup_lba);
 
     /* Media tag tree header and nodes (if present) */
+    PROGRESS("media tag tree");
     if(ctx->sb.media_tag_lba != 0)
     {
         MARK(ctx->sb.media_tag_lba);
@@ -1270,6 +1289,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* CD prefix tree header and nodes (if present) */
+    PROGRESS("CD prefix tree");
     if(ctx->sb.cd_prefix_lba != 0)
     {
         MARK(ctx->sb.cd_prefix_lba);
@@ -1287,6 +1307,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* CD suffix tree header and nodes (if present) */
+    PROGRESS("CD suffix tree");
     if(ctx->sb.cd_suffix_lba != 0)
     {
         MARK(ctx->sb.cd_suffix_lba);
@@ -1304,6 +1325,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* CD subchannel tree header and nodes (if present) */
+    PROGRESS("CD subchannel tree");
     if(ctx->sb.cd_subchannel_lba != 0)
     {
         MARK(ctx->sb.cd_subchannel_lba);
@@ -1321,6 +1343,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Metadata tree header and nodes (multi-block, if present) */
+    PROGRESS("metadata tree");
     if(ctx->sb.metadata_lba != 0)
     {
         MARK(ctx->sb.metadata_lba);
@@ -1340,6 +1363,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Metadata index tree header and nodes (multi-block, if present) */
+    PROGRESS("metadata index tree");
     if(ctx->sb.metadata_idx_lba != 0)
     {
         MARK(ctx->sb.metadata_idx_lba);
@@ -1360,6 +1384,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Refcount tree header and nodes (if present) */
+    PROGRESS("refcount tree");
     if(ctx->sb.refcount_lba != 0)
     {
         MARK(ctx->sb.refcount_lba);
@@ -1377,9 +1402,11 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Bitmap blocks */
+    PROGRESS("bitmap blocks");
     for(uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++) MARK(ctx->sb.bitmap_lba + i);
 
     /* File data blocks from inode extents */
+    PROGRESS("inode data blocks");
     if(ctx->inode_hdr.root_node_lba != 0)
     {
         uint64_t *data_lbas  = NULL;
@@ -1397,6 +1424,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* File data blocks from overflow extents */
+    PROGRESS("overflow data blocks");
     {
         uint64_t *ovf_data_lbas  = NULL;
         uint64_t  ovf_data_count = 0;
@@ -1413,6 +1441,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* Dedup tree blocks: headers, nodes, and data blocks */
+    PROGRESS("dedup data blocks");
     {
         uint64_t *dedup_lbas  = NULL;
         uint64_t  dedup_count = 0;
@@ -1429,6 +1458,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
     /* External media tag data blocks */
+    PROGRESS("media tag data blocks");
     {
         uint64_t *mt_data_lbas  = NULL;
         uint64_t  mt_data_count = 0;
@@ -1445,6 +1475,12 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     }
 
 #undef MARK
+
+    /* Clear the progress line */
+    fprintf(stderr, "\r%80s\r", "");
+    fflush(stderr);
+
+#undef PROGRESS
 
     *out_error = 0;
     return expected;
