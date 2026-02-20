@@ -444,9 +444,189 @@ When a file is written to the filesystem:
 
 6. **Dedup block cache**: The 4 MiB dedup data block accumulator is kept in memory across writes (`dedup_block_cache`). This avoids a costly disk read + decompression on every write call. The cache is flushed and freed on file close.
 
-7. **Background compression**: When enabled, a background worker thread compresses dedup data blocks in parallel with write I/O (`obmafs3_bg_compress_start`/`obmafs3_bg_compress_stop`). The writer fills the in-memory buffer; once full, the worker compresses and writes it to disk while the writer starts filling a new buffer.
+7. **Shared compression pool**: A persistent thread pool handles compression for both regular file writes (block group batches) and dedup data blocks (async jobs). See the [Compression Pool](#compression-pool) section for full details.
 
 8. **Dedup B+Tree node cache**: Frequently accessed B+Tree nodes are cached in memory during dedup writes, reducing disk reads during hash lookups and insertions.
+
+9. **Dedup tree header caching**: The dedup B+Tree header is cached in the `dedup_block_cache` across writes, avoiding a tree-list scan and header read on each FUSE write call.
+
+---
+
+## Compression Pool
+
+All compression — for both regular file block groups and dedup data blocks — is performed by a shared, persistent thread pool. The pool is created once at mount time and reused for the lifetime of the filesystem.
+
+### Architecture
+
+```
+                ┌──────────────┐
+                │  FUSE write  │
+                └──────┬───────┘
+                       │
+          ┌────────────┼────────────┐
+          │ Regular    │            │ Media image
+          │ file       │            │ (dedup)
+          ▼            │            ▼
+  ┌───────────────┐    │    ┌───────────────┐
+  │ Block-group   │    │    │ Async dedup   │
+  │ batch         │    │    │ job           │
+  └───────┬───────┘    │    └───────┬───────┘
+          │            │            │
+          ▼            ▼            ▼
+  ┌─────────────────────────────────────┐
+  │          compress_pool              │
+  │  min(nproc, 32) persistent workers  │
+  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │
+  │  │ W-0 │ │ W-1 │ │ W-2 │ │ ... │   │
+  │  └─────┘ └─────┘ └─────┘ └─────┘   │
+  └─────────────────────────────────────┘
+```
+
+### Pool structure
+
+The pool is defined privately in `block.c`:
+
+```c
+struct compress_pool {
+    pthread_t      *threads;      /* worker thread array */
+    int             num_threads;  /* number of workers */
+    pthread_mutex_t mutex;        /* protects batch, shutdown, generation, async_queue */
+    pthread_cond_t  work_avail;   /* signalled when work is ready */
+    pthread_cond_t  batch_done;   /* signalled when all batch jobs complete */
+    struct compress_batch *batch; /* current batch (NULL when idle) */
+    int             shutdown;     /* non-zero → workers exit */
+    unsigned int    generation;   /* incremented per batch submission */
+    struct pool_async_job *async_queue; /* FIFO of pending async jobs */
+};
+```
+
+### Worker threads
+
+- **Count**: `min(sysconf(_SC_NPROCESSORS_ONLN), 32)` threads, minimum 1.
+- **Persistent ZSTD contexts**: Each worker creates its own `ZSTD_CCtx` (full level) and `ZSTD_CCtx` (probe, level 1) on startup. Contexts are reused across all jobs, avoiding allocation overhead.
+- **Priority**: Workers check the **async queue first** (dedup jobs), then process batch jobs. This ensures dedup compression — which is latency-sensitive because the write path is waiting for a fresh buffer — gets priority.
+
+### Generation-based wake
+
+Each worker tracks its own `my_gen` counter. Workers sleep via `pthread_cond_wait` on `work_avail` while `pool->generation == my_gen && !async_queue && !shutdown`. Each batch submission increments `pool->generation` and broadcasts `work_avail`. Workers update `my_gen` after waking, preventing double-processing of already-completed batches.
+
+### Work distribution
+
+Batch jobs use **lock-free atomic work claiming**:
+
+```c
+struct compress_batch {
+    struct compress_job *jobs;
+    int                  total;    /* number of jobs */
+    atomic_int           next;     /* next job index to claim */
+    atomic_int           done;     /* completed job count */
+};
+```
+
+Each worker atomically claims the next job via `atomic_fetch_add(&batch->next, 1)`. When `done >= total`, the batch is signalled as complete.
+
+### Submitter-participates
+
+The submitting thread does not block idle while workers compress. After broadcasting `work_avail`, it creates temporary ZSTD contexts and calls the same `compress_worker_run` function as pool workers, claiming jobs from the batch via the same atomic counter. This ensures the batch completes even if all pool workers are busy with async jobs.
+
+### Async dedup jobs
+
+Dedup data blocks (4 MiB) are submitted as individual async jobs:
+
+```c
+struct pool_async_job {
+    int (*fn)(void *arg, void *cctx); /* work function */
+    void       *arg;          /* opaque context */
+    int         result;       /* return value from fn */
+    _Atomic int done;         /* set to 1 when complete */
+    pthread_mutex_t mtx;      /* protects cond wait */
+    pthread_cond_t  cond;     /* signalled on completion */
+    struct pool_async_job *next; /* queue link */
+};
+```
+
+Async jobs are enqueued on `pool->async_queue` (FIFO). Workers dequeue and execute them using their persistent ZSTD context. Completion is signalled via the job's own `mtx`/`cond` pair (independent of the batch mechanism). The `done` atomic is set under the job's mutex to prevent use-after-free races.
+
+When the pool is NULL (no workers), async jobs run inline on the calling thread with a temporary ZSTD context.
+
+### Dedup block lifecycle
+
+When a 4 MiB dedup data block fills up during media image writes:
+1. The full buffer is submitted to the pool as an async job (ownership of the data buffer transfers to the worker).
+2. A fresh buffer is `calloc`'d and a new contiguous block range is allocated.
+3. The writer continues accumulating sectors into the new buffer without blocking.
+4. On the next submission (or file close), `dedup_bg_wait` is called — it waits for the async job, then frees any trailing unused standard blocks on the **main thread** (the allocation bitmap is not thread-safe).
+
+**Partial block handling**: The last dedup data block of each tree is always stored with all `std_per_dedup` standard blocks allocated (trailing blocks are not freed). This allows the partial block to be resumed on the next mount without reallocation. The tree header's `last_block_lba` and `last_block_offset` fields track the resume point.
+
+### Fork handling
+
+`obmafs3_compress_pool_reinit` is called from the FUSE `init` callback. When FUSE daemonises (without `-f`), `fork()` is called and the pool worker threads from the parent do not survive into the child. The reinit function safely discards the stale pool struct (no `pthread_join` or mutex/cond destroy — those are unsafe on post-fork inconsistent state) and creates a fresh pool.
+
+---
+
+## Block Group Compression
+
+Regular file data blocks are grouped into **compression groups** of 16 contiguous blocks (64 KiB at default 4096-byte block size).
+
+```c
+#define OBMAFS3_COMPRESS_GROUP_BLOCKS 16  /* 16 × 4096 = 64 KiB per group */
+```
+
+### Write pipeline
+
+The regular file write path (`write_file_data_append`) uses a three-phase pipeline:
+
+**Phase 1 — Assemble**: Write data is distributed into per-group buffers. Each group buffer is `16 × block_size` bytes, zero-filled for unused positions.
+
+**Phase 2 — Parallel compression**: Full groups (exactly 16 blocks) are submitted as a batch to the compression pool. Each group becomes a `compress_job`:
+
+```c
+struct compress_job {
+    const uint8_t *group_data;     /* assembled group data */
+    size_t         grp_bytes;      /* input size */
+    uint64_t       grp_count;      /* logical blocks in this group */
+    int            level;          /* ZSTD compression level */
+    uint64_t       block_size;     /* filesystem block size */
+    uint8_t       *comp_buf;       /* output buffer (allocated by caller) */
+    size_t         comp_buf_size;  /* capacity of comp_buf */
+    int            use_compressed; /* result: non-zero if compression saved space */
+    uint64_t       phys_needed;    /* result: physical blocks for compressed output */
+    size_t         compressed_size;/* result: compressed data size */
+};
+```
+
+**Phase 3 — Allocate and write**: For each group, if compression reduced the physical block count (`phys_needed < grp_count`), the compressed output is written. Otherwise uncompressed data is written. Block extents are recorded in the inode.
+
+### Compressibility probe
+
+For ZSTD levels > 3, the pool workers first compress at **level 1** using a separate probe ZSTD context (`zstd_probe_cctx`). If the probe does not reduce the data by at least 10%, the full-level compression is skipped. This avoids wasting CPU on incompressible data with expensive strategies (e.g., btopt at level 15).
+
+Partial (tail) groups that have fewer than 16 blocks are always stored uncompressed.
+
+---
+
+## Thread-Local Storage
+
+Each FUSE worker thread gets a lazily allocated `obmafs3_thread_bufs` structure via `pthread_key_t`. This avoids contention on shared buffers during concurrent reads and writes.
+
+```c
+struct obmafs3_thread_bufs {
+    uint8_t            *hdr_buf;          /* B+Tree header I/O (block_size) */
+    uint8_t            *node_buf;         /* B+Tree node traversal (block_size) */
+    uint8_t            *io_buf;           /* Data block I/O (group_bytes) */
+    uint8_t            *io_buf2;          /* Decompression work buffer (group_bytes) */
+    uint8_t            *comp_buf;         /* Compression output buffer */
+    size_t              comp_buf_size;    /* Size of comp_buf */
+    struct ZSTD_CCtx_s *zstd_cctx;       /* Full-level ZSTD compression context */
+    struct ZSTD_CCtx_s *zstd_probe_cctx; /* Level-1 probe context */
+    struct ZSTD_DCtx_s *zstd_dctx;       /* ZSTD decompression context */
+};
+```
+
+The `zstd_probe_cctx` is a separate ZSTD context dedicated to level-1 compressibility probes. It must be distinct from `zstd_cctx` because ZSTD's btopt match finder (used at levels ≥ 7) maintains internal window state that conflicts with interleaved level-1 probes on the same context.
+
+Buffers are freed automatically when the thread exits (via the `pthread_key_t` destructor).
 
 ---
 
@@ -509,10 +689,12 @@ Checksums are applied to:
 
 The only supported compression algorithm is **ZSTD** (Zstandard). The compression level is configurable (default: 15). Compression is applied to:
 
-- Regular file data blocks (when `--compress` is used on mount)
-- Dedup data blocks (when compression is enabled)
+- Regular file data block groups (when `--compress` is used on mount) — see [Block Group Compression](#block-group-compression)
+- Dedup data blocks (when compression is enabled) — see [Compression Pool](#compression-pool)
 
 Compression is transparent: the read path checks the `flags` field of each `block_header` and decompresses when needed.
+
+Compression is performed by a shared, persistent thread pool rather than per-file background threads. See the [Compression Pool](#compression-pool) section for the architecture.
 
 ---
 
@@ -535,6 +717,7 @@ Usage: `mount.obmafs --device=<path> <mountpoint> [options]`
 Options:
 - `--compress` — Enable ZSTD compression for writes
 - `--zstd-level=N` — Set ZSTD compression level (default: 15)
+- `-f` — Run in foreground (skip daemonisation/fork)
 
 **Supported FUSE operations:**
 | Operation | Description |
@@ -567,15 +750,18 @@ Options:
 | `ioctl`   | Custom ioctls for media tags, CD image sectors, and image metadata |
 | `copy_file_range` | Clone/reflink a range of blocks between files |
 
+**Write serialisation**: All write-side FUSE callbacks are serialised by a `pthread_mutex_t write_lock` in `obmafs3_ctx`. This avoids data races on the shared allocation bitmap, B+Tree structures, and dedup block caches.
+
 **Per-file-handle context** (`fuse_file_ctx`):
 - `inode_id` — Cached inode ID
 - `sector_size` — Detected sector size (0 for regular files)
 - `inode` — Cached inode structure (write-back on release)
 - `inode_dirty` — Flag indicating the cached inode needs write-back
 - `sme_cache` — In-memory sector map entry cache (flushed on release)
+- `db_cache` — Persistent dedup data block accumulator (also holds: pending async pool job slot, dedup B+Tree node cache, cached dedup tree header)
 - `cd_sme_cache` — In-memory CD sector map entry cache (flushed on release)
-- `dedup_block_cache` — Persistent dedup data block accumulator (avoids re-reading 4 MiB blocks)
-- `bg_compress` — Background compression worker context (compresses dedup blocks in parallel)
+- `ecc_ctx` — Lazy-initialised CD ECC/EDC context (for prefix/suffix reconstruction)
+- `cd_next_sector` — Next expected CD sector LBA (for sequential write optimisation)
 
 **Extended attributes (xattr):** Media tags and image metadata are exposed as extended attributes:
 - `user.mediatag.<name>` — Binary media tags (e.g., `user.mediatag.cd_toc`, `user.mediatag.dvd_pfi`). Read returns binary data; write sets the tag.
@@ -625,7 +811,8 @@ Options:
 | CD prefix/suffix/subchannel trees | Traverse all nodes, verify magic and checksums |
 | Dedup tree list | Verify list header, traverse all per-sector-size trees |
 | Cross-reference | Verify all catalog entries have valid inodes |
-| Block allocation | Verify all referenced blocks are marked allocated in bitmap |
+| Block allocation | Reconstruct expected bitmap from all on-disk structures and compare against on-disk bitmap |
+| Last-block handling | The last dedup data block of each tree marks all `std_per_dedup` blocks as expected (see [Partial block handling](#dedup-block-lifecycle)) |
 | Data block scrub | Read every data block, verify magic and checksum (handles compressed blocks) |
 | Dedup data block scrub | Read every unique dedup data block, verify magic and checksum (handles compressed blocks) |
 
@@ -646,7 +833,10 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Clone/reflink: `obmafs3_clone_file_range`, `obmafs3_free_file_blocks`, `obmafs3_truncate_file_blocks`
 - Refcount: `obmafs3_refcount_get`, `obmafs3_refcount_set`, `obmafs3_refcount_inc`, `obmafs3_refcount_dec`
 - Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`
-- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_bg_compress_start`, `obmafs3_bg_compress_stop`
+- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`
+- Compression pool: `obmafs3_compress_pool_init`, `obmafs3_compress_pool_reinit`, `obmafs3_compress_pool_destroy`
+- Async pool jobs: `obmafs3_pool_async_job_create`, `obmafs3_pool_async_job_free`, `obmafs3_pool_submit_async`, `obmafs3_pool_wait_async`
+- Thread-local buffers: `obmafs3_get_thread_bufs`
 - Sector map cache: `obmafs3_flush_sector_map_cache`, `obmafs3_free_sector_map_cache`
 - CD sector map cache: `obmafs3_flush_cd_sector_map_cache`, `obmafs3_free_cd_sector_map_cache`
 - Media tags: `obmafs3_media_tag_get`, `obmafs3_media_tag_put`, `obmafs3_media_tag_delete`, `obmafs3_media_tag_delete_all`, `obmafs3_media_tag_list`
@@ -693,7 +883,9 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | Dedup data block ZSTD compression | Complete |
 | Dedup data block decompression on read | Complete |
 | Regular data block ZSTD compression | Complete |
-| Background dedup compression | Complete |
+| Shared compression pool | Complete |
+| Block group compression (regular files) | Complete |
+| Async dedup compression (pool-based) | Complete |
 | Dedup B+Tree node cache | Complete |
 | Sector map caching (batched writes) | Complete |
 | Inode caching (per file handle) | Complete |
