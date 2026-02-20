@@ -2366,12 +2366,6 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
         }
     }
 
-    printf("\n  Note: physical allocation is ");
-    print_human_size(ctx->sb.dedup_block_size);
-    printf(" per dedup block.\n"
-           "  Compression reduces payload size within each block\n"
-           "  but does not currently reduce on-disk block allocation.\n");
-
     free(stats);
     free(tl_entries);
     return 0;
