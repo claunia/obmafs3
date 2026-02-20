@@ -180,6 +180,11 @@ static void *obmafs3_fuse_init(struct fuse_conn_info *conn, struct fuse_config *
 {
     (void)cfg;
 
+    /* Re-create the compression pool with live worker threads.
+     * When FUSE daemonises (no -f flag) it forks, and the pool
+     * workers from the parent do not survive into the child. */
+    obmafs3_compress_pool_reinit(g_ctx);
+
     /* Request 1 MiB write buffers (default is 128 KiB). */
     conn->max_write     = 1048576;
     conn->max_readahead = 1048576;

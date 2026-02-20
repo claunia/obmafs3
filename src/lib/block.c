@@ -115,12 +115,13 @@ struct compress_pool
 {
     pthread_t      *threads;        ///< worker thread array
     int             num_threads;    ///< number of worker threads
-    pthread_mutex_t mutex;          ///< protects batch, shutdown, generation
-    pthread_cond_t  work_avail;     ///< signalled when a new batch is ready
+    pthread_mutex_t mutex;          ///< protects batch, shutdown, generation, async_queue
+    pthread_cond_t  work_avail;     ///< signalled when a new batch or async job is ready
     pthread_cond_t  batch_done;     ///< signalled when all jobs complete
     struct compress_batch *batch;   ///< current batch (NULL when idle)
     int             shutdown;       ///< non-zero → workers should exit
     unsigned int    generation;     ///< incremented for each batch submission
+    struct pool_async_job *async_queue; ///< FIFO of pending async jobs
 };
 
 /** Pool worker thread main loop. */
@@ -137,7 +138,7 @@ static void *pool_worker_main(void *arg)
     for(;;)
     {
         pthread_mutex_lock(&pool->mutex);
-        while(pool->generation == my_gen && !pool->shutdown)
+        while(pool->generation == my_gen && !pool->async_queue && !pool->shutdown)
             pthread_cond_wait(&pool->work_avail, &pool->mutex);
 
         if(pool->shutdown)
@@ -146,9 +147,35 @@ static void *pool_worker_main(void *arg)
             break;
         }
 
+        /* Check for an async job first (dedup block compression) */
+        struct pool_async_job *aj = pool->async_queue;
+        if(aj)
+        {
+            pool->async_queue = aj->next;
+            aj->next = NULL;
+            pthread_mutex_unlock(&pool->mutex);
+
+            aj->result = aj->fn(aj->arg, cctx);
+            /* Signal completion under the job's mutex BEFORE setting
+             * done.  If we set done first, the waiter can see it, return,
+             * and the caller can free the job — leaving us accessing
+             * freed mutex/cond memory.  Setting done under the lock
+             * guarantees the waiter cannot observe done=1 and proceed
+             * to free the job until we've released the mutex. */
+            pthread_mutex_lock(&aj->mtx);
+            atomic_store(&aj->done, 1);
+            pthread_cond_signal(&aj->cond);
+            pthread_mutex_unlock(&aj->mtx);
+            continue; /* back to top — don't update my_gen, may have batch too */
+        }
+
         my_gen = pool->generation;
         struct compress_batch *batch = pool->batch;
         pthread_mutex_unlock(&pool->mutex);
+
+        /* The submitter may have already completed the batch and set
+         * pool->batch = NULL before this worker woke up.  Skip. */
+        if(!batch) continue;
 
         int n = 0;
         if(cctx && probe_cctx)
@@ -221,6 +248,32 @@ int obmafs3_compress_pool_init(struct obmafs3_ctx *ctx)
 }
 
 /**
+ * Re-initialise the compression pool after a fork.
+ *
+ * When FUSE daemonises (no -f flag), it forks.  The child inherits the
+ * pool struct but not the worker threads.  This function discards the
+ * stale pool (without joining non-existent threads) and creates a
+ * fresh one with live worker threads.
+ */
+void obmafs3_compress_pool_reinit(struct obmafs3_ctx *ctx)
+{
+    struct compress_pool *old = ctx->compress_pool;
+    if(old)
+    {
+        /* The old threads don't exist in this process — just free the
+         * data structures.  Do NOT pthread_join (UB on ghost tids).
+         * Do NOT pthread_mutex_destroy / pthread_cond_destroy — after
+         * fork the primitives may be in an inconsistent state (e.g.
+         * recorded waiters that no longer exist), causing the destroy
+         * call to block indefinitely.  Simply leak and free. */
+        free(old->threads);
+        free(old);
+        ctx->compress_pool = NULL;
+    }
+    obmafs3_compress_pool_init(ctx);
+}
+
+/**
  * Shut down the compression thread pool and free resources.
  */
 void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx)
@@ -255,7 +308,7 @@ static void compress_pool_submit(struct compress_pool *pool, struct compress_bat
         /* No pool — run inline with temporary contexts */
         ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
         ZSTD_CCtx *cctx       = ZSTD_createCCtx();
-        if(cctx)
+        if(cctx && probe_cctx)
         {
             compress_worker_run(batch, probe_cctx, cctx);
         }
@@ -276,7 +329,7 @@ static void compress_pool_submit(struct compress_pool *pool, struct compress_bat
     {
         ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
         ZSTD_CCtx *cctx       = ZSTD_createCCtx();
-        if(cctx)
+        if(cctx && probe_cctx)
         {
             int n = compress_worker_run(batch, probe_cctx, cctx);
             if(n > 0)
@@ -301,6 +354,92 @@ static void compress_pool_submit(struct compress_pool *pool, struct compress_bat
 
     pool->batch = NULL;
     pthread_mutex_unlock(&pool->mutex);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Async job management for the compression pool                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Create a new async job structure.
+ *
+ * @param fn   Work function to execute (receives the opaque arg and a ZSTD context).
+ * @param arg  Opaque context passed to @p fn.  Ownership is NOT taken;
+ *             the caller must keep @p arg alive until the job completes.
+ * @return     A new pool_async_job, or NULL on allocation failure.
+ */
+struct pool_async_job *obmafs3_pool_async_job_create(int (*fn)(void *arg, void *cctx), void *arg)
+{
+    struct pool_async_job *job = calloc(1, sizeof(*job));
+    if(!job) return NULL;
+    job->fn  = fn;
+    job->arg = arg;
+    atomic_init(&job->done, 0);
+    pthread_mutex_init(&job->mtx, NULL);
+    pthread_cond_init(&job->cond, NULL);
+    return job;
+}
+
+/**
+ * Free a completed async job.
+ * The caller must have waited for the job first (obmafs3_pool_wait_async).
+ */
+void obmafs3_pool_async_job_free(struct pool_async_job *job)
+{
+    if(!job) return;
+    pthread_cond_destroy(&job->cond);
+    pthread_mutex_destroy(&job->mtx);
+    free(job);
+}
+
+/**
+ * Submit an async job to the pool.
+ *
+ * The job is added to the pool's async queue and will be picked up
+ * by the next available worker thread.  If the pool is NULL the job
+ * is executed inline on the calling thread using a temporary ZSTD
+ * context (fallback for single-threaded builds).
+ */
+void obmafs3_pool_submit_async(struct compress_pool *pool, struct pool_async_job *job)
+{
+    if(!pool)
+    {
+        /* Inline fallback */
+        ZSTD_CCtx *cctx = ZSTD_createCCtx();
+        job->result = job->fn(job->arg, cctx);
+        if(cctx) ZSTD_freeCCtx(cctx);
+        atomic_store(&job->done, 1);
+        return;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+    /* Append to queue tail to preserve FIFO order */
+    job->next = NULL;
+    if(!pool->async_queue)
+    {
+        pool->async_queue = job;
+    }
+    else
+    {
+        struct pool_async_job *tail = pool->async_queue;
+        while(tail->next) tail = tail->next;
+        tail->next = job;
+    }
+    pthread_cond_broadcast(&pool->work_avail);
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+/**
+ * Wait for an async job to complete and return its result.
+ */
+int obmafs3_pool_wait_async(struct pool_async_job *job)
+{
+    if(!job) return OBMAFS3_OK;
+    pthread_mutex_lock(&job->mtx);
+    while(!atomic_load(&job->done))
+        pthread_cond_wait(&job->cond, &job->mtx);
+    pthread_mutex_unlock(&job->mtx);
+    return job->result;
 }
 
 /**
@@ -2057,8 +2196,11 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
             size_t   comp_cap     = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
             size_t   comp_size    = comp_cap;
 
-            /* Fast probe: skip expensive compression if data is incompressible */
-            int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
+            /* Fast probe: skip expensive compression if data is incompressible.
+             * Use a SEPARATE ZSTD context for the probe — sharing the same
+             * cctx between a level-1 probe and a high-level compression
+             * triggers a stale-window assertion in ZSTD's btopt match finder. */
+            int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_probe_cctx, group_data, grp_bytes,
                                                comp_out + sizeof(struct block_header), comp_cap, ctx->zstd_level);
             rc = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes, comp_out + sizeof(struct block_header),
                                           &comp_size, ctx->zstd_level)

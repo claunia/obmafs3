@@ -16,43 +16,22 @@
 #include <zstd.h>
 
 /* ------------------------------------------------------------------ */
-/*  Background compression context                                     */
+/*  Background compression via the shared pool                         */
 /* ------------------------------------------------------------------ */
 
 /**
- * Persistent worker thread that compresses and writes full dedup blocks
- * in the background while the main thread continues accumulating data
- * into a fresh buffer.
+ * Argument block for a dedup compression async job.
+ * Allocated by dedup_bg_submit(), freed by dedup_bg_wait().
  */
-struct bg_compress_ctx
+struct dedup_compress_arg
 {
-    pthread_t       thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t  cond_work; /**< Main -> worker: new job available */
-    pthread_cond_t  cond_done; /**< Worker -> main: job complete */
-    int             busy;      /**< Worker is processing a job */
-    int             shutdown;  /**< Signal the worker to exit */
-    int             result;    /**< Result of the last job */
-
-    /* Job parameters — owned by the worker while busy */
-    uint8_t *data;      /**< Buffer to compress and write */
-    uint64_t block_lba; /**< Destination LBA */
-    uint64_t offset;    /**< Byte offset (end of payload) */
-    uint64_t capacity;  /**< Full dedup block size */
-
-    /* Deferred block free — the worker records trailing blocks that
-     * can be freed, but the actual bitmap modification is performed
-     * by the main thread after bg_compress_wait() to avoid a data
-     * race on the shared allocation bitmap. */
-    uint64_t free_lba;   /**< First LBA to free (0 = nothing to free) */
-    uint64_t free_count; /**< Number of contiguous blocks to free */
-
-    /* Read-only references (safe for concurrent access) */
     struct obmafs3_ctx *ctx;
-
-    /* Worker-private ZSTD compression context.  ZSTD_CCtx is NOT
-     * thread-safe, so the worker uses its own private cctx. */
-    ZSTD_CCtx *cctx;
+    uint8_t  *data;        /**< Buffer to compress and write (owned) */
+    uint64_t  block_lba;   /**< Destination LBA */
+    uint64_t  offset;      /**< Byte offset (end of payload) */
+    uint64_t  capacity;    /**< Full dedup block size */
+    uint64_t  free_lba;    /**< Trailing blocks to free (set by worker) */
+    uint64_t  free_count;  /**< Number of trailing blocks (set by worker) */
 };
 
 /**
@@ -145,93 +124,87 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, ZSTD_CCtx *cctx, ui
     return rc;
 }
 
-/** Background worker thread entry point. */
-static void *bg_compress_worker(void *arg)
+/**
+ * Async pool callback — compresses a dedup block and writes it to disk.
+ * Called by a pool worker thread with its persistent ZSTD context.
+ * Ownership of the data buffer is taken: freed after compression.
+ */
+static int dedup_async_compress_fn(void *arg, void *cctx)
 {
-    struct bg_compress_ctx *bc = (struct bg_compress_ctx *)arg;
-
-    pthread_mutex_lock(&bc->mutex);
-    while(!bc->shutdown)
-    {
-        /* Wait for a job or shutdown signal */
-        while(!bc->busy && !bc->shutdown) pthread_cond_wait(&bc->cond_work, &bc->mutex);
-
-        if(bc->shutdown) break;
-
-        /* Snapshot job parameters under the lock */
-        uint8_t            *data      = bc->data;
-        uint64_t            block_lba = bc->block_lba;
-        uint64_t            offset    = bc->offset;
-        uint64_t            capacity  = bc->capacity;
-        struct obmafs3_ctx *ctx       = bc->ctx;
-
-        /* Release the lock while doing heavy compression + I/O */
-        pthread_mutex_unlock(&bc->mutex);
-
-        uint64_t defer_free_lba   = 0;
-        uint64_t defer_free_count = 0;
-        int result = bg_do_compress_and_write(ctx, bc->cctx, data, block_lba, offset, capacity,
-                                              &defer_free_lba, &defer_free_count);
-        free(data); /* we own this buffer */
-
-        pthread_mutex_lock(&bc->mutex);
-        bc->free_lba   = defer_free_lba;
-        bc->free_count = defer_free_count;
-        bc->result = result;
-        bc->data   = NULL;
-        bc->busy   = 0;
-        pthread_cond_signal(&bc->cond_done);
-    }
-    pthread_mutex_unlock(&bc->mutex);
-    return NULL;
+    struct dedup_compress_arg *da = (struct dedup_compress_arg *)arg;
+    int rc = bg_do_compress_and_write(da->ctx, cctx, da->data, da->block_lba, da->offset, da->capacity, &da->free_lba,
+                                      &da->free_count);
+    free(da->data);
+    da->data = NULL;
+    return rc;
 }
 
 /**
- * Wait for any pending background compression to finish.
+ * Wait for a pending pool async dedup job and perform deferred cleanup.
+ *
  * After the worker completes, any trailing blocks that the worker
  * determined can be freed are released here on the calling (main)
  * thread, avoiding a data race on the shared allocation bitmap.
+ *
+ * @param ctx     Filesystem context (for block freeing).
+ * @param pjob    Pointer to the pending job slot (set to NULL on return).
+ * @return        Result from the compression job.
  */
-static int bg_compress_wait(struct bg_compress_ctx *bc)
+static int dedup_bg_wait(struct obmafs3_ctx *ctx, void **pjob)
 {
-    if(!bc) return OBMAFS3_OK;
+    struct pool_async_job *job = (struct pool_async_job *)*pjob;
+    if(!job) return OBMAFS3_OK;
 
-    pthread_mutex_lock(&bc->mutex);
-    while(bc->busy) pthread_cond_wait(&bc->cond_done, &bc->mutex);
-    int      result     = bc->result;
-    uint64_t free_lba   = bc->free_lba;
-    uint64_t free_count = bc->free_count;
-    bc->free_lba   = 0;
-    bc->free_count = 0;
-    pthread_mutex_unlock(&bc->mutex);
+    int result = obmafs3_pool_wait_async(job);
 
+    struct dedup_compress_arg *da = (struct dedup_compress_arg *)job->arg;
     /* Free trailing unused blocks on the main thread (bitmap is not
-     * thread-safe, so this must not happen in the worker). */
-    if(free_count > 0)
-        obmafs3_free_blocks(bc->ctx, free_lba, free_count);
+     * thread-safe, so this must not happen in the pool worker). */
+    if(da->free_count > 0) obmafs3_free_blocks(ctx, da->free_lba, da->free_count);
 
+    free(da);
+    obmafs3_pool_async_job_free(job);
+    *pjob = NULL;
     return result;
 }
 
 /**
- * Submit a buffer for background compression + write.
- * Ownership of @data transfers to the bg worker — the caller must NOT
- * free or reuse the buffer after this call.
+ * Submit a buffer for background compression + write via the pool.
+ *
+ * Ownership of @data transfers to the pool worker — the caller must
+ * NOT free or reuse the buffer after this call.
+ *
+ * @param pool       Compression pool (must not be NULL).
+ * @param pjob       Pointer to pending job slot (receives new job).
+ * @param ctx        Filesystem context.
+ * @param data       Buffer to compress and write (ownership transferred).
+ * @param block_lba  Destination LBA.
+ * @param offset     Byte offset (end of payload).
+ * @param capacity   Full dedup block size.
+ * @return OBMAFS3_OK on success, or error code on allocation failure.
  */
-static void bg_compress_submit(struct bg_compress_ctx *bc, uint8_t *data, uint64_t block_lba, uint64_t offset,
-                               uint64_t capacity)
+static int dedup_bg_submit(struct compress_pool *pool, void **pjob, struct obmafs3_ctx *ctx, uint8_t *data,
+                           uint64_t block_lba, uint64_t offset, uint64_t capacity)
 {
-    pthread_mutex_lock(&bc->mutex);
-    bc->data       = data;
-    bc->block_lba  = block_lba;
-    bc->offset     = offset;
-    bc->capacity   = capacity;
-    bc->result     = OBMAFS3_OK;
-    bc->free_lba   = 0;
-    bc->free_count = 0;
-    bc->busy       = 1;
-    pthread_cond_signal(&bc->cond_work);
-    pthread_mutex_unlock(&bc->mutex);
+    struct dedup_compress_arg *da = calloc(1, sizeof(*da));
+    if(!da) return OBMAFS3_ERR_NOMEM;
+    da->ctx       = ctx;
+    da->data      = data;
+    da->block_lba = block_lba;
+    da->offset    = offset;
+    da->capacity  = capacity;
+
+    struct pool_async_job *job = obmafs3_pool_async_job_create(dedup_async_compress_fn, da);
+    if(!job)
+    {
+        free(da->data);  /* da took ownership of the data buffer */
+        free(da);
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    obmafs3_pool_submit_async(pool, job);
+    *pjob = job;
+    return OBMAFS3_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -513,7 +486,15 @@ static int dedup_tree_list_read(struct obmafs3_ctx *ctx, struct tree_list_header
         return OBMAFS3_OK;
     }
 
-    *entries = malloc((size_t)(hdr->tree_count * sizeof(struct tree_list_entry)));
+    /* Bounds-check: entries must fit within the block */
+    size_t entries_size = (size_t)(hdr->tree_count * sizeof(struct tree_list_entry));
+    if(sizeof(struct tree_list_header) + entries_size > (size_t)ctx->sb.block_size)
+    {
+        free(buf);
+        DBG_RETURN(OBMAFS3_ERR_INVAL, "tree_count exceeds block capacity");
+    }
+
+    *entries = malloc(entries_size);
     if(!*entries)
     {
         free(buf);
@@ -595,6 +576,7 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
     rc = obmafs3_alloc_block(ctx, &root_lba);
     if(rc != OBMAFS3_OK)
     {
+        obmafs3_free_block(ctx, new_hdr_lba);
         free(entries);
         return rc;
     }
@@ -603,6 +585,8 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
     uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
     if(!node_buf)
     {
+        obmafs3_free_block(ctx, new_hdr_lba);
+        obmafs3_free_block(ctx, root_lba);
         free(entries);
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
@@ -620,6 +604,8 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
     free(node_buf);
     if(rc != OBMAFS3_OK)
     {
+        obmafs3_free_block(ctx, new_hdr_lba);
+        obmafs3_free_block(ctx, root_lba);
         free(entries);
         return rc;
     }
@@ -639,6 +625,8 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
     rc = obmafs3_btree_header_write(ctx, new_hdr_lba, &new_hdr);
     if(rc != OBMAFS3_OK)
     {
+        obmafs3_free_block(ctx, new_hdr_lba);
+        obmafs3_free_block(ctx, root_lba);
         free(entries);
         return rc;
     }
@@ -1341,12 +1329,15 @@ static int dedup_block_new(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db)
  * Allocates a new block if the current one is full or doesn't exist.
  * Returns the block_lba and block_offset where the sector was stored.
  *
- * When @bg is non-NULL and the current block is full, the buffer is
- * handed off to the background worker for compression while a fresh
- * buffer is allocated immediately for continued accumulation.
+ * When @pool is non-NULL and the current block is full, the buffer is
+ * submitted to the compression pool for background processing while a
+ * fresh buffer is allocated immediately for continued accumulation.
+ *
+ * @param pending_job  Pointer to the pending async job slot (in db_cache).
  */
 static int dedup_block_store(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db, const void *sector_data,
-                             size_t sector_len, uint64_t *out_lba, uint64_t *out_offset, struct bg_compress_ctx *bg)
+                             size_t sector_len, uint64_t *out_lba, uint64_t *out_offset, struct compress_pool *pool,
+                             void **pending_job)
 {
     int rc;
 
@@ -1359,21 +1350,36 @@ static int dedup_block_store(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db
     else if(db->offset + sector_len > db->capacity)
     {
         /* Current block is full */
-        if(bg)
+        if(pool)
         {
             /* Wait for any previous background job */
-            rc = bg_compress_wait(bg);
+            rc = dedup_bg_wait(ctx, pending_job);
             if(rc != OBMAFS3_OK) return rc;
-            /* Hand off the current buffer to the background worker.
-             * Ownership of db->data transfers to the bg thread. */
-            bg_compress_submit(bg, db->data, db->block_lba, db->offset, db->capacity);
+            /* Submit the current buffer to the pool for compression.
+             * Ownership of db->data transfers to the pool worker. */
+            rc = dedup_bg_submit(pool, pending_job, ctx, db->data, db->block_lba, db->offset, db->capacity);
+            if(rc != OBMAFS3_OK) return rc;
             /* Allocate a fresh buffer and new LBA */
             db->data = calloc(1, (size_t)db->capacity);
-            if(!db->data) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+            if(!db->data)
+            {
+                /* Mark block as clean so the error recovery path doesn't
+                 * try to flush through a NULL data pointer. */
+                db->dirty     = 0;
+                db->block_lba = 0;
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+            }
             db->dirty = 0;
             uint64_t start_lba;
             rc = obmafs3_alloc_blocks(ctx, db->std_blocks, &start_lba);
-            if(rc != OBMAFS3_OK) return rc;
+            if(rc != OBMAFS3_OK)
+            {
+                free(db->data);
+                db->data      = NULL;
+                db->dirty     = 0;
+                db->block_lba = 0;
+                return rc;
+            }
             db->block_lba = start_lba;
             db->offset    = sizeof(struct block_header);
         }
@@ -1620,9 +1626,10 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         else if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             /* New sector — store in the dedup data block */
-            uint64_t                stored_lba, stored_offset;
-            struct bg_compress_ctx *bg = db_cache ? (struct bg_compress_ctx *)db_cache->bg_compress : NULL;
-            rc = dedup_block_store(ctx, db, sector_data, sector_data_len, &stored_lba, &stored_offset, bg);
+            uint64_t             stored_lba, stored_offset;
+            struct compress_pool *pool    = db_cache ? ctx->compress_pool : NULL;
+            void                **pjob    = db_cache ? &db_cache->pending_job : NULL;
+            rc = dedup_block_store(ctx, db, sector_data, sector_data_len, &stored_lba, &stored_offset, pool, pjob);
             if(rc != OBMAFS3_OK) goto out;
 
             /* Insert at the position found by upsert_find (no
@@ -1663,9 +1670,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      *          happen between them.
      */
     /* Wait for any pending background compression before syncing */
-    if(db_cache && db_cache->bg_compress)
+    if(db_cache && db_cache->pending_job)
     {
-        int bg_rc = bg_compress_wait((struct bg_compress_ctx *)db_cache->bg_compress);
+        int bg_rc = dedup_bg_wait(ctx, &db_cache->pending_job);
         if(rc == OBMAFS3_OK) rc = bg_rc;
     }
 
@@ -1749,8 +1756,12 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
 out:
     /* Error path — wait for bg, then flush dedup state */
-    if(db_cache && db_cache->bg_compress) bg_compress_wait((struct bg_compress_ctx *)db_cache->bg_compress);
-    if(db->dirty) dedup_block_flush(ctx, db);
+    if(db_cache && db_cache->pending_job)
+    {
+        int bg_rc = dedup_bg_wait(ctx, &db_cache->pending_job);
+        if(bg_rc != OBMAFS3_OK && rc == OBMAFS3_OK) rc = bg_rc;
+    }
+    if(db->data && db->dirty) dedup_block_flush(ctx, db);
 
     /* Flush cached tree nodes even on error to keep disk consistent */
     if(db_cache && db_cache->node_cache) dedup_cache_flush((struct dedup_node_cache *)db_cache->node_cache, ctx);
@@ -1811,9 +1822,9 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_siz
     int rc = OBMAFS3_OK;
 
     /* Wait for any pending background compression first */
-    if(db_cache->bg_compress)
+    if(db_cache->pending_job)
     {
-        int bg_rc = bg_compress_wait((struct bg_compress_ctx *)db_cache->bg_compress);
+        int bg_rc = dedup_bg_wait(ctx, &db_cache->pending_job);
         if(bg_rc != OBMAFS3_OK) rc = bg_rc;
     }
 
@@ -1871,16 +1882,17 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_siz
 /**
  * Free all resources held by a dedup block cache.
  *
- * Stops the background compression worker, releases the B+Tree node
+ * Waits for any pending pool compression, releases the B+Tree node
  * cache, and frees the data buffer.
  *
+ * @param ctx       Filesystem context (for deferred block freeing).
  * @param db_cache  Dedup block cache to free.
  */
-void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
+void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache)
 {
     if(!db_cache) return;
-    /* Stop the background compression worker if running */
-    obmafs3_bg_compress_stop(db_cache);
+    /* Wait for any pending pool job */
+    if(db_cache->pending_job) dedup_bg_wait(ctx, &db_cache->pending_job);
     /* Free the B+Tree node cache */
     if(db_cache->node_cache)
     {
@@ -1896,80 +1908,6 @@ void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache)
 /* ------------------------------------------------------------------ */
 /*  Background compression start / stop                                */
 /* ------------------------------------------------------------------ */
-
-/**
- * Start the background compression worker thread.
- *
- * The worker thread compresses dedup blocks asynchronously.  If
- * already started this function is a no-op.
- *
- * @param ctx       Filesystem context.
- * @param db_cache  Dedup block cache to associate the worker with.
- * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO if the
- *         thread cannot be created.
- */
-int obmafs3_bg_compress_start(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache)
-{
-    if(!db_cache || db_cache->bg_compress) return OBMAFS3_OK; /* already started or nothing to do */
-
-    struct bg_compress_ctx *bc = calloc(1, sizeof(*bc));
-    if(!bc) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
-
-    bc->ctx  = ctx;
-    bc->cctx = ZSTD_createCCtx();
-    if(!bc->cctx)
-    {
-        free(bc);
-        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
-    }
-    pthread_mutex_init(&bc->mutex, NULL);
-    pthread_cond_init(&bc->cond_work, NULL);
-    pthread_cond_init(&bc->cond_done, NULL);
-
-    int err = pthread_create(&bc->thread, NULL, bg_compress_worker, bc);
-    if(err)
-    {
-        pthread_cond_destroy(&bc->cond_done);
-        pthread_cond_destroy(&bc->cond_work);
-        pthread_mutex_destroy(&bc->mutex);
-        ZSTD_freeCCtx(bc->cctx);
-        free(bc);
-        DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
-    }
-
-    db_cache->bg_compress = bc;
-    return OBMAFS3_OK;
-}
-
-/**
- * Stop the background compression worker thread.
- *
- * Signals shutdown to the worker and joins the thread.  Safe to call
- * even if the worker is not running.
- *
- * @param db_cache  Dedup block cache whose worker to stop.
- */
-void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache)
-{
-    if(!db_cache || !db_cache->bg_compress) return;
-
-    struct bg_compress_ctx *bc = (struct bg_compress_ctx *)db_cache->bg_compress;
-
-    /* Signal shutdown and wait for the worker to exit */
-    pthread_mutex_lock(&bc->mutex);
-    bc->shutdown = 1;
-    pthread_cond_signal(&bc->cond_work);
-    pthread_mutex_unlock(&bc->mutex);
-
-    pthread_join(bc->thread, NULL);
-
-    pthread_cond_destroy(&bc->cond_done);
-    pthread_cond_destroy(&bc->cond_work);
-    pthread_mutex_destroy(&bc->mutex);
-    ZSTD_freeCCtx(bc->cctx);
-    free(bc);
-    db_cache->bg_compress = NULL;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Sector map cache flush / free                                      */

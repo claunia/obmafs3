@@ -34,7 +34,8 @@ static void thread_bufs_destroy(void *ptr)
     free(tb->io_buf);
     free(tb->io_buf2);
     free(tb->comp_buf);
-    if(tb->zstd_cctx) ZSTD_freeCCtx(tb->zstd_cctx);
+    if(tb->zstd_cctx)       ZSTD_freeCCtx(tb->zstd_cctx);
+    if(tb->zstd_probe_cctx) ZSTD_freeCCtx(tb->zstd_probe_cctx);
     if(tb->zstd_dctx) ZSTD_freeDCtx(tb->zstd_dctx);
     free(tb);
 }
@@ -67,10 +68,11 @@ struct obmafs3_thread_bufs *obmafs3_get_thread_bufs(struct obmafs3_ctx *ctx)
     tb->comp_buf      = malloc(comp_need);
     tb->comp_buf_size = comp_need;
     tb->zstd_cctx     = ZSTD_createCCtx();
+    tb->zstd_probe_cctx = ZSTD_createCCtx();
     tb->zstd_dctx     = ZSTD_createDCtx();
 
     if(!tb->hdr_buf || !tb->node_buf || !tb->io_buf || !tb->io_buf2 || !tb->comp_buf || !tb->zstd_cctx ||
-       !tb->zstd_dctx)
+       !tb->zstd_probe_cctx || !tb->zstd_dctx)
     {
         thread_bufs_destroy(tb);
         return NULL;

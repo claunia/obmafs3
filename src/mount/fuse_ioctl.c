@@ -222,11 +222,6 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(!ffctx->db_cache.initialized) ffctx->sector_size = CD_RAW_SECTOR_SIZE;
 
         struct dedup_block_cache *dbc = &ffctx->db_cache;
-        if(!dbc->bg_compress)
-        {
-            int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-            if(brc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-        }
 
         /* Write via the media image data path — dedup_upsert_find handles
          * both hit (skip data) and miss (store + insert) in one traversal,
@@ -356,11 +351,6 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         if(!ffctx->db_cache.initialized) ffctx->sector_size = data_size;
 
         struct dedup_block_cache *dbc = &ffctx->db_cache;
-        if(!dbc->bg_compress)
-        {
-            int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-            if(brc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-        }
 
         /* Write via the media image data path — dedup_upsert_find handles
          * both hit (skip data) and miss (store + insert) in one traversal,

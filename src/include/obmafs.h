@@ -2,6 +2,7 @@
 #define OBMAFS3_OBMAFS_H
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -39,6 +40,7 @@ struct obmafs3_thread_bufs
     uint8_t            *comp_buf;       ///< Compression output buffer
     size_t              comp_buf_size;  ///< Size of comp_buf in bytes
     struct ZSTD_CCtx_s *zstd_cctx;     ///< ZSTD compression context
+    struct ZSTD_CCtx_s *zstd_probe_cctx; ///< ZSTD probe context (fast level-1 compressibility test)
     struct ZSTD_DCtx_s *zstd_dctx;     ///< ZSTD decompression context
 };
 
@@ -98,7 +100,34 @@ struct obmafs3_thread_bufs *obmafs3_get_thread_bufs(struct obmafs3_ctx *ctx);
 
 /* --- Compression thread pool --- */
 int  obmafs3_compress_pool_init(struct obmafs3_ctx *ctx);
+void obmafs3_compress_pool_reinit(struct obmafs3_ctx *ctx);
 void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx);
+
+/* --- Async pool jobs (used by dedup background compression) --- */
+
+/**
+ * A single asynchronous work item that can be submitted to the pool.
+ * Used by the dedup path to compress full dedup blocks in the
+ * background while the main thread continues accumulating data.
+ *
+ * The function pointer uses @c void* for the compression context
+ * to avoid a ZSTD dependency in the header; callers cast as needed.
+ */
+struct pool_async_job
+{
+    int (*fn)(void *arg, void *cctx);  ///< work function (cctx is ZSTD_CCtx*)
+    void       *arg;          ///< opaque context passed to fn
+    int         result;       ///< return value from fn
+    _Atomic int done;         ///< set to 1 when complete
+    pthread_mutex_t mtx;      ///< protects cond wait
+    pthread_cond_t  cond;     ///< signalled on completion
+    struct pool_async_job *next; ///< queue link
+};
+
+struct pool_async_job *obmafs3_pool_async_job_create(int (*fn)(void *arg, void *cctx), void *arg);
+void obmafs3_pool_async_job_free(struct pool_async_job *job);
+void obmafs3_pool_submit_async(struct compress_pool *pool, struct pool_async_job *job);
+int  obmafs3_pool_wait_async(struct pool_async_job *job);
 
 /* --- Superblock operations --- */
 int obmafs3_sb_read(int fd, struct obmafs3_sb *sb);
@@ -191,7 +220,7 @@ struct dedup_block_cache
     uint64_t std_blocks;   ///< Number of standard blocks per dedup block
     int      dirty;        ///< Whether the buffer has been modified
     int      initialized;  ///< Non-zero once first init has run
-    void    *bg_compress;  ///< Opaque background compression context
+    void    *pending_job;  ///< Pending pool_async_job (NULL when idle)
     void    *node_cache;   ///< Opaque dedup B+Tree node cache
     struct btree_header dedup_hdr;     ///< Cached dedup tree header
     uint64_t            dedup_hdr_lba; ///< Cached dedup tree header LBA
@@ -202,12 +231,7 @@ int  obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record
                                     const void *buf, size_t size, uint16_t sector_size, struct sector_map_cache *cache,
                                     struct dedup_block_cache *db_cache);
 int  obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_size, struct dedup_block_cache *db_cache);
-void obmafs3_free_dedup_block_cache(struct dedup_block_cache *db_cache);
-
-/** Start a background compression worker thread for the dedup block cache. */
-int  obmafs3_bg_compress_start(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache);
-/** Wait for any pending background compression and shut down the worker. */
-void obmafs3_bg_compress_stop(struct dedup_block_cache *db_cache);
+void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record *inode, struct sector_map_cache *cache);
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
 

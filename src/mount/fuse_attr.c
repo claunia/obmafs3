@@ -243,7 +243,7 @@ static int obmafs3_fuse_release_impl(const char *path, struct fuse_file_info *fi
         if(rc == OBMAFS3_OK) rc = brc;
     }
 
-    obmafs3_free_dedup_block_cache(&ffctx->db_cache);
+    obmafs3_free_dedup_block_cache(g_ctx, &ffctx->db_cache);
     obmafs3_free_sector_map_cache(&ffctx->sme_cache);
     obmafs3_free_cd_sector_map_cache(&ffctx->cd_sme_cache);
     if(ffctx->ecc_ctx) ecc_cd_free(ffctx->ecc_ctx);

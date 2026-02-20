@@ -126,13 +126,6 @@ static int obmafs3_fuse_write_impl(const char *path, const char *buf, size_t siz
         struct sector_map_cache  *cache = (ffctx && ffctx->sector_size) ? &ffctx->sme_cache : NULL;
         struct dedup_block_cache *dbc   = (ffctx && ffctx->sector_size) ? &ffctx->db_cache : NULL;
 
-        /* Start the background compression worker on the first write */
-        if(dbc && !dbc->bg_compress)
-        {
-            int brc = obmafs3_bg_compress_start(g_ctx, dbc);
-            if(brc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-        }
-
         rc = obmafs3_write_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss, cache, dbc);
     }
     else
