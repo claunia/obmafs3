@@ -1026,6 +1026,58 @@ static void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header 
 }
 
 /* ------------------------------------------------------------------ */
+/*  Free node chain consistency                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Verify that the free node chain fields are zero (since the runtime
+ * never uses them) and optionally repair the header if they aren't.
+ *
+ * The @c free_node_lba and @c free_nodes fields in @c btree_header are
+ * reserved for a future recycling optimisation.  The current runtime always
+ * returns freed nodes directly to the allocation bitmap, so both fields
+ * must be zero on a healthy filesystem.
+ *
+ * @param ctx        Filesystem context.
+ * @param hdr        Pointer to the btree_header (will be modified on fix).
+ * @param hdr_lba    LBA of the header block on disk.
+ * @param tree_name  Human-readable tree name for messages.
+ * @param indent     Indentation prefix for output lines.
+ * @param auto_yes   If non-zero, always repair without asking.
+ * @param auto_no    If non-zero, never repair.
+ * @param errors     Pointer to the cumulative error counter.
+ */
+static void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
+                                  const char *tree_name, const char *indent, int auto_yes, int auto_no, int *errors)
+{
+    if(hdr->free_node_lba == 0 && hdr->free_nodes == 0)
+    {
+        printf("%sFree node chain:  OK\n", indent);
+        return;
+    }
+
+    printf("%sFree node chain:  BAD (free_node_lba=%" PRIu64 ", free_nodes=%u)\n", indent, hdr->free_node_lba,
+           hdr->free_nodes);
+    (*errors)++;
+
+    if(ask_fix(auto_yes, auto_no, "Reset free node chain in header?"))
+    {
+        hdr->free_node_lba = 0;
+        hdr->free_nodes    = 0;
+        int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+        if(rc == OBMAFS3_OK)
+        {
+            printf("%sFree node chain:  FIXED -> 0\n", indent);
+            (*errors)--;
+        }
+        else
+        {
+            fprintf(stderr, "%sError writing %s header: %d\n", indent, tree_name, rc);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Sibling-link consistency                                           */
 /* ------------------------------------------------------------------ */
 
@@ -6066,6 +6118,8 @@ int main(int argc, char *argv[])
             }
             verify_fix_total_nodes(ctx, &ctx->catalog_hdr, ctx->sb.catalog_lba, cat_node_count, "Catalog", "  ",
                                    auto_yes, auto_no, &errors);
+            verify_fix_free_nodes(ctx, &ctx->catalog_hdr, ctx->sb.catalog_lba, "Catalog", "  ",
+                                  auto_yes, auto_no, &errors);
             {
                 uint64_t sib_bad = 0, sib_fix = 0;
                 verify_fix_sibling_links(ctx, ctx->catalog_hdr.root_node_lba,
@@ -6143,6 +6197,8 @@ int main(int argc, char *argv[])
             }
             verify_fix_total_nodes(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, ino_node_count, "Inode", "  ",
                                    auto_yes, auto_no, &errors);
+            verify_fix_free_nodes(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, "Inode", "  ",
+                                  auto_yes, auto_no, &errors);
             {
                 uint64_t sib_bad = 0, sib_fix = 0;
                 verify_fix_sibling_links(ctx, ctx->inode_hdr.root_node_lba,
@@ -6221,6 +6277,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->overflow_hdr, ctx->sb.overflow_lba, ovf_node_count, "Overflow",
                                        "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->overflow_hdr, ctx->sb.overflow_lba, "Overflow", "  ",
+                                      auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->overflow_hdr.root_node_lba,
@@ -6353,6 +6411,8 @@ int main(int argc, char *argv[])
                                     }
                                     verify_fix_total_nodes(ctx, &thdr, tl_entries[t].tree_lba, dd_count, "Dedup",
                                                            "    ", auto_yes, auto_no, &errors);
+                                    verify_fix_free_nodes(ctx, &thdr, tl_entries[t].tree_lba, "Dedup", "    ",
+                                                          auto_yes, auto_no, &errors);
                                     {
                                         uint64_t sib_bad = 0, sib_fix = 0;
                                         verify_fix_sibling_links(ctx, thdr.root_node_lba,
@@ -6451,6 +6511,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, mt_node_count, "Media tag",
                                        "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, "Media tag", "  ",
+                                      auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->media_tag_hdr.root_node_lba,
@@ -6530,6 +6592,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_prefix_hdr, ctx->sb.cd_prefix_lba, node_count, "CD prefix",
                                        "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->cd_prefix_hdr, ctx->sb.cd_prefix_lba, "CD prefix", "  ",
+                                      auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->cd_prefix_hdr.root_node_lba,
@@ -6609,6 +6673,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_suffix_hdr, ctx->sb.cd_suffix_lba, node_count, "CD suffix",
                                        "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->cd_suffix_hdr, ctx->sb.cd_suffix_lba, "CD suffix", "  ",
+                                      auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->cd_suffix_hdr.root_node_lba,
@@ -6688,6 +6754,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_subchannel_hdr, ctx->sb.cd_subchannel_lba, node_count,
                                        "CD subchannel", "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->cd_subchannel_hdr, ctx->sb.cd_subchannel_lba, "CD subchannel",
+                                      "  ", auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->cd_subchannel_hdr.root_node_lba,
@@ -6767,6 +6835,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, node_count, "Metadata",
                                        "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, "Metadata", "  ",
+                                      auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->metadata_hdr.root_node_lba,
@@ -6849,6 +6919,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, node_count,
                                        "Metadata index", "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, "Metadata index",
+                                      "  ", auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->metadata_idx_hdr.root_node_lba,
@@ -6936,6 +7008,8 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, node_count, "Refcount",
                                        "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, "Refcount", "  ",
+                                      auto_yes, auto_no, &errors);
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->refcount_hdr.root_node_lba,
