@@ -367,22 +367,33 @@ static int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, 
  * Verify stored checksums of a list of B+Tree node blocks.
  *
  * Reads each node, recomputes its checksum, and compares it with the
- * stored value.  Reports mismatches to stderr.
+ * stored value.  Reports mismatches to stderr.  Optionally rewrites
+ * nodes with corrected checksums.
  *
- * @param ctx         Filesystem context.
- * @param node_lbas   Array of node LBAs to verify.
- * @param node_count  Number of elements in @p node_lbas.
- * @param tree_name   Human-readable tree name for diagnostic output.
- * @param bad_count   Output: number of nodes with bad checksums.
+ * @param ctx          Filesystem context.
+ * @param node_lbas    Array of node LBAs to verify.
+ * @param node_count   Number of elements in @p node_lbas.
+ * @param tree_name    Human-readable tree name for diagnostic output.
+ * @param auto_yes     If non-zero, always repair without asking.
+ * @param auto_no      If non-zero, never repair.
+ * @param bad_count    Output: number of nodes with bad checksums.
+ * @param fixed_count  Output: number of nodes whose checksums were repaired.
  * @return @c OBMAFS3_OK on success.
  */
 static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count,
-                                       const char *tree_name, uint64_t *bad_count)
+                                       const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
+                                       uint64_t *fixed_count)
 {
+    *bad_count   = 0;
+    *fixed_count = 0;
+
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    uint64_t bad = 0;
+    /* Collect LBAs of nodes with bad checksums */
+    uint64_t *bad_lbas = NULL;
+    uint64_t  bad_cap  = 0;
+    uint64_t  bad      = 0;
 
     for(uint64_t n = 0; n < node_count; n++)
     {
@@ -399,6 +410,7 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
         if(rc != OBMAFS3_OK)
         {
             free(buf);
+            free(bad_lbas);
             return rc;
         }
 
@@ -423,6 +435,14 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
         if(memcmp(stored, computed, 32) != 0)
         {
             fprintf(stderr, "\n  %s node at LBA %" PRIu64 ": checksum mismatch\n", tree_name, lba);
+            if(bad >= bad_cap)
+            {
+                bad_cap = bad_cap ? bad_cap * 2 : 16;
+                uint64_t *tmp = realloc(bad_lbas, bad_cap * sizeof(uint64_t));
+                if(!tmp) { free(buf); free(bad_lbas); return OBMAFS3_ERR_NOMEM; }
+                bad_lbas = tmp;
+            }
+            bad_lbas[bad] = lba;
             bad++;
         }
     }
@@ -433,8 +453,41 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
         fflush(stderr);
     }
 
+    /* Offer to fix */
+    uint64_t fixes = 0;
+    if(bad > 0)
+    {
+        char prompt[128];
+        snprintf(prompt, sizeof(prompt), "  Fix %" PRIu64 " %s node checksum%s?", bad, tree_name,
+                 bad == 1 ? "" : "s");
+        if(ask_fix(auto_yes, auto_no, prompt))
+        {
+            for(uint64_t i = 0; i < bad; i++)
+            {
+                int rc = obmafs3_block_read(ctx, bad_lbas[i], buf, (size_t)ctx->sb.block_size);
+                if(rc != OBMAFS3_OK) continue;
+
+                struct btree_node_header hdr;
+                memcpy(&hdr, buf, sizeof(hdr));
+                size_t data_size = sizeof(struct btree_node_header) + hdr.keys_length;
+                memset(hdr.checksum, 0, 32);
+                memcpy(buf, &hdr, sizeof(hdr));
+                obmafs3_checksum_block(buf, data_size, hdr.checksum);
+                memcpy(buf + __builtin_offsetof(struct btree_node_header, checksum), hdr.checksum, 32);
+
+                rc = obmafs3_block_write(ctx, bad_lbas[i], buf, (size_t)ctx->sb.block_size);
+                if(rc == OBMAFS3_OK)
+                    fixes++;
+                else
+                    fprintf(stderr, "    Error writing LBA %" PRIu64 ": %d\n", bad_lbas[i], rc);
+            }
+        }
+    }
+
     free(buf);
-    *bad_count = bad;
+    free(bad_lbas);
+    *bad_count   = bad;
+    *fixed_count = fixes;
     return OBMAFS3_OK;
 }
 
@@ -1294,22 +1347,32 @@ static int walk_meta_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, siz
  * blocks.
  *
  * Each node spans @c METADATA_NODE_BLOCKS contiguous blocks.
+ * Optionally rewrites nodes with corrected checksums.
  *
- * @param ctx         Filesystem context.
- * @param node_lbas   Array of node LBAs to verify.
- * @param node_count  Number of elements in @p node_lbas.
- * @param tree_name   Human-readable tree name for diagnostic output.
- * @param bad_count   Output: number of nodes with bad checksums.
+ * @param ctx          Filesystem context.
+ * @param node_lbas    Array of node LBAs to verify.
+ * @param node_count   Number of elements in @p node_lbas.
+ * @param tree_name    Human-readable tree name for diagnostic output.
+ * @param auto_yes     If non-zero, always repair without asking.
+ * @param auto_no      If non-zero, never repair.
+ * @param bad_count    Output: number of nodes with bad checksums.
+ * @param fixed_count  Output: number of nodes whose checksums were repaired.
  * @return @c OBMAFS3_OK on success.
  */
 static int verify_meta_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count,
-                                      const char *tree_name, uint64_t *bad_count)
+                                      const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
+                                      uint64_t *fixed_count)
 {
+    *bad_count   = 0;
+    *fixed_count = 0;
+
     size_t   node_sz = (size_t)METADATA_NODE_BLOCKS * ctx->sb.block_size;
     uint8_t *buf     = calloc(1, node_sz);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    uint64_t bad = 0;
+    uint64_t *bad_lbas = NULL;
+    uint64_t  bad_cap  = 0;
+    uint64_t  bad      = 0;
 
     for(uint64_t n = 0; n < node_count; n++)
     {
@@ -1319,6 +1382,7 @@ static int verify_meta_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *n
         if(rc != OBMAFS3_OK)
         {
             free(buf);
+            free(bad_lbas);
             return rc;
         }
 
@@ -1343,12 +1407,53 @@ static int verify_meta_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *n
         if(memcmp(stored, computed, 32) != 0)
         {
             fprintf(stderr, "  %s node at LBA %" PRIu64 ": checksum mismatch\n", tree_name, lba);
+            if(bad >= bad_cap)
+            {
+                bad_cap = bad_cap ? bad_cap * 2 : 16;
+                uint64_t *tmp = realloc(bad_lbas, bad_cap * sizeof(uint64_t));
+                if(!tmp) { free(buf); free(bad_lbas); return OBMAFS3_ERR_NOMEM; }
+                bad_lbas = tmp;
+            }
+            bad_lbas[bad] = lba;
             bad++;
         }
     }
 
+    /* Offer to fix */
+    uint64_t fixes = 0;
+    if(bad > 0)
+    {
+        char prompt[128];
+        snprintf(prompt, sizeof(prompt), "  Fix %" PRIu64 " %s node checksum%s?", bad, tree_name,
+                 bad == 1 ? "" : "s");
+        if(ask_fix(auto_yes, auto_no, prompt))
+        {
+            for(uint64_t i = 0; i < bad; i++)
+            {
+                int rc = obmafs3_block_read(ctx, bad_lbas[i], buf, node_sz);
+                if(rc != OBMAFS3_OK) continue;
+
+                struct btree_node_header hdr;
+                memcpy(&hdr, buf, sizeof(hdr));
+                size_t data_size = sizeof(struct btree_node_header) + hdr.keys_length;
+                memset(hdr.checksum, 0, 32);
+                memcpy(buf, &hdr, sizeof(hdr));
+                obmafs3_checksum_block(buf, data_size, hdr.checksum);
+                memcpy(buf + __builtin_offsetof(struct btree_node_header, checksum), hdr.checksum, 32);
+
+                rc = obmafs3_block_write(ctx, bad_lbas[i], buf, node_sz);
+                if(rc == OBMAFS3_OK)
+                    fixes++;
+                else
+                    fprintf(stderr, "    Error writing LBA %" PRIu64 ": %d\n", bad_lbas[i], rc);
+            }
+        }
+    }
+
     free(buf);
-    *bad_count = bad;
+    free(bad_lbas);
+    *bad_count   = bad;
+    *fixed_count = fixes;
     return OBMAFS3_OK;
 }
 
@@ -3799,6 +3904,249 @@ static void validate_overflow_extents(struct obmafs3_ctx *ctx, uint64_t total_bl
 }
 
 /**
+ * Verify that each inode's file_size matches the sum of its extent
+ * logical blocks (inline + overflow) multiplied by block_size.
+ *
+ * Directories (file_type == kFileTypeDirectory) are skipped because
+ * they have no data extents.
+ *
+ * When a mismatch is detected, the user is offered to update
+ * file_size to match the extent sum.
+ *
+ * @param ctx          Filesystem context.
+ * @param auto_yes     If nonzero, always repair.
+ * @param auto_no      If nonzero, never repair.
+ * @param bad_count    Output: number of mismatches found.
+ * @param fixed_count  Output: number of mismatches repaired.
+ */
+static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, uint64_t *bad_count,
+                                       uint64_t *fixed_count)
+{
+    *bad_count   = 0;
+    *fixed_count = 0;
+
+    uint64_t root_lba = ctx->inode_hdr.root_node_lba;
+    if(root_lba == 0) return;
+
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint8_t *buf = calloc(1, bsz);
+    if(!buf) return;
+
+    /* --- Phase 1: collect per-inode overflow logical_count sums --- */
+
+    /* Hash map: simple open-addressing table mapping inode_id → sum */
+    typedef struct
+    {
+        uint64_t inode_id;
+        uint64_t logical_sum;
+    } ovf_entry_t;
+
+    uint64_t     ovf_cap   = 0;
+    uint64_t     ovf_count = 0;
+    ovf_entry_t *ovf_map   = NULL;
+
+    if(ctx->overflow_hdr.root_node_lba != 0)
+    {
+        uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+        uint64_t  stk_size = 0, stk_cap = 64;
+        if(!stack) { free(buf); return; }
+
+        stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
+
+        while(stk_size > 0)
+        {
+            uint64_t lba = stack[--stk_size];
+
+            if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+            struct btree_node_header nhdr;
+            memcpy(&nhdr, buf, sizeof(nhdr));
+            if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+            if(nhdr.level > 0)
+            {
+                for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                {
+                    struct btree_index_entry ie;
+                    memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                    if(stk_size >= stk_cap)
+                    {
+                        stk_cap *= 2;
+                        uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                        if(!tmp) { free(buf); free(stack); free(ovf_map); return; }
+                        stack = tmp;
+                    }
+                    stack[stk_size++] = ie.child_lba;
+                }
+                continue;
+            }
+
+            /* Leaf: accumulate overflow logical_count per inode_id */
+            for(uint16_t i = 0; i < nhdr.node_keys; i++)
+            {
+                struct overflow_extent oe;
+                memcpy(&oe, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(oe), sizeof(oe));
+
+                /* Linear scan (sufficient for fsck; inodes with overflow are rare) */
+                int found = 0;
+                for(uint64_t j = 0; j < ovf_count; j++)
+                {
+                    if(ovf_map[j].inode_id == oe.inode_id)
+                    {
+                        ovf_map[j].logical_sum += oe.logical_count;
+                        found = 1;
+                        break;
+                    }
+                }
+                if(!found)
+                {
+                    if(ovf_count >= ovf_cap)
+                    {
+                        ovf_cap = ovf_cap ? ovf_cap * 2 : 64;
+                        ovf_entry_t *tmp = realloc(ovf_map, ovf_cap * sizeof(*tmp));
+                        if(!tmp) { free(buf); free(stack); free(ovf_map); return; }
+                        ovf_map = tmp;
+                    }
+                    ovf_map[ovf_count].inode_id    = oe.inode_id;
+                    ovf_map[ovf_count].logical_sum = oe.logical_count;
+                    ovf_count++;
+                }
+            }
+        }
+
+        free(stack);
+    }
+
+    /* --- Phase 2: walk inodes, compare file_size vs extent sum --- */
+    {
+        uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+        uint64_t  stk_size = 0, stk_cap = 64;
+        if(!stack) { free(buf); free(ovf_map); return; }
+
+        stack[stk_size++] = root_lba;
+
+        while(stk_size > 0)
+        {
+            uint64_t lba = stack[--stk_size];
+
+            if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+            struct btree_node_header hdr;
+            memcpy(&hdr, buf, sizeof(hdr));
+            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+            if(hdr.level > 0)
+            {
+                for(uint16_t i = 0; i < hdr.node_keys; i++)
+                {
+                    struct btree_index_entry ie;
+                    memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                    if(stk_size >= stk_cap)
+                    {
+                        stk_cap *= 2;
+                        uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                        if(!tmp) { free(buf); free(stack); free(ovf_map); return; }
+                        stack = tmp;
+                    }
+                    stack[stk_size++] = ie.child_lba;
+                }
+                continue;
+            }
+
+            /* Leaf: check each inode */
+            for(uint16_t i = 0; i < hdr.node_keys; i++)
+            {
+                struct inode_record rec;
+                memcpy(&rec, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(rec), sizeof(rec));
+
+                /* Skip directories — they have no data extents */
+                if(rec.file_type == kFileTypeDirectory) continue;
+
+                /* Skip media/CD images — file_size reflects logical disk size,
+                 * not extent capacity, because data is stored via dedup trees */
+                if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeCompactDiscImage) continue;
+
+                /* Sum inline extents */
+                uint64_t logical_sum = 0;
+                for(int e = 0; e < 8; e++)
+                    logical_sum += rec.extents[e].logical_blocks;
+
+                /* Add overflow extents for this inode */
+                for(uint64_t j = 0; j < ovf_count; j++)
+                {
+                    if(ovf_map[j].inode_id == rec.inode_id)
+                    {
+                        logical_sum += ovf_map[j].logical_sum;
+                        break;
+                    }
+                }
+
+                uint64_t expected_size = logical_sum * bsz;
+
+                /*
+                 * The last extent's logical coverage may exceed the actual
+                 * file_size (partial last block).  So file_size must be:
+                 *   (total_logical - last_extent_logical) * bsz < file_size <= total_logical * bsz
+                 *
+                 * Simplified: file_size must not exceed extent capacity,
+                 * and extent capacity minus one extent worth must not exceed file_size.
+                 * But for files with zero extents, file_size must be 0.
+                 */
+                if(logical_sum == 0)
+                {
+                    if(rec.file_size != 0)
+                    {
+                        printf("    inode %" PRIu64 ": file_size=%" PRIu64
+                               " but no extents (expected 0)\n",
+                               rec.inode_id, rec.file_size);
+                        (*bad_count)++;
+                        if(ask_fix(auto_yes, auto_no, "    Set file_size to 0?"))
+                        {
+                            rec.file_size = 0;
+                            obmafs3_inode_put(ctx, &rec);
+                            (*fixed_count)++;
+                        }
+                    }
+                    continue;
+                }
+
+                if(rec.file_size > expected_size)
+                {
+                    printf("    inode %" PRIu64 ": file_size=%" PRIu64
+                           " exceeds extent capacity %" PRIu64 " (%" PRIu64 " logical blocks)\n",
+                           rec.inode_id, rec.file_size, expected_size, logical_sum);
+                    (*bad_count)++;
+                    if(ask_fix(auto_yes, auto_no, "    Clamp file_size to extent capacity?"))
+                    {
+                        rec.file_size = expected_size;
+                        obmafs3_inode_put(ctx, &rec);
+                        (*fixed_count)++;
+                    }
+                }
+                else if(rec.file_size == 0 && logical_sum > 0)
+                {
+                    printf("    inode %" PRIu64 ": file_size=0 but has %" PRIu64
+                           " logical blocks (capacity %" PRIu64 ")\n",
+                           rec.inode_id, logical_sum, expected_size);
+                    (*bad_count)++;
+                    if(ask_fix(auto_yes, auto_no, "    Set file_size to extent capacity?"))
+                    {
+                        rec.file_size = expected_size;
+                        obmafs3_inode_put(ctx, &rec);
+                        (*fixed_count)++;
+                    }
+                }
+            }
+        }
+
+        free(stack);
+    }
+
+    free(buf);
+    free(ovf_map);
+}
+
+/**
  * Top-level extent validation: inline + overflow.
  *
  * @param ctx       Filesystem context.
@@ -3840,6 +4188,22 @@ static void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int aut
     {
         printf("  Overflow extents: %" PRIu64 " bad\n", overflow_bad);
         *errors += (int)overflow_bad;
+    }
+
+    /* ---- File size vs extent sum ---- */
+    uint64_t sz_bad = 0, sz_fixed = 0;
+    check_file_size_vs_extents(ctx, auto_yes, auto_no, &sz_bad, &sz_fixed);
+
+    if(sz_bad == 0)
+    {
+        printf("  File size check:  OK\n");
+    }
+    else
+    {
+        printf("  File size check:  %" PRIu64 " mismatch", sz_bad);
+        if(sz_fixed > 0) printf(" (%" PRIu64 " fixed)", sz_fixed);
+        printf("\n");
+        *errors += (int)(sz_bad - sz_fixed);
     }
 }
 
@@ -4149,8 +4513,9 @@ int main(int argc, char *argv[])
         int       wrc = walk_catalog_btree_nodes(ctx, ctx->catalog_hdr.root_node_lba, &cat_nodes, &cat_node_count);
         if(wrc == OBMAFS3_OK)
         {
-            uint64_t cat_bad = 0;
-            verify_btree_node_checksums(ctx, cat_nodes, cat_node_count, "Catalog", &cat_bad);
+            uint64_t cat_bad = 0, cat_cs_fix = 0;
+            verify_btree_node_checksums(ctx, cat_nodes, cat_node_count, "Catalog", auto_yes, auto_no,
+                                        &cat_bad, &cat_cs_fix);
             uint64_t cat_ord = 0, cat_fix = 0;
             verify_btree_ordering(ctx, cat_nodes, cat_node_count, ORD_CATALOG,
                                   sizeof(struct catalog_record), sizeof(struct catalog_index_entry),
@@ -4158,8 +4523,10 @@ int main(int argc, char *argv[])
             free(cat_nodes);
             if(cat_bad > 0)
             {
-                printf("  Node checksums:   %" PRIu64 " BAD\n", cat_bad);
-                errors++;
+                printf("  Node checksums:   %" PRIu64 " BAD", cat_bad);
+                if(cat_cs_fix > 0) printf(" (%" PRIu64 " fixed)", cat_cs_fix);
+                printf("\n");
+                errors += (int)(cat_bad - cat_cs_fix);
             }
             else
             {
@@ -4223,8 +4590,9 @@ int main(int argc, char *argv[])
         int       wrc = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ino_nodes, &ino_node_count, ctx->inode_hdr.total_nodes, "Inode");
         if(wrc == OBMAFS3_OK)
         {
-            uint64_t ino_bad = 0;
-            verify_btree_node_checksums(ctx, ino_nodes, ino_node_count, "Inode", &ino_bad);
+            uint64_t ino_bad = 0, ino_cs_fix = 0;
+            verify_btree_node_checksums(ctx, ino_nodes, ino_node_count, "Inode", auto_yes, auto_no,
+                                        &ino_bad, &ino_cs_fix);
             uint64_t ino_ord = 0, ino_fix = 0;
             verify_btree_ordering(ctx, ino_nodes, ino_node_count, ORD_UINT64_KEY,
                                   sizeof(struct inode_record), sizeof(struct btree_index_entry),
@@ -4232,8 +4600,10 @@ int main(int argc, char *argv[])
             free(ino_nodes);
             if(ino_bad > 0)
             {
-                printf("  Node checksums:   %" PRIu64 " BAD\n", ino_bad);
-                errors++;
+                printf("  Node checksums:   %" PRIu64 " BAD", ino_bad);
+                if(ino_cs_fix > 0) printf(" (%" PRIu64 " fixed)", ino_cs_fix);
+                printf("\n");
+                errors += (int)(ino_bad - ino_cs_fix);
             }
             else
             {
@@ -4298,8 +4668,9 @@ int main(int argc, char *argv[])
             int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ovf_nodes, &ovf_node_count, ctx->overflow_hdr.total_nodes, "Overflow");
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t ovf_bad = 0;
-                verify_btree_node_checksums(ctx, ovf_nodes, ovf_node_count, "Overflow", &ovf_bad);
+                uint64_t ovf_bad = 0, ovf_cs_fix = 0;
+                verify_btree_node_checksums(ctx, ovf_nodes, ovf_node_count, "Overflow", auto_yes, auto_no,
+                                            &ovf_bad, &ovf_cs_fix);
                 uint64_t ovf_ord = 0, ovf_fix = 0;
                 verify_btree_ordering(ctx, ovf_nodes, ovf_node_count, ORD_OVERFLOW,
                                       sizeof(struct overflow_extent), sizeof(struct btree_index_entry),
@@ -4307,8 +4678,10 @@ int main(int argc, char *argv[])
                 free(ovf_nodes);
                 if(ovf_bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", ovf_bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", ovf_bad);
+                    if(ovf_cs_fix > 0) printf(" (%" PRIu64 " fixed)", ovf_cs_fix);
+                    printf("\n");
+                    errors += (int)(ovf_bad - ovf_cs_fix);
                 }
                 else
                 {
@@ -4421,8 +4794,9 @@ int main(int argc, char *argv[])
                                 int       wrc = walk_inode_btree_nodes(ctx, thdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &dd_nodes, &dd_count, thdr.total_nodes, "Dedup");
                                 if(wrc == OBMAFS3_OK)
                                 {
-                                    uint64_t dbad = 0;
-                                    verify_btree_node_checksums(ctx, dd_nodes, dd_count, "Dedup", &dbad);
+                                    uint64_t dbad = 0, dcs_fix = 0;
+                                    verify_btree_node_checksums(ctx, dd_nodes, dd_count, "Dedup", auto_yes,
+                                                                auto_no, &dbad, &dcs_fix);
                                     uint64_t dord = 0, dfix = 0;
                                     verify_btree_ordering(ctx, dd_nodes, dd_count, ORD_UINT64_KEY,
                                                           sizeof(struct dedup_entry), sizeof(struct btree_index_entry),
@@ -4431,9 +4805,11 @@ int main(int argc, char *argv[])
                                     if(dbad > 0)
                                     {
                                         printf("    Node checksums: "
-                                               "%" PRIu64 " BAD\n",
+                                               "%" PRIu64 " BAD",
                                                dbad);
-                                        errors++;
+                                        if(dcs_fix > 0) printf(" (%" PRIu64 " fixed)", dcs_fix);
+                                        printf("\n");
+                                        errors += (int)(dbad - dcs_fix);
                                     }
                                     else
                                     {
@@ -4522,8 +4898,9 @@ int main(int argc, char *argv[])
             int       wrc = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, sizeof(struct media_tag_index_entry), __builtin_offsetof(struct media_tag_index_entry, child_lba), &mt_nodes, &mt_node_count, ctx->media_tag_hdr.total_nodes, "Media tag");
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t mt_bad = 0;
-                verify_btree_node_checksums(ctx, mt_nodes, mt_node_count, "Media tag", &mt_bad);
+                uint64_t mt_bad = 0, mt_cs_fix = 0;
+                verify_btree_node_checksums(ctx, mt_nodes, mt_node_count, "Media tag", auto_yes, auto_no,
+                                            &mt_bad, &mt_cs_fix);
                 uint64_t mt_ord = 0, mt_fix = 0;
                 verify_btree_ordering(ctx, mt_nodes, mt_node_count, ORD_MEDIA_TAG,
                                       sizeof(struct media_tag_record), sizeof(struct media_tag_index_entry),
@@ -4531,8 +4908,10 @@ int main(int argc, char *argv[])
                 free(mt_nodes);
                 if(mt_bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", mt_bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", mt_bad);
+                    if(mt_cs_fix > 0) printf(" (%" PRIu64 " fixed)", mt_cs_fix);
+                    printf("\n");
+                    errors += (int)(mt_bad - mt_cs_fix);
                 }
                 else
                 {
@@ -4598,8 +4977,9 @@ int main(int argc, char *argv[])
             int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->cd_prefix_hdr.total_nodes, "CD prefix");
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t bad = 0;
-                verify_btree_node_checksums(ctx, nodes, node_count, "CD prefix", &bad);
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "CD prefix", auto_yes, auto_no,
+                                            &bad, &cs_fix);
                 uint64_t ord = 0, ord_fix = 0;
                 verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
                                       sizeof(struct cd_prefix_record), sizeof(struct btree_index_entry),
@@ -4607,8 +4987,10 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
+                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
+                    printf("\n");
+                    errors += (int)(bad - cs_fix);
                 }
                 else
                 {
@@ -4674,8 +5056,9 @@ int main(int argc, char *argv[])
             int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->cd_suffix_hdr.total_nodes, "CD suffix");
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t bad = 0;
-                verify_btree_node_checksums(ctx, nodes, node_count, "CD suffix", &bad);
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "CD suffix", auto_yes, auto_no,
+                                            &bad, &cs_fix);
                 uint64_t ord = 0, ord_fix = 0;
                 verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
                                       sizeof(struct cd_suffix_record), sizeof(struct btree_index_entry),
@@ -4683,8 +5066,10 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
+                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
+                    printf("\n");
+                    errors += (int)(bad - cs_fix);
                 }
                 else
                 {
@@ -4750,8 +5135,9 @@ int main(int argc, char *argv[])
             int       wrc = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->cd_subchannel_hdr.total_nodes, "CD subchannel");
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t bad = 0;
-                verify_btree_node_checksums(ctx, nodes, node_count, "CD subchannel", &bad);
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "CD subchannel", auto_yes, auto_no,
+                                            &bad, &cs_fix);
                 uint64_t ord = 0, ord_fix = 0;
                 verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
                                       sizeof(struct cd_subchannel_record), sizeof(struct btree_index_entry),
@@ -4759,8 +5145,10 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
+                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
+                    printf("\n");
+                    errors += (int)(bad - cs_fix);
                 }
                 else
                 {
@@ -4828,8 +5216,9 @@ int main(int argc, char *argv[])
                                       __builtin_offsetof(struct metadata_index_entry, child_lba), &nodes, &node_count);
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t bad = 0;
-                verify_meta_node_checksums(ctx, nodes, node_count, "Metadata", &bad);
+                uint64_t bad = 0, cs_fix = 0;
+                verify_meta_node_checksums(ctx, nodes, node_count, "Metadata", auto_yes, auto_no,
+                                           &bad, &cs_fix);
                 uint64_t ord = 0, ord_fix = 0;
                 verify_meta_ordering(ctx, nodes, node_count, ORD_METADATA,
                                      sizeof(struct metadata_record), sizeof(struct metadata_index_entry),
@@ -4837,8 +5226,10 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
+                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
+                    printf("\n");
+                    errors += (int)(bad - cs_fix);
                 }
                 else
                 {
@@ -4905,8 +5296,9 @@ int main(int argc, char *argv[])
                 __builtin_offsetof(struct metadata_idx_index_entry, child_lba), &nodes, &node_count);
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t bad = 0;
-                verify_meta_node_checksums(ctx, nodes, node_count, "Metadata index", &bad);
+                uint64_t bad = 0, cs_fix = 0;
+                verify_meta_node_checksums(ctx, nodes, node_count, "Metadata index", auto_yes, auto_no,
+                                           &bad, &cs_fix);
                 uint64_t ord = 0, ord_fix = 0;
                 verify_meta_ordering(ctx, nodes, node_count, ORD_METADATA_IDX,
                                      sizeof(struct metadata_idx_record), sizeof(struct metadata_idx_index_entry),
@@ -4914,8 +5306,10 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
+                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
+                    printf("\n");
+                    errors += (int)(bad - cs_fix);
                 }
                 else
                 {
@@ -4982,8 +5376,9 @@ int main(int argc, char *argv[])
             int       wrc        = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->refcount_hdr.total_nodes, "Refcount");
             if(wrc == OBMAFS3_OK)
             {
-                uint64_t bad = 0;
-                verify_btree_node_checksums(ctx, nodes, node_count, "Refcount", &bad);
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "Refcount", auto_yes, auto_no,
+                                            &bad, &cs_fix);
                 uint64_t ord = 0, ord_fix = 0;
                 verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
                                       sizeof(struct refcount_record), sizeof(struct btree_index_entry),
@@ -4991,8 +5386,10 @@ int main(int argc, char *argv[])
                 free(nodes);
                 if(bad > 0)
                 {
-                    printf("  Node checksums:   %" PRIu64 " BAD\n", bad);
-                    errors++;
+                    printf("  Node checksums:   %" PRIu64 " BAD", bad);
+                    if(cs_fix > 0) printf(" (%" PRIu64 " fixed)", cs_fix);
+                    printf("\n");
+                    errors += (int)(bad - cs_fix);
                 }
                 else
                 {
