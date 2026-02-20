@@ -613,10 +613,11 @@ static int fix_node_ordering(struct obmafs3_ctx *ctx, uint8_t *buf, size_t buf_s
     uint8_t *entries = buf + sizeof(struct btree_node_header);
     qsort(entries, hdr->node_keys, stride, ordering_qsort_cmp);
 
-    /* Recompute checksum */
+    /* Recompute checksum over header+keys only */
+    size_t cs_data_size = sizeof(struct btree_node_header) + hdr->keys_length;
     memset(hdr->checksum, 0, 32);
     memcpy(buf, hdr, sizeof(*hdr));
-    obmafs3_checksum_block(buf, buf_size, hdr->checksum);
+    obmafs3_checksum_block(buf, cs_data_size, hdr->checksum);
     memcpy(buf + __builtin_offsetof(struct btree_node_header, checksum), hdr->checksum, 32);
 
     /* Write back */
@@ -711,10 +712,11 @@ static int patch_sibling_links(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t n
     hdr.left_link  = new_left;
     hdr.right_link = new_right;
 
-    /* Zero checksum, copy header into buffer, recompute, store */
+    /* Zero checksum, copy header into buffer, recompute over header+keys only */
+    size_t data_size = sizeof(struct btree_node_header) + hdr.keys_length;
     memset(hdr.checksum, 0, 32);
     memcpy(buf, &hdr, sizeof(hdr));
-    obmafs3_checksum_block(buf, node_sz, hdr.checksum);
+    obmafs3_checksum_block(buf, data_size, hdr.checksum);
     memcpy(buf + __builtin_offsetof(struct btree_node_header, checksum), hdr.checksum, 32);
 
     for(int b = 0; b < nblocks; b++)
@@ -3544,6 +3546,304 @@ skip_orphan_fix:
 }
 
 /* ------------------------------------------------------------------ */
+/*  Extent validation                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Validate a single extent run.
+ *
+ * Checks performed:
+ * - @c start_block must not be 0 (that is the superblock).
+ * - @c start_block + @c block_count must not exceed @p total_blocks.
+ * - @c logical_blocks must be >= @c block_count.
+ * - If @c block_count is 0, both @c start_block and @c logical_blocks
+ *   must also be 0 (unused slot).
+ *
+ * @param ext          Pointer to the extent run to validate.
+ * @param total_blocks Total block count of the filesystem.
+ * @param inode_id     Owning inode (for diagnostics).
+ * @param slot         0-based slot/overflow index (for diagnostics).
+ * @param label        "inline" or "overflow" (for diagnostics).
+ * @param bad_count    Incremented for each violation found.
+ */
+static void validate_extent(const struct extent_run *ext, uint64_t total_blocks, uint64_t inode_id, int slot,
+                            const char *label, uint64_t *bad_count)
+{
+    if(ext->block_count == 0 && ext->start_block == 0 && ext->logical_blocks == 0)
+        return; /* unused slot — OK */
+
+    if(ext->block_count == 0)
+    {
+        printf("    inode %" PRIu64 " %s extent %d: block_count=0 but start_block=%" PRIu64
+               " logical_blocks=%" PRIu64 "\n",
+               inode_id, label, slot, ext->start_block, ext->logical_blocks);
+        (*bad_count)++;
+        return;
+    }
+
+    if(ext->start_block == 0)
+    {
+        printf("    inode %" PRIu64 " %s extent %d: start_block=0 (superblock) "
+               "block_count=%" PRIu64 "\n",
+               inode_id, label, slot, ext->block_count);
+        (*bad_count)++;
+        return;
+    }
+
+    if(ext->start_block + ext->block_count > total_blocks)
+    {
+        printf("    inode %" PRIu64 " %s extent %d: out of bounds "
+               "(start=%" PRIu64 " count=%" PRIu64 " total=%" PRIu64 ")\n",
+               inode_id, label, slot, ext->start_block, ext->block_count, total_blocks);
+        (*bad_count)++;
+    }
+
+    if(ext->logical_blocks < ext->block_count)
+    {
+        printf("    inode %" PRIu64 " %s extent %d: logical_blocks (%" PRIu64
+               ") < block_count (%" PRIu64 ")\n",
+               inode_id, label, slot, ext->logical_blocks, ext->block_count);
+        (*bad_count)++;
+    }
+}
+
+/**
+ * Walk all inode records and validate inline extents.
+ *
+ * For each inode leaf record, calls validate_extent() on each of the
+ * 8 inline extent slots.  When a bad extent is found the user is
+ * offered the option to zero it (clearing both the data reference and
+ * the corresponding file_size contribution).
+ *
+ * @param ctx          Filesystem context.
+ * @param total_blocks Total block count of the filesystem.
+ * @param auto_yes     If nonzero, always repair.
+ * @param auto_no      If nonzero, never repair.
+ * @param bad_count    Output: total bad extents found.
+ * @param fixed_count  Output: total bad extents cleared.
+ */
+static void validate_inline_extents(struct obmafs3_ctx *ctx, uint64_t total_blocks, int auto_yes, int auto_no,
+                                    uint64_t *bad_count, uint64_t *fixed_count)
+{
+    *bad_count   = 0;
+    *fixed_count = 0;
+
+    uint64_t root_lba = ctx->inode_hdr.root_node_lba;
+    if(root_lba == 0) return;
+
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint8_t *buf = calloc(1, bsz);
+    if(!buf) return;
+
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t  stk_size = 0, stk_cap = 64;
+    if(!stack) { free(buf); return; }
+
+    stack[stk_size++] = root_lba;
+
+    while(stk_size > 0)
+    {
+        uint64_t lba = stack[--stk_size];
+
+        if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+        if(hdr.level > 0)
+        {
+            for(uint16_t i = 0; i < hdr.node_keys; i++)
+            {
+                struct btree_index_entry ie;
+                memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                if(stk_size >= stk_cap)
+                {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                    if(!tmp) { free(buf); free(stack); return; }
+                    stack = tmp;
+                }
+                stack[stk_size++] = ie.child_lba;
+            }
+            continue;
+        }
+
+        /* Leaf: validate each inode's inline extents */
+        for(uint16_t i = 0; i < hdr.node_keys; i++)
+        {
+            struct inode_record rec;
+            memcpy(&rec, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(rec), sizeof(rec));
+
+            uint64_t this_bad = 0;
+            for(int e = 0; e < 8; e++)
+                validate_extent(&rec.extents[e], total_blocks, rec.inode_id, e, "inline", &this_bad);
+
+            if(this_bad > 0)
+            {
+                *bad_count += this_bad;
+
+                if(ask_fix(auto_yes, auto_no, "    Clear bad inline extent(s)?"))
+                {
+                    int changed = 0;
+                    for(int e = 0; e < 8; e++)
+                    {
+                        struct extent_run *ext = &rec.extents[e];
+                        int bad = 0;
+
+                        if(ext->block_count == 0 && ext->start_block == 0 && ext->logical_blocks == 0)
+                            continue;
+                        if(ext->block_count == 0) bad = 1;
+                        if(ext->start_block == 0 && ext->block_count != 0) bad = 1;
+                        if(ext->block_count != 0 && ext->start_block + ext->block_count > total_blocks) bad = 1;
+                        if(ext->block_count != 0 && ext->logical_blocks < ext->block_count) bad = 1;
+
+                        if(bad)
+                        {
+                            memset(ext, 0, sizeof(*ext));
+                            changed++;
+                            (*fixed_count)++;
+                        }
+                    }
+                    if(changed)
+                    {
+                        /* Re-compute file_size from remaining valid extents */
+                        uint64_t logical_total = 0;
+                        for(int e = 0; e < 8; e++)
+                            logical_total += rec.extents[e].logical_blocks;
+                        rec.file_size = logical_total * ctx->sb.block_size;
+
+                        obmafs3_inode_put(ctx, &rec);
+                    }
+                }
+            }
+        }
+    }
+
+    free(buf);
+    free(stack);
+}
+
+/**
+ * Walk all overflow extent records and validate each one.
+ *
+ * Reports every overflow extent that fails the same structural checks
+ * applied to inline extents.
+ *
+ * @param ctx          Filesystem context.
+ * @param total_blocks Total block count of the filesystem.
+ * @param bad_count    Output: total bad overflow extents found.
+ */
+static void validate_overflow_extents(struct obmafs3_ctx *ctx, uint64_t total_blocks, uint64_t *bad_count)
+{
+    *bad_count = 0;
+
+    if(ctx->overflow_hdr.root_node_lba == 0) return;
+
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint8_t *buf = calloc(1, bsz);
+    if(!buf) return;
+
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t  stk_size = 0, stk_cap = 64;
+    if(!stack) { free(buf); return; }
+
+    stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
+
+    while(stk_size > 0)
+    {
+        uint64_t lba = stack[--stk_size];
+
+        if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+        if(nhdr.level > 0)
+        {
+            for(uint16_t i = 0; i < nhdr.node_keys; i++)
+            {
+                struct btree_index_entry ie;
+                memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                if(stk_size >= stk_cap)
+                {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                    if(!tmp) { free(buf); free(stack); return; }
+                    stack = tmp;
+                }
+                stack[stk_size++] = ie.child_lba;
+            }
+            continue;
+        }
+
+        /* Leaf: validate each overflow_extent */
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        for(uint16_t i = 0; i < nhdr.node_keys; i++)
+        {
+            struct overflow_extent oe;
+            memcpy(&oe, entries + (size_t)i * sizeof(oe), sizeof(oe));
+
+            struct extent_run ext;
+            ext.start_block    = oe.start_block;
+            ext.block_count    = oe.block_count;
+            ext.logical_blocks = oe.logical_count;
+
+            validate_extent(&ext, total_blocks, oe.inode_id, (int)i, "overflow", bad_count);
+        }
+    }
+
+    free(buf);
+    free(stack);
+}
+
+/**
+ * Top-level extent validation: inline + overflow.
+ *
+ * @param ctx       Filesystem context.
+ * @param auto_yes  If nonzero, always repair.
+ * @param auto_no   If nonzero, never repair.
+ * @param errors    In/out: incremented for each unfixed error.
+ */
+static void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, int *errors)
+{
+    uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
+
+    printf("\nExtent validation:\n");
+
+    /* Inline extents */
+    uint64_t inline_bad = 0, inline_fixed = 0;
+    validate_inline_extents(ctx, total_blocks, auto_yes, auto_no, &inline_bad, &inline_fixed);
+
+    if(inline_bad == 0)
+    {
+        printf("  Inline extents:   OK\n");
+    }
+    else
+    {
+        printf("  Inline extents:   %" PRIu64 " bad", inline_bad);
+        if(inline_fixed > 0) printf(" (%" PRIu64 " cleared)", inline_fixed);
+        printf("\n");
+        *errors += (int)(inline_bad - inline_fixed);
+    }
+
+    /* Overflow extents */
+    uint64_t overflow_bad = 0;
+    validate_overflow_extents(ctx, total_blocks, &overflow_bad);
+
+    if(overflow_bad == 0)
+    {
+        printf("  Overflow extents: OK\n");
+    }
+    else
+    {
+        printf("  Overflow extents: %" PRIu64 " bad\n", overflow_bad);
+        *errors += (int)overflow_bad;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -4741,6 +5041,10 @@ int main(int argc, char *argv[])
     /* ---- Inode / Catalog cross-reference ---- */
     if(ctx->catalog_hdr.root_node_lba != 0 && ctx->inode_hdr.root_node_lba != 0)
         cross_check_inodes_catalog(ctx, auto_yes, auto_no, &errors);
+
+    /* ---- Extent validation ---- */
+    if(ctx->inode_hdr.root_node_lba != 0)
+        check_extent_validity(ctx, auto_yes, auto_no, &errors);
 
     /* ---- Allocation bitmap ---- */
     uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
