@@ -62,6 +62,41 @@ static int ask_fix(int auto_yes, int auto_no, const char *prompt)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Progress bar helper                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Print a visual progress bar on stderr.
+ *
+ * Renders something like:
+ *   \r  Walking Dedup tree [==================>           ] 768/27058 nodes
+ *
+ * @param prefix  Label text (e.g. "Walking Dedup tree").
+ * @param done    Number of items completed.
+ * @param total   Total number of items.
+ */
+static void print_bar(const char *prefix, uint64_t done, uint64_t total)
+{
+    const int bar_width = 30;
+    double    frac      = total > 0 ? (double)done / (double)total : 1.0;
+    if(frac > 1.0) frac = 1.0;
+    int filled = (int)(frac * bar_width);
+
+    fprintf(stderr, "\r  %s [" , prefix);
+    for(int i = 0; i < bar_width; i++)
+    {
+        if(i < filled)
+            fputc('=', stderr);
+        else if(i == filled)
+            fputc('>', stderr);
+        else
+            fputc(' ', stderr);
+    }
+    fprintf(stderr, "] %" PRIu64 "/" "%" PRIu64 "   ", done, total);
+    fflush(stderr);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Walk all nodes in the inode B+Tree (DFS)                           */
 /* ------------------------------------------------------------------ */
 
@@ -77,12 +112,15 @@ static int ask_fix(int auto_yes, int auto_no, const char *prompt)
  * @param out_count  Output: number of elements in @p out_lbas.
  * @return @c OBMAFS3_OK on success.
  */
-static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, uint64_t **out_lbas, uint64_t *out_count)
+static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, uint64_t **out_lbas, uint64_t *out_count,
+                                  uint32_t total_nodes, const char *label)
 {
     *out_lbas  = NULL;
     *out_count = 0;
 
     if(root_lba == 0) return OBMAFS3_OK;
+
+    int show_progress = (total_nodes > 10 && label != NULL);
 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if(!buf) return OBMAFS3_ERR_NOMEM;
@@ -100,6 +138,8 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, ui
         free(buf);
         return OBMAFS3_ERR_NOMEM;
     }
+
+    if(show_progress) fflush(stdout); /* ensure prior output appears before progress */
 
     stack[stk_size++] = root_lba;
 
@@ -122,6 +162,13 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, ui
             lbas = tmp;
         }
         lbas[count++] = lba;
+
+        if(show_progress && (count <= 1 || (count & 0xFF) == 0 || count == (uint64_t)total_nodes))
+        {
+            char pfx[64];
+            snprintf(pfx, sizeof(pfx), "Walking %s tree", label);
+            print_bar(pfx, count, (uint64_t)total_nodes);
+        }
 
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
         if(rc != OBMAFS3_OK)
@@ -171,6 +218,13 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, ui
 
     free(buf);
     free(stack);
+
+    if(show_progress)
+    {
+        fprintf(stderr, "\r%80s\r", "");
+        fflush(stderr);
+    }
+
     *out_lbas  = lbas;
     *out_count = count;
     return OBMAFS3_OK;
@@ -322,10 +376,9 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
     {
         if(node_count > 10)
         {
-            fprintf(stderr,
-                    "\r  Verifying %s nodes... %" PRIu64 "/%" PRIu64 "   ",
-                    tree_name, n + 1, node_count);
-            fflush(stderr);
+            char pfx[64];
+            snprintf(pfx, sizeof(pfx), "Verifying %s nodes", tree_name);
+            print_bar(pfx, n + 1, node_count);
         }
 
         uint64_t lba = node_lbas[n];
@@ -1055,11 +1108,12 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, ui
             PUSH_LBA(lba);
 
             nodes_visited++;
-            fprintf(stderr,
-                    "\r  Collecting dedup blocks... [tree %" PRIu64 "/%" PRIu64
-                    "] %" PRIu64 "/%" PRIu32 " nodes   ",
-                    t + 1, tree_count, nodes_visited, thdr.total_nodes);
-            fflush(stderr);
+            {
+                char pfx[80];
+                snprintf(pfx, sizeof(pfx), "Collecting dedup [tree %" PRIu64 "/%" PRIu64 "]",
+                         t + 1, tree_count);
+                print_bar(pfx, nodes_visited, (uint64_t)thdr.total_nodes);
+            }
 
             rc = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK) break;
@@ -1263,7 +1317,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     {
         uint64_t *ino_nodes = NULL;
         uint64_t  ino_count = 0;
-        int       rc        = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, &ino_nodes, &ino_count);
+        int       rc        = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, &ino_nodes, &ino_count, 0, NULL);
         if(rc == OBMAFS3_OK)
         {
             for(uint64_t i = 0; i < ino_count; i++) MARK(ino_nodes[i]);
@@ -1284,7 +1338,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *ovf_nodes = NULL;
             uint64_t  ovf_count = 0;
-            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, &ovf_nodes, &ovf_count);
+            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, &ovf_nodes, &ovf_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < ovf_count; i++) MARK(ovf_nodes[i]);
@@ -1306,7 +1360,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *mt_nodes = NULL;
             uint64_t  mt_count = 0;
-            int       rc       = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, &mt_nodes, &mt_count);
+            int       rc       = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, &mt_nodes, &mt_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < mt_count; i++) MARK(mt_nodes[i]);
@@ -1324,7 +1378,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, &nodes, &count);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1342,7 +1396,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, &nodes, &count);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1360,7 +1414,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, &nodes, &count);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1419,7 +1473,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, &nodes, &count);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -2059,11 +2113,12 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
             uint64_t lba = stk[--stk_sz];
 
             nodes_visited++;
-            fprintf(stderr,
-                    "\r  Dedup stats... [tree %" PRIu64 "/%" PRIu64
-                    "] %" PRIu64 "/%" PRIu32 " nodes   ",
-                    t + 1, tree_count, nodes_visited, thdr.total_nodes);
-            fflush(stderr);
+            {
+                char pfx[80];
+                snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] nodes",
+                         t + 1, tree_count);
+                print_bar(pfx, nodes_visited, (uint64_t)thdr.total_nodes);
+            }
 
             rc           = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK) break;
@@ -2140,11 +2195,12 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
             {
                 for(uint64_t b = 0; b < base_count; b++)
                 {
-                    fprintf(stderr,
-                            "\r  Dedup stats... [tree %" PRIu64 "/%" PRIu64
-                            "] %" PRIu64 "/%" PRIu64 " data blocks   ",
-                            t + 1, tree_count, b + 1, base_count);
-                    fflush(stderr);
+                    {
+                        char pfx[80];
+                        snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] blocks",
+                                 t + 1, tree_count);
+                        print_bar(pfx, b + 1, base_count);
+                    }
 
                     rc = obmafs3_block_read(ctx, bases[b], hdr_buf, (size_t)ctx->sb.block_size);
                     if(rc != OBMAFS3_OK) continue;
@@ -2665,7 +2721,7 @@ int main(int argc, char *argv[])
     {
         uint64_t *ino_nodes      = NULL;
         uint64_t  ino_node_count = 0;
-        int       wrc = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, &ino_nodes, &ino_node_count);
+        int       wrc = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, &ino_nodes, &ino_node_count, ctx->inode_hdr.total_nodes, "Inode");
         if(wrc == OBMAFS3_OK)
         {
             uint64_t ino_bad = 0;
@@ -2705,7 +2761,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *ovf_nodes      = NULL;
             uint64_t  ovf_node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, &ovf_nodes, &ovf_node_count);
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, &ovf_nodes, &ovf_node_count, ctx->overflow_hdr.total_nodes, "Overflow");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t ovf_bad = 0;
@@ -2795,7 +2851,7 @@ int main(int argc, char *argv[])
                             {
                                 uint64_t *dd_nodes = NULL;
                                 uint64_t  dd_count = 0;
-                                int       wrc = walk_inode_btree_nodes(ctx, thdr.root_node_lba, &dd_nodes, &dd_count);
+                                int       wrc = walk_inode_btree_nodes(ctx, thdr.root_node_lba, &dd_nodes, &dd_count, thdr.total_nodes, "Dedup");
                                 if(wrc == OBMAFS3_OK)
                                 {
                                     uint64_t dbad = 0;
@@ -2858,7 +2914,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *mt_nodes      = NULL;
             uint64_t  mt_node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, &mt_nodes, &mt_node_count);
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, &mt_nodes, &mt_node_count, ctx->media_tag_hdr.total_nodes, "Media tag");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t mt_bad = 0;
@@ -2899,7 +2955,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, &nodes, &node_count);
+            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, &nodes, &node_count, ctx->cd_prefix_hdr.total_nodes, "CD prefix");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
@@ -2940,7 +2996,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, &nodes, &node_count);
+            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, &nodes, &node_count, ctx->cd_suffix_hdr.total_nodes, "CD suffix");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
@@ -2981,7 +3037,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, &nodes, &node_count);
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, &nodes, &node_count, ctx->cd_subchannel_hdr.total_nodes, "CD subchannel");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
@@ -3108,7 +3164,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc        = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, &nodes, &node_count);
+            int       wrc        = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, &nodes, &node_count, ctx->refcount_hdr.total_nodes, "Refcount");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
