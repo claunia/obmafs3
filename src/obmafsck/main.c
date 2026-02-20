@@ -97,22 +97,31 @@ static void print_bar(const char *prefix, uint64_t done, uint64_t total)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Walk all nodes in the inode B+Tree (DFS)                           */
+/*  Walk all nodes in a single-block B+Tree (DFS)                      */
+/*  index_entry_size / child_lba_off parameterize the index entry.     */
 /* ------------------------------------------------------------------ */
 
 /**
- * Walk all nodes in the inode B+Tree via iterative DFS.
+ * Walk all nodes in a single-block B+Tree via iterative DFS.
  *
  * Collects the LBA of every node (both index and leaf) reachable
- * from @p root_lba.
+ * from @p root_lba.  The caller provides the index entry size and the
+ * byte offset of the @c child_lba field to correctly parse index nodes
+ * of different tree types.
  *
- * @param ctx        Filesystem context.
- * @param root_lba   Root node LBA of the inode tree.
- * @param out_lbas   Output: heap-allocated array of node LBAs.
- * @param out_count  Output: number of elements in @p out_lbas.
+ * @param ctx              Filesystem context.
+ * @param root_lba         Root node LBA of the tree.
+ * @param index_entry_size Size in bytes of each index entry.
+ * @param child_lba_off    Byte offset of the @c child_lba field in
+ *                         the index entry structure.
+ * @param out_lbas         Output: heap-allocated array of node LBAs.
+ * @param out_count        Output: number of elements in @p out_lbas.
+ * @param total_nodes      Expected total nodes (for progress; 0 to disable).
+ * @param label            Tree label for progress display (NULL to disable).
  * @return @c OBMAFS3_OK on success.
  */
-static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, uint64_t **out_lbas, uint64_t *out_count,
+static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size,
+                                  size_t child_lba_off, uint64_t **out_lbas, uint64_t *out_count,
                                   uint32_t total_nodes, const char *label)
 {
     *out_lbas  = NULL;
@@ -195,8 +204,10 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, ui
             /* Index node: push children onto stack */
             for(uint16_t i = 0; i < hdr.node_keys; i++)
             {
-                struct btree_index_entry ie;
-                memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                uint64_t child_lba;
+                memcpy(&child_lba,
+                       buf + sizeof(struct btree_node_header) + (size_t)i * index_entry_size + child_lba_off,
+                       sizeof(child_lba));
 
                 if(stk_size >= stk_cap)
                 {
@@ -211,7 +222,7 @@ static int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, ui
                     }
                     stack = tmp;
                 }
-                stack[stk_size++] = ie.child_lba;
+                stack[stk_size++] = child_lba;
             }
         }
     }
@@ -423,6 +434,436 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
 
     free(buf);
     *bad_count = bad;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  B+Tree key ordering validation                                     */
+/* ------------------------------------------------------------------ */
+
+/** Ordering tree-type identifiers for verify_btree_ordering(). */
+#define ORD_UINT64_KEY  0  /**< key = first uint64_t (inode, dedup, cd_*, refcount) */
+#define ORD_CATALOG     1  /**< key = (parent_id, name) */
+#define ORD_OVERFLOW    2  /**< leaf: (inode_id, logical_offset), index: uint64_t */
+#define ORD_MEDIA_TAG   3  /**< key = (inode_id, tag_type) */
+#define ORD_METADATA    4  /**< key = (inode_id, key[256]) */
+#define ORD_METADATA_IDX 5 /**< key = (key[256], value[1025], inode_id) */
+
+/**
+ * Compare two B+Tree keys extracted from raw record/entry bytes.
+ *
+ * @param a       Pointer to first record or index entry.
+ * @param b       Pointer to second record or index entry.
+ * @param type    One of the ORD_* tree-type constants.
+ * @param is_leaf Non-zero for leaf records, zero for index entries.
+ * @return Negative if a < b, 0 if equal, positive if a > b.
+ */
+static int ordering_key_cmp(const uint8_t *a, const uint8_t *b, int type, int is_leaf)
+{
+    uint64_t ua, ub;
+
+    switch(type)
+    {
+    case ORD_UINT64_KEY:
+        memcpy(&ua, a, 8);
+        memcpy(&ub, b, 8);
+        return (ua < ub) ? -1 : (ua > ub) ? 1 : 0;
+
+    case ORD_CATALOG:
+        if(is_leaf)
+        {
+            /* catalog_record: inode_id(8), parent_id(8), directory_flag(1), name[256] */
+            uint64_t pid_a, pid_b;
+            memcpy(&pid_a, a + 8, 8);
+            memcpy(&pid_b, b + 8, 8);
+            if(pid_a != pid_b) return (pid_a < pid_b) ? -1 : 1;
+            return strcmp((const char *)(a + 17), (const char *)(b + 17));
+        }
+        else
+        {
+            /* catalog_index_entry: parent_id(8), name[256], child_lba(8) */
+            uint64_t pid_a, pid_b;
+            memcpy(&pid_a, a, 8);
+            memcpy(&pid_b, b, 8);
+            if(pid_a != pid_b) return (pid_a < pid_b) ? -1 : 1;
+            return strcmp((const char *)(a + 8), (const char *)(b + 8));
+        }
+
+    case ORD_OVERFLOW:
+        if(is_leaf)
+        {
+            /* overflow_extent: inode_id(8), logical_offset(8), ... */
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a, 8);
+            memcpy(&id_b, b, 8);
+            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+            uint64_t off_a, off_b;
+            memcpy(&off_a, a + 8, 8);
+            memcpy(&off_b, b + 8, 8);
+            return (off_a < off_b) ? -1 : (off_a > off_b) ? 1 : 0;
+        }
+        else
+        {
+            /* btree_index_entry: key(8) = inode_id, child_lba(8) */
+            memcpy(&ua, a, 8);
+            memcpy(&ub, b, 8);
+            return (ua < ub) ? -1 : (ua > ub) ? 1 : 0;
+        }
+
+    case ORD_MEDIA_TAG:
+    {
+        /* Both leaf and index begin with inode_id(8), tag_type(2) */
+        uint64_t id_a, id_b;
+        memcpy(&id_a, a, 8);
+        memcpy(&id_b, b, 8);
+        if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+        uint16_t ta, tb;
+        memcpy(&ta, a + 8, 2);
+        memcpy(&tb, b + 8, 2);
+        return (ta < tb) ? -1 : (ta > tb) ? 1 : 0;
+    }
+
+    case ORD_METADATA:
+        if(is_leaf)
+        {
+            /* metadata_record: inode_id(8), key[256], value[1025] */
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a, 8);
+            memcpy(&id_b, b, 8);
+            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+            return strncmp((const char *)(a + 8), (const char *)(b + 8), METADATA_KEY_MAX);
+        }
+        else
+        {
+            /* metadata_index_entry: inode_id(8), key[256], child_lba(8) */
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a, 8);
+            memcpy(&id_b, b, 8);
+            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+            return strncmp((const char *)(a + 8), (const char *)(b + 8), METADATA_KEY_MAX);
+        }
+
+    case ORD_METADATA_IDX:
+        if(is_leaf)
+        {
+            /* metadata_idx_record: key[256], value[1025], inode_id(8) */
+            int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
+            if(r != 0) return r;
+            r = strncmp((const char *)(a + METADATA_KEY_MAX), (const char *)(b + METADATA_KEY_MAX),
+                        METADATA_VALUE_MAX);
+            if(r != 0) return r;
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+            memcpy(&id_b, b + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+            return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
+        }
+        else
+        {
+            /* metadata_idx_index_entry: key[256], value[1025], inode_id(8), child_lba(8) */
+            int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
+            if(r != 0) return r;
+            r = strncmp((const char *)(a + METADATA_KEY_MAX), (const char *)(b + METADATA_KEY_MAX),
+                        METADATA_VALUE_MAX);
+            if(r != 0) return r;
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+            memcpy(&id_b, b + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+            return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
+        }
+
+    default:
+        return 0;
+    }
+}
+
+/* Context for qsort comparator (file-scope; obmafsck is single-threaded). */
+static int  s_ord_key_type;
+static int  s_ord_is_leaf;
+
+/** qsort comparator that delegates to ordering_key_cmp(). */
+static int ordering_qsort_cmp(const void *a, const void *b)
+{
+    return ordering_key_cmp((const uint8_t *)a, (const uint8_t *)b, s_ord_key_type, s_ord_is_leaf);
+}
+
+/**
+ * Sort records within a node buffer, recompute the checksum, and write
+ * the corrected node back to disk.
+ *
+ * @param ctx       Filesystem context.
+ * @param buf       Node buffer (single block or multi-block).
+ * @param buf_size  Total size of @p buf in bytes.
+ * @param lba       LBA of the node (first block for multi-block).
+ * @param nblocks   Number of blocks the node spans (1 for normal trees).
+ * @param hdr       Parsed node header.
+ * @param key_type  One of the ORD_* tree-type constants.
+ * @param is_leaf   Non-zero for leaf nodes.
+ * @param stride    Record/entry size in bytes.
+ * @return @c OBMAFS3_OK on successful write.
+ */
+static int fix_node_ordering(struct obmafs3_ctx *ctx, uint8_t *buf, size_t buf_size, uint64_t lba, int nblocks,
+                             struct btree_node_header *hdr, int key_type, int is_leaf, size_t stride)
+{
+    /* Set file-scope qsort context */
+    s_ord_key_type = key_type;
+    s_ord_is_leaf  = is_leaf;
+
+    /* Sort the records in-place */
+    uint8_t *entries = buf + sizeof(struct btree_node_header);
+    qsort(entries, hdr->node_keys, stride, ordering_qsort_cmp);
+
+    /* Recompute checksum */
+    memset(hdr->checksum, 0, 32);
+    memcpy(buf, hdr, sizeof(*hdr));
+    obmafs3_checksum_block(buf, buf_size, hdr->checksum);
+    memcpy(buf + __builtin_offsetof(struct btree_node_header, checksum), hdr->checksum, 32);
+
+    /* Write back */
+    for(int b = 0; b < nblocks; b++)
+    {
+        int rc = obmafs3_block_write(ctx, lba + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
+                                     (size_t)ctx->sb.block_size);
+        if(rc != OBMAFS3_OK) return rc;
+    }
+    return OBMAFS3_OK;
+}
+
+/**
+ * Verify that keys within every node of a single-block B+Tree are
+ * strictly ascending (leaf) or non-decreasing (index).
+ * Optionally repairs misordered nodes by sorting records in-place.
+ *
+ * @param ctx              Filesystem context.
+ * @param node_lbas        Array of node LBAs collected by a walk function.
+ * @param node_count       Number of node LBAs.
+ * @param key_type         One of the ORD_* tree-type constants.
+ * @param leaf_rec_size    sizeof() of the leaf record structure.
+ * @param idx_entry_size   sizeof() of the index entry structure.
+ * @param tree_name        Human-readable tree name for progress/error messages.
+ * @param auto_yes         If non-zero, always repair without asking.
+ * @param auto_no          If non-zero, never repair.
+ * @param bad_count        Output: number of nodes with ordering violations.
+ * @param fixed_count      Output: number of nodes successfully repaired.
+ * @return @c OBMAFS3_OK on success (even if ordering errors were found).
+ */
+static int verify_btree_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count,
+                                 int key_type, size_t leaf_rec_size, size_t idx_entry_size, const char *tree_name,
+                                 int auto_yes, int auto_no, uint64_t *bad_count, uint64_t *fixed_count)
+{
+    *bad_count   = 0;
+    *fixed_count = 0;
+
+    uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    for(uint64_t n = 0; n < node_count; n++)
+    {
+        if(node_count > 10 && (n == 0 || (n & 0xFF) == 0 || n == node_count - 1))
+        {
+            char pfx[80];
+            snprintf(pfx, sizeof(pfx), "Ordering %s", tree_name);
+            print_bar(pfx, n + 1, node_count);
+        }
+
+        int rc = obmafs3_block_read(ctx, node_lbas[n], buf, (size_t)ctx->sb.block_size);
+        if(rc != OBMAFS3_OK) continue;
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+        if(hdr.node_keys < 2) continue; /* 0 or 1 keys — nothing to compare */
+
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        int            is_leaf = (hdr.level == 0);
+        size_t         stride  = is_leaf ? leaf_rec_size : idx_entry_size;
+
+        /* Sanity: ensure records fit within the block */
+        size_t avail = (size_t)ctx->sb.block_size - sizeof(struct btree_node_header);
+        if((size_t)hdr.node_keys * stride > avail)
+        {
+            fprintf(stderr, "\n  %s node at LBA %" PRIu64 ": record count (%u) exceeds block capacity\n", tree_name,
+                    node_lbas[n], hdr.node_keys);
+            (*bad_count)++;
+            continue;
+        }
+
+        int misordered = 0;
+        for(uint16_t i = 1; i < hdr.node_keys; i++)
+        {
+            const uint8_t *prev = entries + (size_t)(i - 1) * stride;
+            const uint8_t *curr = entries + (size_t)i * stride;
+            int            cmp  = ordering_key_cmp(prev, curr, key_type, is_leaf);
+
+            if(is_leaf && cmp >= 0)
+            {
+                fprintf(stderr, "\n  %s leaf at LBA %" PRIu64 ": keys not strictly ascending at position %u\n",
+                        tree_name, node_lbas[n], i);
+                misordered = 1;
+                (*bad_count)++;
+                break;
+            }
+            else if(!is_leaf && cmp > 0)
+            {
+                fprintf(stderr, "\n  %s index at LBA %" PRIu64 ": keys not in order at position %u\n", tree_name,
+                        node_lbas[n], i);
+                misordered = 1;
+                (*bad_count)++;
+                break;
+            }
+        }
+
+        if(misordered)
+        {
+            char prompt[128];
+            snprintf(prompt, sizeof(prompt), "  Sort %s node at LBA %" PRIu64 "?", tree_name, node_lbas[n]);
+            if(ask_fix(auto_yes, auto_no, prompt))
+            {
+                rc = fix_node_ordering(ctx, buf, (size_t)ctx->sb.block_size, node_lbas[n], 1, &hdr, key_type, is_leaf,
+                                       stride);
+                if(rc == OBMAFS3_OK)
+                {
+                    printf("  Repaired %s node at LBA %" PRIu64 "\n", tree_name, node_lbas[n]);
+                    (*fixed_count)++;
+                }
+                else
+                {
+                    fprintf(stderr, "  Error: failed to write repaired node at LBA %" PRIu64 ": %d\n", node_lbas[n],
+                            rc);
+                }
+            }
+        }
+    }
+
+    if(node_count > 10)
+    {
+        fprintf(stderr, "\r%80s\r", "");
+        fflush(stderr);
+    }
+
+    free(buf);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Verify key ordering within every node of a multi-block metadata B+Tree.
+ *
+ * Each node spans @c METADATA_NODE_BLOCKS contiguous blocks.
+ *
+ * @param ctx              Filesystem context.
+ * @param node_lbas        Array of node start-LBAs collected by walk_meta_btree_nodes().
+ * @param node_count       Number of node LBAs.
+ * @param key_type         One of ORD_METADATA or ORD_METADATA_IDX.
+ * @param leaf_rec_size    sizeof() of the leaf record structure.
+ * @param idx_entry_size   sizeof() of the index entry structure.
+ * @param tree_name        Human-readable tree name for progress/error messages.
+ * @param auto_yes         If non-zero, always repair without asking.
+ * @param auto_no          If non-zero, never repair.
+ * @param bad_count        Output: number of nodes with ordering violations.
+ * @param fixed_count      Output: number of nodes successfully repaired.
+ * @return @c OBMAFS3_OK on success (even if ordering errors were found).
+ */
+static int verify_meta_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count, int key_type,
+                                size_t leaf_rec_size, size_t idx_entry_size, const char *tree_name, int auto_yes,
+                                int auto_no, uint64_t *bad_count, uint64_t *fixed_count)
+{
+    *bad_count   = 0;
+    *fixed_count = 0;
+
+    size_t   node_bytes = (size_t)ctx->sb.block_size * METADATA_NODE_BLOCKS;
+    uint8_t *buf        = calloc(1, node_bytes);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    for(uint64_t n = 0; n < node_count; n++)
+    {
+        if(node_count > 10 && (n == 0 || (n & 0xFF) == 0 || n == node_count - 1))
+        {
+            char pfx[80];
+            snprintf(pfx, sizeof(pfx), "Ordering %s", tree_name);
+            print_bar(pfx, n + 1, node_count);
+        }
+
+        /* Read all blocks of this multi-block node */
+        int ok = 1;
+        for(int b = 0; b < METADATA_NODE_BLOCKS; b++)
+        {
+            int rc = obmafs3_block_read(ctx, node_lbas[n] + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
+                                        (size_t)ctx->sb.block_size);
+            if(rc != OBMAFS3_OK) { ok = 0; break; }
+        }
+        if(!ok) continue;
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+        if(hdr.node_keys < 2) continue;
+
+        const uint8_t *entries = buf + sizeof(struct btree_node_header);
+        int            is_leaf = (hdr.level == 0);
+        size_t         stride  = is_leaf ? leaf_rec_size : idx_entry_size;
+
+        size_t avail = node_bytes - sizeof(struct btree_node_header);
+        if((size_t)hdr.node_keys * stride > avail)
+        {
+            fprintf(stderr, "\n  %s node at LBA %" PRIu64 ": record count (%u) exceeds node capacity\n", tree_name,
+                    node_lbas[n], hdr.node_keys);
+            (*bad_count)++;
+            continue;
+        }
+
+        int misordered = 0;
+        for(uint16_t i = 1; i < hdr.node_keys; i++)
+        {
+            const uint8_t *prev = entries + (size_t)(i - 1) * stride;
+            const uint8_t *curr = entries + (size_t)i * stride;
+            int            cmp  = ordering_key_cmp(prev, curr, key_type, is_leaf);
+
+            if(is_leaf && cmp >= 0)
+            {
+                fprintf(stderr, "\n  %s leaf at LBA %" PRIu64 ": keys not strictly ascending at position %u\n",
+                        tree_name, node_lbas[n], i);
+                misordered = 1;
+                (*bad_count)++;
+                break;
+            }
+            else if(!is_leaf && cmp > 0)
+            {
+                fprintf(stderr, "\n  %s index at LBA %" PRIu64 ": keys not in order at position %u\n", tree_name,
+                        node_lbas[n], i);
+                misordered = 1;
+                (*bad_count)++;
+                break;
+            }
+        }
+
+        if(misordered)
+        {
+            char prompt[128];
+            snprintf(prompt, sizeof(prompt), "  Sort %s node at LBA %" PRIu64 "?", tree_name, node_lbas[n]);
+            if(ask_fix(auto_yes, auto_no, prompt))
+            {
+                int wrc = fix_node_ordering(ctx, buf, node_bytes, node_lbas[n], METADATA_NODE_BLOCKS, &hdr, key_type,
+                                            is_leaf, stride);
+                if(wrc == OBMAFS3_OK)
+                {
+                    printf("  Repaired %s node at LBA %" PRIu64 "\n", tree_name, node_lbas[n]);
+                    (*fixed_count)++;
+                }
+                else
+                {
+                    fprintf(stderr, "  Error: failed to write repaired node at LBA %" PRIu64 ": %d\n", node_lbas[n],
+                            wrc);
+                }
+            }
+        }
+    }
+
+    if(node_count > 10)
+    {
+        fprintf(stderr, "\r%80s\r", "");
+        fflush(stderr);
+    }
+
+    free(buf);
     return OBMAFS3_OK;
 }
 
@@ -1317,7 +1758,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     {
         uint64_t *ino_nodes = NULL;
         uint64_t  ino_count = 0;
-        int       rc        = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, &ino_nodes, &ino_count, 0, NULL);
+        int       rc        = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ino_nodes, &ino_count, 0, NULL);
         if(rc == OBMAFS3_OK)
         {
             for(uint64_t i = 0; i < ino_count; i++) MARK(ino_nodes[i]);
@@ -1338,7 +1779,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *ovf_nodes = NULL;
             uint64_t  ovf_count = 0;
-            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, &ovf_nodes, &ovf_count, 0, NULL);
+            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ovf_nodes, &ovf_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < ovf_count; i++) MARK(ovf_nodes[i]);
@@ -1360,7 +1801,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *mt_nodes = NULL;
             uint64_t  mt_count = 0;
-            int       rc       = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, &mt_nodes, &mt_count, 0, NULL);
+            int       rc       = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, sizeof(struct media_tag_index_entry), __builtin_offsetof(struct media_tag_index_entry, child_lba), &mt_nodes, &mt_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < mt_count; i++) MARK(mt_nodes[i]);
@@ -1378,7 +1819,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, &nodes, &count, 0, NULL);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1396,7 +1837,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, &nodes, &count, 0, NULL);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1414,7 +1855,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, &nodes, &count, 0, NULL);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1473,7 +1914,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, &nodes, &count, 0, NULL);
+            int       rc    = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -2255,6 +2696,7 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
 
     uint64_t grand_dedup_entries     = 0;
     uint64_t grand_unique_blocks     = 0;
+    uint64_t grand_unique_sector_bytes = 0;
     uint64_t grand_original          = 0;
     uint64_t grand_compressed        = 0;
     uint64_t grand_physical          = 0;
@@ -2294,6 +2736,7 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
 
         grand_dedup_entries += stats[t].dedup_entries;
         grand_unique_blocks += stats[t].unique_blocks;
+        grand_unique_sector_bytes += stats[t].dedup_entries * (uint64_t)stats[t].sector_size;
         grand_original += stats[t].original_bytes;
         grand_compressed += stats[t].compressed_bytes;
         grand_physical += stats[t].physical_bytes;
@@ -2330,13 +2773,12 @@ static int compute_dedup_stats(struct obmafs3_ctx *ctx)
                dedup_ratio, total_sector_map_entries, grand_dedup_entries);
         printf("    Duplicate sectors:      %" PRIu64 "\n", dup_sectors);
 
-        /* For single-tree case we can compute exact bytes saved */
-        if(tree_count == 1)
+        if(total_media_file_size > grand_unique_sector_bytes)
         {
-            uint64_t bytes_saved_dedup = dup_sectors * (uint64_t)stats[0].sector_size;
+            uint64_t bytes_saved_dedup = total_media_file_size - grand_unique_sector_bytes;
             printf("    Saved by dedup:         ");
             print_human_size(bytes_saved_dedup);
-            printf("\n");
+            printf(" (%.1f%%)\n", (double)bytes_saved_dedup / (double)total_media_file_size * 100.0);
         }
     }
 
@@ -2680,6 +3122,10 @@ int main(int argc, char *argv[])
         {
             uint64_t cat_bad = 0;
             verify_btree_node_checksums(ctx, cat_nodes, cat_node_count, "Catalog", &cat_bad);
+            uint64_t cat_ord = 0, cat_fix = 0;
+            verify_btree_ordering(ctx, cat_nodes, cat_node_count, ORD_CATALOG,
+                                  sizeof(struct catalog_record), sizeof(struct catalog_index_entry),
+                                  "Catalog", auto_yes, auto_no, &cat_ord, &cat_fix);
             free(cat_nodes);
             if(cat_bad > 0)
             {
@@ -2689,6 +3135,17 @@ int main(int argc, char *argv[])
             else
             {
                 printf("  Node checksums:   OK\n");
+            }
+            if(cat_ord > 0)
+            {
+                printf("  Key ordering:     %" PRIu64 " BAD", cat_ord);
+                if(cat_fix > 0) printf(" (%" PRIu64 " fixed)", cat_fix);
+                printf("\n");
+                errors += (int)(cat_ord - cat_fix);
+            }
+            else
+            {
+                printf("  Key ordering:     OK\n");
             }
         }
         else
@@ -2715,11 +3172,15 @@ int main(int argc, char *argv[])
     {
         uint64_t *ino_nodes      = NULL;
         uint64_t  ino_node_count = 0;
-        int       wrc = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, &ino_nodes, &ino_node_count, ctx->inode_hdr.total_nodes, "Inode");
+        int       wrc = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ino_nodes, &ino_node_count, ctx->inode_hdr.total_nodes, "Inode");
         if(wrc == OBMAFS3_OK)
         {
             uint64_t ino_bad = 0;
             verify_btree_node_checksums(ctx, ino_nodes, ino_node_count, "Inode", &ino_bad);
+            uint64_t ino_ord = 0, ino_fix = 0;
+            verify_btree_ordering(ctx, ino_nodes, ino_node_count, ORD_UINT64_KEY,
+                                  sizeof(struct inode_record), sizeof(struct btree_index_entry),
+                                  "Inode", auto_yes, auto_no, &ino_ord, &ino_fix);
             free(ino_nodes);
             if(ino_bad > 0)
             {
@@ -2729,6 +3190,17 @@ int main(int argc, char *argv[])
             else
             {
                 printf("  Node checksums:   OK\n");
+            }
+            if(ino_ord > 0)
+            {
+                printf("  Key ordering:     %" PRIu64 " BAD", ino_ord);
+                if(ino_fix > 0) printf(" (%" PRIu64 " fixed)", ino_fix);
+                printf("\n");
+                errors += (int)(ino_ord - ino_fix);
+            }
+            else
+            {
+                printf("  Key ordering:     OK\n");
             }
         }
         else
@@ -2755,11 +3227,15 @@ int main(int argc, char *argv[])
         {
             uint64_t *ovf_nodes      = NULL;
             uint64_t  ovf_node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, &ovf_nodes, &ovf_node_count, ctx->overflow_hdr.total_nodes, "Overflow");
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ovf_nodes, &ovf_node_count, ctx->overflow_hdr.total_nodes, "Overflow");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t ovf_bad = 0;
                 verify_btree_node_checksums(ctx, ovf_nodes, ovf_node_count, "Overflow", &ovf_bad);
+                uint64_t ovf_ord = 0, ovf_fix = 0;
+                verify_btree_ordering(ctx, ovf_nodes, ovf_node_count, ORD_OVERFLOW,
+                                      sizeof(struct overflow_extent), sizeof(struct btree_index_entry),
+                                      "Overflow", auto_yes, auto_no, &ovf_ord, &ovf_fix);
                 free(ovf_nodes);
                 if(ovf_bad > 0)
                 {
@@ -2769,6 +3245,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ovf_ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", ovf_ord);
+                    if(ovf_fix > 0) printf(" (%" PRIu64 " fixed)", ovf_fix);
+                    printf("\n");
+                    errors += (int)(ovf_ord - ovf_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -2845,11 +3332,15 @@ int main(int argc, char *argv[])
                             {
                                 uint64_t *dd_nodes = NULL;
                                 uint64_t  dd_count = 0;
-                                int       wrc = walk_inode_btree_nodes(ctx, thdr.root_node_lba, &dd_nodes, &dd_count, thdr.total_nodes, "Dedup");
+                                int       wrc = walk_inode_btree_nodes(ctx, thdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &dd_nodes, &dd_count, thdr.total_nodes, "Dedup");
                                 if(wrc == OBMAFS3_OK)
                                 {
                                     uint64_t dbad = 0;
                                     verify_btree_node_checksums(ctx, dd_nodes, dd_count, "Dedup", &dbad);
+                                    uint64_t dord = 0, dfix = 0;
+                                    verify_btree_ordering(ctx, dd_nodes, dd_count, ORD_UINT64_KEY,
+                                                          sizeof(struct dedup_entry), sizeof(struct btree_index_entry),
+                                                          "Dedup", auto_yes, auto_no, &dord, &dfix);
                                     free(dd_nodes);
                                     if(dbad > 0)
                                     {
@@ -2861,6 +3352,20 @@ int main(int argc, char *argv[])
                                     else
                                     {
                                         printf("    Node checksums:"
+                                               " OK\n");
+                                    }
+                                    if(dord > 0)
+                                    {
+                                        printf("    Key ordering:   "
+                                               "%" PRIu64 " BAD",
+                                               dord);
+                                        if(dfix > 0) printf(" (%" PRIu64 " fixed)", dfix);
+                                        printf("\n");
+                                        errors += (int)(dord - dfix);
+                                    }
+                                    else
+                                    {
+                                        printf("    Key ordering:  "
                                                " OK\n");
                                     }
                                 }
@@ -2908,11 +3413,15 @@ int main(int argc, char *argv[])
         {
             uint64_t *mt_nodes      = NULL;
             uint64_t  mt_node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, &mt_nodes, &mt_node_count, ctx->media_tag_hdr.total_nodes, "Media tag");
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, sizeof(struct media_tag_index_entry), __builtin_offsetof(struct media_tag_index_entry, child_lba), &mt_nodes, &mt_node_count, ctx->media_tag_hdr.total_nodes, "Media tag");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t mt_bad = 0;
                 verify_btree_node_checksums(ctx, mt_nodes, mt_node_count, "Media tag", &mt_bad);
+                uint64_t mt_ord = 0, mt_fix = 0;
+                verify_btree_ordering(ctx, mt_nodes, mt_node_count, ORD_MEDIA_TAG,
+                                      sizeof(struct media_tag_record), sizeof(struct media_tag_index_entry),
+                                      "Media tag", auto_yes, auto_no, &mt_ord, &mt_fix);
                 free(mt_nodes);
                 if(mt_bad > 0)
                 {
@@ -2922,6 +3431,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(mt_ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", mt_ord);
+                    if(mt_fix > 0) printf(" (%" PRIu64 " fixed)", mt_fix);
+                    printf("\n");
+                    errors += (int)(mt_ord - mt_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -2949,11 +3469,15 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, &nodes, &node_count, ctx->cd_prefix_hdr.total_nodes, "CD prefix");
+            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->cd_prefix_hdr.total_nodes, "CD prefix");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
                 verify_btree_node_checksums(ctx, nodes, node_count, "CD prefix", &bad);
+                uint64_t ord = 0, ord_fix = 0;
+                verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
+                                      sizeof(struct cd_prefix_record), sizeof(struct btree_index_entry),
+                                      "CD prefix", auto_yes, auto_no, &ord, &ord_fix);
                 free(nodes);
                 if(bad > 0)
                 {
@@ -2963,6 +3487,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
+                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
+                    printf("\n");
+                    errors += (int)(ord - ord_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -2990,11 +3525,15 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, &nodes, &node_count, ctx->cd_suffix_hdr.total_nodes, "CD suffix");
+            int       wrc        = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->cd_suffix_hdr.total_nodes, "CD suffix");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
                 verify_btree_node_checksums(ctx, nodes, node_count, "CD suffix", &bad);
+                uint64_t ord = 0, ord_fix = 0;
+                verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
+                                      sizeof(struct cd_suffix_record), sizeof(struct btree_index_entry),
+                                      "CD suffix", auto_yes, auto_no, &ord, &ord_fix);
                 free(nodes);
                 if(bad > 0)
                 {
@@ -3004,6 +3543,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
+                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
+                    printf("\n");
+                    errors += (int)(ord - ord_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -3031,11 +3581,15 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, &nodes, &node_count, ctx->cd_subchannel_hdr.total_nodes, "CD subchannel");
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->cd_subchannel_hdr.total_nodes, "CD subchannel");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
                 verify_btree_node_checksums(ctx, nodes, node_count, "CD subchannel", &bad);
+                uint64_t ord = 0, ord_fix = 0;
+                verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
+                                      sizeof(struct cd_subchannel_record), sizeof(struct btree_index_entry),
+                                      "CD subchannel", auto_yes, auto_no, &ord, &ord_fix);
                 free(nodes);
                 if(bad > 0)
                 {
@@ -3045,6 +3599,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
+                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
+                    printf("\n");
+                    errors += (int)(ord - ord_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -3079,6 +3644,10 @@ int main(int argc, char *argv[])
             {
                 uint64_t bad = 0;
                 verify_meta_node_checksums(ctx, nodes, node_count, "Metadata", &bad);
+                uint64_t ord = 0, ord_fix = 0;
+                verify_meta_ordering(ctx, nodes, node_count, ORD_METADATA,
+                                     sizeof(struct metadata_record), sizeof(struct metadata_index_entry),
+                                     "Metadata", auto_yes, auto_no, &ord, &ord_fix);
                 free(nodes);
                 if(bad > 0)
                 {
@@ -3088,6 +3657,15 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD\n", ord);
+                    errors++;
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -3122,6 +3700,10 @@ int main(int argc, char *argv[])
             {
                 uint64_t bad = 0;
                 verify_meta_node_checksums(ctx, nodes, node_count, "Metadata index", &bad);
+                uint64_t ord = 0, ord_fix = 0;
+                verify_meta_ordering(ctx, nodes, node_count, ORD_METADATA_IDX,
+                                     sizeof(struct metadata_idx_record), sizeof(struct metadata_idx_index_entry),
+                                     "Metadata index", auto_yes, auto_no, &ord, &ord_fix);
                 free(nodes);
                 if(bad > 0)
                 {
@@ -3131,6 +3713,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
+                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
+                    printf("\n");
+                    errors += (int)(ord - ord_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
@@ -3158,11 +3751,15 @@ int main(int argc, char *argv[])
         {
             uint64_t *nodes      = NULL;
             uint64_t  node_count = 0;
-            int       wrc        = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, &nodes, &node_count, ctx->refcount_hdr.total_nodes, "Refcount");
+            int       wrc        = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &node_count, ctx->refcount_hdr.total_nodes, "Refcount");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t bad = 0;
                 verify_btree_node_checksums(ctx, nodes, node_count, "Refcount", &bad);
+                uint64_t ord = 0, ord_fix = 0;
+                verify_btree_ordering(ctx, nodes, node_count, ORD_UINT64_KEY,
+                                      sizeof(struct refcount_record), sizeof(struct btree_index_entry),
+                                      "Refcount", auto_yes, auto_no, &ord, &ord_fix);
                 free(nodes);
                 if(bad > 0)
                 {
@@ -3172,6 +3769,17 @@ int main(int argc, char *argv[])
                 else
                 {
                     printf("  Node checksums:   OK\n");
+                }
+                if(ord > 0)
+                {
+                    printf("  Key ordering:     %" PRIu64 " BAD", ord);
+                    if(ord_fix > 0) printf(" (%" PRIu64 " fixed)", ord_fix);
+                    printf("\n");
+                    errors += (int)(ord - ord_fix);
+                }
+                else
+                {
+                    printf("  Key ordering:     OK\n");
                 }
             }
             else
