@@ -670,6 +670,258 @@ static void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header 
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Sibling-link consistency                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Patch a single node's left_link and/or right_link on disk.
+ *
+ * Reads the node, updates the header, recomputes the checksum, and
+ * writes back.
+ *
+ * @param ctx         Filesystem context.
+ * @param lba         LBA of the node to patch.
+ * @param new_left    New left_link value.
+ * @param new_right   New right_link value.
+ * @param nblocks     Number of contiguous blocks per node (1 or METADATA_NODE_BLOCKS).
+ * @return @c OBMAFS3_OK on success.
+ */
+static int patch_sibling_links(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t new_left, uint64_t new_right,
+                               int nblocks)
+{
+    size_t   node_sz = (size_t)nblocks * ctx->sb.block_size;
+    uint8_t *buf     = calloc(1, node_sz);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    for(int b = 0; b < nblocks; b++)
+    {
+        int rc = obmafs3_block_read(ctx, lba + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
+                                    (size_t)ctx->sb.block_size);
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            return rc;
+        }
+    }
+
+    struct btree_node_header hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+    hdr.left_link  = new_left;
+    hdr.right_link = new_right;
+
+    /* Zero checksum, copy header into buffer, recompute, store */
+    memset(hdr.checksum, 0, 32);
+    memcpy(buf, &hdr, sizeof(hdr));
+    obmafs3_checksum_block(buf, node_sz, hdr.checksum);
+    memcpy(buf + __builtin_offsetof(struct btree_node_header, checksum), hdr.checksum, 32);
+
+    for(int b = 0; b < nblocks; b++)
+    {
+        int rc = obmafs3_block_write(ctx, lba + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
+                                     (size_t)ctx->sb.block_size);
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            return rc;
+        }
+    }
+    free(buf);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Verify (and optionally repair) sibling-link consistency for a B+Tree.
+ *
+ * Performs a BFS from the root so that nodes at each level are
+ * encountered in left-to-right order.  For every adjacent pair
+ * (A, B) at the same level the check verifies:
+ *   - A.right_link == LBA(B)
+ *   - B.left_link  == LBA(A)
+ *
+ * The leftmost node must have left_link == 0 and the rightmost must
+ * have right_link == 0.
+ *
+ * @param ctx              Filesystem context.
+ * @param root_lba         Root node LBA.
+ * @param index_entry_size sizeof() of the index entry structure.
+ * @param child_lba_off    Offset within the index entry to the child_lba field.
+ * @param nblocks          Blocks per node (1 for normal trees, METADATA_NODE_BLOCKS for metadata).
+ * @param tree_name        Human-readable tree name.
+ * @param auto_yes         If non-zero, always repair without asking.
+ * @param auto_no          If non-zero, never repair.
+ * @param bad_count        Output: number of link violations found.
+ * @param fixed_count      Output: number of nodes whose links were repaired.
+ * @return @c OBMAFS3_OK on success (even if violations were found).
+ */
+static int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size,
+                                    size_t child_lba_off, int nblocks, const char *tree_name, int auto_yes,
+                                    int auto_no, uint64_t *bad_count, uint64_t *fixed_count)
+{
+    *bad_count   = 0;
+    *fixed_count = 0;
+    if(root_lba == 0) return OBMAFS3_OK;
+
+    size_t   node_sz = (size_t)nblocks * ctx->sb.block_size;
+    uint8_t *buf     = calloc(1, node_sz);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    /*
+     * BFS queue.  Each entry is an LBA.  Because BFS visits parents
+     * before children and enumerates children left-to-right, nodes at
+     * each level appear in the correct left-to-right order.
+     */
+    uint64_t *queue    = malloc(64 * sizeof(uint64_t));
+    uint64_t  q_head   = 0;
+    uint64_t  q_tail   = 0;
+    uint64_t  q_cap    = 64;
+    if(!queue) { free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    /* Per-node metadata gathered during BFS */
+    typedef struct
+    {
+        uint64_t lba;
+        uint64_t left_link;
+        uint64_t right_link;
+        uint8_t  level;
+    } node_info_t;
+
+    node_info_t *infos    = malloc(64 * sizeof(node_info_t));
+    uint64_t     info_cnt = 0;
+    uint64_t     info_cap = 64;
+    if(!infos) { free(buf); free(queue); return OBMAFS3_ERR_NOMEM; }
+
+    /* Enqueue root */
+    queue[q_tail++] = root_lba;
+
+    while(q_head < q_tail)
+    {
+        uint64_t lba = queue[q_head++];
+
+        /* Read node */
+        int read_ok = 1;
+        for(int b = 0; b < nblocks; b++)
+        {
+            int rc = obmafs3_block_read(ctx, lba + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
+                                        (size_t)ctx->sb.block_size);
+            if(rc != OBMAFS3_OK) { read_ok = 0; break; }
+        }
+        if(!read_ok) continue;
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+
+        /* Record node info */
+        if(info_cnt >= info_cap)
+        {
+            info_cap *= 2;
+            node_info_t *tmp = realloc(infos, info_cap * sizeof(node_info_t));
+            if(!tmp) { free(buf); free(queue); free(infos); return OBMAFS3_ERR_NOMEM; }
+            infos = tmp;
+        }
+        infos[info_cnt++] = (node_info_t){lba, hdr.left_link, hdr.right_link, hdr.level};
+
+        /* If index node, enqueue children left-to-right */
+        if(hdr.level > 0)
+        {
+            for(uint16_t i = 0; i < hdr.node_keys; i++)
+            {
+                uint64_t child_lba;
+                memcpy(&child_lba,
+                       buf + sizeof(struct btree_node_header) + (size_t)i * index_entry_size + child_lba_off,
+                       sizeof(child_lba));
+
+                if(q_tail >= q_cap)
+                {
+                    q_cap *= 2;
+                    uint64_t *tmp = realloc(queue, q_cap * sizeof(uint64_t));
+                    if(!tmp) { free(buf); free(queue); free(infos); return OBMAFS3_ERR_NOMEM; }
+                    queue = tmp;
+                }
+                queue[q_tail++] = child_lba;
+            }
+        }
+    }
+
+    free(buf);
+    free(queue);
+
+    /*
+     * infos[] now contains nodes in BFS order.  Within the same level
+     * they are already in left-to-right order.  Walk the array and
+     * verify the doubly-linked list for each level.
+     */
+    uint64_t violations = 0;
+    uint64_t fixes      = 0;
+
+    uint64_t run_start = 0;
+    while(run_start < info_cnt)
+    {
+        uint8_t  cur_level = infos[run_start].level;
+        uint64_t run_end   = run_start + 1;
+        while(run_end < info_cnt && infos[run_end].level == cur_level)
+            run_end++;
+
+        /* run_start..run_end-1 are all nodes at cur_level in L→R order */
+        uint64_t run_len = run_end - run_start;
+
+        int level_bad = 0; /* any violation at this level? */
+
+        for(uint64_t i = run_start; i < run_end; i++)
+        {
+            uint64_t expect_left  = (i == run_start) ? 0 : infos[i - 1].lba;
+            uint64_t expect_right = (i == run_end - 1) ? 0 : infos[i + 1].lba;
+
+            if(infos[i].left_link != expect_left || infos[i].right_link != expect_right)
+            {
+                if(!level_bad)
+                    fprintf(stderr,
+                            "\n  %s: sibling-link violations at level %u (%" PRIu64 " node%s):\n",
+                            tree_name, cur_level, run_len, run_len == 1 ? "" : "s");
+                level_bad = 1;
+                violations++;
+
+                fprintf(stderr,
+                        "    LBA %" PRIu64 ": left=%" PRIu64 " (expect %" PRIu64 "), "
+                        "right=%" PRIu64 " (expect %" PRIu64 ")\n",
+                        infos[i].lba, infos[i].left_link, expect_left, infos[i].right_link, expect_right);
+            }
+        }
+
+        if(level_bad)
+        {
+            char prompt[128];
+            snprintf(prompt, sizeof(prompt), "  Fix sibling links at %s level %u?", tree_name, cur_level);
+            if(ask_fix(auto_yes, auto_no, prompt))
+            {
+                for(uint64_t i = run_start; i < run_end; i++)
+                {
+                    uint64_t expect_left  = (i == run_start) ? 0 : infos[i - 1].lba;
+                    uint64_t expect_right = (i == run_end - 1) ? 0 : infos[i + 1].lba;
+
+                    if(infos[i].left_link != expect_left || infos[i].right_link != expect_right)
+                    {
+                        int rc = patch_sibling_links(ctx, infos[i].lba, expect_left, expect_right, nblocks);
+                        if(rc == OBMAFS3_OK)
+                            fixes++;
+                        else
+                            fprintf(stderr, "    Error patching LBA %" PRIu64 ": %d\n", infos[i].lba, rc);
+                    }
+                }
+            }
+        }
+
+        run_start = run_end;
+    }
+
+    free(infos);
+
+    *bad_count   = violations;
+    *fixed_count = fixes;
+    return OBMAFS3_OK;
+}
+
 /**
  * Verify that keys within every node of a single-block B+Tree are
  * strictly ascending (leaf) or non-decreasing (index).
@@ -3190,6 +3442,24 @@ int main(int argc, char *argv[])
             }
             verify_fix_total_nodes(ctx, &ctx->catalog_hdr, ctx->sb.catalog_lba, cat_node_count, "Catalog", "  ",
                                    auto_yes, auto_no, &errors);
+            {
+                uint64_t sib_bad = 0, sib_fix = 0;
+                verify_fix_sibling_links(ctx, ctx->catalog_hdr.root_node_lba,
+                                         sizeof(struct catalog_index_entry),
+                                         __builtin_offsetof(struct catalog_index_entry, child_lba), 1,
+                                         "Catalog", auto_yes, auto_no, &sib_bad, &sib_fix);
+                if(sib_bad > 0)
+                {
+                    printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                    if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                    printf("\n");
+                    errors += (int)(sib_bad - sib_fix);
+                }
+                else
+                {
+                    printf("  Sibling links:    OK\n");
+                }
+            }
         }
         else
         {
@@ -3246,6 +3516,24 @@ int main(int argc, char *argv[])
             }
             verify_fix_total_nodes(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, ino_node_count, "Inode", "  ",
                                    auto_yes, auto_no, &errors);
+            {
+                uint64_t sib_bad = 0, sib_fix = 0;
+                verify_fix_sibling_links(ctx, ctx->inode_hdr.root_node_lba,
+                                         sizeof(struct btree_index_entry),
+                                         __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                         "Inode", auto_yes, auto_no, &sib_bad, &sib_fix);
+                if(sib_bad > 0)
+                {
+                    printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                    if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                    printf("\n");
+                    errors += (int)(sib_bad - sib_fix);
+                }
+                else
+                {
+                    printf("  Sibling links:    OK\n");
+                }
+            }
         }
         else
         {
@@ -3303,6 +3591,24 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->overflow_hdr, ctx->sb.overflow_lba, ovf_node_count, "Overflow",
                                        "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->overflow_hdr.root_node_lba,
+                                             sizeof(struct btree_index_entry),
+                                             __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                             "Overflow", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3414,6 +3720,24 @@ int main(int argc, char *argv[])
                                     }
                                     verify_fix_total_nodes(ctx, &thdr, tl_entries[t].tree_lba, dd_count, "Dedup",
                                                            "    ", auto_yes, auto_no, &errors);
+                                    {
+                                        uint64_t sib_bad = 0, sib_fix = 0;
+                                        verify_fix_sibling_links(ctx, thdr.root_node_lba,
+                                                                 sizeof(struct btree_index_entry),
+                                                                 __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                                                 "Dedup", auto_yes, auto_no, &sib_bad, &sib_fix);
+                                        if(sib_bad > 0)
+                                        {
+                                            printf("    Sibling links:  %" PRIu64 " BAD", sib_bad);
+                                            if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                                            printf("\n");
+                                            errors += (int)(sib_bad - sib_fix);
+                                        }
+                                        else
+                                        {
+                                            printf("    Sibling links:  OK\n");
+                                        }
+                                    }
                                 }
                                 else
                                 {
@@ -3491,6 +3815,24 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, mt_node_count, "Media tag",
                                        "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->media_tag_hdr.root_node_lba,
+                                             sizeof(struct media_tag_index_entry),
+                                             __builtin_offsetof(struct media_tag_index_entry, child_lba), 1,
+                                             "Media tag", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3549,6 +3891,24 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_prefix_hdr, ctx->sb.cd_prefix_lba, node_count, "CD prefix",
                                        "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->cd_prefix_hdr.root_node_lba,
+                                             sizeof(struct btree_index_entry),
+                                             __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                             "CD prefix", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3607,6 +3967,24 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_suffix_hdr, ctx->sb.cd_suffix_lba, node_count, "CD suffix",
                                        "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->cd_suffix_hdr.root_node_lba,
+                                             sizeof(struct btree_index_entry),
+                                             __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                             "CD suffix", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3665,6 +4043,24 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->cd_subchannel_hdr, ctx->sb.cd_subchannel_lba, node_count,
                                        "CD subchannel", "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->cd_subchannel_hdr.root_node_lba,
+                                             sizeof(struct btree_index_entry),
+                                             __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                             "CD subchannel", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3723,6 +4119,25 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, node_count, "Metadata",
                                        "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->metadata_hdr.root_node_lba,
+                                             sizeof(struct metadata_index_entry),
+                                             __builtin_offsetof(struct metadata_index_entry, child_lba),
+                                             METADATA_NODE_BLOCKS,
+                                             "Metadata", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3783,6 +4198,25 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, node_count,
                                        "Metadata index", "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->metadata_idx_hdr.root_node_lba,
+                                             sizeof(struct metadata_idx_index_entry),
+                                             __builtin_offsetof(struct metadata_idx_index_entry, child_lba),
+                                             METADATA_NODE_BLOCKS,
+                                             "Metadata index", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
@@ -3841,6 +4275,24 @@ int main(int argc, char *argv[])
                 }
                 verify_fix_total_nodes(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, node_count, "Refcount",
                                        "  ", auto_yes, auto_no, &errors);
+                {
+                    uint64_t sib_bad = 0, sib_fix = 0;
+                    verify_fix_sibling_links(ctx, ctx->refcount_hdr.root_node_lba,
+                                             sizeof(struct btree_index_entry),
+                                             __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                             "Refcount", auto_yes, auto_no, &sib_bad, &sib_fix);
+                    if(sib_bad > 0)
+                    {
+                        printf("  Sibling links:    %" PRIu64 " BAD", sib_bad);
+                        if(sib_fix > 0) printf(" (%" PRIu64 " fixed)", sib_fix);
+                        printf("\n");
+                        errors += (int)(sib_bad - sib_fix);
+                    }
+                    else
+                    {
+                        printf("  Sibling links:    OK\n");
+                    }
+                }
             }
             else
             {
