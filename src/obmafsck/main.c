@@ -4361,6 +4361,381 @@ static void validate_overflow_extents(struct obmafs3_ctx *ctx, uint64_t total_bl
     free(stack);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Refcount tree validation                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Internal: insert or add to an LBA→count mapping in a sorted array.
+ * Returns the new count on success, 0 on allocation failure.
+ */
+struct lba_count
+{
+    uint64_t lba;
+    uint32_t count;
+};
+
+static uint64_t lba_map_add(struct lba_count **map, uint64_t *cap, uint64_t *len, uint64_t lba)
+{
+    /* Binary search for existing entry */
+    uint64_t lo = 0, hi = *len;
+    while(lo < hi)
+    {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if((*map)[mid].lba < lba)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+
+    if(lo < *len && (*map)[lo].lba == lba)
+    {
+        (*map)[lo].count++;
+        return *len;
+    }
+
+    /* Insert new entry */
+    if(*len >= *cap)
+    {
+        uint64_t new_cap         = *cap ? *cap * 2 : 4096;
+        struct lba_count *tmp    = realloc(*map, (size_t)(new_cap * sizeof(struct lba_count)));
+        if(!tmp) return 0;
+        *map = tmp;
+        *cap = new_cap;
+    }
+
+    if(lo < *len)
+        memmove(&(*map)[lo + 1], &(*map)[lo], (size_t)(*len - lo) * sizeof(struct lba_count));
+
+    (*map)[lo].lba   = lba;
+    (*map)[lo].count = 1;
+    (*len)++;
+    return *len;
+}
+
+/**
+ * Binary search for an LBA in a sorted lba_count array.
+ * Returns the index if found, or UINT64_MAX if not.
+ */
+static uint64_t lba_map_find(const struct lba_count *map, uint64_t len, uint64_t lba)
+{
+    uint64_t lo = 0, hi = len;
+    while(lo < hi)
+    {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if(map[mid].lba < lba)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if(lo < len && map[lo].lba == lba) return lo;
+    return UINT64_MAX;
+}
+
+/**
+ * Verify the refcount tree against actual block sharing across inodes.
+ *
+ * Phase 1: Walk all inode extents (inline + overflow) and count how
+ *          many inodes reference each physical data block.
+ * Phase 2: Walk the refcount tree leaf nodes and collect stored records.
+ * Phase 3: Compare expected vs stored refcounts, reporting and optionally
+ *          fixing mismatches.
+ *
+ * Blocks referenced by exactly one inode have an implicit refcount of 1
+ * and should NOT appear in the refcount tree.  Blocks with refcount > 1
+ * must appear with the correct count.
+ *
+ * @param ctx        Filesystem context.
+ * @param auto_yes   If nonzero, always repair.
+ * @param auto_no    If nonzero, never repair.
+ * @param bad_count  Output: number of mismatches found.
+ * @param fix_count  Output: number of mismatches repaired.
+ */
+static void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, uint64_t *bad_count,
+                                 uint64_t *fix_count)
+{
+    *bad_count = 0;
+    *fix_count = 0;
+
+    uint64_t root_lba = ctx->inode_hdr.root_node_lba;
+    if(root_lba == 0) return;
+
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint8_t *buf = calloc(1, bsz);
+    if(!buf) return;
+
+    /* ---- Phase 1: build expected refcount map from all inode extents ---- */
+    struct lba_count *expected   = NULL;
+    uint64_t          exp_cap    = 0;
+    uint64_t          exp_len    = 0;
+
+    /* 1a: Inline extents from inode tree */
+    {
+        uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+        uint64_t  stk_size = 0, stk_cap = 64;
+        if(!stack) { free(buf); return; }
+
+        stack[stk_size++] = root_lba;
+
+        while(stk_size > 0)
+        {
+            uint64_t lba = stack[--stk_size];
+            if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+            struct btree_node_header nhdr;
+            memcpy(&nhdr, buf, sizeof(nhdr));
+            if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+            if(nhdr.level > 0)
+            {
+                for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                {
+                    struct btree_index_entry ie;
+                    memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                    if(stk_size >= stk_cap)
+                    {
+                        stk_cap *= 2;
+                        uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                        if(!tmp) { free(buf); free(stack); free(expected); return; }
+                        stack = tmp;
+                    }
+                    stack[stk_size++] = ie.child_lba;
+                }
+                continue;
+            }
+
+            /* Leaf: collect physical blocks from each inode's inline extents */
+            for(uint16_t i = 0; i < nhdr.node_keys; i++)
+            {
+                struct inode_record rec;
+                memcpy(&rec, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(rec), sizeof(rec));
+
+                for(int e = 0; e < 8; e++)
+                {
+                    if(rec.extents[e].block_count == 0 || rec.extents[e].start_block == 0) continue;
+
+                    for(uint64_t b = 0; b < rec.extents[e].block_count; b++)
+                    {
+                        if(!lba_map_add(&expected, &exp_cap, &exp_len, rec.extents[e].start_block + b))
+                        {
+                            free(buf);
+                            free(stack);
+                            free(expected);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        free(stack);
+    }
+
+    /* 1b: Overflow extents */
+    if(ctx->overflow_hdr.root_node_lba != 0)
+    {
+        uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+        uint64_t  stk_size = 0, stk_cap = 64;
+        if(!stack) { free(buf); free(expected); return; }
+
+        stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
+
+        while(stk_size > 0)
+        {
+            uint64_t lba = stack[--stk_size];
+            if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+            struct btree_node_header nhdr;
+            memcpy(&nhdr, buf, sizeof(nhdr));
+            if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+            if(nhdr.level > 0)
+            {
+                for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                {
+                    struct btree_index_entry ie;
+                    memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                    if(stk_size >= stk_cap)
+                    {
+                        stk_cap *= 2;
+                        uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                        if(!tmp) { free(buf); free(stack); free(expected); return; }
+                        stack = tmp;
+                    }
+                    stack[stk_size++] = ie.child_lba;
+                }
+                continue;
+            }
+
+            /* Leaf: collect physical blocks from overflow extents */
+            for(uint16_t i = 0; i < nhdr.node_keys; i++)
+            {
+                struct overflow_extent oe;
+                memcpy(&oe, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(oe), sizeof(oe));
+
+                if(oe.block_count == 0 || oe.start_block == 0) continue;
+
+                for(uint64_t b = 0; b < oe.block_count; b++)
+                {
+                    if(!lba_map_add(&expected, &exp_cap, &exp_len, oe.start_block + b))
+                    {
+                        free(buf);
+                        free(stack);
+                        free(expected);
+                        return;
+                    }
+                }
+            }
+        }
+
+        free(stack);
+    }
+
+    /* ---- Phase 2: collect stored refcount records ---- */
+    struct lba_count *stored     = NULL;
+    uint64_t          sto_cap    = 0;
+    uint64_t          sto_len    = 0;
+
+    if(ctx->refcount_hdr.root_node_lba != 0)
+    {
+        uint64_t lba = ctx->refcount_hdr.root_node_lba;
+
+        /* Descend to left-most leaf */
+        while(lba != 0)
+        {
+            if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+
+            struct btree_node_header nhdr;
+            memcpy(&nhdr, buf, sizeof(nhdr));
+            if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+            if(nhdr.level > 0)
+            {
+                struct btree_index_entry ie;
+                memcpy(&ie, buf + sizeof(struct btree_node_header), sizeof(ie));
+                lba = ie.child_lba;
+            }
+            else
+            {
+                /* Walk leaf chain */
+                while(lba != 0)
+                {
+                    if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
+                    memcpy(&nhdr, buf, sizeof(nhdr));
+                    if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+                    const uint8_t *rp = buf + sizeof(struct btree_node_header);
+                    for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                    {
+                        struct refcount_record rr;
+                        memcpy(&rr, rp + (size_t)i * sizeof(rr), sizeof(rr));
+
+                        if(sto_len >= sto_cap)
+                        {
+                            sto_cap = sto_cap ? sto_cap * 2 : 256;
+                            struct lba_count *tmp = realloc(stored, (size_t)(sto_cap * sizeof(*tmp)));
+                            if(!tmp)
+                            {
+                                free(buf);
+                                free(expected);
+                                free(stored);
+                                return;
+                            }
+                            stored = tmp;
+                        }
+                        stored[sto_len].lba   = rr.lba;
+                        stored[sto_len].count = rr.ref_count;
+                        sto_len++;
+                    }
+
+                    lba = nhdr.right_link;
+                }
+                break;
+            }
+        }
+    }
+
+    /* ---- Phase 3: compare expected vs stored ---- */
+
+    /* 3a: Check blocks that should have refcount > 1 */
+    for(uint64_t i = 0; i < exp_len; i++)
+    {
+        uint32_t exp_rc = expected[i].count;
+        if(exp_rc <= 1) continue; /* Implicit refcount 1 — should NOT be in the tree */
+
+        /* Look up in stored records */
+        uint64_t si = lba_map_find(stored, sto_len, expected[i].lba);
+        if(si == UINT64_MAX)
+        {
+            /* Should be in tree but is not */
+            printf("    LBA %" PRIu64 ": expected refcount %" PRIu32 ", not in tree\n",
+                   expected[i].lba, exp_rc);
+            (*bad_count)++;
+            if(ask_fix(auto_yes, auto_no, "    Insert correct refcount?"))
+            {
+                int rc = obmafs3_refcount_set(ctx, expected[i].lba, exp_rc);
+                if(rc == OBMAFS3_OK)
+                    (*fix_count)++;
+                else
+                    fprintf(stderr, "    Error: could not set refcount: %d\n", rc);
+            }
+        }
+        else if(stored[si].count != exp_rc)
+        {
+            printf("    LBA %" PRIu64 ": stored refcount %" PRIu32 ", expected %" PRIu32 "\n",
+                   expected[i].lba, stored[si].count, exp_rc);
+            (*bad_count)++;
+            if(ask_fix(auto_yes, auto_no, "    Fix refcount?"))
+            {
+                int rc = obmafs3_refcount_set(ctx, expected[i].lba, exp_rc);
+                if(rc == OBMAFS3_OK)
+                    (*fix_count)++;
+                else
+                    fprintf(stderr, "    Error: could not set refcount: %d\n", rc);
+            }
+            /* Mark as verified by zeroing (to detect stale entries below) */
+            stored[si].count = 0;
+        }
+        else
+        {
+            /* Correct — mark as verified */
+            stored[si].count = 0;
+        }
+    }
+
+    /* 3b: Check for stale entries in the refcount tree
+     * (entries for blocks that are not shared, or not referenced at all) */
+    for(uint64_t i = 0; i < sto_len; i++)
+    {
+        if(stored[i].count == 0) continue; /* Already verified in 3a */
+
+        /* This entry exists in the tree but shouldn't (block isn't shared) */
+        uint64_t ei = lba_map_find(expected, exp_len, stored[i].lba);
+        uint32_t actual = (ei != UINT64_MAX) ? expected[ei].count : 0;
+
+        if(actual <= 1)
+        {
+            printf("    LBA %" PRIu64 ": stale refcount %" PRIu32 " in tree (actual %s)\n",
+                   stored[i].lba, stored[i].count,
+                   actual == 0 ? "unallocated/unreferenced" : "1");
+            (*bad_count)++;
+            if(ask_fix(auto_yes, auto_no, "    Remove stale refcount entry?"))
+            {
+                /* Setting to 1 removes the entry from the tree */
+                int rc = obmafs3_refcount_set(ctx, stored[i].lba, 1);
+                if(rc == OBMAFS3_OK)
+                    (*fix_count)++;
+                else
+                    fprintf(stderr, "    Error: could not remove refcount: %d\n", rc);
+            }
+        }
+    }
+
+    free(buf);
+    free(expected);
+    free(stored);
+}
+
 /**
  * Verify that each inode's file_size matches the sum of its extent
  * logical blocks (inline + overflow) multiplied by block_size.
@@ -5905,6 +6280,25 @@ int main(int argc, char *argv[])
     /* ---- Extent validation ---- */
     if(ctx->inode_hdr.root_node_lba != 0)
         check_extent_validity(ctx, auto_yes, auto_no, &errors);
+
+    /* ---- Refcount data validation ---- */
+    if(ctx->inode_hdr.root_node_lba != 0)
+    {
+        printf("\nRefcount validation:\n");
+        uint64_t rc_bad = 0, rc_fix = 0;
+        verify_refcount_tree(ctx, auto_yes, auto_no, &rc_bad, &rc_fix);
+        if(rc_bad == 0)
+        {
+            printf("  Refcounts:        OK\n");
+        }
+        else
+        {
+            printf("  Refcounts:        %" PRIu64 " mismatch", rc_bad);
+            if(rc_fix > 0) printf(" (%" PRIu64 " fixed)", rc_fix);
+            printf("\n");
+            errors += (int)(rc_bad - rc_fix);
+        }
+    }
 
     /* ---- Allocation bitmap ---- */
     uint64_t total_blocks = ctx->sb.total_bytes / ctx->sb.block_size;
