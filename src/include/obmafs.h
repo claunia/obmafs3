@@ -131,6 +131,7 @@ int  obmafs3_pool_wait_async(struct pool_async_job *job);
 
 /* --- Superblock operations --- */
 int obmafs3_sb_read(int fd, struct obmafs3_sb *sb);
+int obmafs3_sb_read_lenient(int fd, struct obmafs3_sb *sb, int *checksum_ok);
 int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb);
 int obmafs3_sb_validate(const struct obmafs3_sb *sb);
 

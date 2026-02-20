@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
+#include <xxhash.h>
 
 /**
  * Read the superblock from disk.
@@ -39,10 +40,44 @@ int obmafs3_sb_read(int fd, struct obmafs3_sb *sb)
  */
 int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb)
 {
-    ssize_t n = pwrite(fd, sb, sizeof(*sb), 0);
-    if(n < 0 || (size_t)n != sizeof(*sb))
+    /* Compute checksum: zero field, hash entire struct, store result */
+    struct obmafs3_sb tmp = *sb;
+    memset(tmp.checksum, 0, sizeof(tmp.checksum));
+    obmafs3_checksum_block(&tmp, sizeof(tmp), tmp.checksum);
+
+    ssize_t n = pwrite(fd, &tmp, sizeof(tmp), 0);
+    if(n < 0 || (size_t)n != sizeof(tmp))
         DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                         "sb pwrite expected=%zu got=%zd", sizeof(*sb), n);
+                         "sb pwrite expected=%zu got=%zd", sizeof(tmp), n);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Read a superblock from disk (lenient).
+ *
+ * Reads the superblock and validates magic.  The checksum is verified
+ * but a mismatch is reported via @p checksum_ok rather than causing
+ * an error return.
+ *
+ * @param fd           Open file descriptor for the filesystem image.
+ * @param sb           Output superblock structure.
+ * @param checksum_ok  Set to 1 if the checksum matches, 0 otherwise.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_IO on failure.
+ */
+int obmafs3_sb_read_lenient(int fd, struct obmafs3_sb *sb, int *checksum_ok)
+{
+    int rc = obmafs3_sb_read(fd, sb);
+    if(rc != OBMAFS3_OK) return rc;
+
+    /* Verify checksum: save stored, zero field, recompute, compare */
+    uint8_t stored[32];
+    memcpy(stored, sb->checksum, 32);
+    memset(sb->checksum, 0, 32);
+    uint8_t computed[32];
+    obmafs3_checksum_block(sb, sizeof(*sb), computed);
+    memcpy(sb->checksum, stored, 32);
+    *checksum_ok = (memcmp(stored, computed, 32) == 0);
+
     return OBMAFS3_OK;
 }
 

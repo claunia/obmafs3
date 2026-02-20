@@ -337,6 +337,10 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
     /* ---- Write fixes if any ---- */
     if(fixed > 0)
     {
+        /* Recompute superblock checksum before writing */
+        memset(sb->checksum, 0, sizeof(sb->checksum));
+        obmafs3_checksum_block(sb, sizeof(*sb), sb->checksum);
+
         ssize_t n = pwrite(fd, sb, sizeof(*sb), 0);
         if(n < 0 || (size_t)n != sizeof(*sb))
             fprintf(stderr, "    Error: could not write superblock fix\n");
@@ -5620,6 +5624,35 @@ int main(int argc, char *argv[])
     printf("Superblock:\n");
     printf("  Magic:            0x%016" PRIx64 " (%s)\n", ctx->sb.magic,
            ctx->sb.magic == OBMAFS3_SB_MAGIC ? "OK" : "BAD");
+
+    /* Verify superblock checksum */
+    {
+        uint8_t stored[32], computed[32];
+        memcpy(stored, ctx->sb.checksum, 32);
+        memset(ctx->sb.checksum, 0, 32);
+        obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), computed);
+        memcpy(ctx->sb.checksum, stored, 32);
+        int sb_cs_ok = (memcmp(stored, computed, 32) == 0);
+        printf("  Checksum:         %s\n", sb_cs_ok ? "OK" : "BAD");
+        if(!sb_cs_ok)
+        {
+            errors++;
+            if(ask_fix(auto_yes, auto_no, "  Recompute superblock checksum?"))
+            {
+                memset(ctx->sb.checksum, 0, 32);
+                obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), ctx->sb.checksum);
+                ssize_t nn = pwrite(fd, &ctx->sb, sizeof(ctx->sb), 0);
+                if(nn < 0 || (size_t)nn != sizeof(ctx->sb))
+                    fprintf(stderr, "  Error: could not write superblock checksum fix\n");
+                else
+                {
+                    printf("  Superblock checksum fixed.\n");
+                    errors--;
+                }
+            }
+        }
+    }
+
     printf("  Block size:       %" PRIu64 "\n", ctx->sb.block_size);
     printf("  Dedup block size: %" PRIu64 "\n", ctx->sb.dedup_block_size);
     printf("  Total bytes:      %" PRIu64 "\n", ctx->sb.total_bytes);

@@ -635,6 +635,9 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     sb.next_inode_id = 3;                /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label, sizeof(sb.volume_label) - 1);
 
+    /* Compute superblock checksum (checksum field is already zeroed) */
+    obmafs3_checksum_block(&sb, sizeof(sb), sb.checksum);
+
     rc = write_block(fd, block_size, 0, &sb, sizeof(sb));
     if(rc != OBMAFS3_OK)
     {
