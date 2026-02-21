@@ -1305,13 +1305,13 @@ static void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header 
 /* ------------------------------------------------------------------ */
 
 /**
- * Verify that the free node chain fields are zero (since the runtime
- * never uses them) and optionally repair the header if they aren't.
+ * Walk the free-node chain starting at @c hdr->free_node_lba and verify
+ * that the declared @c free_nodes count matches the actual chain length,
+ * that every LBA is within filesystem bounds, and that the chain
+ * terminates (no cycles).
  *
- * The @c free_node_lba and @c free_nodes fields in @c btree_header are
- * reserved for a future recycling optimisation.  The current runtime always
- * returns freed nodes directly to the allocation bitmap, so both fields
- * must be zero on a healthy filesystem.
+ * Each free node stores a uint64_t "next" pointer at byte offset 0.
+ * The chain ends when next == 0.
  *
  * @param ctx        Filesystem context.
  * @param hdr        Pointer to the btree_header (will be modified on fix).
@@ -1331,8 +1331,99 @@ static void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *
         return;
     }
 
-    result_bad("Free node chain:", "free_node_lba=%" PRIu64 ", free_nodes=%u", hdr->free_node_lba,
-              hdr->free_nodes);
+    /* Both must be zero together or both non-zero */
+    if((hdr->free_node_lba == 0) != (hdr->free_nodes == 0))
+    {
+        result_bad("Free node chain:",
+                   "inconsistent: free_node_lba=%" PRIu64 ", free_nodes=%u",
+                   hdr->free_node_lba, hdr->free_nodes);
+        (*errors)++;
+
+        if(ask_fix(auto_yes, auto_no, "Reset free node chain in header?"))
+        {
+            hdr->free_node_lba = 0;
+            hdr->free_nodes    = 0;
+            int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+            if(rc == OBMAFS3_OK)
+            {
+                result_fixed("Free node chain:", "reset to 0");
+                (*errors)--;
+            }
+            else
+                fprintf(stderr, "%sError writing %s header: %d\n", indent, tree_name, rc);
+        }
+        return;
+    }
+
+    /* Walk the chain and count nodes */
+    size_t   bsz       = (size_t)ctx->sb.block_size;
+    uint64_t max_lba   = ctx->sb.total_bytes / ctx->sb.block_size;
+    uint8_t *buf       = calloc(1, bsz);
+    if(!buf)
+    {
+        result_bad("Free node chain:", "out of memory");
+        (*errors)++;
+        return;
+    }
+
+    uint32_t walked    = 0;
+    uint64_t cur       = hdr->free_node_lba;
+    int      chain_ok  = 1;
+
+    while(cur != 0)
+    {
+        if(cur >= max_lba)
+        {
+            result_bad("Free node chain:",
+                       "LBA %" PRIu64 " out of bounds (max %" PRIu64 ") at position %u",
+                       cur, max_lba - 1, walked);
+            chain_ok = 0;
+            break;
+        }
+
+        if(walked >= hdr->free_nodes + 1)
+        {
+            /* More nodes than declared — likely a cycle */
+            result_bad("Free node chain:",
+                       "chain longer than declared free_nodes=%u (possible cycle)",
+                       hdr->free_nodes);
+            chain_ok = 0;
+            break;
+        }
+
+        int rc = obmafs3_block_read(ctx, cur, buf, bsz);
+        if(rc != OBMAFS3_OK)
+        {
+            result_bad("Free node chain:",
+                       "read error at LBA %" PRIu64 " (position %u): %d",
+                       cur, walked, rc);
+            chain_ok = 0;
+            break;
+        }
+
+        uint64_t next;
+        memcpy(&next, buf, sizeof(next));
+        walked++;
+        cur = next;
+    }
+
+    free(buf);
+
+    if(chain_ok && walked == hdr->free_nodes)
+    {
+        result_ok("Free node chain:",
+                  "free_node_lba=%" PRIu64 ", free_nodes=%u",
+                  hdr->free_node_lba, hdr->free_nodes);
+        return;
+    }
+
+    if(chain_ok && walked != hdr->free_nodes)
+    {
+        result_bad("Free node chain:",
+                   "declared free_nodes=%u but walked %u",
+                   hdr->free_nodes, walked);
+    }
+
     (*errors)++;
 
     if(ask_fix(auto_yes, auto_no, "Reset free node chain in header?"))
@@ -1346,9 +1437,7 @@ static void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *
             (*errors)--;
         }
         else
-        {
             fprintf(stderr, "%sError writing %s header: %d\n", indent, tree_name, rc);
-        }
     }
 }
 
@@ -2270,7 +2359,7 @@ static int collect_overflow_data_blocks(struct obmafs3_ctx *ctx, uint64_t **out_
             /* Index node: push children onto stack */
             for(uint16_t i = 0; i < nhdr.node_keys; i++)
             {
-                struct btree_index_entry ie;
+                struct overflow_index_entry ie;
                 memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
 
                 if(stk_size >= stk_cap)
@@ -2708,6 +2797,75 @@ static int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, ui
 }
 
 /* ------------------------------------------------------------------ */
+/*  Collect free-chain block LBAs from a B+Tree header                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Walk the free-node chain starting at @c hdr->free_node_lba and
+ * collect every LBA in the chain.  Each free node stores a uint64_t
+ * "next" pointer at byte offset 0; the chain ends when next == 0.
+ *
+ * For multi-block nodes (blocks_per_node > 1), each free node occupies
+ * @p blocks_per_node contiguous blocks.
+ *
+ * @param ctx             Filesystem context.
+ * @param hdr             B+Tree header to walk.
+ * @param blocks_per_node Number of contiguous blocks per node (1 for normal trees).
+ * @param out_lbas        Output: heap-allocated array of block LBAs (caller frees).
+ * @param out_count       Output: number of elements in @p out_lbas.
+ * @return @c OBMAFS3_OK on success.
+ */
+static int collect_free_chain_blocks(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t blocks_per_node,
+                                     uint64_t **out_lbas, uint64_t *out_count)
+{
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if(hdr->free_node_lba == 0 || hdr->free_nodes == 0) return OBMAFS3_OK;
+
+    size_t   bsz     = (size_t)ctx->sb.block_size;
+    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
+    uint8_t *buf     = calloc(1, bsz);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    uint64_t *lbas = NULL;
+    uint64_t  count = 0;
+    uint64_t  cap   = 0;
+    uint64_t  cur   = hdr->free_node_lba;
+    uint32_t  limit = hdr->free_nodes + 1; /* safety limit to avoid cycles */
+
+    while(cur != 0 && count < limit)
+    {
+        if(cur >= max_lba) break;
+
+        /* Record all blocks for this node */
+        for(uint64_t b = 0; b < blocks_per_node; b++)
+        {
+            if(count >= cap)
+            {
+                cap          = (cap == 0) ? 64 : cap * 2;
+                uint64_t *t  = realloc(lbas, cap * sizeof(*t));
+                if(!t) { free(buf); free(lbas); return OBMAFS3_ERR_NOMEM; }
+                lbas = t;
+            }
+            lbas[count++] = cur + b;
+        }
+
+        int rc = obmafs3_block_read(ctx, cur, buf, bsz);
+        if(rc != OBMAFS3_OK) break;
+
+        uint64_t next;
+        memcpy(&next, buf, sizeof(next));
+        cur = next;
+    }
+
+    free(buf);
+    *out_lbas  = lbas;
+    *out_count = count;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Build expected bitmap                                              */
 /* ------------------------------------------------------------------ */
 
@@ -2736,9 +2894,10 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         return NULL;
     }
 
-    /* Progress reporting — 17 discrete steps */
+    /* Progress reporting — 19 discrete steps */
     int         step       = 0;
-    const int   total_steps = 17;
+    const int   total_steps = 19;
+
 
 #define PROGRESS(desc)                                                         \
     do                                                                         \
@@ -3023,6 +3182,120 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         }
     }
 
+    /* Dedup data blocks referenced by the persisted pending buffer.
+     * These entries have been deferred and not yet drained into the
+     * B+Tree, so collect_dedup_blocks (which walks tree leaves) will
+     * not see their data blocks.  We must read the on-disk pending
+     * buffer and mark each referenced data block. */
+    if(ctx->sb.pending_lba != 0 && ctx->sb.pending_blocks != 0)
+    {
+        PROGRESS("pending dedup data");
+        uint64_t pb_buf_size = ctx->sb.pending_blocks * ctx->sb.block_size;
+        uint8_t *pb_buf      = malloc((size_t)pb_buf_size);
+        if(pb_buf)
+        {
+            int rc = obmafs3_block_read(ctx, ctx->sb.pending_lba, pb_buf, (size_t)pb_buf_size);
+            if(rc == OBMAFS3_OK)
+            {
+                /* Validate pending persist header */
+                struct {
+                    uint64_t magic;
+                    uint64_t count;
+                    uint16_t sector_size;
+                    uint8_t  _pad[6];
+                    uint64_t checksum;
+                } __attribute__((packed)) pb_hdr;
+
+                memcpy(&pb_hdr, pb_buf, sizeof(pb_hdr));
+                if(pb_hdr.magic == 0x474E49444E455055ULL /* PENDING_PERSIST_MAGIC */
+                   && sizeof(pb_hdr) + pb_hdr.count * sizeof(struct dedup_entry) <= pb_buf_size)
+                {
+                    const struct dedup_entry *pb_entries =
+                        (const struct dedup_entry *)(pb_buf + sizeof(pb_hdr));
+
+                    /* Collect unique data block base LBAs */
+                    uint64_t *pb_unique  = NULL;
+                    uint64_t  pb_ucnt    = 0;
+                    uint64_t  pb_ucap    = 0;
+                    uint64_t  std_per_dd = ctx->sb.dedup_block_size / ctx->sb.block_size;
+
+                    for(uint64_t i = 0; i < pb_hdr.count; i++)
+                    {
+                        uint64_t blba = pb_entries[i].block_lba;
+                        if(blba == 0) continue;
+
+                        /* Deduplicate */
+                        int dup = 0;
+                        for(uint64_t j = 0; j < pb_ucnt; j++)
+                        {
+                            if(pb_unique[j] == blba) { dup = 1; break; }
+                        }
+                        if(dup) continue;
+
+                        if(pb_ucnt >= pb_ucap)
+                        {
+                            pb_ucap      = (pb_ucap == 0) ? 64 : pb_ucap * 2;
+                            uint64_t *ut = realloc(pb_unique, pb_ucap * sizeof(*ut));
+                            if(!ut) break;
+                            pb_unique = ut;
+                        }
+                        pb_unique[pb_ucnt++] = blba;
+
+                        /* Read block header to determine actual allocation.
+                         * If this block is already marked (from tree walk),
+                         * skip — but MARK is idempotent so we just mark. */
+                        uint8_t  hdr_tmp[sizeof(struct block_header)];
+                        int      hrc      = obmafs3_block_read(ctx, blba, hdr_tmp, sizeof(hdr_tmp));
+                        uint64_t mark_std = std_per_dd; /* fallback: full allocation */
+                        if(hrc == OBMAFS3_OK)
+                        {
+                            struct block_header bh;
+                            memcpy(&bh, hdr_tmp, sizeof(bh));
+                            if(bh.magic == OBMAFS3_BLOCK_MAGIC)
+                            {
+                                uint64_t payload =
+                                    (bh.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                        ? bh.compressed_size
+                                        : bh.original_size;
+                                uint64_t on_disk = sizeof(bh) + payload;
+                                uint64_t bs      = ctx->sb.block_size;
+                                uint64_t used    = (on_disk + bs - 1) / bs;
+                                if(used > std_per_dd) used = std_per_dd;
+                                /* Pending data blocks may be partial (last
+                                 * block) and keep all std_per_dedup allocated,
+                                 * or they may have been compressed by the bg
+                                 * pool which frees trailing blocks.  Check if
+                                 * trailing blocks are still allocated in the
+                                 * on-disk bitmap to decide. */
+                                mark_std = used;
+                                /* Also check if the full allocation is present
+                                 * by testing the last standard block. */
+                                uint64_t last_blk = blba + std_per_dd - 1;
+                                if(last_blk < total_blocks)
+                                {
+                                    int last_set = (expected[last_blk / 8] >> (last_blk % 8)) & 1;
+                                    if(!last_set)
+                                    {
+                                        /* Not already marked — check on-disk bitmap */
+                                        const uint8_t *disk_bm = ctx->bitmap;
+                                        if(disk_bm)
+                                        {
+                                            int on_disk_set = (disk_bm[last_blk / 8] >> (last_blk % 8)) & 1;
+                                            if(on_disk_set) mark_std = std_per_dd;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for(uint64_t s = 0; s < mark_std; s++) MARK(blba + s);
+                    }
+                    free(pb_unique);
+                }
+            }
+            free(pb_buf);
+        }
+    }
+
     /* External media tag data blocks */
     PROGRESS("media tag data blocks");
     {
@@ -3038,6 +3311,90 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             fprintf(stderr, "Warning: could not collect media tag data blocks\n");
         }
+    }
+
+    /* Free-chain blocks for every B+Tree that uses clump allocation */
+    PROGRESS("free node chains");
+    {
+        /* Helper macro: walk one tree's free chain and mark blocks */
+#define MARK_FREE_CHAIN(hdr_ptr, bpn)                                        \
+        do                                                                   \
+        {                                                                    \
+            uint64_t *_fc = NULL;                                            \
+            uint64_t  _fn = 0;                                               \
+            if(collect_free_chain_blocks(ctx, (hdr_ptr), (bpn), &_fc, &_fn)  \
+                   == OBMAFS3_OK)                                            \
+            {                                                                \
+                for(uint64_t _i = 0; _i < _fn; _i++) MARK(_fc[_i]);         \
+                free(_fc);                                                   \
+            }                                                                \
+        } while(0)
+
+        /* Catalog tree */
+        MARK_FREE_CHAIN(&ctx->catalog_hdr, 1);
+
+        /* Inode tree */
+        MARK_FREE_CHAIN(&ctx->inode_hdr, 1);
+
+        /* Overflow tree */
+        MARK_FREE_CHAIN(&ctx->overflow_hdr, 1);
+
+        /* Media tag tree */
+        if(ctx->sb.media_tag_lba != 0)
+            MARK_FREE_CHAIN(&ctx->media_tag_hdr, 1);
+
+        /* CD prefix tree */
+        if(ctx->sb.cd_prefix_lba != 0)
+            MARK_FREE_CHAIN(&ctx->cd_prefix_hdr, 1);
+
+        /* CD suffix tree */
+        if(ctx->sb.cd_suffix_lba != 0)
+            MARK_FREE_CHAIN(&ctx->cd_suffix_hdr, 1);
+
+        /* CD subchannel tree */
+        if(ctx->sb.cd_subchannel_lba != 0)
+            MARK_FREE_CHAIN(&ctx->cd_subchannel_hdr, 1);
+
+        /* Metadata tree (multi-block nodes) */
+        if(ctx->sb.metadata_lba != 0)
+            MARK_FREE_CHAIN(&ctx->metadata_hdr, METADATA_NODE_BLOCKS);
+
+        /* Metadata index tree (multi-block nodes) */
+        if(ctx->sb.metadata_idx_lba != 0)
+            MARK_FREE_CHAIN(&ctx->metadata_idx_hdr, METADATA_NODE_BLOCKS);
+
+        /* Refcount tree */
+        if(ctx->sb.refcount_lba != 0)
+            MARK_FREE_CHAIN(&ctx->refcount_hdr, 1);
+
+        /* Dedup trees (each has its own header and free chain) */
+        if(ctx->sb.dedup_lba != 0)
+        {
+            uint8_t *list_buf = calloc(1, (size_t)ctx->sb.block_size);
+            if(list_buf)
+            {
+                int rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, list_buf, (size_t)ctx->sb.block_size);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct tree_list_header lh;
+                    memcpy(&lh, list_buf, sizeof(lh));
+                    if(lh.magic == OBMAFS3_TREELIST_MAGIC)
+                    {
+                        for(uint64_t t = 0; t < lh.tree_count; t++)
+                        {
+                            struct tree_list_entry te;
+                            memcpy(&te, list_buf + sizeof(struct tree_list_header) + t * sizeof(te), sizeof(te));
+                            struct btree_header thdr;
+                            if(obmafs3_btree_header_read(ctx, te.tree_lba, &thdr) == OBMAFS3_OK)
+                                MARK_FREE_CHAIN(&thdr, 1);
+                        }
+                    }
+                }
+                free(list_buf);
+            }
+        }
+
+#undef MARK_FREE_CHAIN
     }
 
 #undef MARK
@@ -6810,8 +7167,8 @@ int main(int argc, char *argv[])
                 {
                     uint64_t sib_bad = 0, sib_fix = 0;
                     verify_fix_sibling_links(ctx, ctx->overflow_hdr.root_node_lba,
-                                             sizeof(struct btree_index_entry),
-                                             __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                                             sizeof(struct overflow_index_entry),
+                                             __builtin_offsetof(struct overflow_index_entry, child_lba), 1,
                                              "Overflow", auto_yes, auto_no, &sib_bad, &sib_fix);
                     if(sib_bad > 0)
                     {
