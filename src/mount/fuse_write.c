@@ -676,6 +676,25 @@ int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi
 
 int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
+    struct fuse_file_ctx *ffctx = fi ? (struct fuse_file_ctx *)(uintptr_t)fi->fh : NULL;
+
+    /* Media-image writes through an open file handle use a narrower
+     * lock scope: hashing, sorting and key-set checks run lock-free
+     * while obmafs3_write_media_image_data acquires write_lock only
+     * around the tree/disk critical section.  This lets FUSE serve
+     * writes to multiple images in parallel. */
+    if(ffctx && ffctx->sector_size > 0)
+    {
+        struct inode_record *ip = &ffctx->inode;
+        int rc = obmafs3_write_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size,
+                                                ffctx->sector_size, &ffctx->sme_cache, &ffctx->db_cache);
+        if(rc == OBMAFS3_ERR_NOSPC) return -ENOSPC;
+        if(rc != OBMAFS3_OK) return -EIO;
+        ffctx->inode_dirty = 1;
+        return (int)size;
+    }
+
+    /* Non-media writes (or media without open file handle): full lock */
     pthread_mutex_lock(&g_ctx->write_lock);
     int rc = obmafs3_fuse_write_impl(path, buf, size, offset, fi);
     pthread_mutex_unlock(&g_ctx->write_lock);

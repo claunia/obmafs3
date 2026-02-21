@@ -197,15 +197,18 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         uint64_t       sub_hash = obmafs3_checksum_xxh64(sub, CD_SUBCHANNEL_SIZE);
         sme.subchannel_hash     = sub_hash;
 
-        /* Store subchannel data in the tree (dedup by hash) */
+        /* Store subchannel data in the tree (dedup by hash).
+         * Lock around shared B+Tree operations. */
+        pthread_mutex_lock(&g_ctx->write_lock);
         uint8_t existing[CD_SUBCHANNEL_DATA_SIZE];
         int     rc = obmafs3_cd_subchannel_get(g_ctx, sub_hash, existing);
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_subchannel_put(g_ctx, sub_hash, sub);
-            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+            if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&g_ctx->write_lock); FUSE_RETURN(-EIO, ""); }
         }
-        else if(rc != OBMAFS3_OK) { FUSE_RETURN(-EIO, ""); }
+        else if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&g_ctx->write_lock); FUSE_RETURN(-EIO, ""); }
+        pthread_mutex_unlock(&g_ctx->write_lock);
     }
 
     /* --- Audio mode: entire 2352 bytes stored as data, no prefix/suffix --- */
@@ -250,18 +253,20 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
 
     if(!pfx_gen)
     {
-        /* Store the non-generatable prefix */
+        /* Store the non-generatable prefix — lock for B+Tree access */
         uint64_t pfx_hash = obmafs3_checksum_xxh64(raw, CD_PREFIX_SIZE);
         sme.prefix_hash   = pfx_hash;
 
+        pthread_mutex_lock(&g_ctx->write_lock);
         uint8_t existing[CD_PREFIX_DATA_SIZE];
         int     rc = obmafs3_cd_prefix_get(g_ctx, pfx_hash, existing);
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_prefix_put(g_ctx, pfx_hash, raw);
-            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+            if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&g_ctx->write_lock); FUSE_RETURN(-EIO, ""); }
         }
-        else if(rc != OBMAFS3_OK) { FUSE_RETURN(-EIO, ""); }
+        else if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&g_ctx->write_lock); FUSE_RETURN(-EIO, ""); }
+        pthread_mutex_unlock(&g_ctx->write_lock);
     }
 
     /* Check if suffix is generatable (only for modes with ECC/EDC) */
@@ -288,19 +293,21 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
 
     if(!sfx_gen)
     {
-        /* Store the non-generatable suffix (last 288 bytes of raw sector) */
+        /* Store the non-generatable suffix — lock for B+Tree access */
         const uint8_t *suffix   = raw + CD_RAW_SECTOR_SIZE - CD_SUFFIX_SIZE;
         uint64_t       sfx_hash = obmafs3_checksum_xxh64(suffix, CD_SUFFIX_SIZE);
         sme.suffix_hash         = sfx_hash;
 
+        pthread_mutex_lock(&g_ctx->write_lock);
         uint8_t existing[CD_SUFFIX_DATA_SIZE];
         int     rc = obmafs3_cd_suffix_get(g_ctx, sfx_hash, existing);
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_suffix_put(g_ctx, sfx_hash, suffix);
-            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+            if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&g_ctx->write_lock); FUSE_RETURN(-EIO, ""); }
         }
-        else if(rc != OBMAFS3_OK) { FUSE_RETURN(-EIO, ""); }
+        else if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&g_ctx->write_lock); FUSE_RETURN(-EIO, ""); }
+        pthread_mutex_unlock(&g_ctx->write_lock);
     }
 
     /* Store subheader for Mode 2 variants (bytes 16-23) */
@@ -750,6 +757,13 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi, unsigned int flags,
                        void *data)
 {
+    /* CD_WRITE_LONG manages its own fine-grained locking inside
+     * obmafs3_cd_write_long — skip the blanket serialisation so
+     * writes to different CD images can overlap their hashing and
+     * ECC computations. */
+    if(cmd == OBMAFS3_IOC_CD_WRITE_LONG)
+        return obmafs3_fuse_ioctl_impl(path, cmd, arg, fi, flags, data);
+
     pthread_mutex_lock(&g_ctx->write_lock);
     int rc = obmafs3_fuse_ioctl_impl(path, cmd, arg, fi, flags, data);
     pthread_mutex_unlock(&g_ctx->write_lock);

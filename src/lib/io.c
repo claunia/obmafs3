@@ -246,7 +246,13 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         free(c);
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "pthread_key_create");
     }
-    pthread_mutex_init(&c->write_lock, NULL);
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&c->write_lock, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
 
     /* Refcount leaf cache buffer (separate from per-thread node_buf so
      * lookups don't clobber the traversal buffer; protected by

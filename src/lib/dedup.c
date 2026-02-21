@@ -2097,7 +2097,14 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     /* Get (or create) the dedup tree for this sector size.
      * When a persistent cache is provided and already has a valid
-     * header, skip the expensive disk read entirely. */
+     * header, skip the expensive disk read entirely.
+     *
+     * Lock for first-call setup that touches shared state (tree list,
+     * block init).  Uses recursive mutex — safe when the caller already
+     * holds the lock (e.g. ioctl path). */
+    int cold_setup = (!db_cache || !db_cache->hdr_cached || !db_cache->initialized);
+    if(cold_setup) pthread_mutex_lock(&ctx->write_lock);
+
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
     if(db_cache && db_cache->hdr_cached)
@@ -2108,7 +2115,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     else
     {
         rc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
-        if(rc != OBMAFS3_OK) return rc;
+        if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&ctx->write_lock); return rc; }
         if(db_cache)
         {
             db_cache->dedup_hdr     = dedup_hdr;
@@ -2136,7 +2143,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             db_local.std_blocks = 0;
             db_local.dirty      = 0;
             rc                  = dedup_block_init(ctx, &dedup_hdr, &db_local);
-            if(rc != OBMAFS3_OK) return rc;
+            if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&ctx->write_lock); return rc; }
             /* Migrate into the persistent cache struct */
             db_cache->data        = db_local.data;
             db_cache->block_lba   = db_local.block_lba;
@@ -2160,9 +2167,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     else
     {
         rc = dedup_block_init(ctx, &dedup_hdr, &db_local);
-        if(rc != OBMAFS3_OK) return rc;
+        if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&ctx->write_lock); return rc; }
         db = &db_local;
     }
+
+    if(cold_setup) pthread_mutex_unlock(&ctx->write_lock);
 
     /*
      * Pre-allocate a buffer for sector_map_entries.
@@ -2190,11 +2199,17 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     obmafs3_dedup_warmup_wait(ctx);
 
     /* Lazy fallback: if warmup wasn't started (e.g. mkobmafs path),
-     * create the node cache and key set inline. */
+     * create the node cache and key set inline.  Double-check under
+     * the lock to avoid creating two caches concurrently. */
     if(!ctx->dedup_node_cache)
     {
-        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
-        if(nc) ctx->dedup_node_cache = nc;
+        pthread_mutex_lock(&ctx->write_lock);
+        if(!ctx->dedup_node_cache)
+        {
+            struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
+            if(nc) ctx->dedup_node_cache = nc;
+        }
+        pthread_mutex_unlock(&ctx->write_lock);
     }
 
     const uint8_t *data = (const uint8_t *)buf;
@@ -2307,6 +2322,14 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             }
         }
     }
+
+    /*
+     * === CRITICAL SECTION ===
+     * From here through Phase 2 we touch shared mutable state (node
+     * cache, key set inserts, B+Tree, bitmap, dedup block store).
+     * Hashing, sorting and key-set reads above were lock-free.
+     */
+    pthread_mutex_lock(&ctx->write_lock);
 
     /*
      * Leaf prefetch: use the pre-computed hashes to find target leaf
@@ -2559,6 +2582,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     clock_gettime(CLOCK_MONOTONIC, &t_sme_end);
 
+    pthread_mutex_unlock(&ctx->write_lock);
+    /* === END CRITICAL SECTION === */
+
     free(sme_buf);
 
     /* Print timing instrumentation */
@@ -2607,7 +2633,8 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     return rc;
 
 out:
-    /* Error path — wait for bg, then flush dedup state */
+    /* Error path — wait for bg, then flush dedup state.
+     * write_lock is held (goto out is reachable only from Phase 1). */
     if(db_cache && db_cache->pending_job)
     {
         int bg_rc = dedup_bg_wait(ctx, &db_cache->pending_job);
@@ -2624,6 +2651,8 @@ out:
 
     /* Keep the cached header in sync */
     if(db_cache) db_cache->dedup_hdr = dedup_hdr;
+
+    pthread_mutex_unlock(&ctx->write_lock);
 
     free(sme_buf);
     if(db_is_cached)
