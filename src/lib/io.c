@@ -246,17 +246,11 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         free(c);
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "pthread_key_create");
     }
-    {
-        pthread_mutexattr_t attr;
-        pthread_mutexattr_init(&attr);
-        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&c->write_lock, &attr);
-        pthread_mutexattr_destroy(&attr);
-    }
+    pthread_rwlock_init(&c->tree_lock, NULL);
 
     /* Refcount leaf cache buffer (separate from per-thread node_buf so
      * lookups don't clobber the traversal buffer; protected by
-     * write_lock since refcount ops are write-side only). */
+     * tree_lock since refcount ops are write-side only). */
     c->rc_leaf_buf   = malloc((size_t)c->sb.block_size);
     c->rc_leaf_valid = 0;
 
@@ -264,7 +258,7 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     {
         free(c->rc_leaf_buf);
         pthread_key_delete(c->tls_key);
-        pthread_mutex_destroy(&c->write_lock);
+        pthread_rwlock_destroy(&c->tree_lock);
         close(fd);
         free(c);
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
@@ -592,7 +586,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
         }
     }
     pthread_key_delete(ctx->tls_key);
-    pthread_mutex_destroy(&ctx->write_lock);
+    pthread_rwlock_destroy(&ctx->tree_lock);
 
     free(ctx->rc_leaf_buf);
     if(ctx->bitmap) free(ctx->bitmap);

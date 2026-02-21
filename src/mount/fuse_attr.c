@@ -259,41 +259,41 @@ static int obmafs3_fuse_release_impl(const char *path, struct fuse_file_info *fi
 
 int obmafs3_fuse_utimens(const char *path, const struct timespec ts[2], struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_utimens_impl(path, ts, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_chmod_impl(path, mode, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_chown_impl(path, uid, gid, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_flush_impl(path, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_release_impl(path, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
@@ -303,7 +303,7 @@ int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi)
  * Populates @p stbuf with block size, total/free block counts, and
  * the number of allocated inodes.
  */
-int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
+static int obmafs3_fuse_statfs_impl(const char *path, struct statvfs *stbuf)
 {
     (void)path;
 
@@ -336,7 +336,7 @@ int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
  * @c STATX_ATTR_COMPRESSED flag for media image files stored with
  * compression.
  */
-int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi)
+static int obmafs3_fuse_statx_impl(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi)
 {
     struct inode_record  inode;
     struct inode_record *ip;
@@ -403,4 +403,20 @@ int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxb
     if(ip->file_type == kFileTypeMediaImage && g_ctx->compression) stxbuf->stx_attributes |= STATX_ATTR_COMPRESSED;
 
     return 0;
+}
+
+int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_statfs_impl(path, stbuf);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
+}
+
+int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_statx_impl(path, flags, mask, stxbuf, fi);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
 }

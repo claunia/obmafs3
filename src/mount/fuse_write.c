@@ -33,18 +33,9 @@ static int obmafs3_fuse_create_impl(const char *path, mode_t mode, struct fuse_f
     /* Allocate a new inode ID */
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
 
-    /* Create the catalog entry */
-    struct catalog_record new_cat;
-    memset(&new_cat, 0, sizeof(new_cat));
-    new_cat.inode_id       = new_inode_id;
-    new_cat.parent_id      = parent_id;
-    new_cat.directory_flag = 0;
-    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
-
-    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-
-    /* Create the inode */
+    /* Create the inode FIRST — an orphan inode (no catalog ref) is
+     * harmless and can be cleaned up by fsck, whereas a dangling
+     * catalog entry (no inode) causes -EIO on every access. */
     uint64_t             now  = (uint64_t)time(NULL);
     struct fuse_context *fctx = fuse_get_context();
 
@@ -69,6 +60,22 @@ static int obmafs3_fuse_create_impl(const char *path, mode_t mode, struct fuse_f
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
     if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+    /* Now create the catalog entry */
+    struct catalog_record new_cat;
+    memset(&new_cat, 0, sizeof(new_cat));
+    new_cat.inode_id       = new_inode_id;
+    new_cat.parent_id      = parent_id;
+    new_cat.directory_flag = 0;
+    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
+
+    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
+    if(rc != OBMAFS3_OK)
+    {
+        /* Roll back the inode to avoid an orphan */
+        obmafs3_inode_delete(g_ctx, new_inode_id);
+        FUSE_RETURN(-EIO, "");
+    }
 
     struct fuse_file_ctx *ffctx = calloc(1, sizeof(*ffctx));
     if(!ffctx) FUSE_RETURN(-ENOMEM, "");
@@ -253,7 +260,19 @@ static int obmafs3_fuse_link_impl(const char *oldpath, const char *newpath)
     if(rc == OBMAFS3_OK) FUSE_RETURN(-EEXIST, "");
     if(rc != OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-EIO, "");
 
-    /* Create new catalog entry pointing to the same inode */
+    /* Increment the reference count FIRST — a ref_count that is too
+     * high is harmless (fsck can fix it), whereas a dangling catalog
+     * entry (ref_count not bumped, then catalog_insert fails) causes
+     * -EIO on every access. */
+    struct inode_record inode;
+    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+    inode.ref_count++;
+    rc = obmafs3_inode_put(g_ctx, &inode);
+    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+    /* Now create the catalog entry */
     struct catalog_record new_cat;
     memset(&new_cat, 0, sizeof(new_cat));
     new_cat.inode_id       = cat_entry.inode_id;
@@ -262,16 +281,13 @@ static int obmafs3_fuse_link_impl(const char *oldpath, const char *newpath)
     strncpy(new_cat.name, new_name, sizeof(new_cat.name) - 1);
 
     rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-
-    /* Increment the reference count */
-    struct inode_record inode;
-    rc = obmafs3_inode_get(g_ctx, cat_entry.inode_id, &inode);
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-
-    inode.ref_count++;
-    rc = obmafs3_inode_put(g_ctx, &inode);
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+    if(rc != OBMAFS3_OK)
+    {
+        /* Roll back the ref_count bump */
+        inode.ref_count--;
+        obmafs3_inode_put(g_ctx, &inode);
+        FUSE_RETURN(-EIO, "");
+    }
 
     return 0;
 }
@@ -300,18 +316,9 @@ static int obmafs3_fuse_symlink_impl(const char *target, const char *linkpath)
     /* Allocate a new inode ID */
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
 
-    /* Create the catalog entry */
-    struct catalog_record new_cat;
-    memset(&new_cat, 0, sizeof(new_cat));
-    new_cat.inode_id       = new_inode_id;
-    new_cat.parent_id      = parent_id;
-    new_cat.directory_flag = 0;
-    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
-
-    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-
-    /* Create the inode */
+    /* Create the inode FIRST — an orphan inode (no catalog ref) is
+     * harmless and can be cleaned up by fsck, whereas a dangling
+     * catalog entry (no inode) causes -EIO on every access. */
     uint64_t             now  = (uint64_t)time(NULL);
     struct fuse_context *fctx = fuse_get_context();
 
@@ -336,6 +343,22 @@ static int obmafs3_fuse_symlink_impl(const char *target, const char *linkpath)
     rc = obmafs3_inode_put(g_ctx, &new_inode);
     if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
+    /* Now create the catalog entry */
+    struct catalog_record new_cat;
+    memset(&new_cat, 0, sizeof(new_cat));
+    new_cat.inode_id       = new_inode_id;
+    new_cat.parent_id      = parent_id;
+    new_cat.directory_flag = 0;
+    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
+
+    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
+    if(rc != OBMAFS3_OK)
+    {
+        /* Roll back the inode to avoid an orphan */
+        obmafs3_inode_delete(g_ctx, new_inode_id);
+        FUSE_RETURN(-EIO, "");
+    }
+
     return 0;
 }
 
@@ -344,7 +367,7 @@ static int obmafs3_fuse_symlink_impl(const char *target, const char *linkpath)
  *
  * Reads the symlink target from the inode's file data into @p buf.
  */
-int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
+static int obmafs3_fuse_readlink_impl(const char *path, char *buf, size_t size)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -373,6 +396,14 @@ int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
 
     buf[to_read] = '\0';
     return 0;
+}
+
+int obmafs3_fuse_readlink(const char *path, char *buf, size_t size)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_readlink_impl(path, buf, size);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
 }
 
 /**
@@ -668,9 +699,9 @@ static int obmafs3_fuse_rename_impl(const char *oldpath, const char *newpath, un
 
 int obmafs3_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_create_impl(path, mode, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
@@ -680,7 +711,7 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
 
     /* Media-image writes through an open file handle use a narrower
      * lock scope: hashing, sorting and key-set checks run lock-free
-     * while obmafs3_write_media_image_data acquires write_lock only
+     * while obmafs3_write_media_image_data acquires tree_lock only
      * around the tree/disk critical section.  This lets FUSE serve
      * writes to multiple images in parallel. */
     if(ffctx && ffctx->sector_size > 0)
@@ -695,48 +726,48 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
     }
 
     /* Non-media writes (or media without open file handle): full lock */
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_write_impl(path, buf, size, offset, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_truncate(const char *path, off_t newsize, struct fuse_file_info *fi)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_truncate_impl(path, newsize, fi);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_link(const char *oldpath, const char *newpath)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_link_impl(oldpath, newpath);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_symlink(const char *target, const char *linkpath)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_symlink_impl(target, linkpath);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_unlink(const char *path)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_unlink_impl(path);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_rename(const char *oldpath, const char *newpath, unsigned int flags)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_rename_impl(oldpath, newpath, flags);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }

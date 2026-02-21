@@ -13,7 +13,7 @@
  * Fills @p stbuf with the stat information for @p path.  Uses the
  * cached inode from the file handle when available.
  */
-int obmafs3_fuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
+static int obmafs3_fuse_getattr_impl(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
 {
     struct inode_record  inode;
     struct inode_record *ip;
@@ -85,8 +85,8 @@ int obmafs3_fuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_
  * Retrieves all catalog entries under the directory identified by
  * @p path and feeds them to the FUSE filler callback.
  */
-int obmafs3_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi,
-                         enum fuse_readdir_flags flags)
+static int obmafs3_fuse_readdir_impl(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
+                                     struct fuse_file_info *fi, enum fuse_readdir_flags flags)
 {
     struct catalog_record *entries = NULL;
     uint32_t               count   = 0;
@@ -140,7 +140,7 @@ int obmafs3_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
  * (@c fuse_file_ctx), and stores it in the file handle.  Detects
  * media image files and records their sector size.
  */
-int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
+static int obmafs3_fuse_open_impl(const char *path, struct fuse_file_info *fi)
 {
     uint64_t              parent_id;
     const char           *name;
@@ -181,7 +181,7 @@ int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
  * @p path.  Uses the cached inode from the file handle when available.
  * Dispatches to the media image read path for media images.
  */
-int obmafs3_fuse_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct fuse_file_ctx *ffctx = fi ? (struct fuse_file_ctx *)(uintptr_t)fi->fh : NULL;
     struct inode_record   inode;
@@ -229,4 +229,41 @@ int obmafs3_fuse_read(const char *path, char *buf, size_t size, off_t offset, st
     if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     return (int)size;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Thread-safe wrappers — take shared (read) lock on tree_lock        */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_fuse_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_getattr_impl(path, stbuf, fi);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
+}
+
+int obmafs3_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi,
+                         enum fuse_readdir_flags flags)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_readdir_impl(path, buf, filler, offset, fi, flags);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
+}
+
+int obmafs3_fuse_open(const char *path, struct fuse_file_info *fi)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_open_impl(path, fi);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
+}
+
+int obmafs3_fuse_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_read_impl(path, buf, size, offset, fi);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
 }

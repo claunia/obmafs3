@@ -263,6 +263,7 @@ struct dedup_node_cache
     uint32_t                 dirty_count; /**< Number of entries in dirty_list */
     uint32_t                 dirty_cap;   /**< Allocated capacity of dirty_list */
     uint32_t                 writes_since_flush; /**< Writes since last node flush */
+    pthread_mutex_t          lock;        /**< Serialises concurrent cache access */
 };
 
 #define DEDUP_CACHE_INIT_CAP        2048 /* power of 2 */
@@ -291,6 +292,7 @@ static struct dedup_node_cache *dedup_cache_create(size_t block_size)
         return NULL;
     }
     nc->dirty_count = 0;
+    pthread_mutex_init(&nc->lock, NULL);
     return nc;
 }
 
@@ -372,22 +374,43 @@ static int cache_grow(struct dedup_node_cache *nc)
  */
 static int dedup_cache_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t bsz)
 {
+    /* Fast path: cache hit under the cache lock. */
+    pthread_mutex_lock(&nc->lock);
     struct dedup_cache_slot *s = cache_find_slot(nc, lba);
     if(s)
     {
         memcpy(buf, s->buf, nc->block_size);
+        pthread_mutex_unlock(&nc->lock);
         return OBMAFS3_OK;
     }
+    pthread_mutex_unlock(&nc->lock);
 
-    /* Cache miss — read from disk */
+    /* Cache miss — read from disk outside the cache lock so
+     * concurrent readers can proceed in parallel. */
     int rc = obmafs3_block_read(ctx, lba, buf, bsz);
     if(rc != OBMAFS3_OK) return rc;
+
+    /* Re-acquire the lock and insert into the cache.
+     * Re-check first: another thread may have inserted this LBA
+     * while we were doing disk I/O. */
+    pthread_mutex_lock(&nc->lock);
+    s = cache_find_slot(nc, lba);
+    if(s)
+    {
+        /* Another thread already cached it — nothing to do. */
+        pthread_mutex_unlock(&nc->lock);
+        return OBMAFS3_OK;
+    }
 
     /* Grow the table when >= 75 % full */
     if(nc->count * 4 >= nc->capacity * 3)
     {
         rc = cache_grow(nc);
-        if(rc != OBMAFS3_OK) return OBMAFS3_OK; /* tolerate: data is in buf already */
+        if(rc != OBMAFS3_OK)
+        {
+            pthread_mutex_unlock(&nc->lock);
+            return OBMAFS3_OK; /* tolerate: data is in buf already */
+        }
     }
 
     uint32_t mask = nc->capacity - 1;
@@ -408,6 +431,7 @@ static int dedup_cache_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx
             break;
         }
     }
+    pthread_mutex_unlock(&nc->lock);
     return OBMAFS3_OK;
 }
 
@@ -564,6 +588,7 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
 static void dedup_cache_free(struct dedup_node_cache *nc)
 {
     if(!nc) return;
+    pthread_mutex_destroy(&nc->lock);
     for(uint32_t i = 0; i < nc->capacity; i++) free(nc->slots[i].buf); /* free(NULL) is safe */
     free(nc->slots);
     free(nc->dirty_list);
@@ -895,7 +920,7 @@ static int dedup_find_leaf_lba(struct obmafs3_ctx *ctx, const struct btree_heade
  * sequential disk reads instead of N random seeks.
  *
  * Clears the buffer afterwards.
- * Must be called under write_lock (or single-threaded context).
+ * Must be called under tree_lock (or single-threaded context).
  */
 static int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
                          struct btree_header *dedup_hdr, uint64_t dedup_hdr_lba)
@@ -1474,7 +1499,7 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
  * then binary-search among sorted dedup_entry records.
  *
  * When the node cache is available, traversal goes through the cache
- * under write_lock to guarantee a consistent view even when dirty
+ * under tree_lock to guarantee a consistent view even when dirty
  * nodes have not yet been flushed to disk.
  */
 int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t hash,
@@ -1485,12 +1510,20 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
     struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
     int use_cache = (nc != NULL);
 
-    if(use_cache) pthread_mutex_lock(&ctx->write_lock);
+    /* Callers hold tree_lock (rdlock from FUSE readers, wrlock from
+     * writers), so we must NOT take tree_lock here — that would
+     * deadlock.  The cache has its own internal mutex for thread
+     * safety; the tree_lock already guarantees tree-structure
+     * stability. */
 
     /* Check pending insert buffers first — O(1), no disk I/O.
      * Entries deferred by the write path live in the active buffer;
      * entries being drained by the housekeeping thread live in the
-     * draining buffer.  Check both. */
+     * draining buffer.  Check both.
+     *
+     * These accesses are safe because the housekeeping thread only
+     * swaps the pending/draining pointers under wrlock, and readers
+     * hold rdlock which prevents that swap. */
     {
         const struct dedup_pending_buf *pb =
             (const struct dedup_pending_buf *)ctx->dedup_pending;
@@ -1500,7 +1533,6 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
             if(pe)
             {
                 *entry = *pe;
-                if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
                 return OBMAFS3_OK;
             }
         }
@@ -1512,7 +1544,6 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
             if(pe)
             {
                 *entry = *pe;
-                if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
                 return OBMAFS3_OK;
             }
         }
@@ -1598,7 +1629,6 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
     }
 
 done:
-    if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
     return result;
 }
 
@@ -2450,7 +2480,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      * block init).  Uses recursive mutex — safe when the caller already
      * holds the lock (e.g. ioctl path). */
     int cold_setup = (!db_cache || !db_cache->hdr_cached || !db_cache->initialized);
-    if(cold_setup) pthread_mutex_lock(&ctx->write_lock);
+    if(cold_setup) pthread_rwlock_wrlock(&ctx->tree_lock);
 
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
@@ -2462,7 +2492,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     else
     {
         rc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
-        if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&ctx->write_lock); return rc; }
+        if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&ctx->tree_lock); return rc; }
         if(db_cache)
         {
             db_cache->dedup_hdr     = dedup_hdr;
@@ -2490,7 +2520,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             db_local.std_blocks = 0;
             db_local.dirty      = 0;
             rc                  = dedup_block_init(ctx, &dedup_hdr, &db_local);
-            if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&ctx->write_lock); return rc; }
+            if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&ctx->tree_lock); return rc; }
             /* Migrate into the persistent cache struct */
             db_cache->data        = db_local.data;
             db_cache->block_lba   = db_local.block_lba;
@@ -2514,11 +2544,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     else
     {
         rc = dedup_block_init(ctx, &dedup_hdr, &db_local);
-        if(rc != OBMAFS3_OK) { pthread_mutex_unlock(&ctx->write_lock); return rc; }
+        if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&ctx->tree_lock); return rc; }
         db = &db_local;
     }
 
-    if(cold_setup) pthread_mutex_unlock(&ctx->write_lock);
+    if(cold_setup) pthread_rwlock_unlock(&ctx->tree_lock);
 
     /*
      * Pre-allocate a buffer for sector_map_entries.
@@ -2550,13 +2580,13 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      * the lock to avoid creating two caches concurrently. */
     if(!ctx->dedup_node_cache)
     {
-        pthread_mutex_lock(&ctx->write_lock);
+        pthread_rwlock_wrlock(&ctx->tree_lock);
         if(!ctx->dedup_node_cache)
         {
             struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
             if(nc) ctx->dedup_node_cache = nc;
         }
-        pthread_mutex_unlock(&ctx->write_lock);
+        pthread_rwlock_unlock(&ctx->tree_lock);
     }
 
     const uint8_t *data = (const uint8_t *)buf;
@@ -2679,7 +2709,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      * Hashing, sorting and key-set reads above were lock-free.
      */
     clock_gettime(CLOCK_MONOTONIC, &t_lock_start);
-    pthread_mutex_lock(&ctx->write_lock);
+    pthread_rwlock_wrlock(&ctx->tree_lock);
     clock_gettime(CLOCK_MONOTONIC, &t_lock_end);
 
     clock_gettime(CLOCK_MONOTONIC, &t_prefetch_start);
@@ -2984,7 +3014,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     clock_gettime(CLOCK_MONOTONIC, &t_sme_end);
 
-    pthread_mutex_unlock(&ctx->write_lock);
+    pthread_rwlock_unlock(&ctx->tree_lock);
     /* === END CRITICAL SECTION === */
 
     free(sme_buf);
@@ -3040,7 +3070,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
 out:
     /* Error path — wait for bg, then flush dedup state.
-     * write_lock is held (goto out is reachable only from Phase 1). */
+     * tree_lock is held (goto out is reachable only from Phase 1). */
     if(db_cache && db_cache->pending_job)
     {
         int bg_rc = dedup_bg_wait(ctx, &db_cache->pending_job);
@@ -3058,7 +3088,7 @@ out:
     /* Keep the cached header in sync */
     if(db_cache) db_cache->dedup_hdr = dedup_hdr;
 
-    pthread_mutex_unlock(&ctx->write_lock);
+    pthread_rwlock_unlock(&ctx->tree_lock);
 
     free(sme_buf);
     if(db_is_cached)
@@ -3193,7 +3223,10 @@ void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx)
 {
     if(!ctx || !ctx->dedup_node_cache) return;
-    dedup_cache_free((struct dedup_node_cache *)ctx->dedup_node_cache);
+    struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    /* Flush any dirty entries before releasing the cache. */
+    dedup_cache_flush(nc, ctx);
+    dedup_cache_free(nc);
     ctx->dedup_node_cache = NULL;
 }
 
@@ -3760,7 +3793,7 @@ int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
 /* ------------------------------------------------------------------ */
 
 /** Maximum entries per housekeeping batch.
- *  Kept small so the write_lock is held for only a few milliseconds
+ *  Kept small so the tree_lock is held for only a few milliseconds
  *  per batch — avoiding long stalls on the write path. */
 #define HOUSEKEEPING_BATCH_SIZE  32
 
@@ -3774,12 +3807,12 @@ int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
  * Lock-free B+Tree traversal to find the leaf LBA for a given hash.
  *
  * Uses direct pread() — does NOT touch the shared node cache.
- * Safe to call without write_lock held because:
+ * Safe to call without tree_lock held because:
  *  - In steady state only the housekeeping thread modifies the tree
  *    (the write path uses the deferred pending-buffer insert).
  *  - Even if a concurrent split rearranges nodes, we only use the
  *    result to warm the kernel page cache; the actual insert under
- *    write_lock re-traverses via the node cache.
+ *    tree_lock re-traverses via the node cache.
  */
 static int dedup_find_leaf_lba_direct(int fd, uint64_t root_lba,
                                       uint64_t hash, uint64_t *out_leaf_lba,
@@ -3831,10 +3864,10 @@ static int dedup_find_leaf_lba_direct(int fd, uint64_t root_lba,
 /**
  * Pre-warm the kernel page cache for a batch of entries.
  *
- * Called WITHOUT write_lock.  Walks the B+Tree using direct pread()
+ * Called WITHOUT tree_lock.  Walks the B+Tree using direct pread()
  * to find target leaf LBAs, issues posix_fadvise(WILLNEED), then
  * reads them into a throwaway buffer so the data sits in the page
- * cache.  The subsequent drain_batch under write_lock will find these
+ * cache.  The subsequent drain_batch under tree_lock will find these
  * pages already present and avoid blocking disk I/O.
  *
  * @param ctx       Filesystem context (only ctx->fd and ctx->sb used).
@@ -3897,7 +3930,7 @@ static void housekeeping_prefetch_batch(struct obmafs3_ctx *ctx,
  * Assumes the caller has already called housekeeping_prefetch_batch()
  * WITHOUT the lock so that relevant tree nodes are in the kernel page
  * cache.  This function only does the actual B+Tree inserts (using
- * the node cache) and must be called under write_lock.
+ * the node cache) and must be called under tree_lock.
  *
  * @param ctx      Filesystem context.
  * @param entries  Sorted array of entries to insert.
@@ -3942,7 +3975,7 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx,
  *
  * Waits for warmup to complete, then continuously drains the pending
  * buffer into the B+Tree in small batches.  Each batch acquires
- * write_lock for the actual B+Tree inserts and releases it between
+ * tree_lock for the actual B+Tree inserts and releases it between
  * batches so the write path is never blocked for long.
  *
  * The thread swaps the active pending buffer to a "draining" pointer
@@ -3962,7 +3995,7 @@ static void *housekeeping_thread_func(void *arg)
     {
         /* --- check for work --- */
         int have_work = 0;
-        pthread_mutex_lock(&ctx->write_lock);
+        pthread_rwlock_wrlock(&ctx->tree_lock);
         {
             struct dedup_pending_buf *pb =
                 (struct dedup_pending_buf *)ctx->dedup_pending;
@@ -3988,7 +4021,7 @@ static void *housekeeping_thread_func(void *arg)
                 have_work = 1;
             }
         }
-        pthread_mutex_unlock(&ctx->write_lock);
+        pthread_rwlock_unlock(&ctx->tree_lock);
 
         if(!have_work)
         {
@@ -4036,14 +4069,14 @@ static void *housekeeping_thread_func(void *arg)
             /* Phase A — snapshot root LBA under a brief lock. */
             uint64_t root_lba = 0;
             {
-                pthread_mutex_lock(&ctx->write_lock);
+                pthread_rwlock_wrlock(&ctx->tree_lock);
                 struct btree_header hdr_snap;
                 uint64_t            hdr_lba_snap;
                 int rc = obmafs3_dedup_get_tree(ctx, drain->sector_size,
                                                 &hdr_snap, &hdr_lba_snap);
                 if(rc == OBMAFS3_OK)
                     root_lba = hdr_snap.root_node_lba;
-                pthread_mutex_unlock(&ctx->write_lock);
+                pthread_rwlock_unlock(&ctx->tree_lock);
             }
 
             /* Phase B — prefetch WITHOUT lock (direct pread). */
@@ -4052,7 +4085,7 @@ static void *housekeeping_thread_func(void *arg)
                                            sorted + off, batch);
 
             /* Phase C — insert under lock (page cache should be warm). */
-            pthread_mutex_lock(&ctx->write_lock);
+            pthread_rwlock_wrlock(&ctx->tree_lock);
             {
                 struct btree_header hdr;
                 uint64_t            hdr_lba;
@@ -4065,7 +4098,7 @@ static void *housekeeping_thread_func(void *arg)
                     if(rc == OBMAFS3_OK) total_inserted += batch;
                 }
             }
-            pthread_mutex_unlock(&ctx->write_lock);
+            pthread_rwlock_unlock(&ctx->tree_lock);
 
             /* Yield I/O to the write path between batches. */
             if(off + HOUSEKEEPING_BATCH_SIZE < extracted && !ctx->shutdown_requested)
@@ -4082,14 +4115,14 @@ static void *housekeeping_thread_func(void *arg)
 
 finish_drain:
         /* Release the draining buffer. */
-        pthread_mutex_lock(&ctx->write_lock);
+        pthread_rwlock_wrlock(&ctx->tree_lock);
         {
             struct dedup_pending_buf *old =
                 (struct dedup_pending_buf *)ctx->dedup_pending_draining;
             ctx->dedup_pending_draining = NULL;
             pending_free(old);
         }
-        pthread_mutex_unlock(&ctx->write_lock);
+        pthread_rwlock_unlock(&ctx->tree_lock);
     }
 
     fprintf(stderr, "[housekeeping] stopped\n");

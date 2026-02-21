@@ -31,18 +31,9 @@ static int obmafs3_fuse_mkdir_impl(const char *path, mode_t mode)
     /* Allocate a new inode ID */
     uint64_t new_inode_id = obmafs3_alloc_inode_id(g_ctx);
 
-    /* Create the catalog entry */
-    struct catalog_record new_cat;
-    memset(&new_cat, 0, sizeof(new_cat));
-    new_cat.inode_id       = new_inode_id;
-    new_cat.parent_id      = parent_id;
-    new_cat.directory_flag = 1;
-    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
-
-    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
-
-    /* Create the inode */
+    /* Create the inode FIRST — an orphan inode (no catalog ref) is
+     * harmless and can be cleaned up by fsck, whereas a dangling
+     * catalog entry (no inode) causes -EIO on every access. */
     uint64_t             now  = (uint64_t)time(NULL);
     struct fuse_context *fctx = fuse_get_context();
 
@@ -61,6 +52,22 @@ static int obmafs3_fuse_mkdir_impl(const char *path, mode_t mode)
 
     rc = obmafs3_inode_put(g_ctx, &new_inode);
     if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+    /* Now create the catalog entry */
+    struct catalog_record new_cat;
+    memset(&new_cat, 0, sizeof(new_cat));
+    new_cat.inode_id       = new_inode_id;
+    new_cat.parent_id      = parent_id;
+    new_cat.directory_flag = 1;
+    strncpy(new_cat.name, name, sizeof(new_cat.name) - 1);
+
+    rc = obmafs3_catalog_insert(g_ctx, &new_cat);
+    if(rc != OBMAFS3_OK)
+    {
+        /* Roll back the inode to avoid an orphan */
+        obmafs3_inode_delete(g_ctx, new_inode_id);
+        FUSE_RETURN(-EIO, "");
+    }
 
     return 0;
 }
@@ -113,16 +120,16 @@ static int obmafs3_fuse_rmdir_impl(const char *path)
 
 int obmafs3_fuse_mkdir(const char *path, mode_t mode)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_mkdir_impl(path, mode);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_rmdir(const char *path)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_rmdir_impl(path);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }

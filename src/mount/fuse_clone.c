@@ -87,8 +87,8 @@ ssize_t obmafs3_fuse_copy_file_range(const char *path_in, struct fuse_file_info 
                                      const char *path_out, struct fuse_file_info *fi_out, off_t offset_out, size_t size,
                                      int flags)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     ssize_t rc = obmafs3_fuse_copy_file_range_impl(path_in, fi_in, offset_in, path_out, fi_out, offset_out, size, flags);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }

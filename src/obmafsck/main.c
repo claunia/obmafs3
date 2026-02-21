@@ -6269,7 +6269,7 @@ int main(int argc, char *argv[])
         free(ctx);
         return 1;
     }
-    pthread_mutex_init(&ctx->write_lock, NULL);
+    pthread_rwlock_init(&ctx->tree_lock, NULL);
 
     /* Force lazy TLS allocation so the library has buffers to work with */
     struct obmafs3_thread_bufs *tb = obmafs3_get_thread_bufs(ctx);

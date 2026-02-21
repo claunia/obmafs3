@@ -76,7 +76,7 @@ struct obmafs3_ctx
     int                 compression;        ///< Non-zero to compress data blocks on write
     int                 zstd_level;         ///< ZSTD compression level (1-15)
     pthread_key_t       tls_key;            ///< Thread-local scratch buffers (obmafs3_thread_bufs)
-    pthread_mutex_t     write_lock;         ///< Serialises all write-side FUSE callbacks
+    pthread_rwlock_t    tree_lock;          ///< Serialises writers; readers take shared lock
     uint8_t            *rc_leaf_buf;        ///< Cached refcount B+Tree leaf node
     uint64_t            rc_leaf_lba;        ///< LBA of the cached refcount leaf
     uint64_t            rc_leaf_min;        ///< Smallest key in the cached leaf

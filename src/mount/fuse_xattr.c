@@ -146,7 +146,7 @@ static int is_image_file_type(uint8_t ft) { return ft == kFileTypeMediaImage || 
  * xattrs (@c "user.metadata.*").  Returns @c -ENODATA if the
  * attribute is not found or the file is not a media image.
  */
-int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_t size)
+static int obmafs3_fuse_getxattr_impl(const char *path, const char *name, char *value, size_t size)
 {
     int want_mediatag = is_mediatag_xattr(name);
     int want_metadata = is_metadata_xattr(name);
@@ -211,6 +211,14 @@ int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_
     if(size < vlen) FUSE_RETURN(-ERANGE, "");
     memcpy(value, meta_value, vlen);
     return (int)vlen;
+}
+
+int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_t size)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_getxattr_impl(path, name, value, size);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
 }
 
 /**
@@ -280,7 +288,7 @@ static int obmafs3_fuse_setxattr_impl(const char *path, const char *name, const 
  * media image file.  Returns the required buffer size when
  * @p size is zero.
  */
-int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
+static int obmafs3_fuse_listxattr_impl(const char *path, char *list, size_t size)
 {
     if(strcmp(path, "/") == 0) return 0;
 
@@ -362,6 +370,14 @@ int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
     return (int)total;
 }
 
+int obmafs3_fuse_listxattr(const char *path, char *list, size_t size)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_listxattr_impl(path, list, size);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
+}
+
 /**
  * FUSE callback: remove an extended attribute.
  *
@@ -420,16 +436,16 @@ static int obmafs3_fuse_removexattr_impl(const char *path, const char *name)
 
 int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_setxattr_impl(path, name, value, size, flags);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
 
 int obmafs3_fuse_removexattr(const char *path, const char *name)
 {
-    pthread_mutex_lock(&g_ctx->write_lock);
+    pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_removexattr_impl(path, name);
-    pthread_mutex_unlock(&g_ctx->write_lock);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
