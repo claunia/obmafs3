@@ -525,6 +525,12 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     pthread_mutex_destroy(&ctx->warmup_mutex);
     pthread_cond_destroy(&ctx->warmup_cond);
 
+    /* Persist the dedup key set to disk before freeing it.
+     * Must happen before bitmap/sb write since it allocates blocks
+     * and updates sb.keyset_lba / sb.keyset_blocks. */
+    if(ctx->bitmap && ctx->fd >= 0 && ctx->dedup_key_set)
+        obmafs3_dedup_keyset_save(ctx);
+
     /* Free the global dedup B+Tree node cache and key set. */
     obmafs3_dedup_node_cache_free(ctx);
     obmafs3_dedup_key_set_free(ctx);

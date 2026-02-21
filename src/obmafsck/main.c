@@ -413,6 +413,28 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
         }
     }
 
+    /* ---- keyset_lba / keyset_blocks ---- */
+    if(sb->keyset_lba != 0)
+    {
+        if(sb->keyset_lba >= total_blocks)
+        {
+            printf("    keyset_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
+                   sb->keyset_lba, total_blocks);
+            bad++;
+        }
+        if(sb->keyset_blocks == 0)
+        {
+            printf("    keyset_lba is set but keyset_blocks is 0\n");
+            bad++;
+        }
+        else if(sb->keyset_lba + sb->keyset_blocks > total_blocks)
+        {
+            printf("    keyset extends beyond filesystem (LBA %" PRIu64 " + %" PRIu64 " blocks > %" PRIu64 ")\n",
+                   sb->keyset_lba, sb->keyset_blocks, total_blocks);
+            bad++;
+        }
+    }
+
     /* ---- LBA range checks ---- */
     struct { const char *name; uint64_t lba; } lba_fields[] = {
         { "catalog_lba",       sb->catalog_lba       },
@@ -2882,6 +2904,13 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     /* Bitmap blocks */
     PROGRESS("bitmap blocks");
     for(uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++) MARK(ctx->sb.bitmap_lba + i);
+
+    /* Keyset blocks */
+    if(ctx->sb.keyset_lba != 0 && ctx->sb.keyset_blocks != 0)
+    {
+        PROGRESS("keyset blocks");
+        for(uint64_t i = 0; i < ctx->sb.keyset_blocks; i++) MARK(ctx->sb.keyset_lba + i);
+    }
 
     /* Backup superblock at the last block */
     MARK(total_blocks - 1);

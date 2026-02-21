@@ -245,6 +245,8 @@ int  obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_si
 void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache);
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx);
+int  obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx);
+int  obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_warmup_start(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_warmup_wait(struct obmafs3_ctx *ctx);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record *inode, struct sector_map_cache *cache);

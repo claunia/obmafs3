@@ -2830,6 +2830,227 @@ void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Persisted dedup key set (save / load)                              */
+/* ------------------------------------------------------------------ */
+
+/** On-disk header for the persisted key set extent. */
+#define KEYSET_PERSIST_MAGIC 0x53594B44444E4F4DULL /* "MONDKEYS" LE */
+
+struct __attribute__((packed)) keyset_persist_header
+{
+    uint64_t magic;      /**< KEYSET_PERSIST_MAGIC */
+    uint64_t count;      /**< Number of uint64_t keys following this header */
+    uint64_t checksum;   /**< XXH64 of the packed key array (count * 8 bytes) */
+};
+
+/**
+ * Persist the in-memory dedup key set to a contiguous extent on disk.
+ *
+ * Packs all non-empty keys into a flat uint64_t array, prepends a
+ * small header with magic + count + XXH64 checksum, and writes the
+ * result to contiguously allocated blocks.  Updates
+ * ctx->sb.keyset_lba / keyset_blocks so the next superblock write
+ * records the location.
+ *
+ * If a previous keyset extent exists its blocks are freed first.
+ *
+ * @param ctx  Filesystem context (must have bitmap + fd).
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || !ctx->dedup_key_set || !ctx->bitmap || ctx->fd < 0)
+        return OBMAFS3_ERR_INVAL;
+
+    struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+    if(ks->count == 0)
+    {
+        /* Nothing to persist — free old extent if any. */
+        if(ctx->sb.keyset_lba != 0 && ctx->sb.keyset_blocks != 0)
+            obmafs3_free_blocks(ctx, ctx->sb.keyset_lba, ctx->sb.keyset_blocks);
+        ctx->sb.keyset_lba    = 0;
+        ctx->sb.keyset_blocks = 0;
+        return OBMAFS3_OK;
+    }
+
+    /* Pack non-empty keys into a contiguous array. */
+    uint64_t *packed = malloc((size_t)ks->count * sizeof(uint64_t));
+    if(!packed) return OBMAFS3_ERR_NOMEM;
+
+    uint32_t n = 0;
+    for(uint32_t i = 0; i < ks->capacity; i++)
+    {
+        if(ks->keys[i] != KEYSET_EMPTY)
+            packed[n++] = ks->keys[i];
+    }
+
+    /* Build header. */
+    struct keyset_persist_header hdr;
+    hdr.magic    = KEYSET_PERSIST_MAGIC;
+    hdr.count    = n;
+    hdr.checksum = obmafs3_checksum_xxh64(packed, (size_t)n * sizeof(uint64_t));
+
+    /* Compute total bytes and number of blocks needed. */
+    size_t   payload_bytes  = sizeof(hdr) + (size_t)n * sizeof(uint64_t);
+    uint64_t block_size     = ctx->sb.block_size;
+    uint64_t needed_blocks  = (payload_bytes + block_size - 1) / block_size;
+
+    /* Free old extent if present. */
+    if(ctx->sb.keyset_lba != 0 && ctx->sb.keyset_blocks != 0)
+        obmafs3_free_blocks(ctx, ctx->sb.keyset_lba, ctx->sb.keyset_blocks);
+
+    /* Allocate contiguous blocks. */
+    uint64_t start_lba = 0;
+    int rc = obmafs3_alloc_blocks(ctx, needed_blocks, &start_lba);
+    if(rc != OBMAFS3_OK)
+    {
+        free(packed);
+        ctx->sb.keyset_lba    = 0;
+        ctx->sb.keyset_blocks = 0;
+        return rc;
+    }
+
+    /* Write the header + packed keys to disk using block-aligned I/O.
+     * Allocate a zeroed buffer covering all blocks so the tail is padded. */
+    size_t   buf_size = (size_t)(needed_blocks * block_size);
+    uint8_t *buf      = calloc(1, buf_size);
+    if(!buf)
+    {
+        obmafs3_free_blocks(ctx, start_lba, needed_blocks);
+        free(packed);
+        ctx->sb.keyset_lba    = 0;
+        ctx->sb.keyset_blocks = 0;
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    memcpy(buf, &hdr, sizeof(hdr));
+    memcpy(buf + sizeof(hdr), packed, (size_t)n * sizeof(uint64_t));
+    free(packed);
+
+    /* Write each block. */
+    for(uint64_t i = 0; i < needed_blocks; i++)
+    {
+        rc = obmafs3_block_write(ctx, start_lba + i,
+                                 buf + (size_t)(i * block_size),
+                                 (size_t)block_size);
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            obmafs3_free_blocks(ctx, start_lba, needed_blocks);
+            ctx->sb.keyset_lba    = 0;
+            ctx->sb.keyset_blocks = 0;
+            return rc;
+        }
+    }
+    free(buf);
+
+    ctx->sb.keyset_lba    = start_lba;
+    ctx->sb.keyset_blocks = needed_blocks;
+
+    fprintf(stderr, "[dedup-keyset] persisted %u keys (%" PRIu64 " blocks at LBA %" PRIu64 ")\n",
+            n, needed_blocks, start_lba);
+
+    return OBMAFS3_OK;
+}
+
+/**
+ * Load a persisted dedup key set from disk.
+ *
+ * Reads the contiguous extent at ctx->sb.keyset_lba, validates the
+ * header (magic + XXH64 checksum), and bulk-inserts all keys into a
+ * freshly created key set.
+ *
+ * @param ctx  Filesystem context.
+ * @return @c OBMAFS3_OK on success (key set stored in ctx->dedup_key_set),
+ *         or an error code on failure (caller should fall back to tree scan).
+ */
+int obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || ctx->sb.keyset_lba == 0 || ctx->sb.keyset_blocks == 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    uint64_t block_size    = ctx->sb.block_size;
+    uint64_t needed_blocks = ctx->sb.keyset_blocks;
+    size_t   buf_size      = (size_t)(needed_blocks * block_size);
+
+    uint8_t *buf = malloc(buf_size);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    /* Read all blocks. */
+    for(uint64_t i = 0; i < needed_blocks; i++)
+    {
+        int rc = obmafs3_block_read(ctx, ctx->sb.keyset_lba + i,
+                                    buf + (size_t)(i * block_size),
+                                    (size_t)block_size);
+        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+    }
+
+    /* Validate header. */
+    if(buf_size < sizeof(struct keyset_persist_header))
+    { free(buf); return OBMAFS3_ERR_INVAL; }
+
+    struct keyset_persist_header hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+
+    if(hdr.magic != KEYSET_PERSIST_MAGIC)
+    {
+        fprintf(stderr, "[dedup-keyset] bad magic in persisted keyset — falling back to tree scan\n");
+        free(buf);
+        return OBMAFS3_ERR_BADMAGIC;
+    }
+
+    /* Sanity-check count fits in the extent. */
+    size_t payload_size = (size_t)hdr.count * sizeof(uint64_t);
+    if(sizeof(hdr) + payload_size > buf_size)
+    {
+        fprintf(stderr, "[dedup-keyset] persisted keyset count %" PRIu64 " overflows extent\n", hdr.count);
+        free(buf);
+        return OBMAFS3_ERR_INVAL;
+    }
+
+    /* Verify checksum. */
+    const uint8_t *key_data = buf + sizeof(hdr);
+    uint64_t computed = obmafs3_checksum_xxh64(key_data, payload_size);
+    if(computed != hdr.checksum)
+    {
+        fprintf(stderr, "[dedup-keyset] checksum mismatch in persisted keyset — falling back to tree scan\n");
+        free(buf);
+        return OBMAFS3_ERR_CHECKSUM;
+    }
+
+    /* Create key set and bulk-insert. */
+    /* Choose initial capacity: next power-of-2 >= count / 0.75 */
+    uint32_t min_cap = (uint32_t)((hdr.count * 4 + 2) / 3); /* ceil(count / 0.75) */
+    uint32_t cap = KEYSET_INIT_CAP;
+    while(cap < min_cap) cap *= 2;
+
+    struct dedup_key_set *ks = calloc(1, sizeof(*ks));
+    if(!ks) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    ks->capacity = cap;
+    ks->keys     = calloc(cap, sizeof(uint64_t));
+    if(!ks->keys) { free(ks); free(buf); return OBMAFS3_ERR_NOMEM; }
+
+    const uint64_t *keys = (const uint64_t *)key_data;
+    uint32_t mask = cap - 1;
+    for(uint64_t i = 0; i < hdr.count; i++)
+    {
+        uint64_t key = keys[i];
+        if(key == KEYSET_EMPTY) continue;
+        uint32_t idx = keyset_hash(key, mask);
+        for(uint32_t j = 0; j < cap; j++)
+        {
+            uint32_t s = (idx + j) & mask;
+            if(ks->keys[s] == KEYSET_EMPTY) { ks->keys[s] = key; ks->count++; break; }
+            if(ks->keys[s] == key) break; /* duplicate */
+        }
+    }
+    free(buf);
+
+    ctx->dedup_key_set = ks;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Background dedup key set warmup                                    */
 /* ------------------------------------------------------------------ */
 
@@ -2855,43 +3076,62 @@ static void *warmup_thread_func(void *arg)
         if(nc) ctx->dedup_node_cache = nc;
     }
 
-    /* Create the key set. */
-    struct dedup_key_set *ks = keyset_create();
-    if(!ks) goto done;
-    ctx->dedup_key_set = ks;
-
-    /* Seed from any already-cached nodes (may be 0). */
-    keyset_seed_from_cache(ks, (const struct dedup_node_cache *)ctx->dedup_node_cache);
-
-    /* Read the dedup tree list and warm up every tree. */
-    struct tree_list_header list_hdr;
-    struct tree_list_entry *entries = NULL;
-    uint64_t                count   = 0;
-    int rc = dedup_tree_list_read(ctx, &list_hdr, &entries, &count);
-    if(rc == OBMAFS3_OK && count > 0)
+    /* Try to load the persisted key set from disk (fast path).
+     * If keyset_lba is 0 the FS has no persisted keyset yet — treat as
+     * stale and fall through to the full tree scan. */
+    int loaded = 0;
+    if(ctx->sb.keyset_lba != 0)
     {
-        /* Allocate a scratch buffer for tree traversal. */
-        uint8_t *buf = malloc((size_t)ctx->sb.block_size);
-        if(buf)
+        int lrc = obmafs3_dedup_keyset_load(ctx);
+        if(lrc == OBMAFS3_OK)
         {
-            for(uint64_t i = 0; i < count; i++)
-            {
-                struct btree_header hdr;
-                rc = obmafs3_btree_header_read(ctx, entries[i].tree_lba, &hdr);
-                if(rc == OBMAFS3_OK && hdr.root_node_lba != 0)
-                {
-                    keyset_warmup(ctx, &hdr, buf,
-                                  (struct dedup_node_cache *)ctx->dedup_node_cache);
-                }
-            }
-            free(buf);
+            loaded = 1;
+            struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+            clock_gettime(CLOCK_MONOTONIC, &t_end);
+            fprintf(stderr, "[dedup-warmup] loaded persisted key set in %.1fms — %u keys\n",
+                    timespec_diff_ms(&t_start, &t_end), ks->count);
         }
-        free(entries);
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t_end);
-    fprintf(stderr, "[dedup-warmup] background warmup completed in %.1fms — key set has %u keys\n",
-            timespec_diff_ms(&t_start, &t_end), ks->count);
+    if(!loaded)
+    {
+        /* Full tree scan (slow path). */
+        struct dedup_key_set *ks = keyset_create();
+        if(!ks) goto done;
+        ctx->dedup_key_set = ks;
+
+        /* Seed from any already-cached nodes (may be 0). */
+        keyset_seed_from_cache(ks, (const struct dedup_node_cache *)ctx->dedup_node_cache);
+
+        /* Read the dedup tree list and warm up every tree. */
+        struct tree_list_header list_hdr;
+        struct tree_list_entry *entries = NULL;
+        uint64_t                count   = 0;
+        int rc = dedup_tree_list_read(ctx, &list_hdr, &entries, &count);
+        if(rc == OBMAFS3_OK && count > 0)
+        {
+            uint8_t *buf = malloc((size_t)ctx->sb.block_size);
+            if(buf)
+            {
+                for(uint64_t i = 0; i < count; i++)
+                {
+                    struct btree_header hdr;
+                    rc = obmafs3_btree_header_read(ctx, entries[i].tree_lba, &hdr);
+                    if(rc == OBMAFS3_OK && hdr.root_node_lba != 0)
+                    {
+                        keyset_warmup(ctx, &hdr, buf,
+                                      (struct dedup_node_cache *)ctx->dedup_node_cache);
+                    }
+                }
+                free(buf);
+            }
+            free(entries);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        fprintf(stderr, "[dedup-warmup] background warmup completed in %.1fms — key set has %u keys\n",
+                timespec_diff_ms(&t_start, &t_end), ks->count);
+    }
 
 done:
     pthread_mutex_lock(&ctx->warmup_mutex);
