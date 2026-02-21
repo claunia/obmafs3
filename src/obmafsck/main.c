@@ -1068,7 +1068,7 @@ static int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *
 /** Ordering tree-type identifiers for verify_btree_ordering(). */
 #define ORD_UINT64_KEY  0  /**< key = first uint64_t (inode, dedup, cd_*, refcount) */
 #define ORD_CATALOG     1  /**< key = (parent_id, name) */
-#define ORD_OVERFLOW    2  /**< leaf: (inode_id, logical_offset), index: uint64_t */
+#define ORD_OVERFLOW    2  /**< leaf: (inode_id, logical_offset), index: (inode_id, logical_offset) */
 #define ORD_MEDIA_TAG   3  /**< key = (inode_id, tag_type) */
 #define ORD_METADATA    4  /**< key = (inode_id, key[256]) */
 #define ORD_METADATA_IDX 5 /**< key = (key[256], value[1025], inode_id) */
@@ -1128,10 +1128,15 @@ static int ordering_key_cmp(const uint8_t *a, const uint8_t *b, int type, int is
         }
         else
         {
-            /* btree_index_entry: key(8) = inode_id, child_lba(8) */
-            memcpy(&ua, a, 8);
-            memcpy(&ub, b, 8);
-            return (ua < ub) ? -1 : (ua > ub) ? 1 : 0;
+            /* overflow_index_entry: inode_id(8), logical_offset(8), child_lba(8) */
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a, 8);
+            memcpy(&id_b, b, 8);
+            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+            uint64_t off_a, off_b;
+            memcpy(&off_a, a + 8, 8);
+            memcpy(&off_b, b + 8, 8);
+            return (off_a < off_b) ? -1 : (off_a > off_b) ? 1 : 0;
         }
 
     case ORD_MEDIA_TAG:
@@ -2801,7 +2806,7 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             uint64_t *ovf_nodes = NULL;
             uint64_t  ovf_count = 0;
-            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ovf_nodes, &ovf_count, 0, NULL);
+            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct overflow_index_entry), __builtin_offsetof(struct overflow_index_entry, child_lba), &ovf_nodes, &ovf_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < ovf_count; i++) MARK(ovf_nodes[i]);
@@ -6763,7 +6768,7 @@ int main(int argc, char *argv[])
         {
             uint64_t *ovf_nodes      = NULL;
             uint64_t  ovf_node_count = 0;
-            int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ovf_nodes, &ovf_node_count, ctx->overflow_hdr.total_nodes, "Overflow");
+            int       wrc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct overflow_index_entry), __builtin_offsetof(struct overflow_index_entry, child_lba), &ovf_nodes, &ovf_node_count, ctx->overflow_hdr.total_nodes, "Overflow");
             if(wrc == OBMAFS3_OK)
             {
                 uint64_t ovf_bad = 0, ovf_cs_fix = 0;
@@ -6771,7 +6776,7 @@ int main(int argc, char *argv[])
                                             &ovf_bad, &ovf_cs_fix);
                 uint64_t ovf_ord = 0, ovf_fix = 0;
                 verify_btree_ordering(ctx, ovf_nodes, ovf_node_count, ORD_OVERFLOW,
-                                      sizeof(struct overflow_extent), sizeof(struct btree_index_entry),
+                                      sizeof(struct overflow_extent), sizeof(struct overflow_index_entry),
                                       "Overflow", auto_yes, auto_no, &ovf_ord, &ovf_fix);
                 free(ovf_nodes);
                 if(ovf_bad > 0)

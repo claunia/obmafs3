@@ -105,6 +105,18 @@ struct __attribute__((packed)) btree_index_entry
 };
 
 /**
+ * Index entry for overflow B+Tree internal nodes.
+ * Uses composite key (inode_id, logical_offset) so that files with
+ * many extents are correctly routed across multiple leaves.
+ */
+struct __attribute__((packed)) overflow_index_entry
+{
+    uint64_t inode_id;        ///< Smallest inode_id reachable through child
+    uint64_t logical_offset;  ///< Smallest logical_offset reachable through child
+    uint64_t child_lba;       ///< LBA of the child node
+};
+
+/**
  * Index entry for catalog B+Tree internal nodes.
  * Uses the full composite key (parent_id, name) so that directories
  * with hundreds of entries are correctly routed across multiple leaves.

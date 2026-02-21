@@ -552,10 +552,10 @@ static uint16_t overflow_leaf_max_keys(const struct obmafs3_ctx *ctx)
     return (uint16_t)((ctx->sb.block_size - sizeof(struct btree_node_header)) / sizeof(struct overflow_extent));
 }
 
-/** Maximum btree_index_entry entries in an index node. */
+/** Maximum overflow_index_entry entries in an index node. */
 static uint16_t overflow_index_max_keys(const struct obmafs3_ctx *ctx)
 {
-    return (uint16_t)((ctx->sb.block_size - sizeof(struct btree_node_header)) / sizeof(struct btree_index_entry));
+    return (uint16_t)((ctx->sb.block_size - sizeof(struct btree_node_header)) / sizeof(struct overflow_index_entry));
 }
 
 /**
@@ -587,10 +587,12 @@ static int overflow_leaf_find(const uint8_t *buf, uint16_t node_keys, uint64_t i
 }
 
 /**
- * Binary search in an overflow index node for the child covering inode_id.
+ * Binary search in an overflow index node for the child covering
+ * (inode_id, logical_offset).  Uses the full composite key so that
+ * files with many extents are correctly routed across multiple leaves.
  * Returns the slot index of the child pointer to follow.
  */
-static uint16_t overflow_index_find(const uint8_t *buf, uint16_t node_keys, uint64_t inode_id)
+static uint16_t overflow_index_find(const uint8_t *buf, uint16_t node_keys, uint64_t inode_id, uint64_t logical_offset)
 {
     const uint8_t *data = buf + sizeof(struct btree_node_header);
     int            lo = 0, hi = (int)node_keys - 1;
@@ -598,10 +600,12 @@ static uint16_t overflow_index_find(const uint8_t *buf, uint16_t node_keys, uint
 
     while(lo <= hi)
     {
-        int      mid = lo + (hi - lo) / 2;
-        uint64_t mid_key;
-        memcpy(&mid_key, data + (size_t)mid * sizeof(struct btree_index_entry), sizeof(mid_key));
-        if(mid_key <= inode_id)
+        int                          mid = lo + (hi - lo) / 2;
+        struct overflow_index_entry  ie;
+        memcpy(&ie, data + (size_t)mid * sizeof(ie), sizeof(ie));
+
+        if(ie.inode_id < inode_id ||
+           (ie.inode_id == inode_id && ie.logical_offset <= logical_offset))
         {
             result = (uint16_t)mid;
             lo     = mid + 1;
@@ -635,10 +639,10 @@ static uint16_t overflow_index_find_left(const uint8_t *buf, uint16_t node_keys,
 
     while(lo <= hi)
     {
-        int      mid = lo + (hi - lo) / 2;
-        uint64_t mid_key;
-        memcpy(&mid_key, data + (size_t)mid * sizeof(struct btree_index_entry), sizeof(mid_key));
-        if(mid_key < inode_id)
+        int                          mid = lo + (hi - lo) / 2;
+        struct overflow_index_entry  ie;
+        memcpy(&ie, data + (size_t)mid * sizeof(ie), sizeof(ie));
+        if(ie.inode_id < inode_id)
         {
             result = (uint16_t)mid;
             lo     = mid + 1;
@@ -721,12 +725,12 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
 
         if(depth >= OVERFLOW_BTREE_MAX_DEPTH) DBG_RETURN(OBMAFS3_ERR_INVAL, "invalid parameter");
 
-        uint16_t slot    = overflow_index_find(buf, nhdr.node_keys, entry->inode_id);
+        uint16_t slot    = overflow_index_find(buf, nhdr.node_keys, entry->inode_id, entry->logical_offset);
         path[depth].lba  = lba;
         path[depth].slot = slot;
         depth++;
 
-        struct btree_index_entry ie;
+        struct overflow_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
     }
@@ -736,9 +740,19 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
 
     int      idx        = overflow_leaf_find(buf, leaf_hdr.node_keys, entry->inode_id, entry->logical_offset);
-    int      insert_pos = (idx >= 0) ? idx : -(idx + 1);
     uint16_t max_leaf   = overflow_leaf_max_keys(ctx);
     size_t   rec_sz     = sizeof(struct overflow_extent);
+
+    /* Exact match — update the existing record in place (no duplicate) */
+    if(idx >= 0)
+    {
+        uint8_t *data = buf + sizeof(struct btree_node_header);
+        memcpy(data + (size_t)idx * rec_sz, entry, rec_sz);
+        compute_node_checksum(buf);
+        return obmafs3_block_write(ctx, lba, buf, bsz);
+    }
+
+    int insert_pos = -(idx + 1);
 
     if(leaf_hdr.node_keys < max_leaf)
     {
@@ -823,8 +837,10 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     }
 
     uint64_t push_key       = all[left_count].inode_id;
+    uint64_t push_offset    = all[left_count].logical_offset;
     uint64_t push_child     = new_leaf_lba;
     uint64_t left_first_key = all[0].inode_id;
+    uint64_t left_first_off = all[0].logical_offset;
     uint64_t left_lba       = lba;
 
     free(all);
@@ -860,7 +876,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
 
         uint16_t max_idx    = overflow_index_max_keys(ctx);
         uint16_t idx_insert = parent_slot + 1;
-        size_t   ie_sz      = sizeof(struct btree_index_entry);
+        size_t   ie_sz      = sizeof(struct overflow_index_entry);
 
         if(phdr.node_keys < max_idx)
         {
@@ -871,9 +887,10 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
 
-            struct btree_index_entry ne;
-            ne.key       = push_key;
-            ne.child_lba = push_child;
+            struct overflow_index_entry ne;
+            ne.inode_id       = push_key;
+            ne.logical_offset = push_offset;
+            ne.child_lba      = push_child;
             memcpy(id + (size_t)idx_insert * ie_sz, &ne, sizeof(ne));
 
             phdr.node_keys++;
@@ -887,14 +904,15 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         }
 
         /* Parent is full — split the index node */
-        uint16_t                  idx_total = max_idx + 1;
-        struct btree_index_entry *aie       = calloc(idx_total, ie_sz);
+        uint16_t                     idx_total = max_idx + 1;
+        struct overflow_index_entry *aie       = calloc(idx_total, ie_sz);
         if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
-        aie[idx_insert].key       = push_key;
-        aie[idx_insert].child_lba = push_child;
+        aie[idx_insert].inode_id       = push_key;
+        aie[idx_insert].logical_offset = push_offset;
+        aie[idx_insert].child_lba      = push_child;
         memcpy(&aie[idx_insert + 1], id + (size_t)idx_insert * ie_sz, ((size_t)max_idx - (size_t)idx_insert) * ie_sz);
 
         uint16_t il = idx_total / 2;
@@ -945,9 +963,11 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
             return rc;
         }
 
-        push_key       = aie[il].key;
+        push_key       = aie[il].inode_id;
+        push_offset    = aie[il].logical_offset;
         push_child     = new_idx_lba;
-        left_first_key = aie[0].key;
+        left_first_key = aie[0].inode_id;
+        left_first_off = aie[0].logical_offset;
         left_lba       = parent_lba;
 
         free(aie);
@@ -987,14 +1007,16 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     rh.record_type = kBtreeDataTypeExtent;
     rh.level       = old_hdr.level + 1;
     rh.node_keys   = 2;
-    rh.keys_length = (uint16_t)(2 * sizeof(struct btree_index_entry));
+    rh.keys_length = (uint16_t)(2 * sizeof(struct overflow_index_entry));
     memcpy(buf, &rh, sizeof(rh));
 
-    struct btree_index_entry roots[2];
-    roots[0].key       = left_first_key;
-    roots[0].child_lba = left_lba;
-    roots[1].key       = push_key;
-    roots[1].child_lba = push_child;
+    struct overflow_index_entry roots[2];
+    roots[0].inode_id       = left_first_key;
+    roots[0].logical_offset = left_first_off;
+    roots[0].child_lba      = left_lba;
+    roots[1].inode_id       = push_key;
+    roots[1].logical_offset = push_offset;
+    roots[1].child_lba      = push_child;
     memcpy(buf + sizeof(rh), roots, sizeof(roots));
     compute_node_checksum(buf);
 
@@ -1060,8 +1082,8 @@ static int overflow_find_extent(struct obmafs3_ctx *ctx, uint64_t inode_id, uint
         if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return 0;
         if(nhdr.level == 0) break;
 
-        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
-        struct btree_index_entry ie;
+        uint16_t                    slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
+        struct overflow_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
     }
@@ -1127,8 +1149,8 @@ static uint64_t overflow_count_logical(struct obmafs3_ctx *ctx, uint64_t inode_i
         if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) return 0;
         if(nhdr.level == 0) break;
 
-        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
-        struct btree_index_entry ie;
+        uint16_t                    slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
+        struct overflow_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
     }
@@ -1483,8 +1505,8 @@ static int overflow_collect_extents(struct obmafs3_ctx *ctx, uint64_t inode_id, 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
         if(nhdr.level == 0) break;
-        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
-        struct btree_index_entry ie;
+        uint16_t                    slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
+        struct overflow_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
     }
@@ -1572,8 +1594,8 @@ static int overflow_clear_inode(struct obmafs3_ctx *ctx, uint64_t inode_id)
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
         if(nhdr.level == 0) break;
-        uint16_t                 slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
-        struct btree_index_entry ie;
+        uint16_t                    slot = overflow_index_find_left(buf, nhdr.node_keys, inode_id);
+        struct overflow_index_entry ie;
         memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
         lba = ie.child_lba;
     }
