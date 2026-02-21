@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include <execinfo.h>
 
 /* Global debug flag (default off; set OBMAFS3_DEBUG=1 to enable). */
 int obmafs3_debug = 0;
@@ -119,6 +120,13 @@ static void generate_guid(uint8_t *guid)
  */
 int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t size)
 {
+    if(lba == 0x45444E4545525442ULL) /* "BTREENDE" */
+    {
+        fprintf(stderr, "DEBUG: block_read called with BTREENDE magic as LBA!\n");
+        void *bt[32];
+        int   bt_count = backtrace(bt, 32);
+        backtrace_symbols_fd(bt, bt_count, STDERR_FILENO);
+    }
     off_t   offset = (off_t)(lba * ctx->sb.block_size);
     ssize_t n      = pread(ctx->fd, buf, size, offset);
     if(n < 0 || (size_t)n != size)

@@ -2712,6 +2712,22 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     pthread_rwlock_wrlock(&ctx->tree_lock);
     clock_gettime(CLOCK_MONOTONIC, &t_lock_end);
 
+    /* Refresh the dedup header from disk under the lock.
+     * The housekeeping thread may have modified the tree (splits,
+     * node allocations) since we cached the header, so free_node_lba
+     * and root_node_lba could be stale. */
+    {
+        struct btree_header fresh_hdr;
+        int rrc = obmafs3_btree_header_read(ctx, dedup_hdr_lba, &fresh_hdr);
+        if(rrc == OBMAFS3_OK)
+        {
+            dedup_hdr.root_node_lba = fresh_hdr.root_node_lba;
+            dedup_hdr.free_node_lba = fresh_hdr.free_node_lba;
+            dedup_hdr.free_nodes    = fresh_hdr.free_nodes;
+            dedup_hdr.total_nodes   = fresh_hdr.total_nodes;
+        }
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &t_prefetch_start);
 
     /*
@@ -3163,20 +3179,22 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_siz
     }
 
     /* Update the tree header with the current partial block state.
-     * Use the cached header if available to avoid a disk read. */
+     * Re-read from disk to pick up any changes the housekeeping
+     * thread may have made (root_node_lba, free_node_lba, etc.).
+     * Only overlay last_block_lba/offset onto the fresh copy. */
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
     int                 hrc;
     if(db_cache->hdr_cached)
-    {
-        dedup_hdr     = db_cache->dedup_hdr;
         dedup_hdr_lba = db_cache->dedup_hdr_lba;
-        hrc           = OBMAFS3_OK;
-    }
     else
     {
-        hrc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
+        /* Need the LBA — look it up once. */
+        struct btree_header tmp;
+        hrc = obmafs3_dedup_get_tree(ctx, sector_size, &tmp, &dedup_hdr_lba);
+        if(hrc != OBMAFS3_OK) goto flush_done;
     }
+    hrc = obmafs3_btree_header_read(ctx, dedup_hdr_lba, &dedup_hdr);
     if(hrc == OBMAFS3_OK)
     {
         dedup_hdr.last_block_lba    = db.block_lba;
@@ -3188,6 +3206,7 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_siz
         db_cache->hdr_cached    = 1;
     }
 
+flush_done:
     /* Copy state back */
     db_cache->block_lba = db.block_lba;
     db_cache->offset    = db.offset;

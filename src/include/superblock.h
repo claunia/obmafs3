@@ -37,14 +37,14 @@ struct __attribute__((packed)) obmafs3_sb
     uint64_t next_inode_id;      ///< Next available inode ID
     uint64_t bitmap_lba;         ///< LBA of the first allocation bitmap block
     uint64_t bitmap_blocks;      ///< Number of blocks used by the allocation bitmap
-    uint8_t  volume_label[256];  ///< Volume label of the filesystem
-    uint8_t  checksum[32];       ///< Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed)
     uint64_t keyset_lba;         ///< LBA of the persisted dedup key set (0 = none)
     uint64_t keyset_blocks;      ///< Number of blocks used by the persisted key set
     uint64_t pending_lba;        ///< LBA of the persisted pending insert buffer (0 = none)
     uint64_t pending_blocks;     ///< Number of blocks used by the persisted pending buffer
     uint32_t btree_clump_size;   ///< Nodes to pre-allocate per growth for non-dedup trees (0 = default)
     uint32_t dedup_clump_size;   ///< Nodes to pre-allocate per growth for dedup trees (0 = default)
+    uint8_t  volume_label[256];  ///< Volume label of the filesystem
+    uint8_t  checksum[32];       ///< Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed)
 };
 
 #endif /* OBMAFS3_SUPERBLOCK_H */
