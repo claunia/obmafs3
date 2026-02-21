@@ -1022,9 +1022,16 @@ static int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
 
     /* ---- Phase 5: single flush of dirty cache nodes ---- */
 
-    /* Clear the buffer. */
-    memset(pb->slots, 0, (size_t)pb->capacity * sizeof(struct dedup_entry));
-    pb->count = 0;
+    /* Only clear the buffer when ALL entries were successfully
+     * inserted.  On partial failure, keep the entries so a retry
+     * (or pending persistence on unmount) can recover them.
+     * Re-inserting already-drained entries is safe — upsert_find
+     * will see them as duplicates and skip. */
+    if(rc == OBMAFS3_OK)
+    {
+        memset(pb->slots, 0, (size_t)pb->capacity * sizeof(struct dedup_entry));
+        pb->count = 0;
+    }
 
     /* Flush cached tree nodes after the batch insert. */
     if(nc && nc->dirty_count > 0)
@@ -2843,8 +2850,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 uint64_t            flush_hdr_lba;
                 int frc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &flush_hdr, &flush_hdr_lba);
                 if(frc == OBMAFS3_OK)
-                    pending_flush(pb, ctx, &flush_hdr, flush_hdr_lba);
-                pb->sector_size = 0;
+                    frc = pending_flush(pb, ctx, &flush_hdr, flush_hdr_lba);
+                /* Only reset sector_size when flush succeeded;
+                 * otherwise keep old entries for retry / persistence. */
+                if(frc == OBMAFS3_OK || pb->count == 0)
+                    pb->sector_size = 0;
             }
 
             /* Keyset says "miss" and pending buffer is available.
@@ -3980,6 +3990,13 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx,
             rc = dedup_upsert_insert(ctx, hdr, &entries[i], &uctx, tree_buf, nc);
             if(rc != OBMAFS3_OK) return rc;
         }
+        else if(rc != OBMAFS3_OK)
+        {
+            /* Propagate I/O or other errors — do not silently drop
+             * entries.  The caller will preserve the draining buffer
+             * so these entries survive for the next mount. */
+            return rc;
+        }
     }
 
     /* Flush dirty cache entries. */
@@ -4133,15 +4150,30 @@ static void *housekeeping_thread_func(void *arg)
         free(sorted);
 
 finish_drain:
-        /* Release the draining buffer. */
-        pthread_rwlock_wrlock(&ctx->tree_lock);
+        /* Release the draining buffer only when ALL entries were
+         * successfully drained.  If shutdown interrupted the drain,
+         * leave the buffer in place so that
+         * obmafs3_dedup_pending_flush_and_free() can persist the
+         * remaining entries for the next mount.  Re-draining
+         * already-inserted entries on the next mount is safe because
+         * dedup_upsert_find skips duplicates. */
+        if(total_inserted >= extracted)
         {
-            struct dedup_pending_buf *old =
-                (struct dedup_pending_buf *)ctx->dedup_pending_draining;
-            ctx->dedup_pending_draining = NULL;
-            pending_free(old);
+            pthread_rwlock_wrlock(&ctx->tree_lock);
+            {
+                struct dedup_pending_buf *old =
+                    (struct dedup_pending_buf *)ctx->dedup_pending_draining;
+                ctx->dedup_pending_draining = NULL;
+                pending_free(old);
+            }
+            pthread_rwlock_unlock(&ctx->tree_lock);
         }
-        pthread_rwlock_unlock(&ctx->tree_lock);
+        else
+        {
+            fprintf(stderr, "[housekeeping] drain incomplete (%u/%u) — "
+                    "preserving draining buffer for persistence\n",
+                    total_inserted, extracted);
+        }
     }
 
     fprintf(stderr, "[housekeeping] stopped\n");
@@ -4442,7 +4474,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
     int                 rc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
-    if(rc != OBMAFS3_OK) return rc;
+    if(rc != OBMAFS3_OK)
+    {
+        fprintf(stderr, "[read_media_image] dedup_get_tree FAILED rc=%d ss=%u\n", rc, sector_size);
+        return rc;
+    }
 
     /* Buffer for reading the dedup data block (dedup_block_size bytes) */
     uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
@@ -4480,6 +4516,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         rc                                 = obmafs3_read_file_data(ctx, &map_inode, sme_offset, &sme, sizeof(sme));
         if(rc != OBMAFS3_OK)
         {
+            fprintf(stderr, "[read_media_image] read_file_data(sme) FAILED rc=%d sector=%" PRId64
+                    " sme_offset=%" PRIu64 " map_file_size=%" PRIu64
+                    " sector_map_size=%" PRIu64 " inode=%" PRIu64 "\n",
+                    rc, sector_num, sme_offset, map_inode.file_size,
+                    inode->sector_map_size, inode->inode_id);
             free(decomp_buf);
             free(dedup_buf);
             return rc;
@@ -4490,6 +4531,10 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, sme.hash, &de);
         if(rc != OBMAFS3_OK)
         {
+            fprintf(stderr, "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64
+                    " sector=%" PRId64 " sme_offset=%" PRIu64
+                    " inode=%" PRIu64 "\n",
+                    rc, sme.hash, sector_num, sme_offset, inode->inode_id);
             free(decomp_buf);
             free(dedup_buf);
             return rc;
@@ -4502,6 +4547,9 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             rc = obmafs3_block_read(ctx, de.block_lba, dedup_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK)
             {
+                fprintf(stderr, "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64
+                        " hash=%" PRIu64 " sector=%" PRId64 "\n",
+                        rc, de.block_lba, sme.hash, sector_num);
                 free(decomp_buf);
                 free(dedup_buf);
                 return rc;

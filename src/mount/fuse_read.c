@@ -226,7 +226,12 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
         rc = obmafs3_read_file_data(g_ctx, ip, (uint64_t)offset, buf, size);
     }
 
-    if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+    if(rc != OBMAFS3_OK)
+    {
+        fprintf(stderr, "[fuse_read] RETURNING -EIO rc=%d path=%s offset=%ld size=%zu file_type=%u\n",
+                rc, path ? path : "(null)", (long)offset, size, ip->file_type);
+        FUSE_RETURN(-EIO, "");
+    }
 
     return (int)size;
 }
