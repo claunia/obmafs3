@@ -14,6 +14,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <fcntl.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <zstd.h>
 
@@ -460,7 +461,9 @@ static int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
 }
 
 /** Flush all dirty entries to disk, clear dirty flags.
- *  Sorts dirty nodes by LBA for sequential disk I/O. */
+ *  Sorts dirty nodes by LBA, then coalesces consecutive LBAs into
+ *  single pwritev() calls to minimise syscall overhead and let the
+ *  kernel elevator-sort the resulting I/O. */
 static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
 {
     if(nc->dirty_count == 0) { nc->writes_since_flush = 0; return OBMAFS3_OK; }
@@ -479,16 +482,78 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
         nc->dirty_list[j + 1] = key;
     }
 
-    for(uint32_t d = 0; d < nc->dirty_count; d++)
+    /* Coalesce runs of consecutive LBAs into single pwritev() calls.
+     * IOV_MAX is typically 1024; dirty_count rarely exceeds a few
+     * hundred so an array sized to dirty_count suffices. */
+    struct iovec *iov = malloc(nc->dirty_count * sizeof(struct iovec));
+    if(!iov)
     {
-        uint32_t i = nc->dirty_list[d];
-        if(nc->slots[i].buf && nc->slots[i].dirty)
+        /* Fallback: write individually if malloc fails. */
+        for(uint32_t d = 0; d < nc->dirty_count; d++)
         {
-            int rc = obmafs3_block_write(ctx, nc->slots[i].lba, nc->slots[i].buf, nc->block_size);
-            if(rc != OBMAFS3_OK) return rc;
-            nc->slots[i].dirty = 0;
+            uint32_t i = nc->dirty_list[d];
+            if(nc->slots[i].buf && nc->slots[i].dirty)
+            {
+                int rc = obmafs3_block_write(ctx, nc->slots[i].lba,
+                                             nc->slots[i].buf, nc->block_size);
+                if(rc != OBMAFS3_OK) return rc;
+                nc->slots[i].dirty = 0;
+            }
+        }
+        nc->dirty_count        = 0;
+        nc->writes_since_flush = 0;
+        return OBMAFS3_OK;
+    }
+
+    uint32_t d = 0;
+    while(d < nc->dirty_count)
+    {
+        /* Skip already-clean slots (shouldn't happen, but be safe). */
+        uint32_t si = nc->dirty_list[d];
+        if(!nc->slots[si].buf || !nc->slots[si].dirty) { d++; continue; }
+
+        /* Start a new run at this slot's LBA. */
+        uint64_t run_start_lba = nc->slots[si].lba;
+        uint32_t iov_count     = 0;
+        uint64_t expect_lba    = run_start_lba;
+
+        /* Gather consecutive LBAs into the iovec. */
+        while(d < nc->dirty_count)
+        {
+            uint32_t ci = nc->dirty_list[d];
+            if(!nc->slots[ci].buf || !nc->slots[ci].dirty) { d++; continue; }
+            if(nc->slots[ci].lba != expect_lba) break;
+            iov[iov_count].iov_base = nc->slots[ci].buf;
+            iov[iov_count].iov_len  = nc->block_size;
+            iov_count++;
+            expect_lba++;
+            d++;
+        }
+
+        if(iov_count == 0) continue;
+
+        /* Issue a single pwritev for the whole consecutive run. */
+        off_t   off      = (off_t)(run_start_lba * ctx->sb.block_size);
+        size_t  expected = nc->block_size * iov_count;
+        ssize_t n        = pwritev(ctx->fd, iov, (int)iov_count, off);
+        if(n < 0 || (size_t)n != expected)
+        {
+            free(iov);
+            DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
+                             "pwritev lba=%" PRIu64 " count=%u expect=%zu got=%zd",
+                             run_start_lba, iov_count, expected, n);
+        }
+
+        /* Mark all slots in this run as clean. */
+        for(uint32_t r = 0; r < iov_count; r++)
+        {
+            uint64_t lba = run_start_lba + r;
+            struct dedup_cache_slot *s = cache_find_slot(nc, lba);
+            if(s) s->dirty = 0;
         }
     }
+
+    free(iov);
     nc->dirty_count        = 0;
     nc->writes_since_flush = 0;
     return OBMAFS3_OK;
