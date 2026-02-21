@@ -269,7 +269,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     if(root_lba == 0)
     {
         uint64_t new_lba;
-        rc = obmafs3_alloc_block(ctx, &new_lba);
+        rc = obmafs3_btree_alloc_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
@@ -384,7 +384,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
     uint64_t old_right = leaf_hdr.right_link;
 
     uint64_t new_leaf_lba;
-    rc = obmafs3_alloc_block(ctx, &new_leaf_lba);
+    rc = obmafs3_btree_alloc_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -506,7 +506,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        rc = obmafs3_btree_alloc_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -578,7 +578,7 @@ static int media_tag_tree_put(struct obmafs3_ctx *ctx, const struct media_tag_re
 
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
-    rc = obmafs3_alloc_block(ctx, &new_root_lba);
+    rc = obmafs3_btree_alloc_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, &new_root_lba);
     if(rc != OBMAFS3_OK) return rc;
 
     rc = obmafs3_block_read(ctx, left_lba, buf, bsz);
@@ -682,7 +682,7 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
             ctx->media_tag_hdr.root_node_lba = 0;
             ctx->media_tag_hdr.total_nodes--;
             rc = obmafs3_btree_header_write(ctx, ctx->sb.media_tag_lba, &ctx->media_tag_hdr);
-            obmafs3_free_block(ctx, lba);
+            obmafs3_btree_free_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, lba);
         }
         else
         {
@@ -745,8 +745,8 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
                 ctx->media_tag_hdr.root_node_lba = 0;
                 ctx->media_tag_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.media_tag_lba, &ctx->media_tag_hdr);
-                obmafs3_free_block(ctx, lba);
-                obmafs3_free_block(ctx, plba);
+                obmafs3_btree_free_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, lba);
+                obmafs3_btree_free_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, plba);
             }
             else if(phdr.node_keys == 1 && depth == 1)
             {
@@ -755,8 +755,8 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
                 ctx->media_tag_hdr.root_node_lba = remaining.child_lba;
                 ctx->media_tag_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.media_tag_lba, &ctx->media_tag_hdr);
-                obmafs3_free_block(ctx, lba);
-                obmafs3_free_block(ctx, plba);
+                obmafs3_btree_free_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, lba);
+                obmafs3_btree_free_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, plba);
             }
             else
             {
@@ -768,7 +768,7 @@ static int media_tag_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, uin
                     ctx->media_tag_hdr.total_nodes--;
                     rc = obmafs3_btree_header_write(ctx, ctx->sb.media_tag_lba, &ctx->media_tag_hdr);
                 }
-                obmafs3_free_block(ctx, lba);
+                obmafs3_btree_free_node(ctx, &ctx->media_tag_hdr, ctx->sb.media_tag_lba, lba);
             }
 
             free(pbuf);

@@ -282,7 +282,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     if(root_lba == 0)
     {
         uint64_t new_lba;
-        rc = obmafs3_alloc_block(ctx, &new_lba);
+        rc = obmafs3_btree_alloc_node(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
@@ -400,7 +400,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     uint64_t old_right = leaf_hdr.right_link;
 
     uint64_t new_leaf_lba;
-    rc = obmafs3_alloc_block(ctx, &new_leaf_lba);
+    rc = obmafs3_btree_alloc_node(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -520,7 +520,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        rc = obmafs3_btree_alloc_node(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -587,7 +587,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
 
     /* ---- Need a new root ---- */
     uint64_t new_root_lba;
-    rc = obmafs3_alloc_block(ctx, &new_root_lba);
+    rc = obmafs3_btree_alloc_node(ctx, &ctx->refcount_hdr, ctx->sb.refcount_lba, &new_root_lba);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Read old root to get its level */

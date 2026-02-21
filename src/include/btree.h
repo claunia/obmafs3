@@ -9,6 +9,11 @@
 /* "BTREENDE" as little-endian uint64 */
 #define OBMAFS3_BTREE_NODE_MAGIC 0x45444E4545525442ULL
 
+/// Default clump size for dedup trees (nodes per allocation).
+#define OBMAFS3_DEDUP_CLUMP_SIZE   1024
+/// Default clump size for all other trees (nodes per allocation).
+#define OBMAFS3_DEFAULT_CLUMP_SIZE 64
+
 /// On-disk B+Tree header stored at the tree's anchor LBA.
 struct __attribute__((packed)) btree_header
 {

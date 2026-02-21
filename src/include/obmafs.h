@@ -189,6 +189,10 @@ int      obmafs3_free_block(struct obmafs3_ctx *ctx, uint64_t lba);
 int      obmafs3_free_blocks(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t count);
 uint64_t obmafs3_alloc_inode_id(struct obmafs3_ctx *ctx);
 
+/* --- B+Tree node allocation (clump-aware) --- */
+int obmafs3_btree_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t *node_lba);
+int obmafs3_btree_free_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t node_lba);
+
 /* --- Catalog mutations --- */
 int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record *entry);
 int obmafs3_catalog_delete(struct obmafs3_ctx *ctx, uint64_t parent_id, const char *name);

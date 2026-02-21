@@ -1878,7 +1878,7 @@ static int dedup_upsert_insert(struct obmafs3_ctx *ctx, struct btree_header *hdr
     uint64_t old_right = leaf_hdr.right_link;
 
     uint64_t new_leaf_lba;
-    rc = obmafs3_alloc_block(ctx, &new_leaf_lba);
+    rc = obmafs3_btree_alloc_node(ctx, hdr, 0, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -2016,7 +2016,7 @@ static int dedup_upsert_insert(struct obmafs3_ctx *ctx, struct btree_header *hdr
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        rc = obmafs3_btree_alloc_node(ctx, hdr, 0, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -2084,7 +2084,7 @@ static int dedup_upsert_insert(struct obmafs3_ctx *ctx, struct btree_header *hdr
 
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
-    rc = obmafs3_alloc_block(ctx, &new_root_lba);
+    rc = obmafs3_btree_alloc_node(ctx, hdr, 0, &new_root_lba);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Read old root to get its level */

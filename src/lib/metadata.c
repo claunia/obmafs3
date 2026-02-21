@@ -104,16 +104,16 @@ struct meta_btree_path
     uint16_t slot;
 };
 
-/** Allocate a multi-block node. */
-static int meta_alloc_node(struct obmafs3_ctx *ctx, uint64_t *lba)
+/** Allocate a multi-block node via the btree clump allocator. */
+static int meta_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t *lba)
 {
-    return obmafs3_alloc_blocks(ctx, METADATA_NODE_BLOCKS, lba);
+    return obmafs3_btree_alloc_node(ctx, hdr, hdr_lba, lba);
 }
 
-/** Free a multi-block node. */
-static void meta_free_node(struct obmafs3_ctx *ctx, uint64_t lba)
+/** Free a multi-block node via the btree clump allocator. */
+static void meta_free_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t lba)
 {
-    obmafs3_free_blocks(ctx, lba, METADATA_NODE_BLOCKS);
+    obmafs3_btree_free_node(ctx, hdr, hdr_lba, lba);
 }
 
 /** Read a multi-block node. */
@@ -213,7 +213,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
     if(root_lba == 0)
     {
         uint64_t new_lba;
-        rc = meta_alloc_node(ctx, &new_lba);
+        rc = meta_alloc_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = calloc(1, nsz);
@@ -342,7 +342,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
 
     uint64_t old_right = leaf_hdr.right_link;
     uint64_t new_leaf_lba;
-    rc = meta_alloc_node(ctx, &new_leaf_lba);
+    rc = meta_alloc_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -471,7 +471,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = meta_alloc_node(ctx, &new_idx_lba);
+        rc = meta_alloc_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -545,7 +545,7 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
 
     /* Create new root */
     uint64_t new_root_lba;
-    rc = meta_alloc_node(ctx, &new_root_lba);
+    rc = meta_alloc_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, &new_root_lba);
     if(rc != OBMAFS3_OK)
     {
         free(buf);
@@ -671,7 +671,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
             ctx->metadata_hdr.root_node_lba = 0;
             ctx->metadata_hdr.total_nodes--;
             rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba, &ctx->metadata_hdr);
-            meta_free_node(ctx, lba);
+            meta_free_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, lba);
         }
         else
         {
@@ -738,8 +738,8 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
                 ctx->metadata_hdr.root_node_lba = 0;
                 ctx->metadata_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba, &ctx->metadata_hdr);
-                meta_free_node(ctx, lba);
-                meta_free_node(ctx, plba);
+                meta_free_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, lba);
+                meta_free_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, plba);
             }
             else if(phdr.node_keys == 1 && depth == 1)
             {
@@ -748,8 +748,8 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
                 ctx->metadata_hdr.root_node_lba = remaining.child_lba;
                 ctx->metadata_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba, &ctx->metadata_hdr);
-                meta_free_node(ctx, lba);
-                meta_free_node(ctx, plba);
+                meta_free_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, lba);
+                meta_free_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, plba);
             }
             else
             {
@@ -761,7 +761,7 @@ static int meta_tree_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
                     ctx->metadata_hdr.total_nodes--;
                     rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_lba, &ctx->metadata_hdr);
                 }
-                meta_free_node(ctx, lba);
+                meta_free_node(ctx, &ctx->metadata_hdr, ctx->sb.metadata_lba, lba);
             }
             free(pbuf);
         }
@@ -886,7 +886,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
     if(root_lba == 0)
     {
         uint64_t new_lba;
-        rc = meta_alloc_node(ctx, &new_lba);
+        rc = meta_alloc_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = calloc(1, nsz);
@@ -1013,7 +1013,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
 
     uint64_t old_right = leaf_hdr.right_link;
     uint64_t new_leaf_lba;
-    rc = meta_alloc_node(ctx, &new_leaf_lba);
+    rc = meta_alloc_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -1144,7 +1144,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = meta_alloc_node(ctx, &new_idx_lba);
+        rc = meta_alloc_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -1220,7 +1220,7 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
 
     /* Create new root */
     uint64_t new_root_lba;
-    rc = meta_alloc_node(ctx, &new_root_lba);
+    rc = meta_alloc_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, &new_root_lba);
     if(rc != OBMAFS3_OK)
     {
         free(buf);
@@ -1344,7 +1344,7 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
             ctx->metadata_idx_hdr.root_node_lba = 0;
             ctx->metadata_idx_hdr.total_nodes--;
             rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr);
-            meta_free_node(ctx, lba);
+            meta_free_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, lba);
         }
         else
         {
@@ -1411,8 +1411,8 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
                 ctx->metadata_idx_hdr.root_node_lba = 0;
                 ctx->metadata_idx_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr);
-                meta_free_node(ctx, lba);
-                meta_free_node(ctx, plba);
+                meta_free_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, lba);
+                meta_free_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, plba);
             }
             else if(phdr.node_keys == 1 && depth == 1)
             {
@@ -1421,8 +1421,8 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
                 ctx->metadata_idx_hdr.root_node_lba = remaining.child_lba;
                 ctx->metadata_idx_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr);
-                meta_free_node(ctx, lba);
-                meta_free_node(ctx, plba);
+                meta_free_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, lba);
+                meta_free_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, plba);
             }
             else
             {
@@ -1434,7 +1434,7 @@ static int midx_tree_delete(struct obmafs3_ctx *ctx, const char *key, const char
                     ctx->metadata_idx_hdr.total_nodes--;
                     rc = obmafs3_btree_header_write(ctx, ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr);
                 }
-                meta_free_node(ctx, lba);
+                meta_free_node(ctx, &ctx->metadata_idx_hdr, ctx->sb.metadata_idx_lba, lba);
             }
             free(pbuf);
         }

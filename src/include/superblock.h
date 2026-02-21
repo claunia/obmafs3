@@ -43,6 +43,8 @@ struct __attribute__((packed)) obmafs3_sb
     uint64_t keyset_blocks;      ///< Number of blocks used by the persisted key set
     uint64_t pending_lba;        ///< LBA of the persisted pending insert buffer (0 = none)
     uint64_t pending_blocks;     ///< Number of blocks used by the persisted pending buffer
+    uint32_t btree_clump_size;   ///< Nodes to pre-allocate per growth for non-dedup trees (0 = default)
+    uint32_t dedup_clump_size;   ///< Nodes to pre-allocate per growth for dedup trees (0 = default)
 };
 
 #endif /* OBMAFS3_SUPERBLOCK_H */

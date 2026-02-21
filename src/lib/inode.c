@@ -170,7 +170,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx, const struct inode_record *inode)
     if(root_lba == 0)
     {
         uint64_t new_lba;
-        rc = obmafs3_alloc_block(ctx, &new_lba);
+        rc = obmafs3_btree_alloc_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
@@ -287,7 +287,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx, const struct inode_record *inode)
     uint64_t old_right = leaf_hdr.right_link;
 
     uint64_t new_leaf_lba;
-    rc = obmafs3_alloc_block(ctx, &new_leaf_lba);
+    rc = obmafs3_btree_alloc_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -408,7 +408,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx, const struct inode_record *inode)
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        rc = obmafs3_btree_alloc_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -476,7 +476,7 @@ int obmafs3_inode_put(struct obmafs3_ctx *ctx, const struct inode_record *inode)
 
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
-    rc = obmafs3_alloc_block(ctx, &new_root_lba);
+    rc = obmafs3_btree_alloc_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, &new_root_lba);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Read old root to get its level */
@@ -585,7 +585,7 @@ int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
             ctx->inode_hdr.root_node_lba = 0;
             ctx->inode_hdr.total_nodes--;
             rc = obmafs3_btree_header_write(ctx, ctx->sb.inode_lba, &ctx->inode_hdr);
-            obmafs3_free_block(ctx, lba);
+            obmafs3_btree_free_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, lba);
         }
         else
         {
@@ -650,8 +650,8 @@ int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
                 ctx->inode_hdr.root_node_lba = 0;
                 ctx->inode_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.inode_lba, &ctx->inode_hdr);
-                obmafs3_free_block(ctx, lba);
-                obmafs3_free_block(ctx, plba);
+                obmafs3_btree_free_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, lba);
+                obmafs3_btree_free_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, plba);
             }
             else if(phdr.node_keys == 1 && depth == 1)
             {
@@ -661,8 +661,8 @@ int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
                 ctx->inode_hdr.root_node_lba = remaining.child_lba;
                 ctx->inode_hdr.total_nodes -= 2;
                 rc = obmafs3_btree_header_write(ctx, ctx->sb.inode_lba, &ctx->inode_hdr);
-                obmafs3_free_block(ctx, lba);
-                obmafs3_free_block(ctx, plba);
+                obmafs3_btree_free_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, lba);
+                obmafs3_btree_free_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, plba);
             }
             else
             {
@@ -674,7 +674,7 @@ int obmafs3_inode_delete(struct obmafs3_ctx *ctx, uint64_t inode_id)
                     ctx->inode_hdr.total_nodes--;
                     rc = obmafs3_btree_header_write(ctx, ctx->sb.inode_lba, &ctx->inode_hdr);
                 }
-                obmafs3_free_block(ctx, lba);
+                obmafs3_btree_free_node(ctx, &ctx->inode_hdr, ctx->sb.inode_lba, lba);
             }
 
             free(pbuf);

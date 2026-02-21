@@ -134,6 +134,159 @@ int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *star
     return OBMAFS3_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Clump-aware B+Tree node allocation                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Allocate a B+Tree node using the free-node list with clump growth.
+ *
+ * If the tree header's free-node list is non-empty, pops the first free
+ * node.  Otherwise, allocates a contiguous clump of @c clump_size nodes
+ * (falling back to smaller sizes if contiguous space is unavailable),
+ * links all but the first into the free-node list, and returns the
+ * first.
+ *
+ * The btree header (@p hdr) is updated in memory but NOT written to
+ * disk — the caller is responsible for persisting it.
+ *
+ * For multi-block nodes (node_size > block_size), each "node" occupies
+ * node_size/block_size contiguous blocks.
+ *
+ * @param ctx       Filesystem context.
+ * @param hdr       In-memory btree header (updated on return).
+ * @param hdr_lba   LBA where the btree header is stored on disk (unused today, reserved).
+ * @param node_lba  Output: LBA of the newly allocated node.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_btree_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t *node_lba)
+{
+    (void)hdr_lba;
+    size_t   bsz             = (size_t)ctx->sb.block_size;
+    uint64_t blocks_per_node = hdr->node_size / ctx->sb.block_size;
+    if(blocks_per_node == 0) blocks_per_node = 1;
+
+    /* ---- Pop from free list ---- */
+    if(hdr->free_node_lba != 0 && hdr->free_nodes > 0)
+    {
+        *node_lba = hdr->free_node_lba;
+
+        /* Read the free node to get the next pointer (stored as uint64_t at offset 0) */
+        uint8_t *buf = obmafs3_get_thread_bufs(ctx)->hdr_buf;
+        int rc = obmafs3_block_read(ctx, hdr->free_node_lba, buf, bsz);
+        if(rc != OBMAFS3_OK) return rc;
+
+        uint64_t next_free;
+        memcpy(&next_free, buf, sizeof(next_free));
+
+        hdr->free_node_lba = next_free;
+        hdr->free_nodes--;
+
+        return OBMAFS3_OK;
+    }
+
+    /* ---- Free list empty: allocate a clump ---- */
+    uint32_t clump = (hdr->tree_type == kBtreeTypeDeduplication)
+                         ? ctx->sb.dedup_clump_size
+                         : ctx->sb.btree_clump_size;
+    if(clump == 0)
+        clump = (hdr->tree_type == kBtreeTypeDeduplication)
+                    ? OBMAFS3_DEDUP_CLUMP_SIZE
+                    : OBMAFS3_DEFAULT_CLUMP_SIZE;
+
+    uint64_t alloc_blocks = (uint64_t)clump * blocks_per_node;
+    uint64_t start_lba;
+    int      rc;
+
+    /* Try the full clump first; if that fails, halve until 1 */
+    while(alloc_blocks > blocks_per_node)
+    {
+        rc = obmafs3_alloc_blocks(ctx, alloc_blocks, &start_lba);
+        if(rc == OBMAFS3_OK) goto clump_allocated;
+        alloc_blocks /= 2;
+        /* Round down to a multiple of blocks_per_node */
+        alloc_blocks = (alloc_blocks / blocks_per_node) * blocks_per_node;
+        if(alloc_blocks < blocks_per_node) alloc_blocks = blocks_per_node;
+    }
+
+    /* Last resort: single node */
+    rc = obmafs3_alloc_blocks(ctx, blocks_per_node, &start_lba);
+    if(rc != OBMAFS3_OK) return rc;
+
+clump_allocated:;
+    uint64_t nodes_in_clump = alloc_blocks / blocks_per_node;
+
+    /* Return the first node */
+    *node_lba = start_lba;
+
+    /* Link remaining nodes into the free list */
+    if(nodes_in_clump > 1)
+    {
+        uint8_t *buf = calloc(1, bsz);
+        if(!buf) return OBMAFS3_OK; /* first node is usable even without free list */
+
+        /* Build chain: node[1] -> node[2] -> ... -> node[N-1] -> old_free_head */
+        uint64_t old_head = hdr->free_node_lba;
+
+        for(uint64_t i = nodes_in_clump - 1; i >= 1; i--)
+        {
+            uint64_t this_lba = start_lba + i * blocks_per_node;
+            uint64_t next_ptr = (i == nodes_in_clump - 1) ? old_head : (start_lba + (i + 1) * blocks_per_node);
+
+            memset(buf, 0, bsz);
+            memcpy(buf, &next_ptr, sizeof(next_ptr));
+
+            rc = obmafs3_block_write(ctx, this_lba, buf, bsz);
+            if(rc != OBMAFS3_OK)
+            {
+                free(buf);
+                return OBMAFS3_OK; /* first node still usable */
+            }
+        }
+
+        free(buf);
+
+        hdr->free_node_lba = start_lba + blocks_per_node; /* points to node[1] */
+        hdr->free_nodes += (uint32_t)(nodes_in_clump - 1);
+    }
+
+    return OBMAFS3_OK;
+}
+
+/**
+ * Return a B+Tree node to the tree's free-node list.
+ *
+ * Pushes the node onto the head of the free list.  Updates @p hdr in
+ * memory but does NOT write it to disk — the caller is responsible for
+ * persisting it.
+ *
+ * @param ctx       Filesystem context.
+ * @param hdr       In-memory btree header (updated on return).
+ * @param hdr_lba   LBA where the btree header is stored on disk (unused today, reserved).
+ * @param node_lba  LBA of the node to free.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_btree_free_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t node_lba)
+{
+    (void)hdr_lba;
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint8_t *buf = calloc(1, bsz);
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    /* Write the current free list head as the next pointer */
+    uint64_t next_ptr = hdr->free_node_lba;
+    memcpy(buf, &next_ptr, sizeof(next_ptr));
+
+    int rc = obmafs3_block_write(ctx, node_lba, buf, bsz);
+    free(buf);
+    if(rc != OBMAFS3_OK) return rc;
+
+    hdr->free_node_lba = node_lba;
+    hdr->free_nodes++;
+
+    return OBMAFS3_OK;
+}
+
 /**
  * Allocate a new inode ID.
  *

@@ -675,7 +675,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     if(hdr->root_node_lba == 0)
     {
         uint64_t root_lba;
-        rc = obmafs3_alloc_block(ctx, &root_lba);
+        rc = obmafs3_btree_alloc_node(ctx, hdr, hdr_lba, &root_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
@@ -782,7 +782,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     uint64_t old_right = leaf_hdr.right_link;
 
     uint64_t new_leaf_lba;
-    rc = obmafs3_alloc_block(ctx, &new_leaf_lba);
+    rc = obmafs3_btree_alloc_node(ctx, hdr, hdr_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK)
     {
         free(all);
@@ -903,7 +903,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         /* Allocate new index node before writing so we can set sibling links */
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = obmafs3_alloc_block(ctx, &new_idx_lba);
+        rc = obmafs3_btree_alloc_node(ctx, hdr, hdr_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK)
         {
             free(aie);
@@ -971,7 +971,7 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
 
     /* ---- Create new root ---- */
     uint64_t new_root_lba;
-    rc = obmafs3_alloc_block(ctx, &new_root_lba);
+    rc = obmafs3_btree_alloc_node(ctx, hdr, hdr_lba, &new_root_lba);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Read old root to get its level */

@@ -692,6 +692,8 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     sb.refcount_lba      = 13; /* block 13 */
     sb.checksum_type     = kChecksumTypeXXH64;
     sb.creation_time     = (uint64_t)time(NULL);
+    sb.btree_clump_size  = OBMAFS3_DEFAULT_CLUMP_SIZE;
+    sb.dedup_clump_size  = OBMAFS3_DEDUP_CLUMP_SIZE;
 
     /* Calculate allocation bitmap size */
     uint64_t total_blocks         = total_size / block_size;

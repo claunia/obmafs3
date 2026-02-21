@@ -523,6 +523,28 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
         }
     }
 
+    /* ---- btree_clump_size / dedup_clump_size ---- */
+    if(sb->btree_clump_size == 0 || sb->dedup_clump_size == 0)
+    {
+        if(sb->btree_clump_size == 0)
+            printf("    btree_clump_size is 0 (no clumping configured)\n");
+        if(sb->dedup_clump_size == 0)
+            printf("    dedup_clump_size is 0 (no clumping configured)\n");
+        bad++;
+        char clump_prompt[128];
+        snprintf(clump_prompt, sizeof(clump_prompt),
+                 "    Set clump sizes to defaults (btree=%d, dedup=%d)?",
+                 OBMAFS3_DEFAULT_CLUMP_SIZE, OBMAFS3_DEDUP_CLUMP_SIZE);
+        if(ask_fix(auto_yes, auto_no, clump_prompt))
+        {
+            if(sb->btree_clump_size == 0)
+                sb->btree_clump_size = OBMAFS3_DEFAULT_CLUMP_SIZE;
+            if(sb->dedup_clump_size == 0)
+                sb->dedup_clump_size = OBMAFS3_DEDUP_CLUMP_SIZE;
+            fixed++;
+        }
+    }
+
     /* ---- creation_time ---- */
     if(sb->creation_time == 0)
     {
