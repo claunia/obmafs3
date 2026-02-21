@@ -260,9 +260,12 @@ struct dedup_node_cache
     uint32_t                *dirty_list;  /**< Indices of dirty slots */
     uint32_t                 dirty_count; /**< Number of entries in dirty_list */
     uint32_t                 dirty_cap;   /**< Allocated capacity of dirty_list */
+    uint32_t                 writes_since_flush; /**< Writes since last node flush */
 };
 
-#define DEDUP_CACHE_INIT_CAP 2048 /* power of 2 */
+#define DEDUP_CACHE_INIT_CAP        2048 /* power of 2 */
+#define DEDUP_NC_FLUSH_INTERVAL       32 /* max writes between forced flushes */
+#define DEDUP_NC_DIRTY_THRESHOLD     256 /* dirty-count ceiling for forced flush */
 
 /** Allocate and initialise a dedup B+Tree node cache. */
 static struct dedup_node_cache *dedup_cache_create(size_t block_size)
@@ -456,9 +459,26 @@ static int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
     DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); /* table full (shouldn't happen) */
 }
 
-/** Flush all dirty entries to disk, clear dirty flags. */
+/** Flush all dirty entries to disk, clear dirty flags.
+ *  Sorts dirty nodes by LBA for sequential disk I/O. */
 static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
 {
+    if(nc->dirty_count == 0) { nc->writes_since_flush = 0; return OBMAFS3_OK; }
+
+    /* Sort dirty list by LBA for sequential disk access (insertion sort). */
+    for(uint32_t i = 1; i < nc->dirty_count; i++)
+    {
+        uint32_t key  = nc->dirty_list[i];
+        uint64_t klba = nc->slots[key].lba;
+        int32_t  j    = (int32_t)i - 1;
+        while(j >= 0 && nc->slots[nc->dirty_list[j]].lba > klba)
+        {
+            nc->dirty_list[j + 1] = nc->dirty_list[j];
+            j--;
+        }
+        nc->dirty_list[j + 1] = key;
+    }
+
     for(uint32_t d = 0; d < nc->dirty_count; d++)
     {
         uint32_t i = nc->dirty_list[d];
@@ -469,7 +489,8 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
             nc->slots[i].dirty = 0;
         }
     }
-    nc->dirty_count = 0;
+    nc->dirty_count        = 0;
+    nc->writes_since_flush = 0;
     return OBMAFS3_OK;
 }
 
@@ -2279,6 +2300,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     } /* keyset_fast_hits < num_sectors */
 
     clock_gettime(CLOCK_MONOTONIC, &t_prefetch_end);
+
+    /* Remember root LBA before Phase 1 — if a root split changes it
+     * we must flush tree nodes before writing the header. */
+    uint64_t original_root = dedup_hdr.root_node_lba;
+
     clock_gettime(CLOCK_MONOTONIC, &t_phase1_start);
 
     /*
@@ -2392,11 +2418,28 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     clock_gettime(CLOCK_MONOTONIC, &t_flush_end);
 
-    /* Flush cached tree nodes to disk before updating the header */
+    /* Flush cached tree nodes — deferred to reduce I/O.
+     * Forced when the root changed (header needs a valid root on disk),
+     * when the dirty count exceeds a threshold, or periodically after
+     * DEDUP_NC_FLUSH_INTERVAL writes to bound unflushed state. */
     if(ctx->dedup_node_cache)
     {
-        int nc_rc = dedup_cache_flush((struct dedup_node_cache *)ctx->dedup_node_cache, ctx);
-        if(rc == OBMAFS3_OK) rc = nc_rc;
+        struct dedup_node_cache *nc_flush = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        if(nc_flush->dirty_count > 0)
+        {
+            int must_flush = (dedup_hdr.root_node_lba != original_root)
+                          || (nc_flush->writes_since_flush >= DEDUP_NC_FLUSH_INTERVAL)
+                          || (nc_flush->dirty_count >= DEDUP_NC_DIRTY_THRESHOLD);
+            if(must_flush)
+            {
+                int nc_rc = dedup_cache_flush(nc_flush, ctx);
+                if(rc == OBMAFS3_OK) rc = nc_rc;
+            }
+            else
+            {
+                nc_flush->writes_since_flush++;
+            }
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_ncflush_end);
