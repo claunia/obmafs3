@@ -185,6 +185,12 @@ static void *obmafs3_fuse_init(struct fuse_conn_info *conn, struct fuse_config *
      * workers from the parent do not survive into the child. */
     obmafs3_compress_pool_reinit(g_ctx);
 
+    /* Start background warmup of the dedup key set.
+     * This scans all dedup B+Tree leaves and populates an in-memory
+     * hash set so that subsequent writes can skip tree traversal for
+     * duplicate sectors.  Runs concurrently with early FUSE ops. */
+    obmafs3_dedup_warmup_start(g_ctx);
+
     /* Request 1 MiB write buffers (default is 128 KiB). */
     conn->max_write     = 1048576;
     conn->max_readahead = 1048576;

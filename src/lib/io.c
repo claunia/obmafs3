@@ -195,6 +195,9 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     c->fd          = fd;
     c->compression = 1;  /* compression on by default */
     c->zstd_level  = 15; /* ZSTD level 15 by default */
+    c->warmup_done = 1;  /* default: no warmup pending */
+    pthread_mutex_init(&c->warmup_mutex, NULL);
+    pthread_cond_init(&c->warmup_cond, NULL);
 
     int rc = obmafs3_sb_read(fd, &c->sb);
     if(rc != OBMAFS3_OK || obmafs3_sb_validate(&c->sb) != OBMAFS3_OK)
@@ -508,6 +511,17 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
 
     /* Shut down the compression thread pool before anything else. */
     obmafs3_compress_pool_destroy(ctx);
+
+    /* Wait for and join the background warmup thread (if any). */
+    obmafs3_dedup_warmup_wait(ctx);
+    if(ctx->warmup_started)
+        pthread_join(ctx->warmup_thread, NULL);
+    pthread_mutex_destroy(&ctx->warmup_mutex);
+    pthread_cond_destroy(&ctx->warmup_cond);
+
+    /* Free the global dedup B+Tree node cache and key set. */
+    obmafs3_dedup_node_cache_free(ctx);
+    obmafs3_dedup_key_set_free(ctx);
 
     /* Persist the allocation bitmap and superblock on close (unmount).
      * During normal operation these are deferred from the hot alloc/free

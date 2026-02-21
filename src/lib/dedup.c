@@ -13,7 +13,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <time.h>
 #include <zstd.h>
+
+/* ---- Timing instrumentation ---- */
+static inline double timespec_diff_ms(const struct timespec *a, const struct timespec *b)
+{
+    return (double)(b->tv_sec - a->tv_sec) * 1000.0 + (double)(b->tv_nsec - a->tv_nsec) / 1e6;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Background compression via the shared pool                         */
@@ -246,9 +254,12 @@ struct dedup_cache_slot
 struct dedup_node_cache
 {
     struct dedup_cache_slot *slots;
-    uint32_t                 capacity; /**< Always a power of 2 */
-    uint32_t                 count;    /**< Number of occupied slots */
+    uint32_t                 capacity;    /**< Always a power of 2 */
+    uint32_t                 count;       /**< Number of occupied slots */
     size_t                   block_size;
+    uint32_t                *dirty_list;  /**< Indices of dirty slots */
+    uint32_t                 dirty_count; /**< Number of entries in dirty_list */
+    uint32_t                 dirty_cap;   /**< Allocated capacity of dirty_list */
 };
 
 #define DEDUP_CACHE_INIT_CAP 2048 /* power of 2 */
@@ -266,6 +277,15 @@ static struct dedup_node_cache *dedup_cache_create(size_t block_size)
         free(nc);
         return NULL;
     }
+    nc->dirty_cap  = 256;
+    nc->dirty_list = malloc(nc->dirty_cap * sizeof(uint32_t));
+    if(!nc->dirty_list)
+    {
+        free(nc->slots);
+        free(nc);
+        return NULL;
+    }
+    nc->dirty_count = 0;
     return nc;
 }
 
@@ -287,6 +307,20 @@ static struct dedup_cache_slot *cache_find_slot(struct dedup_node_cache *nc, uin
         if(nc->slots[s].lba == lba) return &nc->slots[s];
     }
     return NULL;
+}
+
+/** Append a slot index to the dirty list, growing it if needed. */
+static void dirty_list_add(struct dedup_node_cache *nc, uint32_t slot_idx)
+{
+    if(nc->dirty_count >= nc->dirty_cap)
+    {
+        uint32_t  new_cap = nc->dirty_cap * 2;
+        uint32_t *tmp     = realloc(nc->dirty_list, new_cap * sizeof(uint32_t));
+        if(!tmp) return; /* non-fatal: flush will still work, just slower */
+        nc->dirty_list = tmp;
+        nc->dirty_cap  = new_cap;
+    }
+    nc->dirty_list[nc->dirty_count++] = slot_idx;
 }
 
 /** Double the table capacity and re-hash all entries. */
@@ -314,6 +348,15 @@ static int cache_grow(struct dedup_node_cache *nc)
     free(nc->slots);
     nc->slots    = ns;
     nc->capacity = new_cap;
+
+    /* Rebuild the dirty list — slot indices changed after rehash */
+    nc->dirty_count = 0;
+    for(uint32_t i = 0; i < new_cap; i++)
+    {
+        if(ns[i].buf && ns[i].dirty)
+            dirty_list_add(nc, i);
+    }
+
     return OBMAFS3_OK;
 }
 
@@ -378,7 +421,11 @@ static int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
     if(s)
     {
         memcpy(s->buf, buf, nc->block_size);
-        s->dirty = 1;
+        if(!s->dirty)
+        {
+            s->dirty = 1;
+            dirty_list_add(nc, (uint32_t)(s - nc->slots));
+        }
         return OBMAFS3_OK;
     }
 
@@ -402,6 +449,7 @@ static int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
             memcpy(nc->slots[slot].buf, buf, nc->block_size);
             nc->slots[slot].dirty = 1;
             nc->count++;
+            dirty_list_add(nc, slot);
             return OBMAFS3_OK;
         }
     }
@@ -411,8 +459,9 @@ static int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
 /** Flush all dirty entries to disk, clear dirty flags. */
 static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
 {
-    for(uint32_t i = 0; i < nc->capacity; i++)
+    for(uint32_t d = 0; d < nc->dirty_count; d++)
     {
+        uint32_t i = nc->dirty_list[d];
         if(nc->slots[i].buf && nc->slots[i].dirty)
         {
             int rc = obmafs3_block_write(ctx, nc->slots[i].lba, nc->slots[i].buf, nc->block_size);
@@ -420,6 +469,7 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
             nc->slots[i].dirty = 0;
         }
     }
+    nc->dirty_count = 0;
     return OBMAFS3_OK;
 }
 
@@ -429,17 +479,384 @@ static void dedup_cache_free(struct dedup_node_cache *nc)
     if(!nc) return;
     for(uint32_t i = 0; i < nc->capacity; i++) free(nc->slots[i].buf); /* free(NULL) is safe */
     free(nc->slots);
+    free(nc->dirty_list);
     free(nc);
+}
+
+/* ------------------------------------------------------------------ */
+/*  In-memory hash set of known dedup keys (Bloom-filter replacement)  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Open-addressing hash set storing dedup hash keys (uint64_t).
+ *
+ * When all leaf nodes have been seen at least once, the set contains
+ * every key in the dedup B+Tree.  A lookup in this set answers "does
+ * this hash exist?" in O(1) without any disk I/O.
+ *
+ * For 183k keys at 8 bytes each, the table uses ~3 MiB of RAM.
+ */
+struct dedup_key_set
+{
+    uint64_t *keys;      /**< Slot array — 0 means empty */
+    uint32_t  capacity;  /**< Always a power of 2 */
+    uint32_t  count;     /**< Number of occupied slots */
+};
+
+/** Sentinel: hash value 0 is reserved as "empty slot". */
+#define KEYSET_EMPTY 0ULL
+
+#define KEYSET_INIT_CAP 4096 /* power of 2 */
+
+/** Allocate a dedup key set. */
+static struct dedup_key_set *keyset_create(void)
+{
+    struct dedup_key_set *ks = calloc(1, sizeof(*ks));
+    if(!ks) return NULL;
+    ks->capacity = KEYSET_INIT_CAP;
+    ks->keys     = calloc(ks->capacity, sizeof(uint64_t)); /* 0 = empty */
+    if(!ks->keys) { free(ks); return NULL; }
+    return ks;
+}
+
+/** Fibonacci-hashing of a key to a table index. */
+static uint32_t keyset_hash(uint64_t key, uint32_t mask)
+{
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+/** Grow the key set (double capacity, re-insert all entries). */
+static int keyset_grow(struct dedup_key_set *ks)
+{
+    uint32_t  new_cap  = ks->capacity * 2;
+    uint64_t *new_keys = calloc(new_cap, sizeof(uint64_t));
+    if(!new_keys) return OBMAFS3_ERR_NOMEM;
+
+    uint32_t new_mask = new_cap - 1;
+    for(uint32_t i = 0; i < ks->capacity; i++)
+    {
+        if(ks->keys[i] == KEYSET_EMPTY) continue;
+        uint32_t idx = keyset_hash(ks->keys[i], new_mask);
+        for(uint32_t j = 0; j < new_cap; j++)
+        {
+            uint32_t s = (idx + j) & new_mask;
+            if(new_keys[s] == KEYSET_EMPTY) { new_keys[s] = ks->keys[i]; break; }
+        }
+    }
+    free(ks->keys);
+    ks->keys     = new_keys;
+    ks->capacity = new_cap;
+    return OBMAFS3_OK;
+}
+
+/** Insert a key into the set (no-op if already present). */
+static void keyset_insert(struct dedup_key_set *ks, uint64_t key)
+{
+    if(key == KEYSET_EMPTY) return; /* cannot store sentinel */
+
+    /* Grow at 75% load */
+    if(ks->count * 4 >= ks->capacity * 3)
+    {
+        if(keyset_grow(ks) != OBMAFS3_OK) return; /* non-fatal */
+    }
+
+    uint32_t mask = ks->capacity - 1;
+    uint32_t idx  = keyset_hash(key, mask);
+    for(uint32_t i = 0; i < ks->capacity; i++)
+    {
+        uint32_t s = (idx + i) & mask;
+        if(ks->keys[s] == KEYSET_EMPTY) { ks->keys[s] = key; ks->count++; return; }
+        if(ks->keys[s] == key) return; /* already present */
+    }
+}
+
+/** Check if a key exists in the set. */
+static int keyset_contains(const struct dedup_key_set *ks, uint64_t key)
+{
+    if(!ks || key == KEYSET_EMPTY) return 0;
+
+    uint32_t mask = ks->capacity - 1;
+    uint32_t idx  = keyset_hash(key, mask);
+    for(uint32_t i = 0; i < ks->capacity; i++)
+    {
+        uint32_t s = (idx + i) & mask;
+        if(ks->keys[s] == KEYSET_EMPTY) return 0;
+        if(ks->keys[s] == key) return 1;
+    }
+    return 0;
+}
+
+/** Free the key set. */
+static void keyset_free(struct dedup_key_set *ks)
+{
+    if(!ks) return;
+    free(ks->keys);
+    free(ks);
+}
+
+/**
+ * Extract all dedup hash keys from a B+Tree leaf node buffer and
+ * insert them into the key set.
+ *
+ * Called automatically whenever a leaf is read through the cache,
+ * so that after one full pass the key set contains every hash in
+ * the tree.
+ */
+static void keyset_ingest_leaf(struct dedup_key_set *ks, const void *buf)
+{
+    if(!ks) return;
+
+    const struct btree_node_header *nhdr = (const struct btree_node_header *)buf;
+    if(nhdr->magic != OBMAFS3_BTREE_NODE_MAGIC || nhdr->level != 0) return;
+
+    const uint8_t *data = (const uint8_t *)buf + sizeof(struct btree_node_header);
+    for(uint16_t i = 0; i < nhdr->node_keys; i++)
+    {
+        uint64_t hash;
+        memcpy(&hash, data + (size_t)i * sizeof(struct dedup_entry), sizeof(hash));
+        keyset_insert(ks, hash);
+    }
+}
+
+/**
+ * Seed the key set from all leaf nodes already present in the node cache.
+ *
+ * Called once when the key set is first created while the node cache
+ * is already warm.  Without this, cached leaves would never be
+ * ingested because the prefetch phase skips them (cache_find_slot
+ * returns true → nc_block_read is never called → keyset_ingest_leaf
+ * is never invoked for those nodes).
+ */
+static void keyset_seed_from_cache(struct dedup_key_set *ks, const struct dedup_node_cache *nc)
+{
+    if(!ks || !nc) return;
+    for(uint32_t i = 0; i < nc->capacity; i++)
+    {
+        if(nc->slots[i].buf) keyset_ingest_leaf(ks, nc->slots[i].buf);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  One-time full leaf scan to warm the key set                        */
+/* ------------------------------------------------------------------ */
+
+/* Forward declaration — defined later alongside tree traversal helpers. */
+static int lba_cmp(const void *a, const void *b);
+/* ------------------------------------------------------------------ */
+
+/**
+ * Collect all leaf LBAs by DFS traversal of B+Tree index nodes.
+ *
+ * Index nodes are read through the node cache (fast after the first
+ * write).  Leaf nodes are NOT read here — only their LBAs are
+ * collected for batch reading later.
+ *
+ * @param ctx        Filesystem context.
+ * @param hdr        B+Tree header.
+ * @param buf        Scratch buffer (at least block_size bytes).
+ * @param nc         Node cache (may be NULL — direct I/O fallback).
+ * @param out_lbas   Receives allocated array of leaf LBAs (caller frees).
+ * @param out_count  Receives the number of leaf LBAs.
+ * @return OBMAFS3_OK on success, error code otherwise.
+ */
+static int collect_all_leaf_lbas(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
+                                 uint8_t *buf, struct dedup_node_cache *nc,
+                                 uint64_t **out_lbas, uint64_t *out_count)
+{
+    size_t bsz = (size_t)ctx->sb.block_size;
+
+    *out_lbas  = NULL;
+    *out_count = 0;
+
+    if(hdr->root_node_lba == 0) return OBMAFS3_OK;
+
+    /* Dynamic arrays for the DFS stack and collected leaf LBAs. */
+    uint64_t leaf_cap = 4096, leaf_n = 0;
+    uint64_t *leaves = malloc(leaf_cap * sizeof(uint64_t));
+    if(!leaves) return OBMAFS3_ERR_NOMEM;
+
+    uint64_t stk_cap = 256, stk_n = 0;
+    uint64_t *stk = malloc(stk_cap * sizeof(uint64_t));
+    if(!stk) { free(leaves); return OBMAFS3_ERR_NOMEM; }
+
+    stk[stk_n++] = hdr->root_node_lba;
+
+    while(stk_n > 0)
+    {
+        uint64_t lba = stk[--stk_n];
+
+        int rc;
+        if(nc) rc = dedup_cache_read(nc, ctx, lba, buf, bsz);
+        else   rc = obmafs3_block_read(ctx, lba, buf, bsz);
+        if(rc != OBMAFS3_OK) { free(leaves); free(stk); return rc; }
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            free(leaves);
+            free(stk);
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic in warmup");
+        }
+
+        if(nhdr.level == 0)
+        {
+            /* Root is a leaf (single-level tree) — record its LBA. */
+            if(leaf_n >= leaf_cap)
+            {
+                leaf_cap *= 2;
+                uint64_t *tmp = realloc(leaves, leaf_cap * sizeof(uint64_t));
+                if(!tmp) { free(leaves); free(stk); return OBMAFS3_ERR_NOMEM; }
+                leaves = tmp;
+            }
+            leaves[leaf_n++] = lba;
+        }
+        else
+        {
+            /* Index node — extract children. */
+            const uint8_t *data = buf + sizeof(struct btree_node_header);
+            for(uint16_t i = 0; i < nhdr.node_keys; i++)
+            {
+                struct btree_index_entry ie;
+                memcpy(&ie, data + (size_t)i * sizeof(ie), sizeof(ie));
+
+                if(nhdr.level == 1)
+                {
+                    /* Level-1 node: children are leaves — collect
+                     * their LBAs directly without reading them. */
+                    if(leaf_n >= leaf_cap)
+                    {
+                        leaf_cap *= 2;
+                        uint64_t *tmp = realloc(leaves, leaf_cap * sizeof(uint64_t));
+                        if(!tmp) { free(leaves); free(stk); return OBMAFS3_ERR_NOMEM; }
+                        leaves = tmp;
+                    }
+                    leaves[leaf_n++] = ie.child_lba;
+                }
+                else
+                {
+                    /* Level > 1: push child for further traversal. */
+                    if(stk_n >= stk_cap)
+                    {
+                        stk_cap *= 2;
+                        uint64_t *tmp = realloc(stk, stk_cap * sizeof(uint64_t));
+                        if(!tmp) { free(leaves); free(stk); return OBMAFS3_ERR_NOMEM; }
+                        stk = tmp;
+                    }
+                    stk[stk_n++] = ie.child_lba;
+                }
+            }
+        }
+    }
+
+    free(stk);
+    *out_lbas  = leaves;
+    *out_count = leaf_n;
+    return OBMAFS3_OK;
+}
+
+/**
+ * Warm up the key set by reading every leaf in the B+Tree.
+ *
+ * Traverses all index nodes (cached — fast) to discover leaf LBAs,
+ * sorts them for sequential disk access, then reads each uncached
+ * leaf directly (NOT through the node cache) and ingests its keys.
+ *
+ * This avoids bloating the node cache with tens of thousands of
+ * leaf buffers that are only needed for existence checks.  The key
+ * set alone is sufficient for the hits-only fast path.
+ *
+ * Typical cost: one-time ~2-15 seconds on HDD (depends on tree size),
+ * after which every hit-only write completes in <1ms.
+ */
+static void keyset_warmup(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
+                           uint8_t *buf, struct dedup_node_cache *nc)
+{
+    struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+    if(!ks || hdr->root_node_lba == 0) return;
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    uint64_t *leaf_lbas = NULL;
+    uint64_t  leaf_count = 0;
+    int rc = collect_all_leaf_lbas(ctx, hdr, buf, nc, &leaf_lbas, &leaf_count);
+    if(rc != OBMAFS3_OK || leaf_count == 0) { free(leaf_lbas); return; }
+
+    /* Sort for sequential disk access. */
+    qsort(leaf_lbas, (size_t)leaf_count, sizeof(uint64_t), lba_cmp);
+
+    /* Deduplicate (the DFS may visit the root as a leaf in a
+     * single-level tree, but mainly this removes nothing). */
+    uint64_t unique = 0;
+    for(uint64_t i = 0; i < leaf_count; i++)
+    {
+        if(unique > 0 && leaf_lbas[i] == leaf_lbas[unique - 1]) continue;
+        leaf_lbas[unique++] = leaf_lbas[i];
+    }
+    leaf_count = unique;
+
+    size_t bsz = (size_t)ctx->sb.block_size;
+
+    /* Issue readahead hints for all uncached leaves. */
+    for(uint64_t i = 0; i < leaf_count; i++)
+    {
+        if(nc && cache_find_slot(nc, leaf_lbas[i])) continue;
+        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
+                      (off_t)bsz, POSIX_FADV_WILLNEED);
+    }
+
+    /* Read leaves and ingest their keys into the key set.
+     * Cached leaves are ingested directly from the cache buffer.
+     * Uncached leaves are read from disk (bypassing the node cache
+     * to avoid bloating it with tens of thousands of leaf buffers). */
+    uint64_t read_count = 0, cached_count = 0;
+    for(uint64_t i = 0; i < leaf_count; i++)
+    {
+        if(nc)
+        {
+            struct dedup_cache_slot *slot = cache_find_slot(nc, leaf_lbas[i]);
+            if(slot)
+            {
+                keyset_ingest_leaf(ks, slot->buf);
+                cached_count++;
+                continue;
+            }
+        }
+        rc = obmafs3_block_read(ctx, leaf_lbas[i], buf, bsz);
+        if(rc == OBMAFS3_OK)
+        {
+            keyset_ingest_leaf(ks, buf);
+            read_count++;
+        }
+    }
+
+    free(leaf_lbas);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    fprintf(stderr,
+            "[dedup-warmup] scanned %" PRIu64 " leaves (%" PRIu64 " disk, %" PRIu64 " cached) "
+            "in %.1fms — key set now has %u keys\n",
+            leaf_count, read_count, cached_count,
+            timespec_diff_ms(&t_start, &t_end), ks->count);
 }
 
 /**
  * Wrappers that dispatch to the cache when available,
  * falling back to direct I/O when nc is NULL.
+ * After reading, leaf nodes are ingested into the key set.
  */
 static int nc_block_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t bsz)
 {
-    if(nc) return dedup_cache_read(nc, ctx, lba, buf, bsz);
-    return obmafs3_block_read(ctx, lba, buf, bsz);
+    int rc;
+    if(nc) rc = dedup_cache_read(nc, ctx, lba, buf, bsz);
+    else   rc = obmafs3_block_read(ctx, lba, buf, bsz);
+
+    if(rc == OBMAFS3_OK)
+        keyset_ingest_leaf((struct dedup_key_set *)ctx->dedup_key_set, buf);
+
+    return rc;
 }
 
 /** Cache-aware block write: delegates to the node cache or a direct write. */
@@ -770,6 +1187,79 @@ struct dedup_upsert_ctx
     int                      insert_pos;
     struct btree_node_header leaf_hdr;
 };
+
+/* ---- Comparison for sorting LBAs (used by leaf prefetch) ---- */
+static int lba_cmp(const void *a, const void *b)
+{
+    uint64_t la = *(const uint64_t *)a;
+    uint64_t lb = *(const uint64_t *)b;
+    return (la < lb) ? -1 : (la > lb) ? 1 : 0;
+}
+
+/**
+ * Lightweight tree traversal: find which leaf node would contain @hash
+ * by descending through index nodes only.  Stops at level 1 and returns
+ * the child_lba (the leaf), so the leaf itself is NOT read from disk.
+ *
+ * Index nodes are read through the node cache (nc), so after the first
+ * write most or all index reads are cache hits.
+ *
+ * For a single-level tree (root is the leaf), the root LBA is returned
+ * and it IS read (unavoidable).
+ *
+ * @param out_leaf_lba  Receives the LBA of the target leaf node.
+ * @return OBMAFS3_OK on success, error code otherwise.
+ */
+static int dedup_find_leaf_lba(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
+                               uint64_t hash, uint64_t *out_leaf_lba,
+                               uint8_t *buf, struct dedup_node_cache *nc)
+{
+    size_t   bsz = (size_t)ctx->sb.block_size;
+    uint64_t lba = hdr->root_node_lba;
+
+    if(lba == 0) { *out_leaf_lba = 0; return OBMAFS3_OK; }
+
+    while(1)
+    {
+        int rc = nc_block_read(nc, ctx, lba, buf, bsz);
+        if(rc != OBMAFS3_OK) return rc;
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+
+        if(nhdr.level == 0)
+        {
+            /* Root is the only node (single-level tree). */
+            *out_leaf_lba = lba;
+            return OBMAFS3_OK;
+        }
+
+        /* Index node — binary search for the correct child. */
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        uint16_t       slot = 0;
+        int            lo = 0, hi = (int)nhdr.node_keys - 1;
+        while(lo <= hi)
+        {
+            int      mid = lo + (hi - lo) / 2;
+            uint64_t mid_key;
+            memcpy(&mid_key, data + (size_t)mid * sizeof(struct btree_index_entry), sizeof(mid_key));
+            if(mid_key <= hash) { slot = (uint16_t)mid; lo = mid + 1; }
+            else                { hi = mid - 1; }
+        }
+
+        struct btree_index_entry ie;
+        memcpy(&ie, data + (size_t)slot * sizeof(ie), sizeof(ie));
+
+        if(nhdr.level == 1)
+        {
+            /* Next level is leaf — return its LBA without reading it. */
+            *out_leaf_lba = ie.child_lba;
+            return OBMAFS3_OK;
+        }
+
+        lba = ie.child_lba;
+    }
+}
 
 /**
  * Phase 1 of upsert: traverse from root to leaf looking for @hash.
@@ -1513,7 +2003,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                                    const void *buf, size_t size, uint16_t sector_size, struct sector_map_cache *cache,
                                    struct dedup_block_cache *db_cache)
 {
-    int rc;
+    int rc = OBMAFS3_OK;
 
     /* Update file_size (the logical image size) */
     uint64_t new_end = offset + size;
@@ -1608,96 +2098,268 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         }
     }
 
+    /* Wait for the background warmup thread to finish populating
+     * the node cache and key set.  If warmup is already done, this
+     * returns immediately (just a mutex lock + flag check). */
+    obmafs3_dedup_warmup_wait(ctx);
+
+    /* Lazy fallback: if warmup wasn't started (e.g. mkobmafs path),
+     * create the node cache and key set inline. */
+    if(!ctx->dedup_node_cache)
+    {
+        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
+        if(nc) ctx->dedup_node_cache = nc;
+    }
+
+    const uint8_t *data = (const uint8_t *)buf;
+    size_t         bsz  = (size_t)ctx->sb.block_size;
+
     /* Use the thread-local node buffer for dedup tree traversal. */
     uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
-    /* Create the dedup B+Tree node cache if the caller provides a
-     * persistent dedup block cache (i.e. across FUSE write calls). */
-    if(db_cache && !db_cache->node_cache)
+    struct timespec t_prefetch_start, t_prefetch_end;
+    struct timespec t_phase1_start, t_phase1_end;
+    struct timespec t_phase2_start;
+    struct timespec t_bgwait_end, t_flush_end, t_ncflush_end, t_hdr_end, t_sme_end;
+    uint64_t dedup_hits = 0, dedup_misses = 0;
+    uint64_t prefetch_advised = 0;
+
+    /*
+     * Pre-compute per-sector metadata: hash, data pointer, length,
+     * sector number.  This array feeds both the leaf prefetch and the
+     * hash-sorted main loop, eliminating double-hashing.
+     */
+    uint64_t num_sectors = size / sector_size + (size % sector_size ? 1 : 0);
+
+    struct sector_work
     {
-        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
-        if(nc) db_cache->node_cache = nc;
-        /* Non-fatal: if allocation fails, we fall back to direct I/O */
+        uint64_t       hash;
+        const uint8_t *data;
+        size_t         len;
+        int64_t        sector_num;
+    };
+
+    struct sector_work *sw = malloc((size_t)(num_sectors * sizeof(struct sector_work)));
+    if(!sw)
+    {
+        free(sme_buf);
+        if(!db_is_cached) dedup_block_free(db);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    {
+        size_t bp = 0;
+        uint64_t si = 0;
+        while(bp < size && si < num_sectors)
+        {
+            uint64_t wp  = offset + bp;
+            size_t   ois = (size_t)(wp % sector_size);
+            size_t   riw = size - bp;
+            size_t   ris = (size_t)sector_size - ois;
+            size_t   ch  = (riw < ris) ? riw : ris;
+
+            sw[si].data       = data + bp;
+            sw[si].len        = ch;
+            sw[si].sector_num = (int64_t)(wp / sector_size);
+            sw[si].hash       = obmafs3_checksum_xxh64(sw[si].data, sw[si].len);
+            si++;
+            bp += ch;
+        }
+        num_sectors = si;
+    }
+
+    /* Build a hash-sorted index for processing order.
+     * Processing sectors in hash order groups tree lookups/inserts
+     * that target the same leaf node, turning N separate
+     * read-modify-write cycles into 1 read + N inserts + 1 write. */
+    uint32_t *sorted_idx = malloc((size_t)(num_sectors * sizeof(uint32_t)));
+    if(!sorted_idx)
+    {
+        free(sw);
+        free(sme_buf);
+        if(!db_is_cached) dedup_block_free(db);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+    for(uint64_t i = 0; i < num_sectors; i++) sorted_idx[i] = (uint32_t)i;
+
+    /* Indirect sort by hash — keeps sw[] in original order for sme_buf. */
+    {
+        /* Use sw pointer via a file-scope helper (qsort_r is non-portable) */
+        const struct sector_work *g_sw = sw;
+        /* Simple insertion sort: num_sectors is small (≤512) and the
+         * array is often nearly sorted by hash already. */
+        for(uint64_t i = 1; i < num_sectors; i++)
+        {
+            uint32_t key = sorted_idx[i];
+            uint64_t kh  = g_sw[key].hash;
+            int64_t  j   = (int64_t)i - 1;
+            while(j >= 0 && g_sw[sorted_idx[j]].hash > kh)
+            {
+                sorted_idx[j + 1] = sorted_idx[j];
+                j--;
+            }
+            sorted_idx[j + 1] = key;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_prefetch_start);
+
+    /*
+     * Fast-path: check how many hashes are already in the key set.
+     * If all are known, we can skip the entire prefetch phase —
+     * the Phase 1 loop will resolve them via keyset_contains()
+     * without any tree traversal or disk I/O.
+     */
+    uint64_t keyset_fast_hits = 0;
+    {
+        const struct dedup_key_set *ks = (const struct dedup_key_set *)ctx->dedup_key_set;
+        if(ks)
+        {
+            for(uint64_t i = 0; i < num_sectors; i++)
+            {
+                if(keyset_contains(ks, sw[i].hash)) keyset_fast_hits++;
+            }
+        }
     }
 
     /*
-     * Phase 1: Process sectors — hash, dedup lookup/store, collect
-     *          sector_map_entries in memory.  All dedup tree node
-     *          allocations happen here, before any sector map block
-     *          allocations, preventing extent fragmentation.
+     * Leaf prefetch: use the pre-computed hashes to find target leaf
+     * LBAs and batch-prefetch them with posix_fadvise.
+     * Skipped entirely when all hashes are already in the key set.
      */
-    const uint8_t *data            = (const uint8_t *)buf;
-    size_t         bytes_processed = 0;
-
-    while(bytes_processed < size)
+    if(keyset_fast_hits < num_sectors)
     {
-        uint64_t write_pos        = offset + bytes_processed;
-        int64_t  sector_num       = (int64_t)(write_pos / sector_size);
-        size_t   offset_in_sector = (size_t)(write_pos % sector_size);
-
-        size_t remaining_in_write  = size - bytes_processed;
-        size_t remaining_in_sector = (size_t)sector_size - offset_in_sector;
-        size_t chunk = (remaining_in_write < remaining_in_sector) ? remaining_in_write : remaining_in_sector;
-
-        if(offset_in_sector != 0)
+        struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        if(nc && dedup_hdr.root_node_lba != 0)
         {
-            /* Partial sector write not starting at sector boundary.
-             * This shouldn't happen in normal sequential writes.
-             * Fall back to storing it as a unique (non-dedup) sector. */
+            uint64_t *pf_lbas = malloc((size_t)(num_sectors * sizeof(uint64_t)));
+            if(pf_lbas)
+            {
+                for(uint64_t i = 0; i < num_sectors; i++)
+                {
+                    uint64_t leaf_lba = 0;
+                    dedup_find_leaf_lba(ctx, &dedup_hdr, sw[i].hash, &leaf_lba, tree_buf, nc);
+                    pf_lbas[i] = leaf_lba;
+                }
+
+                /* Sort leaf LBAs for sequential disk access */
+                qsort(pf_lbas, (size_t)num_sectors, sizeof(uint64_t), lba_cmp);
+
+                uint64_t prev_lba = 0;
+                for(uint64_t i = 0; i < num_sectors; i++)
+                {
+                    if(pf_lbas[i] == 0 || pf_lbas[i] == prev_lba) continue;
+                    prev_lba = pf_lbas[i];
+                    if(cache_find_slot(nc, pf_lbas[i])) continue;
+                    posix_fadvise(ctx->fd, (off_t)(pf_lbas[i] * bsz),
+                                  (off_t)bsz, POSIX_FADV_WILLNEED);
+                    prefetch_advised++;
+                }
+
+                prev_lba = 0;
+                for(uint64_t i = 0; i < num_sectors; i++)
+                {
+                    if(pf_lbas[i] == 0 || pf_lbas[i] == prev_lba) continue;
+                    prev_lba = pf_lbas[i];
+                    struct dedup_cache_slot *slot = cache_find_slot(nc, pf_lbas[i]);
+                    if(slot)
+                    {
+                        /* Leaf is cached — still ingest its keys into
+                         * the key set in case it was cached before the
+                         * set was created or last seeded. */
+                        keyset_ingest_leaf((struct dedup_key_set *)ctx->dedup_key_set, slot->buf);
+                        continue;
+                    }
+                    nc_block_read(nc, ctx, pf_lbas[i], tree_buf, bsz);
+                }
+
+                free(pf_lbas);
+            }
         }
+    } /* keyset_fast_hits < num_sectors */
 
-        size_t         sector_data_len = chunk;
-        const uint8_t *sector_data     = data + bytes_processed;
+    clock_gettime(CLOCK_MONOTONIC, &t_prefetch_end);
+    clock_gettime(CLOCK_MONOTONIC, &t_phase1_start);
 
-        /* Hash the sector data */
-        uint64_t hash = obmafs3_checksum_xxh64(sector_data, sector_data_len);
+    /*
+     * Phase 1: Process sectors in hash-sorted order — dedup lookup,
+     *          store new sectors, insert into tree.  Hash ordering
+     *          groups accesses to the same leaf node, so consecutive
+     *          inserts typically share a single cached leaf read.
+     *
+     *          sector_map_entries are filled at their original index
+     *          to preserve positional ordering for reads.
+     */
+    sme_count = num_sectors; /* all slots will be filled */
+    for(uint64_t si = 0; si < num_sectors; si++)
+    {
+        uint32_t idx = sorted_idx[si];
+        uint64_t hash       = sw[idx].hash;
+        const uint8_t *sdata = sw[idx].data;
+        size_t         slen  = sw[idx].len;
+        int64_t        snum  = sw[idx].sector_num;
 
-        /* Look up in the dedup tree, saving traversal for insert */
-        struct dedup_entry       existing;
-        struct dedup_upsert_ctx  uctx;
-        struct dedup_node_cache *nc = db_cache ? (struct dedup_node_cache *)db_cache->node_cache : NULL;
-        rc                          = dedup_upsert_find(ctx, &dedup_hdr, hash, &existing, &uctx, tree_buf, nc);
-
-        if(rc == OBMAFS3_OK) { /* Already stored — skip the data, just record the mapping */ }
-        else if(rc == OBMAFS3_ERR_NOTFOUND)
+        /* Fast path: if the key set confirms this hash exists,
+         * skip the full tree traversal entirely — zero disk I/O. */
+        struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+        if(keyset_contains(ks, hash))
         {
-            /* New sector — store in the dedup data block */
-            uint64_t             stored_lba, stored_offset;
-            struct compress_pool *pool    = db_cache ? ctx->compress_pool : NULL;
-            void                **pjob    = db_cache ? &db_cache->pending_job : NULL;
-            rc = dedup_block_store(ctx, db, sector_data, sector_data_len, &stored_lba, &stored_offset, pool, pjob);
-            if(rc != OBMAFS3_OK) goto out;
-
-            /* Insert at the position found by upsert_find (no
-             * re-traversal, no redundant header write) */
-            struct dedup_entry new_entry;
-            new_entry.hash         = hash;
-            new_entry.block_lba    = stored_lba;
-            new_entry.block_offset = stored_offset;
-
-            rc = dedup_upsert_insert(ctx, &dedup_hdr, &new_entry, &uctx, tree_buf, nc);
-            if(rc != OBMAFS3_OK) goto out;
+            dedup_hits++;
         }
         else
         {
-            /* Lookup error */
-            goto out;
+            /* Full tree lookup, saving traversal for potential insert */
+            struct dedup_entry       existing;
+            struct dedup_upsert_ctx  uctx;
+            struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+            rc = dedup_upsert_find(ctx, &dedup_hdr, hash, &existing, &uctx, tree_buf, nc);
+
+            if(rc == OBMAFS3_OK) { dedup_hits++; }
+            else if(rc == OBMAFS3_ERR_NOTFOUND)
+            {
+                dedup_misses++;
+                uint64_t             stored_lba, stored_offset;
+                struct compress_pool *pool = db_cache ? ctx->compress_pool : NULL;
+                void                **pjob = db_cache ? &db_cache->pending_job : NULL;
+                rc = dedup_block_store(ctx, db, sdata, slen, &stored_lba, &stored_offset, pool, pjob);
+                if(rc != OBMAFS3_OK) { free(sw); free(sorted_idx); goto out; }
+
+                struct dedup_entry new_entry;
+                new_entry.hash         = hash;
+                new_entry.block_lba    = stored_lba;
+                new_entry.block_offset = stored_offset;
+
+                rc = dedup_upsert_insert(ctx, &dedup_hdr, &new_entry, &uctx, tree_buf, nc);
+                if(rc != OBMAFS3_OK) { free(sw); free(sorted_idx); goto out; }
+
+                /* Add the newly inserted key to the set for future lookups */
+                if(ks) keyset_insert(ks, hash);
+            }
+            else
+            {
+                free(sw); free(sorted_idx); goto out;
+            }
         }
 
-        /* Collect the sector_map_entry (skipped for CD images) */
+        /* Fill sme_buf at the original position (sector order) */
         if(!skip_sme)
         {
-            sme_buf[sme_count].sector      = sector_num;
-            sme_buf[sme_count].sector_size = sector_size;
-            sme_buf[sme_count].hash        = hash;
-            sme_count++;
+            sme_buf[idx].sector      = snum;
+            sme_buf[idx].sector_size = sector_size;
+            sme_buf[idx].hash        = hash;
         }
 
         /* Update sector count */
-        if((uint64_t)(sector_num + 1) > inode->sector_count) inode->sector_count = (uint64_t)(sector_num + 1);
-
-        bytes_processed += chunk;
+        if((uint64_t)(snum + 1) > inode->sector_count) inode->sector_count = (uint64_t)(snum + 1);
     }
+
+    free(sw);
+    free(sorted_idx);
+
+    /* Adjust sme_count: when skip_sme, it stays 0 */
+    if(skip_sme) sme_count = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &t_phase1_end);
 
     /*
      * Phase 2: Flush dedup data, then write all sector_map_entries in
@@ -1705,12 +2367,16 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      *          are contiguous (single extent), since no other allocations
      *          happen between them.
      */
+    clock_gettime(CLOCK_MONOTONIC, &t_phase2_start);
+
     /* Wait for any pending background compression before syncing */
     if(db_cache && db_cache->pending_job)
     {
         int bg_rc = dedup_bg_wait(ctx, &db_cache->pending_job);
         if(rc == OBMAFS3_OK) rc = bg_rc;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_bgwait_end);
 
     /* Flush any remaining dedup block data to disk (synchronous).
      * Skip intermediate flushes when using a persistent cache —
@@ -1724,18 +2390,29 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         if(rc == OBMAFS3_OK) rc = flush_rc;
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &t_flush_end);
+
     /* Flush cached tree nodes to disk before updating the header */
-    if(db_cache && db_cache->node_cache)
+    if(ctx->dedup_node_cache)
     {
-        int nc_rc = dedup_cache_flush((struct dedup_node_cache *)db_cache->node_cache, ctx);
+        int nc_rc = dedup_cache_flush((struct dedup_node_cache *)ctx->dedup_node_cache, ctx);
         if(rc == OBMAFS3_OK) rc = nc_rc;
     }
 
-    /* Update the tree header with the current partial block state */
+    clock_gettime(CLOCK_MONOTONIC, &t_ncflush_end);
+
+    /* Update the tree header with the current partial block state.
+     * Skip the disk write when nothing changed (all duplicates and
+     * the dedup block position is unchanged). */
     dedup_hdr.last_block_lba    = db->block_lba;
     dedup_hdr.last_block_offset = db->offset;
-    int hdr_rc                  = obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
-    if(rc == OBMAFS3_OK) rc = hdr_rc;
+    if(dedup_misses > 0 || !db_is_cached)
+    {
+        int hdr_rc = obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
+        if(rc == OBMAFS3_OK) rc = hdr_rc;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_hdr_end);
 
     /* Keep the cached header in sync */
     if(db_cache) db_cache->dedup_hdr = dedup_hdr;
@@ -1772,7 +2449,38 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         }
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &t_sme_end);
+
     free(sme_buf);
+
+    /* Print timing instrumentation */
+    {
+        struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        struct dedup_key_set    *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+        uint32_t nc_count = nc ? nc->count : 0;
+        uint32_t nc_cap   = nc ? nc->capacity : 0;
+        uint32_t ks_count = ks ? ks->count : 0;
+        uint32_t ks_cap   = ks ? ks->capacity : 0;
+        fprintf(stderr,
+                "[dedup-timing] write %zu bytes @ %" PRIu64 ": "
+                "prefetch=%.1fms(%" PRIu64 " leaves)  "
+                "phase1=%.1fms  bg_wait=%.1fms  blk_flush=%.1fms  "
+                "nc_flush=%.1fms  hdr=%.1fms  sme=%.1fms  TOTAL=%.1fms  "
+                "hits=%" PRIu64 " misses=%" PRIu64
+                " nc_count=%u/%u ks=%u/%u ks_fast=%" PRIu64 "\n",
+                size, offset,
+                timespec_diff_ms(&t_prefetch_start, &t_prefetch_end), prefetch_advised,
+                timespec_diff_ms(&t_phase1_start, &t_phase1_end),
+                timespec_diff_ms(&t_phase2_start, &t_bgwait_end),
+                timespec_diff_ms(&t_bgwait_end, &t_flush_end),
+                timespec_diff_ms(&t_flush_end, &t_ncflush_end),
+                timespec_diff_ms(&t_ncflush_end, &t_hdr_end),
+                timespec_diff_ms(&t_hdr_end, &t_sme_end),
+                timespec_diff_ms(&t_prefetch_start, &t_sme_end),
+                dedup_hits, dedup_misses, nc_count, nc_cap,
+                ks_count, ks_cap, keyset_fast_hits);
+    }
+
     /* Copy updated state back to the persistent cache if used */
     if(db_is_cached)
     {
@@ -1800,7 +2508,7 @@ out:
     if(db->data && db->dirty) dedup_block_flush(ctx, db);
 
     /* Flush cached tree nodes even on error to keep disk consistent */
-    if(db_cache && db_cache->node_cache) dedup_cache_flush((struct dedup_node_cache *)db_cache->node_cache, ctx);
+    if(ctx->dedup_node_cache) dedup_cache_flush((struct dedup_node_cache *)ctx->dedup_node_cache, ctx);
 
     dedup_hdr.last_block_lba    = db->block_lba;
     dedup_hdr.last_block_offset = db->offset;
@@ -1875,9 +2583,9 @@ int obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_siz
     }
 
     /* Flush any cached tree nodes to disk */
-    if(db_cache->node_cache)
+    if(ctx->dedup_node_cache)
     {
-        int nc_rc = dedup_cache_flush((struct dedup_node_cache *)db_cache->node_cache, ctx);
+        int nc_rc = dedup_cache_flush((struct dedup_node_cache *)ctx->dedup_node_cache, ctx);
         if(rc == OBMAFS3_OK) rc = nc_rc;
     }
 
@@ -1929,16 +2637,155 @@ void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_
     if(!db_cache) return;
     /* Wait for any pending pool job */
     if(db_cache->pending_job) dedup_bg_wait(ctx, &db_cache->pending_job);
-    /* Free the B+Tree node cache */
-    if(db_cache->node_cache)
-    {
-        dedup_cache_free((struct dedup_node_cache *)db_cache->node_cache);
-        db_cache->node_cache = NULL;
-    }
     free(db_cache->data);
     db_cache->data        = NULL;
     db_cache->initialized = 0;
     db_cache->hdr_cached  = 0;
+}
+
+/**
+ * Free the global dedup B+Tree node cache stored in the filesystem context.
+ * Called during unmount (obmafs3_close) to release memory.
+ */
+void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || !ctx->dedup_node_cache) return;
+    dedup_cache_free((struct dedup_node_cache *)ctx->dedup_node_cache);
+    ctx->dedup_node_cache = NULL;
+}
+
+/**
+ * Free the global dedup key set stored in the filesystem context.
+ * Called during unmount (obmafs3_close) to release memory.
+ */
+void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || !ctx->dedup_key_set) return;
+    keyset_free((struct dedup_key_set *)ctx->dedup_key_set);
+    ctx->dedup_key_set = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Background dedup key set warmup                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Background thread entry point: create the node cache and key set,
+ * then scan every dedup tree's leaves to populate the key set.
+ *
+ * Runs entirely independently of the FUSE write path.  The write path
+ * calls obmafs3_dedup_warmup_wait() which blocks until this thread
+ * signals completion.
+ */
+static void *warmup_thread_func(void *arg)
+{
+    struct obmafs3_ctx *ctx = (struct obmafs3_ctx *)arg;
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    /* Create the node cache if it doesn't exist yet. */
+    if(!ctx->dedup_node_cache)
+    {
+        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
+        if(nc) ctx->dedup_node_cache = nc;
+    }
+
+    /* Create the key set. */
+    struct dedup_key_set *ks = keyset_create();
+    if(!ks) goto done;
+    ctx->dedup_key_set = ks;
+
+    /* Seed from any already-cached nodes (may be 0). */
+    keyset_seed_from_cache(ks, (const struct dedup_node_cache *)ctx->dedup_node_cache);
+
+    /* Read the dedup tree list and warm up every tree. */
+    struct tree_list_header list_hdr;
+    struct tree_list_entry *entries = NULL;
+    uint64_t                count   = 0;
+    int rc = dedup_tree_list_read(ctx, &list_hdr, &entries, &count);
+    if(rc == OBMAFS3_OK && count > 0)
+    {
+        /* Allocate a scratch buffer for tree traversal. */
+        uint8_t *buf = malloc((size_t)ctx->sb.block_size);
+        if(buf)
+        {
+            for(uint64_t i = 0; i < count; i++)
+            {
+                struct btree_header hdr;
+                rc = obmafs3_btree_header_read(ctx, entries[i].tree_lba, &hdr);
+                if(rc == OBMAFS3_OK && hdr.root_node_lba != 0)
+                {
+                    keyset_warmup(ctx, &hdr, buf,
+                                  (struct dedup_node_cache *)ctx->dedup_node_cache);
+                }
+            }
+            free(buf);
+        }
+        free(entries);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    fprintf(stderr, "[dedup-warmup] background warmup completed in %.1fms — key set has %u keys\n",
+            timespec_diff_ms(&t_start, &t_end), ks->count);
+
+done:
+    pthread_mutex_lock(&ctx->warmup_mutex);
+    ctx->warmup_done    = 1;
+    ctx->warmup_running = 0;
+    pthread_cond_broadcast(&ctx->warmup_cond);
+    pthread_mutex_unlock(&ctx->warmup_mutex);
+    return NULL;
+}
+
+/**
+ * Start the background dedup key set warmup thread.
+ *
+ * Called from FUSE init (after daemonisation) so the warmup runs
+ * concurrently with any early FUSE operations.  The write path
+ * calls obmafs3_dedup_warmup_wait() to block until completion.
+ */
+void obmafs3_dedup_warmup_start(struct obmafs3_ctx *ctx)
+{
+    if(!ctx) return;
+
+    pthread_mutex_lock(&ctx->warmup_mutex);
+    ctx->warmup_done    = 0;
+    ctx->warmup_running = 1;
+    pthread_mutex_unlock(&ctx->warmup_mutex);
+
+    int rc = pthread_create(&ctx->warmup_thread, NULL, warmup_thread_func, ctx);
+    if(rc != 0)
+    {
+        /* Thread creation failed — fall back to lazy init in write path. */
+        fprintf(stderr, "[dedup-warmup] failed to create background thread (rc=%d)\n", rc);
+        pthread_mutex_lock(&ctx->warmup_mutex);
+        ctx->warmup_running = 0;
+        ctx->warmup_done    = 1;
+        pthread_cond_broadcast(&ctx->warmup_cond);
+        pthread_mutex_unlock(&ctx->warmup_mutex);
+    }
+    else
+    {
+        ctx->warmup_started = 1;
+    }
+}
+
+/**
+ * Wait for the background warmup thread to finish.
+ *
+ * Called at the top of the write path and during unmount.  If warmup
+ * is already done, this returns immediately (just a mutex lock +
+ * flag check).  Safe to call multiple times.
+ */
+void obmafs3_dedup_warmup_wait(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || !ctx->warmup_started) return;
+
+    pthread_mutex_lock(&ctx->warmup_mutex);
+    while(!ctx->warmup_done)
+        pthread_cond_wait(&ctx->warmup_cond, &ctx->warmup_mutex);
+    pthread_mutex_unlock(&ctx->warmup_mutex);
 }
 
 /* ------------------------------------------------------------------ */

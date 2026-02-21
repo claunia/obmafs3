@@ -84,6 +84,14 @@ struct obmafs3_ctx
     uint16_t            rc_leaf_count;      ///< Number of keys in the cached leaf
     int                 rc_leaf_valid;      ///< Non-zero when the leaf cache is populated
     struct compress_pool *compress_pool;    ///< Persistent compression thread pool
+    void                *dedup_node_cache;  ///< Global dedup B+Tree node cache (shared across files)
+    void                *dedup_key_set;     ///< Global dedup hash key set (fast existence check)
+    pthread_t            warmup_thread;      ///< Background keyset warmup thread
+    pthread_mutex_t      warmup_mutex;       ///< Protects warmup_done flag
+    pthread_cond_t       warmup_cond;        ///< Signalled when warmup completes
+    int                  warmup_running;     ///< 1 while background warmup is active
+    int                  warmup_done;        ///< 1 after warmup has completed
+    int                  warmup_started;     ///< 1 if warmup thread was created (needs join)
 };
 
 /* Open flags */
@@ -225,7 +233,6 @@ struct dedup_block_cache
     int      dirty;        ///< Whether the buffer has been modified
     int      initialized;  ///< Non-zero once first init has run
     void    *pending_job;  ///< Pending pool_async_job (NULL when idle)
-    void    *node_cache;   ///< Opaque dedup B+Tree node cache
     struct btree_header dedup_hdr;     ///< Cached dedup tree header
     uint64_t            dedup_hdr_lba; ///< Cached dedup tree header LBA
     int                 hdr_cached;    ///< Non-zero when dedup_hdr is valid
@@ -236,6 +243,10 @@ int  obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record
                                     struct dedup_block_cache *db_cache);
 int  obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_size, struct dedup_block_cache *db_cache);
 void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache);
+void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx);
+void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx);
+void obmafs3_dedup_warmup_start(struct obmafs3_ctx *ctx);
+void obmafs3_dedup_warmup_wait(struct obmafs3_ctx *ctx);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record *inode, struct sector_map_cache *cache);
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
 
