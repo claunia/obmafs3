@@ -58,6 +58,12 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t next_inode_id;      /* Next available inode ID */
     uint64_t bitmap_lba;         /* LBA of the first allocation bitmap block (block 14) */
     uint64_t bitmap_blocks;      /* Number of blocks used by the allocation bitmap */
+    uint64_t keyset_lba;         /* LBA of the persisted dedup key set (0 = none) */
+    uint64_t keyset_blocks;      /* Number of blocks used by the persisted key set */
+    uint64_t pending_lba;        /* LBA of the persisted pending insert buffer (0 = none) */
+    uint64_t pending_blocks;     /* Number of blocks used by the persisted pending buffer */
+    uint32_t btree_clump_size;   /* Nodes to pre-allocate per growth for non-dedup trees (0 = default 64) */
+    uint32_t dedup_clump_size;   /* Nodes to pre-allocate per growth for dedup trees (0 = default 1024) */
     uint8_t  volume_label[256];  /* Volume label, UTF-8, NUL-terminated */
     uint8_t  checksum[32];       /* Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed) */
 };
@@ -81,6 +87,10 @@ A byte-identical **backup copy** of the superblock is stored at the last block o
 - `metadata_idx_lba` — LBA of the Metadata Index Tree header, a reverse-index B+Tree keyed by `(key, value, inode_id)` for metadata queries.
 - `refcount_lba` — LBA of the Refcount Tree header, a B+Tree that tracks per-block reference counts for shared (cloned) data blocks.
 - `bitmap_lba`, `bitmap_blocks` — Location and size of the allocation bitmap on disk.
+- `keyset_lba`, `keyset_blocks` — Location and size of the persisted dedup key set extent. When zero, no key set has been persisted (see [Dedup Key Set](#dedup-key-set)).
+- `pending_lba`, `pending_blocks` — Location and size of the persisted pending insert buffer extent. When zero, no pending buffer has been persisted (see [Pending Insert Buffer](#pending-insert-buffer)).
+- `btree_clump_size` — Number of nodes to pre-allocate per growth for non-dedup B+Trees. 0 uses the default of 64 (see [Clump Allocation](#clump-allocation)).
+- `dedup_clump_size` — Number of nodes to pre-allocate per growth for dedup B+Trees. 0 uses the default of 1024 (see [Clump Allocation](#clump-allocation)).
 
 ---
 
@@ -283,7 +293,7 @@ If a file requires more than 8 extents, additional extents are stored in the Ove
 
 ### Overflow Tree (extra extents)
 
-The Overflow Tree is a B+Tree that stores additional extent runs for files that exceed the 8 inline extents available in the inode. Leaf nodes contain sorted `overflow_extent` records; index nodes use `btree_index_entry` to route lookups by `inode_id`.
+The Overflow Tree is a B+Tree that stores additional extent runs for files that exceed the 8 inline extents available in the inode. Leaf nodes contain sorted `overflow_extent` records; index nodes use `overflow_index_entry` to route lookups by the composite key `(inode_id, logical_offset)`.
 
 ```c
 struct overflow_extent {                     /* packed, 40 bytes */
@@ -295,7 +305,17 @@ struct overflow_extent {                     /* packed, 40 bytes */
 };
 ```
 
-Overflow entries are sorted by the composite key `(inode_id, logical_offset)`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 40 = **100 entries**. Maximum index entries per node: (4096 − 70) / 16 = **251 entries**.
+Overflow entries are sorted by the composite key `(inode_id, logical_offset)`. Maximum records per leaf node with a 4096-byte block: (4096 − 70) / 40 = **100 entries**.
+
+```c
+struct overflow_index_entry {                /* packed, 24 bytes */
+    uint64_t inode_id;       /* Smallest inode_id reachable through child */
+    uint64_t logical_offset; /* Smallest logical_offset reachable through child */
+    uint64_t child_lba;      /* LBA of the child node */
+};
+```
+
+Maximum index entries per node: (4096 − 70) / 24 = **167 entries**.
 
 When reading file data, the system first uses the 8 inline extents from the inode, then traverses the overflow B+Tree to find any additional extents for that inode. The `level` field in the node header distinguishes index nodes (`level > 0`) from leaf nodes (`level == 0`).
 
@@ -535,6 +555,203 @@ When a file is written to the filesystem:
 8. **Dedup B+Tree node cache**: Frequently accessed B+Tree nodes are cached in memory during dedup writes, reducing disk reads during hash lookups and insertions.
 
 9. **Dedup tree header caching**: The dedup B+Tree header is cached in the `dedup_block_cache` across writes, avoiding a tree-list scan and header read on each FUSE write call.
+
+---
+
+## Clump Allocation
+
+B+Tree node allocation uses an HFS+-style **clump allocation** strategy to improve on-disk contiguity and reduce allocation overhead. Instead of allocating one node at a time, the allocator pre-allocates a contiguous batch ("clump") of nodes and links the extras into the tree's free-node chain for subsequent use.
+
+```c
+#define OBMAFS3_DEFAULT_CLUMP_SIZE 64   /* Non-dedup trees */
+#define OBMAFS3_DEDUP_CLUMP_SIZE   1024 /* Dedup trees */
+```
+
+### Node Allocation (`obmafs3_btree_alloc_node`)
+
+1. **Pop from free list**: If the tree header's `free_node_lba` is non-zero and `free_nodes > 0`, the first free node is popped. The node's first 8 bytes store the LBA of the next free node in the chain (a singly-linked list).
+
+2. **Clump growth**: When the free list is empty, a contiguous clump of nodes is allocated:
+   - The clump size is determined by `btree_clump_size` (non-dedup) or `dedup_clump_size` (dedup) from the superblock. A value of 0 uses the compile-time default (64 or 1024).
+   - `obmafs3_alloc_blocks()` is called for `clump × blocks_per_node` contiguous blocks.
+   - If contiguous allocation fails, the request is halved repeatedly until it succeeds (minimum: 1 node).
+   - The first node is returned to the caller.
+   - Remaining nodes are linked into a singly-linked free chain: each node's first 8 bytes store the LBA of the next free node.
+   - `hdr->free_node_lba` and `hdr->free_nodes` are updated in memory.
+
+3. For multi-block nodes (e.g., metadata trees with 8-block nodes), each "node" occupies `node_size / block_size` contiguous blocks.
+
+### Node Freeing (`obmafs3_btree_free_node`)
+
+Freed nodes are pushed onto the head of the tree's free-node list. The node's first 8 bytes are overwritten with the current `free_node_lba`, then `free_node_lba` is updated to point to the freed node and `free_nodes` is incremented.
+
+### Free Node Chain Format
+
+The free node chain is a singly-linked list. Each free node's on-disk content starts with a `uint64_t` containing the LBA of the next free node (0 = end of chain). The rest of the block is zero-filled.
+
+---
+
+## Dedup Key Set
+
+The **dedup key set** is an in-memory open-addressing hash table that stores every dedup hash key in the B+Tree. This enables O(1) existence checks ("has this sector hash been seen before?") without any disk I/O.
+
+### Structure
+
+```c
+struct dedup_key_set {
+    uint64_t *keys;      /* Slot array — 0 means empty */
+    uint32_t  capacity;  /* Always a power of 2 */
+    uint32_t  count;     /* Number of occupied slots */
+};
+```
+
+- **Hashing**: Fibonacci hashing (`key × 0x9E3779B97F4A7C15 >> 32`) maps keys to table indices.
+- **Collision resolution**: Linear probing.
+- **Load factor**: Grows (doubles capacity) at 75% occupancy.
+- **Sentinel**: Hash value 0 is reserved as "empty slot" and cannot be stored.
+- **Memory**: For 183k keys at 8 bytes each, the table uses ~3 MiB of RAM.
+
+### Population
+
+The key set is populated during the [warmup phase](#warmup-thread):
+1. **Fast path**: If a persisted key set exists on disk (`keyset_lba ≠ 0`), it is loaded directly.
+2. **Slow path**: All dedup tree leaves are scanned via BFS, and each leaf's hash keys are ingested into the set.
+
+During normal operation, newly inserted keys are added to the set immediately.
+
+### Persistence
+
+The key set is persisted to disk at unmount time so the next mount can use the fast-path load.
+
+```c
+#define KEYSET_PERSIST_MAGIC 0x53594B44444E4F4DULL /* "MONDKEYS" LE */
+
+struct keyset_persist_header {       /* packed */
+    uint64_t magic;      /* KEYSET_PERSIST_MAGIC */
+    uint64_t count;      /* Number of uint64_t keys following this header */
+    uint64_t checksum;   /* XXH64 of the packed key array (count × 8 bytes) */
+};
+```
+
+All non-empty keys are packed into a flat `uint64_t` array, prepended with the header, and written to a contiguously allocated extent. The superblock's `keyset_lba` / `keyset_blocks` fields record the location. On load, the header magic and XXH64 checksum are validated; if either check fails, the key set falls back to a full tree scan.
+
+---
+
+## Pending Insert Buffer
+
+The **pending insert buffer** is an in-memory open-addressing hash table that defers B+Tree insertions for new dedup entries. Instead of immediately inserting each new sector hash into the B+Tree (which requires expensive random disk reads to find the correct leaf), new entries are buffered here and flushed in bulk by the [housekeeping thread](#housekeeping-thread).
+
+### Structure
+
+```c
+struct dedup_pending_buf {
+    struct dedup_entry *slots;     /* Open-addressing table */
+    uint32_t            capacity;  /* Always a power of 2 */
+    uint32_t            count;     /* Number of occupied slots */
+    uint16_t            sector_size; /* Sector size of the dedup tree */
+};
+```
+
+- Uses the same Fibonacci hashing and linear probing as the key set.
+- Stores full `dedup_entry` records (hash + block_lba + block_offset).
+- The write path checks here before the B+Tree: if a hash is found in the pending buffer, the existing entry is reused (deduplication hit).
+
+### Write Path Integration
+
+1. Check the **key set** — if the hash exists, it's a known duplicate; look up the B+Tree.
+2. If the key set says "not found", check the **pending buffer** — if found, reuse the pending entry.
+3. If neither has the hash, it's a genuinely new sector: write the data, create a `dedup_entry`, insert into the pending buffer, and add the hash to the key set.
+
+This avoids B+Tree traversals entirely for new sectors during the hot write path.
+
+### Persistence
+
+The pending buffer is persisted to disk at unmount time so un-drained entries survive across mounts.
+
+```c
+#define PENDING_PERSIST_MAGIC 0x474E49444E455055ULL /* "UPENDING" LE */
+
+struct pending_persist_header {      /* packed */
+    uint64_t magic;         /* PENDING_PERSIST_MAGIC */
+    uint64_t count;         /* Number of dedup_entry records */
+    uint16_t sector_size;   /* Sector size of the pending buffer */
+    uint8_t  _pad[6];       /* Alignment padding */
+    uint64_t checksum;      /* XXH64 of the packed entry array */
+};
+```
+
+Entries from both the active pending buffer and any in-progress draining buffer are merged and written contiguously. The superblock's `pending_lba` / `pending_blocks` fields record the location.
+
+---
+
+## Housekeeping Thread
+
+A background **housekeeping thread** drains the pending insert buffer into the B+Tree in small batches, running concurrently with the FUSE write path.
+
+### Lifecycle
+
+1. Started after the warmup thread completes (via `obmafs3_housekeeping_start()`).
+2. Waits for the warmup thread to finish before doing any drain work.
+3. Runs continuously until `obmafs3_housekeeping_stop()` is called at unmount.
+
+### Drain Algorithm
+
+1. **Swap**: Under `tree_lock`, the active pending buffer is moved to a "draining" pointer and a fresh empty buffer is created for the write path.
+2. **Extract and sort**: All entries are extracted from the draining buffer and sorted by hash for sequential B+Tree leaf access.
+3. **Batch processing**: Entries are processed in batches of 32 (`HOUSEKEEPING_BATCH_SIZE`):
+   - **Phase A — Snapshot**: Briefly acquire `tree_lock` to read the current root LBA.
+   - **Phase B — Prefetch** (without lock): Use direct `pread()` to traverse the B+Tree and find target leaf LBAs, then issue `posix_fadvise(WILLNEED)` and pre-read them into the kernel page cache.
+   - **Phase C — Insert** (under lock): Perform the actual B+Tree insertions using the node cache. Because the leaves are already in the page cache, disk reads are served from RAM.
+   - **Yield**: Sleep 50ms (`HOUSEKEEPING_YIELD_US`) between batches to yield I/O bandwidth to the write path.
+4. **Idle sleep**: When no work is available, the thread sleeps for 5 seconds (`HOUSEKEEPING_IDLE_SEC`) before checking again.
+5. **Shutdown**: If shutdown is requested mid-drain, the incomplete draining buffer is preserved so `obmafs3_dedup_pending_save()` can persist the remaining entries for the next mount.
+
+### Thread Safety
+
+- The draining buffer is only accessed by the housekeeping thread (no lock needed for extraction/sorting).
+- B+Tree inserts are serialised via `tree_lock`.
+- Re-draining already-inserted entries on the next mount is safe because `dedup_upsert_find` skips duplicates.
+
+---
+
+## Warmup Thread
+
+A background **warmup thread** populates the dedup key set and node cache at mount time, running concurrently with early FUSE operations.
+
+### Sequence
+
+1. Creates the dedup node cache if not already present.
+2. **Fast path**: Tries to load the persisted key set from disk (`obmafs3_dedup_keyset_load`). If successful, skips the tree scan.
+3. **Slow path**: If no persisted key set exists or validation fails, creates a fresh key set and scans all dedup tree leaves via BFS to populate it.
+4. Loads the persisted pending buffer from disk (if `pending_lba ≠ 0`).
+5. Creates a fresh pending buffer if none was loaded.
+6. Signals completion via `warmup_cond` broadcast.
+
+The write path calls `obmafs3_dedup_warmup_wait()` which blocks until the warmup thread signals completion. This ensures the key set and pending buffer are ready before any dedup writes occur.
+
+---
+
+## Tree Defragmentation
+
+The `obmafsck` tool supports optional B+Tree defragmentation via the `-f` / `--defrag` flag. This relocates fragmented tree nodes into a contiguous extent, improving sequential access performance.
+
+### Algorithm
+
+For each tree:
+
+1. **BFS collection**: Traverse the tree via breadth-first search to collect all node LBAs in logical order.
+2. **Contiguity check**: If the nodes are already contiguous on disk, the tree is skipped.
+3. **Free region search**: Find a contiguous free region large enough for all nodes.
+4. **User prompt**: Unless `-y` is specified, ask the user to confirm the relocation.
+5. **Relocation map**: Build a mapping from old LBAs to new LBAs.
+6. **Read, remap, and write**: Read each node, update all internal LBA references (child pointers, sibling links, overflow links) using the relocation map, and write to the new location.
+7. **Free old blocks**: Release the old node blocks back to the allocation bitmap.
+8. **Update header**: Update the tree header's `root_node_lba` and reset the free-node chain.
+9. **Persist bitmap**: Write the updated allocation bitmap to disk.
+
+### Scope
+
+Defragmentation is applied to all B+Trees: catalog, inode, overflow, media tag, CD prefix/suffix/subchannel, refcount, metadata, metadata index, and all per-sector-size dedup sub-trees.
 
 ---
 
@@ -886,14 +1103,16 @@ Options:
 
 Checks and verifies OBMAFS v3 filesystem integrity.
 
-Usage: `obmafsck [-y] [-n] [-s] [-d] [-v] <path>`
+Usage: `obmafsck [-y] [-n] [-s] [-d] [-D] [-v] [-f] <path>`
 
 Options:
 - `-y` — Assume 'yes' to all repair questions
 - `-n` — Assume 'no' to all repair questions (report errors only, do not modify)
-- `-s` — Run data block scrub (verify all block checksums)
-- `-d` — Show deduplication and compression statistics
-- `-v` — Verify dedup and CD hashes against stored data
+- `-s, --scrub` — Run data block scrub (verify all block checksums)
+- `-d, --dedup-stats` — Show deduplication and compression statistics
+- `-D, --dedup-stats-only` — Show dedup statistics and exit (skip all checks)
+- `-v, --verify-hashes` — Verify dedup and CD hashes against stored data
+- `-f, --defrag` — Defragment B+Tree nodes (relocate to contiguous extents)
 
 **Checks performed:**
 
@@ -915,13 +1134,21 @@ Options:
 | CD prefix/suffix/subchannel trees | Traverse all nodes, verify magic and checksums |
 | Dedup tree list | Verify list header, traverse all per-sector-size trees |
 | Cross-reference | Verify all catalog entries have valid inodes |
-| Free node chain | Verify `free_node_lba` and `free_nodes` are zero in every B+Tree header (the runtime never uses the free node chain); reset to zero on mismatch |
-| Block allocation | Reconstruct expected bitmap from all on-disk structures and compare against on-disk bitmap |
+| Key ordering | Verify records within each leaf node are in ascending key order; verify keys across sibling nodes are monotonically increasing |
+| Sibling link verification | Verify `left_link` / `right_link` bidirectional consistency between adjacent nodes at each tree level |
+| Extent validation | Verify all inline and overflow extents reference valid, in-bounds LBAs; check for overlapping extent ranges |
+| File size check | Verify that the total logical extent coverage matches `file_size` for regular files |
+| Orphan inode detection | Detect inodes with no catalog entry (`ref_count` mismatch) and offer to delete them |
+| next_inode_id validation | Verify `next_inode_id` is greater than all existing inode IDs; offer to fix if stale |
+| Pending dedup data blocks | Include data blocks referenced by the persisted pending insert buffer in the expected allocation bitmap |
+| Free node chain | Verify `free_node_lba` chain is well-formed: walk the singly-linked list, check that `free_nodes` matches the actual chain length, and that all free-chain blocks are within bounds and marked allocated |
+| Block allocation | Reconstruct expected bitmap from all on-disk structures (including free node chain blocks and persisted keyset/pending extents) and compare against on-disk bitmap |
 | Last-block handling | The last dedup data block of each tree marks all `std_per_dedup` blocks as expected (see [Partial block handling](#dedup-block-lifecycle)) |
 | Data block scrub | Read every data block, verify magic and checksum (handles compressed blocks) |
 | Dedup data block scrub | Read every unique dedup data block, verify magic and checksum (handles compressed blocks) |
 | Dedup hash verification | Walk all dedup trees, read sector data from data blocks, recompute XXH64 hash, compare against stored hash (optional, `-v`) |
 | CD hash verification | Walk CD prefix/suffix/subchannel trees, recompute XXH64 from inline data, compare against stored hash (optional, `-v`) |
+| Tree defragmentation | Relocate fragmented B+Tree nodes to contiguous extents (optional, `-f`); see [Tree Defragmentation](#tree-defragmentation) |
 
 The scrub functions correctly handle both compressed and uncompressed blocks by checking the `OBMAFS3_BLOCK_FLAG_COMPRESSED` flag to determine whether to checksum `compressed_size` or `original_size` bytes.
 
@@ -935,6 +1162,7 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Block I/O: `obmafs3_block_read`, `obmafs3_block_write`
 - B+Tree: `obmafs3_btree_header_read`, `obmafs3_btree_header_read_lenient`, `obmafs3_btree_header_write`, catalog lookup/list/insert/delete, inode get/put/delete
 - Allocation: `obmafs3_alloc_block`, `obmafs3_alloc_blocks`, `obmafs3_free_block`, `obmafs3_free_blocks`, `obmafs3_alloc_inode_id`
+- B+Tree node allocation: `obmafs3_btree_alloc_node`, `obmafs3_btree_free_node`
 - Bitmap: `obmafs3_bitmap_read`, `obmafs3_bitmap_write`, `obmafs3_bitmap_set`, `obmafs3_bitmap_clear`, `obmafs3_bitmap_is_set`, `obmafs3_bitmap_find_free`
 - Catalog: `obmafs3_catalog_lookup`, `obmafs3_catalog_list`, `obmafs3_catalog_list_free`, `obmafs3_catalog_insert`, `obmafs3_catalog_delete`
 - Inode: `obmafs3_inode_get`, `obmafs3_inode_put`, `obmafs3_inode_delete`
@@ -942,7 +1170,11 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Clone/reflink: `obmafs3_clone_file_range`, `obmafs3_free_file_blocks`, `obmafs3_truncate_file_blocks`
 - Refcount: `obmafs3_refcount_get`, `obmafs3_refcount_set`, `obmafs3_refcount_inc`, `obmafs3_refcount_dec`
 - Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`
-- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`
+- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_dedup_node_cache_free`, `obmafs3_dedup_key_set_free`
+- Dedup key set: `obmafs3_dedup_keyset_save`, `obmafs3_dedup_keyset_load`
+- Dedup pending buffer: `obmafs3_dedup_pending_save`, `obmafs3_dedup_pending_load`, `obmafs3_dedup_pending_flush_and_free`
+- Dedup warmup: `obmafs3_dedup_warmup_start`, `obmafs3_dedup_warmup_wait`
+- Housekeeping: `obmafs3_housekeeping_start`, `obmafs3_housekeeping_stop`
 - Compression pool: `obmafs3_compress_pool_init`, `obmafs3_compress_pool_reinit`, `obmafs3_compress_pool_destroy`
 - Async pool jobs: `obmafs3_pool_async_job_create`, `obmafs3_pool_async_job_free`, `obmafs3_pool_submit_async`, `obmafs3_pool_wait_async`
 - Thread-local buffers: `obmafs3_get_thread_bufs`
@@ -1051,7 +1283,14 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | `mkobmafs` (create filesystem) | Complete |
 | `mount.obmafs` (FUSE mount) | Complete |
 | `obmafsck` (filesystem checker + scrub) | Complete |
-| Filesystem repair in `obmafsck` | Partial (superblock + backup, superblock fields, B+Tree ordering/siblings/checksums/free-node-chain, bitmap, refcounts, orphan inodes) |
+| Filesystem repair in `obmafsck` | Partial (superblock + backup, superblock fields, B+Tree ordering/siblings/checksums/free-node-chain, bitmap, refcounts, orphan inodes, metadata bidirectional consistency) |
+| B+Tree defragmentation in `obmafsck` | Complete |
+| Clump allocation (HFS+-style B+Tree growth) | Complete |
+| Dedup key set (O(1) existence check) | Complete |
+| Pending insert buffer (deferred B+Tree inserts) | Complete |
+| Background housekeeping thread | Complete |
+| Background warmup thread | Complete |
+| Persisted key set / pending buffer | Complete |
 | Rename / move | Complete |
 
 ---
