@@ -87,6 +87,13 @@ struct obmafs3_ctx
     pid_t                pre_fuse_pid;      ///< PID before fuse_main (detect fork in init)
     void                *dedup_node_cache;  ///< Global dedup B+Tree node cache (shared across files)
     void                *dedup_key_set;     ///< Global dedup hash key set (fast existence check)
+    void                *dedup_pending;     ///< Pending insert buffer (deferred B+Tree inserts)
+    void                *dedup_pending_flushing; ///< Buffer currently being flushed by bg thread
+    pthread_t            pending_flush_thread;   ///< Background pending-flush thread
+    pthread_mutex_t      pending_flush_mutex;    ///< Protects pending_flush_active / condvar
+    pthread_cond_t       pending_flush_cond;     ///< Signalled when flush work is available or done
+    volatile int         pending_flush_active;   ///< 1 while bg flush is in progress
+    int                  pending_flush_started;  ///< 1 if flush thread was created (needs join)
     pthread_t            warmup_thread;      ///< Background keyset warmup thread
     pthread_mutex_t      warmup_mutex;       ///< Protects warmup_done flag
     pthread_cond_t       warmup_cond;        ///< Signalled when warmup completes
@@ -247,6 +254,9 @@ int  obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_si
 void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache);
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx);
+void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx);
+void obmafs3_dedup_pending_flush_thread_start(struct obmafs3_ctx *ctx);
+void obmafs3_dedup_pending_flush_thread_stop(struct obmafs3_ctx *ctx);
 int  obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx);
 int  obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_warmup_start(struct obmafs3_ctx *ctx);

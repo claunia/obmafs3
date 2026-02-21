@@ -531,7 +531,15 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
         pthread_join(ctx->warmup_thread, NULL);
     pthread_mutex_destroy(&ctx->warmup_mutex);
     pthread_cond_destroy(&ctx->warmup_cond);
-    fprintf(stderr, "[obmafs3] close: step 3 — keyset save (warmup_done=%d)\n",
+    fprintf(stderr, "[obmafs3] close: step 3 — pending buffer flush\n");
+    fflush(stderr);
+
+    /* Stop the background pending-flush thread (waits for any in-flight
+     * flush to complete), then synchronously flush + free the buffer. */
+    obmafs3_dedup_pending_flush_thread_stop(ctx);
+    obmafs3_dedup_pending_flush_and_free(ctx);
+
+    fprintf(stderr, "[obmafs3] close: step 4 — keyset save (warmup_done=%d)\n",
             ctx->warmup_done);
     fflush(stderr);
 
