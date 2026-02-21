@@ -1165,23 +1165,44 @@ int obmafs3_dedup_get_tree(struct obmafs3_ctx *ctx, uint16_t sector_size, struct
  *
  * B+Tree traversal: descend through index nodes to the correct leaf,
  * then binary-search among sorted dedup_entry records.
+ *
+ * When the node cache is available, traversal goes through the cache
+ * under write_lock to guarantee a consistent view even when dirty
+ * nodes have not yet been flushed to disk.
  */
 int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t hash,
                          struct dedup_entry *entry)
 {
     uint8_t *buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
+    struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    int use_cache = (nc != NULL);
+
+    if(use_cache) pthread_mutex_lock(&ctx->write_lock);
+
     uint64_t lba = hdr->root_node_lba;
+    int      result = OBMAFS3_ERR_NOTFOUND;
 
     while(1)
     {
-        int rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
-        if(rc != OBMAFS3_OK) return rc;
+        int rc;
+        if(use_cache)
+            rc = dedup_cache_read(nc, ctx, lba, buf, (size_t)ctx->sb.block_size);
+        else
+            rc = obmafs3_block_read(ctx, lba, buf, (size_t)ctx->sb.block_size);
+        if(rc != OBMAFS3_OK) { result = rc; break; }
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
-        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
+        if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            if(obmafs3_debug)
+                fprintf(stderr, "OBMAFS3 ERR %d [%s:%d %s] bad magic\n",
+                        OBMAFS3_ERR_BADMAGIC, __FILE__, __LINE__, __func__);
+            result = OBMAFS3_ERR_BADMAGIC;
+            break;
+        }
 
         if(nhdr.level > 0)
         {
@@ -1225,7 +1246,8 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
                 struct dedup_entry de;
                 memcpy(&de, data + (size_t)mid * sizeof(struct dedup_entry), sizeof(de));
                 *entry = de;
-                return OBMAFS3_OK;
+                result = OBMAFS3_OK;
+                goto done;
             }
             if(mid_hash < hash)
                 lo = mid + 1;
@@ -1233,8 +1255,13 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
                 hi = mid - 1;
         }
 
-        return OBMAFS3_ERR_NOTFOUND;
+        result = OBMAFS3_ERR_NOTFOUND;
+        break;
     }
+
+done:
+    if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
+    return result;
 }
 
 /**
