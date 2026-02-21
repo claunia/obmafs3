@@ -3759,8 +3759,10 @@ int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
 /*  Background housekeeping thread (pending → B+Tree drain)            */
 /* ------------------------------------------------------------------ */
 
-/** Maximum entries per housekeeping batch. */
-#define HOUSEKEEPING_BATCH_SIZE  256
+/** Maximum entries per housekeeping batch.
+ *  Kept small so the write_lock is held for only a few milliseconds
+ *  per batch — avoiding long stalls on the write path. */
+#define HOUSEKEEPING_BATCH_SIZE  32
 
 /** Sleep interval (seconds) when idle. */
 #define HOUSEKEEPING_IDLE_SEC    5
@@ -3769,10 +3771,133 @@ int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
 #define HOUSEKEEPING_YIELD_US    50000   /* 50 ms */
 
 /**
+ * Lock-free B+Tree traversal to find the leaf LBA for a given hash.
+ *
+ * Uses direct pread() — does NOT touch the shared node cache.
+ * Safe to call without write_lock held because:
+ *  - In steady state only the housekeeping thread modifies the tree
+ *    (the write path uses the deferred pending-buffer insert).
+ *  - Even if a concurrent split rearranges nodes, we only use the
+ *    result to warm the kernel page cache; the actual insert under
+ *    write_lock re-traverses via the node cache.
+ */
+static int dedup_find_leaf_lba_direct(int fd, uint64_t root_lba,
+                                      uint64_t hash, uint64_t *out_leaf_lba,
+                                      uint8_t *buf, size_t bsz)
+{
+    uint64_t lba = root_lba;
+    if(lba == 0) { *out_leaf_lba = 0; return OBMAFS3_OK; }
+
+    while(1)
+    {
+        ssize_t rd = pread(fd, buf, bsz, (off_t)(lba * bsz));
+        if(rd != (ssize_t)bsz) return OBMAFS3_ERR_IO;
+
+        struct btree_node_header nhdr;
+        memcpy(&nhdr, buf, sizeof(nhdr));
+
+        if(nhdr.level == 0)
+        {
+            *out_leaf_lba = lba;
+            return OBMAFS3_OK;
+        }
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        uint16_t slot = 0;
+        int lo = 0, hi = (int)nhdr.node_keys - 1;
+        while(lo <= hi)
+        {
+            int      mid = lo + (hi - lo) / 2;
+            uint64_t mid_key;
+            memcpy(&mid_key, data + (size_t)mid * sizeof(struct btree_index_entry),
+                   sizeof(mid_key));
+            if(mid_key <= hash) { slot = (uint16_t)mid; lo = mid + 1; }
+            else                { hi  = mid - 1; }
+        }
+
+        struct btree_index_entry ie;
+        memcpy(&ie, data + (size_t)slot * sizeof(ie), sizeof(ie));
+
+        if(nhdr.level == 1)
+        {
+            *out_leaf_lba = ie.child_lba;
+            return OBMAFS3_OK;
+        }
+
+        lba = ie.child_lba;
+    }
+}
+
+/**
+ * Pre-warm the kernel page cache for a batch of entries.
+ *
+ * Called WITHOUT write_lock.  Walks the B+Tree using direct pread()
+ * to find target leaf LBAs, issues posix_fadvise(WILLNEED), then
+ * reads them into a throwaway buffer so the data sits in the page
+ * cache.  The subsequent drain_batch under write_lock will find these
+ * pages already present and avoid blocking disk I/O.
+ *
+ * @param ctx       Filesystem context (only ctx->fd and ctx->sb used).
+ * @param root_lba  Current root node of the dedup tree.
+ * @param entries   Sorted hash entries.
+ * @param count     Number of entries.
+ */
+static void housekeeping_prefetch_batch(struct obmafs3_ctx *ctx,
+                                        uint64_t root_lba,
+                                        const struct dedup_entry *entries,
+                                        uint32_t count)
+{
+    if(count == 0 || root_lba == 0) return;
+
+    size_t bsz = (size_t)ctx->sb.block_size;
+
+    /* Private traversal buffer — not shared with any other thread. */
+    uint8_t *buf = malloc(bsz);
+    if(!buf) return;
+
+    uint64_t *leaf_lbas = malloc((size_t)count * sizeof(uint64_t));
+    if(!leaf_lbas) { free(buf); return; }
+
+    for(uint32_t i = 0; i < count; i++)
+    {
+        uint64_t leaf_lba = 0;
+        dedup_find_leaf_lba_direct(ctx->fd, root_lba, entries[i].hash,
+                                   &leaf_lba, buf, bsz);
+        leaf_lbas[i] = leaf_lba;
+    }
+
+    /* Sort + dedup for sequential I/O. */
+    qsort(leaf_lbas, count, sizeof(uint64_t), lba_cmp);
+
+    uint32_t unique = 0;
+    {
+        uint64_t prev = 0;
+        for(uint32_t i = 0; i < count; i++)
+        {
+            if(leaf_lbas[i] == 0 || leaf_lbas[i] == prev) continue;
+            leaf_lbas[unique++] = leaf_lbas[i];
+            prev = leaf_lbas[i];
+        }
+    }
+
+    /* Advise + pre-read into page cache. */
+    for(uint32_t i = 0; i < unique; i++)
+        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
+                      (off_t)bsz, POSIX_FADV_WILLNEED);
+    for(uint32_t i = 0; i < unique; i++)
+        pread(ctx->fd, buf, bsz, (off_t)(leaf_lbas[i] * bsz));
+
+    free(leaf_lbas);
+    free(buf);
+}
+
+/**
  * Drain a batch of entries from the draining buffer into the B+Tree.
  *
- * Uses the same leaf-prefetch strategy as pending_flush but operates
- * on a subset of entries.  Must be called under write_lock.
+ * Assumes the caller has already called housekeeping_prefetch_batch()
+ * WITHOUT the lock so that relevant tree nodes are in the kernel page
+ * cache.  This function only does the actual B+Tree inserts (using
+ * the node cache) and must be called under write_lock.
  *
  * @param ctx      Filesystem context.
  * @param entries  Sorted array of entries to insert.
@@ -3789,47 +3914,10 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx,
 
     uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
     struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
-    size_t bsz = (size_t)ctx->sb.block_size;
 
-    /* Find target leaf LBAs for each entry. */
-    uint64_t *leaf_lbas = malloc((size_t)count * sizeof(uint64_t));
-    if(!leaf_lbas) return OBMAFS3_ERR_NOMEM;
-
-    for(uint32_t i = 0; i < count; i++)
-    {
-        uint64_t leaf_lba = 0;
-        dedup_find_leaf_lba(ctx, hdr, entries[i].hash, &leaf_lba, tree_buf, nc);
-        leaf_lbas[i] = leaf_lba;
-    }
-
-    /* Sort + dedup leaf LBAs for sequential I/O. */
-    qsort(leaf_lbas, count, sizeof(uint64_t), lba_cmp);
-    uint32_t unique_leaves = 0;
-    {
-        uint64_t prev = 0;
-        for(uint32_t i = 0; i < count; i++)
-        {
-            if(leaf_lbas[i] == 0 || leaf_lbas[i] == prev) continue;
-            leaf_lbas[unique_leaves++] = leaf_lbas[i];
-            prev = leaf_lbas[i];
-        }
-    }
-
-    /* Prefetch + pre-read leaves into cache. */
-    for(uint32_t i = 0; i < unique_leaves; i++)
-    {
-        if(cache_find_slot(nc, leaf_lbas[i])) continue;
-        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
-                      (off_t)bsz, POSIX_FADV_WILLNEED);
-    }
-    for(uint32_t i = 0; i < unique_leaves; i++)
-    {
-        if(cache_find_slot(nc, leaf_lbas[i])) continue;
-        nc_block_read(nc, ctx, leaf_lbas[i], tree_buf, bsz);
-    }
-    free(leaf_lbas);
-
-    /* Insert all entries (should be 100% cache hits). */
+    /* Insert all entries — tree nodes should be in the kernel page
+     * cache thanks to housekeeping_prefetch_batch(), so nc_block_read
+     * cache-miss pread() calls will be served from RAM. */
     for(uint32_t i = 0; i < count; i++)
     {
         struct dedup_entry       existing;
@@ -3945,6 +4033,25 @@ static void *housekeeping_thread_func(void *arg)
             uint32_t batch = extracted - off;
             if(batch > HOUSEKEEPING_BATCH_SIZE) batch = HOUSEKEEPING_BATCH_SIZE;
 
+            /* Phase A — snapshot root LBA under a brief lock. */
+            uint64_t root_lba = 0;
+            {
+                pthread_mutex_lock(&ctx->write_lock);
+                struct btree_header hdr_snap;
+                uint64_t            hdr_lba_snap;
+                int rc = obmafs3_dedup_get_tree(ctx, drain->sector_size,
+                                                &hdr_snap, &hdr_lba_snap);
+                if(rc == OBMAFS3_OK)
+                    root_lba = hdr_snap.root_node_lba;
+                pthread_mutex_unlock(&ctx->write_lock);
+            }
+
+            /* Phase B — prefetch WITHOUT lock (direct pread). */
+            if(root_lba != 0)
+                housekeeping_prefetch_batch(ctx, root_lba,
+                                           sorted + off, batch);
+
+            /* Phase C — insert under lock (page cache should be warm). */
             pthread_mutex_lock(&ctx->write_lock);
             {
                 struct btree_header hdr;
