@@ -5,9 +5,11 @@
 #include "fuse_ops.h"
 #include "debug.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 struct obmafs3_options
 {
@@ -122,9 +124,26 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Record PID before fuse_main so reinit can detect whether a fork
+     * happened (daemonisation) vs. foreground mode (-f). */
+    if(g_ctx) g_ctx->pre_fuse_pid = getpid();
+
     rc = fuse_main(args.argc, args.argv, &obmafs3_fuse_ops, NULL);
 
-    if(g_ctx) obmafs3_close(g_ctx);
+    if(g_ctx)
+    {
+        /* fuse_main restores the default signal handlers before returning,
+         * so a stray ^C during obmafs3_close would kill the process mid-save.
+         * Ignore SIGINT/SIGTERM/SIGHUP to let the close path complete. */
+        signal(SIGINT,  SIG_IGN);
+        signal(SIGTERM, SIG_IGN);
+        signal(SIGHUP,  SIG_IGN);
+
+        fprintf(stderr, "[obmafs3] shutting down — persisting keyset and metadata...\n");        fflush(stderr);
+        fprintf(stderr, "[obmafs3] calling obmafs3_close...\n");
+        fflush(stderr);        obmafs3_close(g_ctx);
+        fprintf(stderr, "[obmafs3] shutdown complete.\n");
+    }
     fuse_opt_free_args(&args);
     return rc;
 }

@@ -262,15 +262,25 @@ void obmafs3_compress_pool_reinit(struct obmafs3_ctx *ctx)
     struct compress_pool *old = ctx->compress_pool;
     if(old)
     {
-        /* The old threads don't exist in this process — just free the
-         * data structures.  Do NOT pthread_join (UB on ghost tids).
-         * Do NOT pthread_mutex_destroy / pthread_cond_destroy — after
-         * fork the primitives may be in an inconsistent state (e.g.
-         * recorded waiters that no longer exist), causing the destroy
-         * call to block indefinitely.  Simply leak and free. */
-        free(old->threads);
-        free(old);
-        ctx->compress_pool = NULL;
+        pid_t now = getpid();
+        if(now == ctx->pre_fuse_pid)
+        {
+            /* No fork happened (-f flag) — the old threads are still
+             * alive.  Shut them down properly before re-creating. */
+            obmafs3_compress_pool_destroy(ctx);
+        }
+        else
+        {
+            /* The old threads don't exist in this process — just free the
+             * data structures.  Do NOT pthread_join (UB on ghost tids).
+             * Do NOT pthread_mutex_destroy / pthread_cond_destroy — after
+             * fork the primitives may be in an inconsistent state (e.g.
+             * recorded waiters that no longer exist), causing the destroy
+             * call to block indefinitely.  Simply leak and free. */
+            free(old->threads);
+            free(old);
+            ctx->compress_pool = NULL;
+        }
     }
     obmafs3_compress_pool_init(ctx);
 }

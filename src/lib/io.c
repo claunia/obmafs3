@@ -515,21 +515,42 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
 {
     if(!ctx) return;
 
+    /* Signal the warmup thread to abort early if still running. */
+    ctx->shutdown_requested = 1;
+
     /* Shut down the compression thread pool before anything else. */
+    fprintf(stderr, "[obmafs3] close: step 1 — compress pool destroy\n");
+    fflush(stderr);
     obmafs3_compress_pool_destroy(ctx);
 
     /* Wait for and join the background warmup thread (if any). */
+    fprintf(stderr, "[obmafs3] close: step 2 — warmup thread join\n");
+    fflush(stderr);
     obmafs3_dedup_warmup_wait(ctx);
     if(ctx->warmup_started)
         pthread_join(ctx->warmup_thread, NULL);
     pthread_mutex_destroy(&ctx->warmup_mutex);
     pthread_cond_destroy(&ctx->warmup_cond);
+    fprintf(stderr, "[obmafs3] close: step 3 — keyset save (warmup_done=%d)\n",
+            ctx->warmup_done);
+    fflush(stderr);
 
     /* Persist the dedup key set to disk before freeing it.
      * Must happen before bitmap/sb write since it allocates blocks
-     * and updates sb.keyset_lba / sb.keyset_blocks. */
-    if(ctx->bitmap && ctx->fd >= 0 && ctx->dedup_key_set)
-        obmafs3_dedup_keyset_save(ctx);
+     * and updates sb.keyset_lba / sb.keyset_blocks.
+     * Only save if warmup completed — a partial keyset is worse than
+     * none because the next mount would skip the tree scan. */
+    if(ctx->bitmap && ctx->fd >= 0 && ctx->dedup_key_set && ctx->warmup_done
+       && !ctx->warmup_running)
+    {
+        int ks_rc = obmafs3_dedup_keyset_save(ctx);
+        if(ks_rc != OBMAFS3_OK)
+            fprintf(stderr, "[dedup-keyset] save failed (rc=%d)\n", ks_rc);
+    }
+    else if(ctx->dedup_key_set && (!ctx->warmup_done || ctx->warmup_running))
+    {
+        fprintf(stderr, "[dedup-keyset] warmup was incomplete — skipping keyset persist\n");
+    }
 
     /* Free the global dedup B+Tree node cache and key set. */
     obmafs3_dedup_node_cache_free(ctx);

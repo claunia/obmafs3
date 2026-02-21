@@ -84,6 +84,7 @@ struct obmafs3_ctx
     uint16_t            rc_leaf_count;      ///< Number of keys in the cached leaf
     int                 rc_leaf_valid;      ///< Non-zero when the leaf cache is populated
     struct compress_pool *compress_pool;    ///< Persistent compression thread pool
+    pid_t                pre_fuse_pid;      ///< PID before fuse_main (detect fork in init)
     void                *dedup_node_cache;  ///< Global dedup B+Tree node cache (shared across files)
     void                *dedup_key_set;     ///< Global dedup hash key set (fast existence check)
     pthread_t            warmup_thread;      ///< Background keyset warmup thread
@@ -92,6 +93,7 @@ struct obmafs3_ctx
     int                  warmup_running;     ///< 1 while background warmup is active
     int                  warmup_done;        ///< 1 after warmup has completed
     int                  warmup_started;     ///< 1 if warmup thread was created (needs join)
+    volatile int         shutdown_requested; ///< 1 when close() wants warmup to abort early
 };
 
 /* Open flags */

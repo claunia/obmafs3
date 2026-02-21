@@ -15,6 +15,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <sys/uio.h>
+#include <unistd.h>
 #include <time.h>
 #include <zstd.h>
 
@@ -900,6 +901,7 @@ static void keyset_warmup(struct obmafs3_ctx *ctx, const struct btree_header *hd
     uint64_t read_count = 0, cached_count = 0;
     for(uint64_t i = 0; i < leaf_count; i++)
     {
+        if(ctx->shutdown_requested) { free(leaf_lbas); return; }
         if(nc)
         {
             struct dedup_cache_slot *slot = cache_find_slot(nc, leaf_lbas[i]);
@@ -2873,27 +2875,48 @@ int obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx)
         return OBMAFS3_OK;
     }
 
-    /* Pack non-empty keys into a contiguous array. */
-    uint64_t *packed = malloc((size_t)ks->count * sizeof(uint64_t));
-    if(!packed) return OBMAFS3_ERR_NOMEM;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
+    /* Compute sizes up-front so we only allocate ONE buffer. */
+    uint32_t count          = ks->count;
+    size_t   payload_bytes  = sizeof(struct keyset_persist_header) +
+                              (size_t)count * sizeof(uint64_t);
+    uint64_t block_size     = ctx->sb.block_size;
+    uint64_t needed_blocks  = (payload_bytes + block_size - 1) / block_size;
+    size_t   buf_size       = (size_t)(needed_blocks * block_size);
+
+    /* Single buffer: [header][packed keys][zero-padded tail].
+     * Only zero the tail padding, not the entire buffer. */
+    uint8_t *buf = malloc(buf_size);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    /* Pack non-empty keys directly after the header space. */
+    uint64_t *key_dst = (uint64_t *)(buf + sizeof(struct keyset_persist_header));
     uint32_t n = 0;
     for(uint32_t i = 0; i < ks->capacity; i++)
     {
         if(ks->keys[i] != KEYSET_EMPTY)
-            packed[n++] = ks->keys[i];
+            key_dst[n++] = ks->keys[i];
     }
 
-    /* Build header. */
+    /* Zero-pad tail to block boundary. */
+    size_t used = sizeof(struct keyset_persist_header) + (size_t)n * sizeof(uint64_t);
+    if(used < buf_size)
+        memset(buf + used, 0, buf_size - used);
+
+    /* Build header (checksum computed over the packed keys in-place). */
     struct keyset_persist_header hdr;
     hdr.magic    = KEYSET_PERSIST_MAGIC;
     hdr.count    = n;
-    hdr.checksum = obmafs3_checksum_xxh64(packed, (size_t)n * sizeof(uint64_t));
+    hdr.checksum = obmafs3_checksum_xxh64(key_dst, (size_t)n * sizeof(uint64_t));
+    memcpy(buf, &hdr, sizeof(hdr));
 
-    /* Compute total bytes and number of blocks needed. */
-    size_t   payload_bytes  = sizeof(hdr) + (size_t)n * sizeof(uint64_t);
-    uint64_t block_size     = ctx->sb.block_size;
-    uint64_t needed_blocks  = (payload_bytes + block_size - 1) / block_size;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double pack_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                   + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    fprintf(stderr, "[dedup-keyset] packed %u keys (%.1f MiB) in %.1f ms\n",
+            n, (double)(n * sizeof(uint64_t)) / (1024.0 * 1024.0), pack_ms);
 
     /* Free old extent if present. */
     if(ctx->sb.keyset_lba != 0 && ctx->sb.keyset_blocks != 0)
@@ -2901,54 +2924,57 @@ int obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx)
 
     /* Allocate contiguous blocks. */
     uint64_t start_lba = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     int rc = obmafs3_alloc_blocks(ctx, needed_blocks, &start_lba);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double alloc_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    fprintf(stderr, "[dedup-keyset] alloc %" PRIu64 " blocks: %s in %.1f ms\n",
+            needed_blocks, rc == OBMAFS3_OK ? "ok" : "FAILED", alloc_ms);
+
     if(rc != OBMAFS3_OK)
     {
-        free(packed);
+        free(buf);
         ctx->sb.keyset_lba    = 0;
         ctx->sb.keyset_blocks = 0;
         return rc;
     }
 
-    /* Write the header + packed keys to disk using block-aligned I/O.
-     * Allocate a zeroed buffer covering all blocks so the tail is padded. */
-    size_t   buf_size = (size_t)(needed_blocks * block_size);
-    uint8_t *buf      = calloc(1, buf_size);
-    if(!buf)
+    /* Write the entire extent in a single pwrite. */
+    fprintf(stderr, "[dedup-keyset] writing %" PRIu64 " blocks (%.1f MiB) to LBA %" PRIu64 "...\n",
+            needed_blocks, (double)buf_size / (1024.0 * 1024.0), start_lba);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     {
-        obmafs3_free_blocks(ctx, start_lba, needed_blocks);
-        free(packed);
-        ctx->sb.keyset_lba    = 0;
-        ctx->sb.keyset_blocks = 0;
-        return OBMAFS3_ERR_NOMEM;
-    }
+        off_t   offset    = (off_t)(start_lba * block_size);
+        size_t  remaining = buf_size;
+        size_t  written   = 0;
 
-    memcpy(buf, &hdr, sizeof(hdr));
-    memcpy(buf + sizeof(hdr), packed, (size_t)n * sizeof(uint64_t));
-    free(packed);
-
-    /* Write each block. */
-    for(uint64_t i = 0; i < needed_blocks; i++)
-    {
-        rc = obmafs3_block_write(ctx, start_lba + i,
-                                 buf + (size_t)(i * block_size),
-                                 (size_t)block_size);
-        if(rc != OBMAFS3_OK)
+        while(remaining > 0)
         {
-            free(buf);
-            obmafs3_free_blocks(ctx, start_lba, needed_blocks);
-            ctx->sb.keyset_lba    = 0;
-            ctx->sb.keyset_blocks = 0;
-            return rc;
+            ssize_t w = pwrite(ctx->fd, buf + written, remaining, offset + (off_t)written);
+            if(w <= 0)
+            {
+                rc = OBMAFS3_ERR_IO;
+                free(buf);
+                obmafs3_free_blocks(ctx, start_lba, needed_blocks);
+                ctx->sb.keyset_lba    = 0;
+                ctx->sb.keyset_blocks = 0;
+                return rc;
+            }
+            written   += (size_t)w;
+            remaining -= (size_t)w;
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double write_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     free(buf);
 
     ctx->sb.keyset_lba    = start_lba;
     ctx->sb.keyset_blocks = needed_blocks;
 
-    fprintf(stderr, "[dedup-keyset] persisted %u keys (%" PRIu64 " blocks at LBA %" PRIu64 ")\n",
-            n, needed_blocks, start_lba);
+    fprintf(stderr, "[dedup-keyset] persisted %u keys (%" PRIu64 " blocks at LBA %" PRIu64 ") — "
+            "write %.1f ms\n", n, needed_blocks, start_lba, write_ms);
 
     return OBMAFS3_OK;
 }
@@ -2976,13 +3002,19 @@ int obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx)
     uint8_t *buf = malloc(buf_size);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    /* Read all blocks. */
-    for(uint64_t i = 0; i < needed_blocks; i++)
+    /* Read the entire extent in a single pread. */
     {
-        int rc = obmafs3_block_read(ctx, ctx->sb.keyset_lba + i,
-                                    buf + (size_t)(i * block_size),
-                                    (size_t)block_size);
-        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+        off_t   offset    = (off_t)(ctx->sb.keyset_lba * block_size);
+        size_t  remaining = buf_size;
+        size_t  rd        = 0;
+
+        while(remaining > 0)
+        {
+            ssize_t n = pread(ctx->fd, buf + rd, remaining, offset + (off_t)rd);
+            if(n <= 0) { free(buf); return OBMAFS3_ERR_IO; }
+            rd        += (size_t)n;
+            remaining -= (size_t)n;
+        }
     }
 
     /* Validate header. */
@@ -3091,6 +3123,14 @@ static void *warmup_thread_func(void *arg)
             fprintf(stderr, "[dedup-warmup] loaded persisted key set in %.1fms — %u keys\n",
                     timespec_diff_ms(&t_start, &t_end), ks->count);
         }
+        else
+        {
+            fprintf(stderr, "[dedup-warmup] persisted keyset stale/invalid — rebuilding via tree scan\n");
+        }
+    }
+    else
+    {
+        fprintf(stderr, "[dedup-warmup] no persisted keyset (keyset_lba=0) — building via tree scan\n");
     }
 
     if(!loaded)
@@ -3115,6 +3155,7 @@ static void *warmup_thread_func(void *arg)
             {
                 for(uint64_t i = 0; i < count; i++)
                 {
+                    if(ctx->shutdown_requested) break;
                     struct btree_header hdr;
                     rc = obmafs3_btree_header_read(ctx, entries[i].tree_lba, &hdr);
                     if(rc == OBMAFS3_OK && hdr.root_node_lba != 0)
