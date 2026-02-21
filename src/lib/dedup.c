@@ -747,7 +747,6 @@ struct dedup_pending_buf
 };
 
 #define PENDING_INIT_CAP     4096    /**< Initial capacity (power of 2) */
-#define PENDING_FLUSH_THRESH 65536   /**< Flush when count reaches this */
 
 /** Allocate a pending insert buffer. */
 static struct dedup_pending_buf *pending_create(void)
@@ -870,21 +869,44 @@ static int dedup_upsert_find(struct obmafs3_ctx *ctx, const struct btree_header 
 static int dedup_upsert_insert(struct obmafs3_ctx *ctx, struct btree_header *hdr, const struct dedup_entry *entry,
                                struct dedup_upsert_ctx *uctx, uint8_t *buf, struct dedup_node_cache *nc);
 
+/* Forward declarations for helpers defined later in this file. */
+static int lba_cmp(const void *a, const void *b);
+static struct dedup_cache_slot *cache_find_slot(struct dedup_node_cache *nc, uint64_t lba);
+static int nc_block_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t bsz);
+static int dedup_find_leaf_lba(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
+                               uint64_t hash, uint64_t *out_leaf_lba,
+                               uint8_t *buf, struct dedup_node_cache *nc);
+
 /**
- * Flush all pending inserts into the B+Tree, sorted by hash for
- * sequential leaf access.  Clears the buffer afterwards.
+ * Flush all pending inserts into the B+Tree using leaf prefetch.
  *
- * Must be called under write_lock.
+ * Strategy:
+ *   1. Extract + sort entries by hash.
+ *   2. Find target leaf LBA for each entry via index traversal
+ *      (index nodes are cached → in-memory only).
+ *   3. Sort + deduplicate leaf LBAs.
+ *   4. posix_fadvise(WILLNEED) all unique leaves for sequential
+ *      read-ahead on HDD.
+ *   5. Pre-read all unique leaves into the node cache.
+ *   6. Run all upsert_find + upsert_insert — 100% cache hits.
+ *   7. Single dedup_cache_flush + header write at the end.
+ *
+ * The result: N entries touching K unique leaves generate K
+ * sequential disk reads instead of N random seeks.
+ *
+ * Clears the buffer afterwards.
+ * Must be called under write_lock (or single-threaded context).
  */
 static int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
                          struct btree_header *dedup_hdr, uint64_t dedup_hdr_lba)
 {
     if(!pb || pb->count == 0) return OBMAFS3_OK;
 
-    struct timespec t_start, t_end;
+    struct timespec t_start, t_prefetch, t_insert, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-    /* Extract and sort entries by hash for sequential B+Tree leaf access. */
+    /* ---- Phase 1: extract + sort entries by hash ---- */
+
     struct dedup_entry *sorted = malloc((size_t)pb->count * sizeof(struct dedup_entry));
     if(!sorted) return OBMAFS3_ERR_NOMEM;
 
@@ -896,10 +918,61 @@ static int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
     }
     qsort(sorted, n, sizeof(struct dedup_entry), pending_entry_cmp);
 
-    /* Batch-insert into the B+Tree. */
+    /* ---- Phase 2: find target leaf LBAs via cached index nodes ---- */
+
     uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
     struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    size_t bsz = (size_t)ctx->sb.block_size;
     int rc = OBMAFS3_OK;
+
+    uint64_t *leaf_lbas = malloc((size_t)n * sizeof(uint64_t));
+    if(!leaf_lbas) { free(sorted); return OBMAFS3_ERR_NOMEM; }
+
+    for(uint32_t i = 0; i < n; i++)
+    {
+        uint64_t leaf_lba = 0;
+        dedup_find_leaf_lba(ctx, dedup_hdr, sorted[i].hash, &leaf_lba, tree_buf, nc);
+        leaf_lbas[i] = leaf_lba;
+    }
+
+    /* Sort + deduplicate leaf LBAs for sequential I/O. */
+    qsort(leaf_lbas, n, sizeof(uint64_t), lba_cmp);
+
+    uint32_t unique_leaves = 0;
+    {
+        uint64_t prev = 0;
+        for(uint32_t i = 0; i < n; i++)
+        {
+            if(leaf_lbas[i] == 0 || leaf_lbas[i] == prev) continue;
+            leaf_lbas[unique_leaves++] = leaf_lbas[i];
+            prev = leaf_lbas[i];
+        }
+    }
+
+    /* ---- Phase 3: posix_fadvise + pre-read all leaves ---- */
+
+    /* Issue WILLNEED for all unique leaves (sorted = sequential). */
+    for(uint32_t i = 0; i < unique_leaves; i++)
+    {
+        if(cache_find_slot(nc, leaf_lbas[i])) continue;
+        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
+                      (off_t)bsz, POSIX_FADV_WILLNEED);
+    }
+
+    /* Pre-read all leaves into the node cache (sequential from page cache). */
+    uint32_t leaf_reads = 0;
+    for(uint32_t i = 0; i < unique_leaves; i++)
+    {
+        if(cache_find_slot(nc, leaf_lbas[i])) continue;
+        nc_block_read(nc, ctx, leaf_lbas[i], tree_buf, bsz);
+        leaf_reads++;
+    }
+
+    free(leaf_lbas);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_prefetch);
+
+    /* ---- Phase 4: batch insert (all cache hits) ---- */
 
     for(uint32_t i = 0; i < n; i++)
     {
@@ -915,24 +988,24 @@ static int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
         {
             break; /* I/O error */
         }
-        /* else: duplicate found — another write beat us; skip */
+        /* else: duplicate found — skip */
     }
 
     free(sorted);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_insert);
+
+    /* ---- Phase 5: single flush of dirty cache nodes ---- */
 
     /* Clear the buffer. */
     memset(pb->slots, 0, (size_t)pb->capacity * sizeof(struct dedup_entry));
     pb->count = 0;
 
     /* Flush cached tree nodes after the batch insert. */
-    if(ctx->dedup_node_cache)
+    if(nc && nc->dirty_count > 0)
     {
-        struct dedup_node_cache *nc_flush = (struct dedup_node_cache *)ctx->dedup_node_cache;
-        if(nc_flush->dirty_count > 0)
-        {
-            int nc_rc = dedup_cache_flush(nc_flush, ctx);
-            if(rc == OBMAFS3_OK) rc = nc_rc;
-        }
+        int nc_rc = dedup_cache_flush(nc, ctx);
+        if(rc == OBMAFS3_OK) rc = nc_rc;
     }
 
     /* Write tree header. */
@@ -943,8 +1016,14 @@ static int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_end);
-    fprintf(stderr, "[dedup-pending] flushed %u entries to B+Tree in %.1f ms\n",
-            n, timespec_diff_ms(&t_start, &t_end));
+    fprintf(stderr,
+            "[dedup-pending] flushed %u entries (%u unique leaves, %u reads) "
+            "prefetch=%.1fms insert=%.1fms flush=%.1fms TOTAL=%.1fms\n",
+            n, unique_leaves, leaf_reads,
+            timespec_diff_ms(&t_start, &t_prefetch),
+            timespec_diff_ms(&t_prefetch, &t_insert),
+            timespec_diff_ms(&t_insert, &t_end),
+            timespec_diff_ms(&t_start, &t_end));
 
     return rc;
 }
@@ -1408,24 +1487,34 @@ int obmafs3_dedup_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr
 
     if(use_cache) pthread_mutex_lock(&ctx->write_lock);
 
-    /* Check pending insert buffer first — O(1), no disk I/O.
-     * Entries deferred by the write path live here until flushed
-     * into the B+Tree.  The buffer is only mutated under write_lock.
-     * Also check the flushing buffer (being drained by the background
-     * flush thread) — its contents are immutable until freed. */
+    /* Check pending insert buffers first — O(1), no disk I/O.
+     * Entries deferred by the write path live in the active buffer;
+     * entries being drained by the housekeeping thread live in the
+     * draining buffer.  Check both. */
     {
         const struct dedup_pending_buf *pb =
             (const struct dedup_pending_buf *)ctx->dedup_pending;
-        const struct dedup_pending_buf *pf =
-            (const struct dedup_pending_buf *)ctx->dedup_pending_flushing;
-        const struct dedup_entry *pe = NULL;
-        if(pb) pe = pending_lookup(pb, hash);
-        if(!pe && pf) pe = pending_lookup(pf, hash);
-        if(pe)
+        if(pb)
         {
-            *entry = *pe;
-            if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
-            return OBMAFS3_OK;
+            const struct dedup_entry *pe = pending_lookup(pb, hash);
+            if(pe)
+            {
+                *entry = *pe;
+                if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
+                return OBMAFS3_OK;
+            }
+        }
+        const struct dedup_pending_buf *drain =
+            (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
+        if(drain)
+        {
+            const struct dedup_entry *pe = pending_lookup(drain, hash);
+            if(pe)
+            {
+                *entry = *pe;
+                if(use_cache) pthread_mutex_unlock(&ctx->write_lock);
+                return OBMAFS3_OK;
+            }
         }
     }
 
@@ -2476,6 +2565,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     /* Use the thread-local node buffer for dedup tree traversal. */
     uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
 
+    struct timespec t_lock_start, t_lock_end;
     struct timespec t_prefetch_start, t_prefetch_end;
     struct timespec t_phase1_start, t_phase1_end;
     struct timespec t_phase2_start;
@@ -2561,11 +2651,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         }
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t_prefetch_start);
-
     /*
-     * Fast-path: check how many hashes are already in the key set,
-     * the pending insert buffer, or the buffer being flushed.
+     * Fast-path: check how many hashes are already in the key set
+     * or the pending insert buffer.
      * If all are known, we can skip the entire prefetch phase —
      * the Phase 1 loop will resolve them via keyset_contains()
      * without any tree traversal or disk I/O.
@@ -2574,12 +2662,12 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     {
         const struct dedup_key_set    *ks = (const struct dedup_key_set *)ctx->dedup_key_set;
         const struct dedup_pending_buf *pb = (const struct dedup_pending_buf *)ctx->dedup_pending;
-        const struct dedup_pending_buf *pf = (const struct dedup_pending_buf *)ctx->dedup_pending_flushing;
+        const struct dedup_pending_buf *drain_pb = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
         for(uint64_t i = 0; i < num_sectors; i++)
         {
             if((ks && keyset_contains(ks, sw[i].hash)) ||
                pending_lookup(pb, sw[i].hash) ||
-               pending_lookup(pf, sw[i].hash))
+               pending_lookup(drain_pb, sw[i].hash))
                 keyset_fast_hits++;
         }
     }
@@ -2590,7 +2678,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      * cache, key set inserts, B+Tree, bitmap, dedup block store).
      * Hashing, sorting and key-set reads above were lock-free.
      */
+    clock_gettime(CLOCK_MONOTONIC, &t_lock_start);
     pthread_mutex_lock(&ctx->write_lock);
+    clock_gettime(CLOCK_MONOTONIC, &t_lock_end);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_prefetch_start);
 
     /*
      * Leaf prefetch: use the pre-computed hashes to find target leaf
@@ -2686,14 +2778,13 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         size_t         slen  = sw[idx].len;
         int64_t        snum  = sw[idx].sector_num;
 
-        /* Fast path: if the key set, pending buffer, or the buffer
-         * being flushed by the background thread confirms this hash
-         * exists, skip tree traversal — zero disk I/O. */
+        /* Fast path: if the key set or pending buffer confirms this
+         * hash exists, skip tree traversal — zero disk I/O. */
         struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
-        const struct dedup_pending_buf *pf =
-            (const struct dedup_pending_buf *)ctx->dedup_pending_flushing;
+        const struct dedup_pending_buf *drain_pb2 =
+            (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
         if(keyset_contains(ks, hash) || pending_lookup(pb, hash) ||
-           pending_lookup(pf, hash))
+           pending_lookup(drain_pb2, hash))
         {
             dedup_hits++;
         }
@@ -2780,40 +2871,6 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     free(sw);
     free(sorted_idx);
-
-    /* Trigger background pending buffer flush when it reaches the threshold.
-     * Swap the full buffer to the flushing slot and give the write path
-     * a fresh empty buffer.  If a previous bg flush is still in flight,
-     * skip — the buffer will grow until the next opportunity. */
-    if(pb && pb->count >= PENDING_FLUSH_THRESH && ctx->pending_flush_started)
-    {
-        pthread_mutex_lock(&ctx->pending_flush_mutex);
-        if(!ctx->pending_flush_active)
-        {
-            uint16_t saved_ss = pb->sector_size;
-
-            /* Swap buffers: hand current to bg thread, create fresh one. */
-            ctx->dedup_pending_flushing = pb;
-            struct dedup_pending_buf *new_pb = pending_create();
-            if(new_pb)
-            {
-                new_pb->sector_size = saved_ss;
-                ctx->dedup_pending = new_pb;
-            }
-            else
-            {
-                /* Allocation failed — put the buffer back and skip. */
-                ctx->dedup_pending_flushing = NULL;
-            }
-
-            if(ctx->dedup_pending_flushing)
-            {
-                ctx->pending_flush_active = 1;
-                pthread_cond_signal(&ctx->pending_flush_cond);
-            }
-        }
-        pthread_mutex_unlock(&ctx->pending_flush_mutex);
-    }
 
     /* Adjust sme_count: when skip_sme, it stays 0 */
     if(skip_sme) sme_count = 0;
@@ -2942,6 +2999,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         uint32_t ks_cap   = ks ? ks->capacity : 0;
         fprintf(stderr,
                 "[dedup-timing] write %zu bytes @ %" PRIu64 ": "
+                "lock_wait=%.1fms  "
                 "prefetch=%.1fms(%" PRIu64 " leaves)  "
                 "phase1=%.1fms  bg_wait=%.1fms  blk_flush=%.1fms  "
                 "nc_flush=%.1fms  hdr=%.1fms  sme=%.1fms  TOTAL=%.1fms  "
@@ -2949,6 +3007,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 " pending=%" PRIu64
                 " nc_count=%u/%u ks=%u/%u ks_fast=%" PRIu64 "\n",
                 size, offset,
+                timespec_diff_ms(&t_lock_start, &t_lock_end),
                 timespec_diff_ms(&t_prefetch_start, &t_prefetch_end), prefetch_advised,
                 timespec_diff_ms(&t_phase1_start, &t_phase1_end),
                 timespec_diff_ms(&t_phase2_start, &t_bgwait_end),
@@ -2956,7 +3015,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 timespec_diff_ms(&t_flush_end, &t_ncflush_end),
                 timespec_diff_ms(&t_ncflush_end, &t_hdr_end),
                 timespec_diff_ms(&t_hdr_end, &t_sme_end),
-                timespec_diff_ms(&t_prefetch_start, &t_sme_end),
+                timespec_diff_ms(&t_lock_start, &t_sme_end),
                 dedup_hits, dedup_misses, pending_deferred,
                 nc_count, nc_cap,
                 ks_count, ks_cap, keyset_fast_hits);
@@ -3150,222 +3209,49 @@ void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx)
 }
 
 /**
- * Flush all pending deferred inserts into the B+Tree and free the
- * pending buffer.  Must be called under write_lock (or single-threaded
- * context like close).
+ * Persist any pending deferred inserts to disk and free the buffers.
+ *
+ * Saves both the active pending buffer and any draining buffer to a
+ * contiguous on-disk extent (milliseconds), then frees the in-memory
+ * buffers.  The entries will be loaded and drained into the B+Tree
+ * by the housekeeping thread on the next mount.
  */
 void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx)
 {
-    if(!ctx || !ctx->dedup_pending) return;
+    if(!ctx) return;
 
-    struct dedup_pending_buf *pb = (struct dedup_pending_buf *)ctx->dedup_pending;
-    if(pb->count > 0 && pb->sector_size != 0)
+    const struct dedup_pending_buf *pb1 =
+        (const struct dedup_pending_buf *)ctx->dedup_pending;
+    const struct dedup_pending_buf *pb2 =
+        (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
+
+    uint32_t total = 0;
+    if(pb1) total += pb1->count;
+    if(pb2) total += pb2->count;
+
+    if(total > 0 && ctx->bitmap && ctx->fd >= 0)
     {
-        struct btree_header hdr;
-        uint64_t            hdr_lba;
-        int rc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &hdr, &hdr_lba);
-        if(rc == OBMAFS3_OK)
-        {
-            pending_flush(pb, ctx, &hdr, hdr_lba);
-        }
-        else
-        {
-            fprintf(stderr, "[dedup-pending] failed to get tree for flush (rc=%d)\n", rc);
-        }
+        int rc = obmafs3_dedup_pending_save(ctx);
+        if(rc != OBMAFS3_OK)
+            fprintf(stderr, "[dedup-pending] save failed (rc=%d) — %u entries lost\n",
+                    rc, total);
     }
-    else if(pb->count > 0)
+    else if(total > 0)
     {
-        fprintf(stderr, "[dedup-pending] %u entries lost (no sector_size)\n", pb->count);
-    }
-
-    pending_free(pb);
-    ctx->dedup_pending = NULL;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Background pending-flush thread                                    */
-/* ------------------------------------------------------------------ */
-
-/** Number of B+Tree inserts per batch before yielding write_lock. */
-#define PENDING_FLUSH_BATCH 256
-
-/**
- * Background thread that flushes the pending insert buffer into the
- * B+Tree.  It waits for work via a condvar, extracts + sorts entries
- * without write_lock, then inserts in small batches (releasing
- * write_lock between batches so writers can interleave).
- *
- * After all entries are flushed the buffer is freed and the "flushing"
- * slot in ctx is cleared.
- */
-static void *pending_flush_thread_func(void *arg)
-{
-    struct obmafs3_ctx *ctx = (struct obmafs3_ctx *)arg;
-
-    for(;;)
-    {
-        /* Wait for work or shutdown. */
-        pthread_mutex_lock(&ctx->pending_flush_mutex);
-        while(!ctx->pending_flush_active && !ctx->shutdown_requested)
-            pthread_cond_wait(&ctx->pending_flush_cond, &ctx->pending_flush_mutex);
-
-        if(ctx->shutdown_requested && !ctx->pending_flush_active)
-        {
-            pthread_mutex_unlock(&ctx->pending_flush_mutex);
-            break;
-        }
-        pthread_mutex_unlock(&ctx->pending_flush_mutex);
-
-        /* The buffer to flush is in ctx->dedup_pending_flushing. */
-        struct dedup_pending_buf *pb =
-            (struct dedup_pending_buf *)ctx->dedup_pending_flushing;
-        if(!pb || pb->count == 0) goto done;
-
-        struct timespec t_start, t_end;
-        clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-        /* ---- Phase A: extract + sort (no lock needed) ---- */
-        struct dedup_entry *sorted = malloc((size_t)pb->count * sizeof(*sorted));
-        if(!sorted) goto done;
-
-        uint32_t n = 0;
-        for(uint32_t i = 0; i < pb->capacity; i++)
-        {
-            if(pb->slots[i].hash != KEYSET_EMPTY)
-                sorted[n++] = pb->slots[i];
-        }
-        qsort(sorted, n, sizeof(struct dedup_entry), pending_entry_cmp);
-
-        /* ---- Phase B: batched tree insert (takes/releases lock) ---- */
-        struct btree_header hdr;
-        uint64_t            hdr_lba;
-        int                 rc;
-
-        pthread_mutex_lock(&ctx->write_lock);
-        rc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &hdr, &hdr_lba);
-        pthread_mutex_unlock(&ctx->write_lock);
-        if(rc != OBMAFS3_OK) { free(sorted); goto done; }
-
-        uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
-
-        for(uint32_t batch_start = 0; batch_start < n; batch_start += PENDING_FLUSH_BATCH)
-        {
-            uint32_t batch_end = batch_start + PENDING_FLUSH_BATCH;
-            if(batch_end > n) batch_end = n;
-
-            pthread_mutex_lock(&ctx->write_lock);
-            struct dedup_node_cache *nc =
-                (struct dedup_node_cache *)ctx->dedup_node_cache;
-            uint64_t prev_root = hdr.root_node_lba;
-
-            for(uint32_t i = batch_start; i < batch_end; i++)
-            {
-                struct dedup_upsert_ctx uctx;
-                struct dedup_entry      existing;
-                rc = dedup_upsert_find(ctx, &hdr, sorted[i].hash,
-                                       &existing, &uctx, tree_buf, nc);
-                if(rc == OBMAFS3_ERR_NOTFOUND)
-                {
-                    rc = dedup_upsert_insert(ctx, &hdr, &sorted[i],
-                                             &uctx, tree_buf, nc);
-                    if(rc != OBMAFS3_OK) break;
-                }
-                else if(rc != OBMAFS3_OK) break;
-            }
-
-            /* Flush dirty cache nodes before releasing the lock so that
-             * concurrent readers see consistent on-disk state. */
-            if(nc && nc->dirty_count > 0)
-                dedup_cache_flush(nc, ctx);
-
-            /* If a root split happened, persist the header immediately
-             * so concurrent reads see the new root. */
-            if(hdr.root_node_lba != prev_root)
-                obmafs3_btree_header_write(ctx, hdr_lba, &hdr);
-
-            pthread_mutex_unlock(&ctx->write_lock);
-
-            if(rc != OBMAFS3_OK) break;
-        }
-
-        /* Write final header update (may have changed since last batch). */
-        pthread_mutex_lock(&ctx->write_lock);
-        obmafs3_btree_header_write(ctx, hdr_lba, &hdr);
-        pthread_mutex_unlock(&ctx->write_lock);
-
-        free(sorted);
-
-        clock_gettime(CLOCK_MONOTONIC, &t_end);
-        fprintf(stderr,
-                "[dedup-pending] bg flush %u entries in %.1f ms\n",
-                n, timespec_diff_ms(&t_start, &t_end));
-
-done:
-        /* Remove flushing buffer from ctx under write_lock so that
-         * concurrent readers stop checking it, then free it. */
-        pthread_mutex_lock(&ctx->write_lock);
-        ctx->dedup_pending_flushing = NULL;
-        pthread_mutex_unlock(&ctx->write_lock);
-        pending_free(pb);
-
-        /* Signal completion. */
-        pthread_mutex_lock(&ctx->pending_flush_mutex);
-        ctx->pending_flush_active = 0;
-        pthread_cond_broadcast(&ctx->pending_flush_cond);
-        pthread_mutex_unlock(&ctx->pending_flush_mutex);
+        fprintf(stderr, "[dedup-pending] %u entries lost (no bitmap or fd)\n", total);
     }
 
-    return NULL;
-}
-
-/**
- * Start the background pending-flush thread.
- * Safe to call multiple times — only the first call creates the thread.
- */
-void obmafs3_dedup_pending_flush_thread_start(struct obmafs3_ctx *ctx)
-{
-    if(!ctx || ctx->pending_flush_started) return;
-
-    pthread_mutex_init(&ctx->pending_flush_mutex, NULL);
-    pthread_cond_init(&ctx->pending_flush_cond, NULL);
-    ctx->pending_flush_active  = 0;
-
-    if(pthread_create(&ctx->pending_flush_thread, NULL,
-                      pending_flush_thread_func, ctx) == 0)
+    /* Free both buffers. */
+    if(ctx->dedup_pending)
     {
-        ctx->pending_flush_started = 1;
+        pending_free((struct dedup_pending_buf *)ctx->dedup_pending);
+        ctx->dedup_pending = NULL;
     }
-    else
+    if(ctx->dedup_pending_draining)
     {
-        fprintf(stderr, "[dedup-pending] failed to create bg flush thread\n");
-        pthread_mutex_destroy(&ctx->pending_flush_mutex);
-        pthread_cond_destroy(&ctx->pending_flush_cond);
+        pending_free((struct dedup_pending_buf *)ctx->dedup_pending_draining);
+        ctx->dedup_pending_draining = NULL;
     }
-}
-
-/**
- * Stop the background pending-flush thread and join it.
- * Waits for any in-flight flush to finish first.
- */
-void obmafs3_dedup_pending_flush_thread_stop(struct obmafs3_ctx *ctx)
-{
-    if(!ctx || !ctx->pending_flush_started) return;
-
-    /* Wait for any in-flight flush to complete. */
-    pthread_mutex_lock(&ctx->pending_flush_mutex);
-    while(ctx->pending_flush_active)
-        pthread_cond_wait(&ctx->pending_flush_cond, &ctx->pending_flush_mutex);
-
-    /* Tell the thread to exit and wake it. */
-    ctx->shutdown_requested = 1;
-    pthread_cond_broadcast(&ctx->pending_flush_cond);
-    pthread_mutex_unlock(&ctx->pending_flush_mutex);
-
-    pthread_join(ctx->pending_flush_thread, NULL);
-    ctx->pending_flush_started = 0;
-
-    pthread_mutex_destroy(&ctx->pending_flush_mutex);
-    pthread_cond_destroy(&ctx->pending_flush_cond);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3620,6 +3506,533 @@ int obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Persisted pending insert buffer (save / load)                      */
+/* ------------------------------------------------------------------ */
+
+/** On-disk header for the persisted pending buffer extent. */
+#define PENDING_PERSIST_MAGIC 0x474E49444E455055ULL /* "UPENDING" LE */
+
+struct __attribute__((packed)) pending_persist_header
+{
+    uint64_t magic;         /**< PENDING_PERSIST_MAGIC */
+    uint64_t count;         /**< Number of dedup_entry records */
+    uint16_t sector_size;   /**< Sector size of the pending buffer */
+    uint8_t  _pad[6];       /**< Alignment padding */
+    uint64_t checksum;      /**< XXH64 of the packed entry array */
+};
+
+/**
+ * Persist the in-memory pending insert buffer(s) to disk.
+ *
+ * Packs all non-empty entries from both the active pending buffer
+ * (ctx->dedup_pending) and the draining buffer (ctx->dedup_pending_draining)
+ * into a flat dedup_entry array, prepends a header with magic + count +
+ * sector_size + XXH64 checksum, and writes to contiguously allocated blocks.
+ *
+ * @param ctx  Filesystem context.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_dedup_pending_save(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || !ctx->bitmap || ctx->fd < 0)
+        return OBMAFS3_ERR_INVAL;
+
+    const struct dedup_pending_buf *pb1 =
+        (const struct dedup_pending_buf *)ctx->dedup_pending;
+    const struct dedup_pending_buf *pb2 =
+        (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
+
+    uint32_t total_count = 0;
+    uint16_t sector_size = 0;
+    if(pb1) { total_count += pb1->count; if(pb1->sector_size) sector_size = pb1->sector_size; }
+    if(pb2) { total_count += pb2->count; if(pb2->sector_size) sector_size = pb2->sector_size; }
+
+    if(total_count == 0)
+    {
+        /* Nothing to persist — free old extent if any. */
+        if(ctx->sb.pending_lba != 0 && ctx->sb.pending_blocks != 0)
+            obmafs3_free_blocks(ctx, ctx->sb.pending_lba, ctx->sb.pending_blocks);
+        ctx->sb.pending_lba    = 0;
+        ctx->sb.pending_blocks = 0;
+        return OBMAFS3_OK;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    size_t   payload_bytes = sizeof(struct pending_persist_header) +
+                             (size_t)total_count * sizeof(struct dedup_entry);
+    uint64_t block_size    = ctx->sb.block_size;
+    uint64_t needed_blocks = (payload_bytes + block_size - 1) / block_size;
+    size_t   buf_size      = (size_t)(needed_blocks * block_size);
+
+    uint8_t *buf = malloc(buf_size);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    /* Pack entries after header space. */
+    struct dedup_entry *dst = (struct dedup_entry *)(buf + sizeof(struct pending_persist_header));
+    uint32_t n = 0;
+
+    if(pb1)
+    {
+        for(uint32_t i = 0; i < pb1->capacity; i++)
+            if(pb1->slots[i].hash != KEYSET_EMPTY)
+                dst[n++] = pb1->slots[i];
+    }
+    if(pb2)
+    {
+        for(uint32_t i = 0; i < pb2->capacity; i++)
+            if(pb2->slots[i].hash != KEYSET_EMPTY)
+                dst[n++] = pb2->slots[i];
+    }
+
+    /* Zero-pad tail. */
+    size_t used = sizeof(struct pending_persist_header) + (size_t)n * sizeof(struct dedup_entry);
+    if(used < buf_size)
+        memset(buf + used, 0, buf_size - used);
+
+    /* Build header. */
+    struct pending_persist_header hdr;
+    hdr.magic       = PENDING_PERSIST_MAGIC;
+    hdr.count       = n;
+    hdr.sector_size = sector_size;
+    memset(hdr._pad, 0, sizeof(hdr._pad));
+    hdr.checksum    = obmafs3_checksum_xxh64(dst, (size_t)n * sizeof(struct dedup_entry));
+    memcpy(buf, &hdr, sizeof(hdr));
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "[dedup-pending] packed %u entries (%.1f KiB) in %.1f ms\n",
+            n, (double)(n * sizeof(struct dedup_entry)) / 1024.0,
+            (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+
+    /* Free old extent. */
+    if(ctx->sb.pending_lba != 0 && ctx->sb.pending_blocks != 0)
+        obmafs3_free_blocks(ctx, ctx->sb.pending_lba, ctx->sb.pending_blocks);
+
+    /* Allocate contiguous blocks. */
+    uint64_t start_lba = 0;
+    int rc = obmafs3_alloc_blocks(ctx, needed_blocks, &start_lba);
+    if(rc != OBMAFS3_OK)
+    {
+        free(buf);
+        ctx->sb.pending_lba    = 0;
+        ctx->sb.pending_blocks = 0;
+        return rc;
+    }
+
+    /* Single pwrite. */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    {
+        off_t   offset    = (off_t)(start_lba * block_size);
+        size_t  remaining = buf_size;
+        size_t  written   = 0;
+        while(remaining > 0)
+        {
+            ssize_t w = pwrite(ctx->fd, buf + written, remaining, offset + (off_t)written);
+            if(w <= 0)
+            {
+                free(buf);
+                obmafs3_free_blocks(ctx, start_lba, needed_blocks);
+                ctx->sb.pending_lba    = 0;
+                ctx->sb.pending_blocks = 0;
+                return OBMAFS3_ERR_IO;
+            }
+            written   += (size_t)w;
+            remaining -= (size_t)w;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    free(buf);
+
+    ctx->sb.pending_lba    = start_lba;
+    ctx->sb.pending_blocks = needed_blocks;
+
+    fprintf(stderr, "[dedup-pending] persisted %u entries (%" PRIu64 " blocks at LBA %" PRIu64 ") — "
+            "write %.1f ms\n", n, needed_blocks, start_lba,
+            (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+
+    return OBMAFS3_OK;
+}
+
+/**
+ * Load a persisted pending insert buffer from disk.
+ *
+ * Reads the extent at ctx->sb.pending_lba, validates the header,
+ * and creates a pending buffer with all entries.  Also inserts all
+ * loaded hashes into the keyset (if available) so the write path's
+ * fast existence check sees them.
+ *
+ * @param ctx  Filesystem context.
+ * @return @c OBMAFS3_OK on success, or an error code.
+ */
+int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || ctx->sb.pending_lba == 0 || ctx->sb.pending_blocks == 0)
+        return OBMAFS3_ERR_NOTFOUND;
+
+    uint64_t block_size    = ctx->sb.block_size;
+    uint64_t needed_blocks = ctx->sb.pending_blocks;
+    size_t   buf_size      = (size_t)(needed_blocks * block_size);
+
+    uint8_t *buf = malloc(buf_size);
+    if(!buf) return OBMAFS3_ERR_NOMEM;
+
+    /* Read extent. */
+    {
+        off_t   offset    = (off_t)(ctx->sb.pending_lba * block_size);
+        size_t  remaining = buf_size;
+        size_t  rd        = 0;
+        while(remaining > 0)
+        {
+            ssize_t n = pread(ctx->fd, buf + rd, remaining, offset + (off_t)rd);
+            if(n <= 0) { free(buf); return OBMAFS3_ERR_IO; }
+            rd        += (size_t)n;
+            remaining -= (size_t)n;
+        }
+    }
+
+    /* Validate header. */
+    if(buf_size < sizeof(struct pending_persist_header))
+    { free(buf); return OBMAFS3_ERR_INVAL; }
+
+    struct pending_persist_header hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+
+    if(hdr.magic != PENDING_PERSIST_MAGIC)
+    {
+        fprintf(stderr, "[dedup-pending] bad magic in persisted pending buffer\n");
+        free(buf);
+        return OBMAFS3_ERR_BADMAGIC;
+    }
+
+    size_t payload_size = (size_t)hdr.count * sizeof(struct dedup_entry);
+    if(sizeof(hdr) + payload_size > buf_size)
+    {
+        fprintf(stderr, "[dedup-pending] persisted pending count %" PRIu64 " overflows extent\n",
+                hdr.count);
+        free(buf);
+        return OBMAFS3_ERR_INVAL;
+    }
+
+    const uint8_t *entry_data = buf + sizeof(hdr);
+    uint64_t computed = obmafs3_checksum_xxh64(entry_data, payload_size);
+    if(computed != hdr.checksum)
+    {
+        fprintf(stderr, "[dedup-pending] checksum mismatch in persisted pending buffer\n");
+        free(buf);
+        return OBMAFS3_ERR_CHECKSUM;
+    }
+
+    /* Create pending buffer and insert all entries. */
+    struct dedup_pending_buf *pb = pending_create();
+    if(!pb) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    pb->sector_size = hdr.sector_size;
+
+    const struct dedup_entry *entries = (const struct dedup_entry *)entry_data;
+    for(uint64_t i = 0; i < hdr.count; i++)
+    {
+        if(entries[i].hash == KEYSET_EMPTY) continue;
+        pending_insert(pb, &entries[i]);
+    }
+
+    /* Also insert all loaded hashes into the keyset for fast lookups. */
+    struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+    if(ks)
+    {
+        for(uint64_t i = 0; i < hdr.count; i++)
+        {
+            if(entries[i].hash == KEYSET_EMPTY) continue;
+            keyset_insert(ks, entries[i].hash);
+        }
+    }
+
+    free(buf);
+    ctx->dedup_pending = pb;
+
+    fprintf(stderr, "[dedup-pending] loaded %u persisted entries (sector_size=%u)\n",
+            pb->count, pb->sector_size);
+
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Background housekeeping thread (pending → B+Tree drain)            */
+/* ------------------------------------------------------------------ */
+
+/** Maximum entries per housekeeping batch. */
+#define HOUSEKEEPING_BATCH_SIZE  256
+
+/** Sleep interval (seconds) when idle. */
+#define HOUSEKEEPING_IDLE_SEC    5
+
+/** Pause between batches (microseconds) to yield I/O to writes. */
+#define HOUSEKEEPING_YIELD_US    50000   /* 50 ms */
+
+/**
+ * Drain a batch of entries from the draining buffer into the B+Tree.
+ *
+ * Uses the same leaf-prefetch strategy as pending_flush but operates
+ * on a subset of entries.  Must be called under write_lock.
+ *
+ * @param ctx      Filesystem context.
+ * @param entries  Sorted array of entries to insert.
+ * @param count    Number of entries.
+ * @param hdr      B+Tree header (updated in place on splits).
+ * @param hdr_lba  LBA where the header lives.
+ * @return @c OBMAFS3_OK on success.
+ */
+static int housekeeping_drain_batch(struct obmafs3_ctx *ctx,
+                                    struct dedup_entry *entries, uint32_t count,
+                                    struct btree_header *hdr, uint64_t hdr_lba)
+{
+    if(count == 0) return OBMAFS3_OK;
+
+    uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
+    struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    size_t bsz = (size_t)ctx->sb.block_size;
+
+    /* Find target leaf LBAs for each entry. */
+    uint64_t *leaf_lbas = malloc((size_t)count * sizeof(uint64_t));
+    if(!leaf_lbas) return OBMAFS3_ERR_NOMEM;
+
+    for(uint32_t i = 0; i < count; i++)
+    {
+        uint64_t leaf_lba = 0;
+        dedup_find_leaf_lba(ctx, hdr, entries[i].hash, &leaf_lba, tree_buf, nc);
+        leaf_lbas[i] = leaf_lba;
+    }
+
+    /* Sort + dedup leaf LBAs for sequential I/O. */
+    qsort(leaf_lbas, count, sizeof(uint64_t), lba_cmp);
+    uint32_t unique_leaves = 0;
+    {
+        uint64_t prev = 0;
+        for(uint32_t i = 0; i < count; i++)
+        {
+            if(leaf_lbas[i] == 0 || leaf_lbas[i] == prev) continue;
+            leaf_lbas[unique_leaves++] = leaf_lbas[i];
+            prev = leaf_lbas[i];
+        }
+    }
+
+    /* Prefetch + pre-read leaves into cache. */
+    for(uint32_t i = 0; i < unique_leaves; i++)
+    {
+        if(cache_find_slot(nc, leaf_lbas[i])) continue;
+        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
+                      (off_t)bsz, POSIX_FADV_WILLNEED);
+    }
+    for(uint32_t i = 0; i < unique_leaves; i++)
+    {
+        if(cache_find_slot(nc, leaf_lbas[i])) continue;
+        nc_block_read(nc, ctx, leaf_lbas[i], tree_buf, bsz);
+    }
+    free(leaf_lbas);
+
+    /* Insert all entries (should be 100% cache hits). */
+    for(uint32_t i = 0; i < count; i++)
+    {
+        struct dedup_entry       existing;
+        struct dedup_upsert_ctx  uctx;
+        int rc = dedup_upsert_find(ctx, hdr, entries[i].hash, &existing, &uctx, tree_buf, nc);
+        if(rc == OBMAFS3_ERR_NOTFOUND)
+        {
+            rc = dedup_upsert_insert(ctx, hdr, &entries[i], &uctx, tree_buf, nc);
+            if(rc != OBMAFS3_OK) return rc;
+        }
+    }
+
+    /* Flush dirty cache entries. */
+    dedup_cache_flush(nc, ctx);
+
+    /* Write updated header. */
+    return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+}
+
+/**
+ * Background housekeeping thread entry point.
+ *
+ * Waits for warmup to complete, then continuously drains the pending
+ * buffer into the B+Tree in small batches.  Each batch acquires
+ * write_lock for the actual B+Tree inserts and releases it between
+ * batches so the write path is never blocked for long.
+ *
+ * The thread swaps the active pending buffer to a "draining" pointer
+ * (visible to the read path for lookups) and processes it.  When
+ * draining completes, the draining pointer is freed.
+ */
+static void *housekeeping_thread_func(void *arg)
+{
+    struct obmafs3_ctx *ctx = (struct obmafs3_ctx *)arg;
+
+    /* Wait for warmup to finish before starting drain work. */
+    obmafs3_dedup_warmup_wait(ctx);
+
+    fprintf(stderr, "[housekeeping] started\n");
+
+    while(!ctx->shutdown_requested)
+    {
+        /* --- check for work --- */
+        int have_work = 0;
+        pthread_mutex_lock(&ctx->write_lock);
+        {
+            struct dedup_pending_buf *pb =
+                (struct dedup_pending_buf *)ctx->dedup_pending;
+            /* Start draining when active buffer has entries and no drain
+             * is already in progress. */
+            if(pb && pb->count > 0 && !ctx->dedup_pending_draining)
+            {
+                /* Swap: move active buffer to draining, create fresh one. */
+                ctx->dedup_pending_draining = pb;
+                ctx->dedup_pending = pending_create();
+                if(ctx->dedup_pending)
+                {
+                    /* Preserve sector_size for new buffer. */
+                    ((struct dedup_pending_buf *)ctx->dedup_pending)->sector_size =
+                        pb->sector_size;
+                }
+                have_work = 1;
+            }
+            else if(ctx->dedup_pending_draining)
+            {
+                /* Previous drain cycle not yet consumed — shouldn't
+                 * happen but guard anyway. */
+                have_work = 1;
+            }
+        }
+        pthread_mutex_unlock(&ctx->write_lock);
+
+        if(!have_work)
+        {
+            /* Sleep until woken or timeout. */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += HOUSEKEEPING_IDLE_SEC;
+            pthread_mutex_lock(&ctx->housekeeping_mutex);
+            if(!ctx->shutdown_requested)
+                pthread_cond_timedwait(&ctx->housekeeping_cond,
+                                       &ctx->housekeeping_mutex, &ts);
+            pthread_mutex_unlock(&ctx->housekeeping_mutex);
+            continue;
+        }
+
+        /* --- drain the buffer in batches --- */
+        struct dedup_pending_buf *drain =
+            (struct dedup_pending_buf *)ctx->dedup_pending_draining;
+        if(!drain || drain->count == 0) goto finish_drain;
+
+        /* Extract all entries and sort by hash (no lock needed —
+         * only this thread touches the draining buffer). */
+        uint32_t n = drain->count;
+        struct dedup_entry *sorted = malloc((size_t)n * sizeof(struct dedup_entry));
+        if(!sorted) goto finish_drain;
+
+        uint32_t extracted = 0;
+        for(uint32_t i = 0; i < drain->capacity && extracted < n; i++)
+        {
+            if(drain->slots[i].hash != KEYSET_EMPTY)
+                sorted[extracted++] = drain->slots[i];
+        }
+        qsort(sorted, extracted, sizeof(struct dedup_entry), pending_entry_cmp);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        uint32_t total_inserted = 0;
+        for(uint32_t off = 0; off < extracted && !ctx->shutdown_requested;
+            off += HOUSEKEEPING_BATCH_SIZE)
+        {
+            uint32_t batch = extracted - off;
+            if(batch > HOUSEKEEPING_BATCH_SIZE) batch = HOUSEKEEPING_BATCH_SIZE;
+
+            pthread_mutex_lock(&ctx->write_lock);
+            {
+                struct btree_header hdr;
+                uint64_t            hdr_lba;
+                int rc = obmafs3_dedup_get_tree(ctx, drain->sector_size,
+                                                &hdr, &hdr_lba);
+                if(rc == OBMAFS3_OK)
+                {
+                    rc = housekeeping_drain_batch(ctx, sorted + off, batch,
+                                                 &hdr, hdr_lba);
+                    if(rc == OBMAFS3_OK) total_inserted += batch;
+                }
+            }
+            pthread_mutex_unlock(&ctx->write_lock);
+
+            /* Yield I/O to the write path between batches. */
+            if(off + HOUSEKEEPING_BATCH_SIZE < extracted && !ctx->shutdown_requested)
+                usleep(HOUSEKEEPING_YIELD_US);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                  + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        fprintf(stderr, "[housekeeping] drained %u/%u entries in %.1f ms\n",
+                total_inserted, extracted, ms);
+
+        free(sorted);
+
+finish_drain:
+        /* Release the draining buffer. */
+        pthread_mutex_lock(&ctx->write_lock);
+        {
+            struct dedup_pending_buf *old =
+                (struct dedup_pending_buf *)ctx->dedup_pending_draining;
+            ctx->dedup_pending_draining = NULL;
+            pending_free(old);
+        }
+        pthread_mutex_unlock(&ctx->write_lock);
+    }
+
+    fprintf(stderr, "[housekeeping] stopped\n");
+    return NULL;
+}
+
+/**
+ * Start the background housekeeping thread.
+ *
+ * Should be called after warmup has been started — the housekeeping
+ * thread will internally wait for warmup completion before doing any
+ * drain work.
+ */
+void obmafs3_housekeeping_start(struct obmafs3_ctx *ctx)
+{
+    if(!ctx) return;
+
+    pthread_mutex_init(&ctx->housekeeping_mutex, NULL);
+    pthread_cond_init(&ctx->housekeeping_cond, NULL);
+    ctx->housekeeping_started = 0;
+
+    int rc = pthread_create(&ctx->housekeeping_thread, NULL,
+                            housekeeping_thread_func, ctx);
+    if(rc != 0)
+    {
+        fprintf(stderr, "[housekeeping] failed to create thread (rc=%d)\n", rc);
+        return;
+    }
+    ctx->housekeeping_started = 1;
+}
+
+/**
+ * Signal the housekeeping thread to stop and wait for it to exit.
+ */
+void obmafs3_housekeeping_stop(struct obmafs3_ctx *ctx)
+{
+    if(!ctx || !ctx->housekeeping_started) return;
+
+    /* Wake the thread if it's sleeping. */
+    pthread_mutex_lock(&ctx->housekeeping_mutex);
+    pthread_cond_signal(&ctx->housekeeping_cond);
+    pthread_mutex_unlock(&ctx->housekeeping_mutex);
+
+    pthread_join(ctx->housekeeping_thread, NULL);
+    pthread_mutex_destroy(&ctx->housekeeping_mutex);
+    pthread_cond_destroy(&ctx->housekeeping_cond);
+    ctx->housekeeping_started = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Background dedup key set warmup                                    */
 /* ------------------------------------------------------------------ */
 
@@ -3712,15 +4125,31 @@ static void *warmup_thread_func(void *arg)
     }
 
 done:
-    /* Create the pending insert buffer (shared across all dedup trees). */
+    /* Try to load persisted pending entries from a previous mount.
+     * This creates the pending buffer and populates it from disk.
+     * Also inserts loaded hashes into the keyset. */
+    if(!ctx->dedup_pending && ctx->sb.pending_lba != 0)
+    {
+        int prc = obmafs3_dedup_pending_load(ctx);
+        if(prc == OBMAFS3_OK)
+        {
+            struct dedup_pending_buf *lpb =
+                (struct dedup_pending_buf *)ctx->dedup_pending;
+            fprintf(stderr, "[dedup-warmup] loaded persisted pending buffer — %u entries\n",
+                    lpb ? lpb->count : 0);
+        }
+        else
+        {
+            fprintf(stderr, "[dedup-warmup] failed to load persisted pending (rc=%d)\n", prc);
+        }
+    }
+
+    /* Create the pending insert buffer if not loaded from disk. */
     if(!ctx->dedup_pending)
     {
         struct dedup_pending_buf *pb = pending_create();
         if(pb) ctx->dedup_pending = pb;
     }
-
-    /* Start the background flush thread alongside the buffer. */
-    obmafs3_dedup_pending_flush_thread_start(ctx);
 
     pthread_mutex_lock(&ctx->warmup_mutex);
     ctx->warmup_done    = 1;

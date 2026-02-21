@@ -88,12 +88,11 @@ struct obmafs3_ctx
     void                *dedup_node_cache;  ///< Global dedup B+Tree node cache (shared across files)
     void                *dedup_key_set;     ///< Global dedup hash key set (fast existence check)
     void                *dedup_pending;     ///< Pending insert buffer (deferred B+Tree inserts)
-    void                *dedup_pending_flushing; ///< Buffer currently being flushed by bg thread
-    pthread_t            pending_flush_thread;   ///< Background pending-flush thread
-    pthread_mutex_t      pending_flush_mutex;    ///< Protects pending_flush_active / condvar
-    pthread_cond_t       pending_flush_cond;     ///< Signalled when flush work is available or done
-    volatile int         pending_flush_active;   ///< 1 while bg flush is in progress
-    int                  pending_flush_started;  ///< 1 if flush thread was created (needs join)
+    void                *dedup_pending_draining; ///< Pending buffer being drained by housekeeping thread
+    pthread_t            housekeeping_thread; ///< Background housekeeping thread (drains pending → B+Tree)
+    pthread_mutex_t      housekeeping_mutex;  ///< Protects housekeeping condvar
+    pthread_cond_t       housekeeping_cond;   ///< Signalled to wake or stop housekeeping
+    int                  housekeeping_started;///< 1 if housekeeping thread was created
     pthread_t            warmup_thread;      ///< Background keyset warmup thread
     pthread_mutex_t      warmup_mutex;       ///< Protects warmup_done flag
     pthread_cond_t       warmup_cond;        ///< Signalled when warmup completes
@@ -255,12 +254,14 @@ void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx);
-void obmafs3_dedup_pending_flush_thread_start(struct obmafs3_ctx *ctx);
-void obmafs3_dedup_pending_flush_thread_stop(struct obmafs3_ctx *ctx);
+int  obmafs3_dedup_pending_save(struct obmafs3_ctx *ctx);
+int  obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx);
 int  obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx);
 int  obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_warmup_start(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_warmup_wait(struct obmafs3_ctx *ctx);
+void obmafs3_housekeeping_start(struct obmafs3_ctx *ctx);
+void obmafs3_housekeeping_stop(struct obmafs3_ctx *ctx);
 int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record *inode, struct sector_map_cache *cache);
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
 

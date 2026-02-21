@@ -523,23 +523,29 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     fflush(stderr);
     obmafs3_compress_pool_destroy(ctx);
 
+    /* Stop the background housekeeping thread (pending → B+Tree drain). */
+    fprintf(stderr, "[obmafs3] close: step 2 — housekeeping stop\n");
+    fflush(stderr);
+    obmafs3_housekeeping_stop(ctx);
+
     /* Wait for and join the background warmup thread (if any). */
-    fprintf(stderr, "[obmafs3] close: step 2 — warmup thread join\n");
+    fprintf(stderr, "[obmafs3] close: step 3 — warmup thread join\n");
     fflush(stderr);
     obmafs3_dedup_warmup_wait(ctx);
     if(ctx->warmup_started)
         pthread_join(ctx->warmup_thread, NULL);
     pthread_mutex_destroy(&ctx->warmup_mutex);
     pthread_cond_destroy(&ctx->warmup_cond);
-    fprintf(stderr, "[obmafs3] close: step 3 — pending buffer flush\n");
+
+    fprintf(stderr, "[obmafs3] close: step 4 — pending buffer save\n");
     fflush(stderr);
 
-    /* Stop the background pending-flush thread (waits for any in-flight
-     * flush to complete), then synchronously flush + free the buffer. */
-    obmafs3_dedup_pending_flush_thread_stop(ctx);
+    /* Persist any remaining pending entries to disk (fast sequential
+     * write of ~1-2 MiB).  Entries will be loaded and drained into
+     * the B+Tree by the housekeeping thread on the next mount. */
     obmafs3_dedup_pending_flush_and_free(ctx);
 
-    fprintf(stderr, "[obmafs3] close: step 4 — keyset save (warmup_done=%d)\n",
+    fprintf(stderr, "[obmafs3] close: step 5 — keyset save (warmup_done=%d)\n",
             ctx->warmup_done);
     fflush(stderr);
 

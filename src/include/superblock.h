@@ -41,6 +41,8 @@ struct __attribute__((packed)) obmafs3_sb
     uint8_t  checksum[32];       ///< Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed)
     uint64_t keyset_lba;         ///< LBA of the persisted dedup key set (0 = none)
     uint64_t keyset_blocks;      ///< Number of blocks used by the persisted key set
+    uint64_t pending_lba;        ///< LBA of the persisted pending insert buffer (0 = none)
+    uint64_t pending_blocks;     ///< Number of blocks used by the persisted pending buffer
 };
 
 #endif /* OBMAFS3_SUPERBLOCK_H */

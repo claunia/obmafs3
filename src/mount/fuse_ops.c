@@ -191,6 +191,11 @@ static void *obmafs3_fuse_init(struct fuse_conn_info *conn, struct fuse_config *
      * duplicate sectors.  Runs concurrently with early FUSE ops. */
     obmafs3_dedup_warmup_start(g_ctx);
 
+    /* Start the background housekeeping thread.
+     * It waits for warmup to finish, then continuously drains the
+     * pending insert buffer into the B+Tree in small batches. */
+    obmafs3_housekeeping_start(g_ctx);
+
     /* Request 1 MiB write buffers (default is 128 KiB). */
     conn->max_write     = 1048576;
     conn->max_readahead = 1048576;

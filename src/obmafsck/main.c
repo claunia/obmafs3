@@ -435,6 +435,28 @@ static void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t f
         }
     }
 
+    /* ---- pending_lba / pending_blocks ---- */
+    if(sb->pending_lba != 0)
+    {
+        if(sb->pending_lba >= total_blocks)
+        {
+            printf("    pending_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
+                   sb->pending_lba, total_blocks);
+            bad++;
+        }
+        if(sb->pending_blocks == 0)
+        {
+            printf("    pending_lba is set but pending_blocks is 0\n");
+            bad++;
+        }
+        else if(sb->pending_lba + sb->pending_blocks > total_blocks)
+        {
+            printf("    pending extends beyond filesystem (LBA %" PRIu64 " + %" PRIu64 " blocks > %" PRIu64 ")\n",
+                   sb->pending_lba, sb->pending_blocks, total_blocks);
+            bad++;
+        }
+    }
+
     /* ---- LBA range checks ---- */
     struct { const char *name; uint64_t lba; } lba_fields[] = {
         { "catalog_lba",       sb->catalog_lba       },
@@ -2910,6 +2932,13 @@ static uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_bl
     {
         PROGRESS("keyset blocks");
         for(uint64_t i = 0; i < ctx->sb.keyset_blocks; i++) MARK(ctx->sb.keyset_lba + i);
+    }
+
+    /* Pending insert buffer blocks */
+    if(ctx->sb.pending_lba != 0 && ctx->sb.pending_blocks != 0)
+    {
+        PROGRESS("pending buffer blocks");
+        for(uint64_t i = 0; i < ctx->sb.pending_blocks; i++) MARK(ctx->sb.pending_lba + i);
     }
 
     /* Backup superblock at the last block */
