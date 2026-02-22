@@ -292,6 +292,7 @@ static int obmafs3_fuse_release_impl(const char *path, struct fuse_file_info *fi
     obmafs3_free_sector_map_cache(&ffctx->sme_cache);
     obmafs3_free_cd_sector_map_cache(&ffctx->cd_sme_cache);
     if(ffctx->media_leaf_cache) obmafs3_free_media_leaf_cache(ffctx->media_leaf_cache);
+    if(ffctx->media_dedup_cache) obmafs3_free_media_dedup_cache(ffctx->media_dedup_cache);
     if(ffctx->ecc_ctx) ecc_cd_free(ffctx->ecc_ctx);
     free(ffctx);
     fi->fh = 0;

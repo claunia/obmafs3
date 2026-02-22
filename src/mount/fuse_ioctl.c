@@ -468,7 +468,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         rc = obmafs3_read_media_image_data(g_ctx, &ffctx->inode, (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE, out,
-                                           CD_RAW_SECTOR_SIZE, CD_RAW_SECTOR_SIZE, NULL);
+                                           CD_RAW_SECTOR_SIZE, CD_RAW_SECTOR_SIZE, NULL, NULL);
         return (rc == OBMAFS3_OK) ? 0 : -EIO;
     }
 
@@ -536,7 +536,7 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
         memcpy(&data_inode, &ffctx->inode, sizeof(data_inode));
         /* The data was stored with offset = sector_lba * data_size */
         rc = obmafs3_read_media_image_data(g_ctx, &data_inode, (uint64_t)sector_lba * data_size,
-                                           out + data_offset_in_sector, data_size, data_size, NULL);
+                                           out + data_offset_in_sector, data_size, data_size, NULL, NULL);
         if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 

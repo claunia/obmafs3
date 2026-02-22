@@ -268,8 +268,16 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
             ffctx->media_leaf_cache = obmafs3_alloc_media_leaf_cache();
             /* Non-fatal — pass NULL to fall back to a per-call cache */
         }
+        /* Lazily allocate a persistent dedup block cache so that the
+         * last-read 4 MiB dedup block survives across FUSE read calls. */
+        if(ffctx && !ffctx->media_dedup_cache)
+        {
+            ffctx->media_dedup_cache = obmafs3_alloc_media_dedup_cache(g_ctx);
+            /* Non-fatal — pass NULL to fall back to per-call buffers */
+        }
         rc = obmafs3_read_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss,
-                                           ffctx ? ffctx->media_leaf_cache : NULL);
+                                           ffctx ? ffctx->media_leaf_cache : NULL,
+                                           ffctx ? ffctx->media_dedup_cache : NULL);
     }
     else if(ip->file_type == kFileTypeCompactDiscImage)
     {

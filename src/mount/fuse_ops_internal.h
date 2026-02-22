@@ -62,6 +62,7 @@ struct fuse_file_ctx
     struct cd_sector_map_cache cd_sme_cache;     ///< CD sector map cache
     void                      *ecc_ctx;          ///< CD ECC context (lazy-init)
     void                      *media_leaf_cache; ///< Persistent dedup leaf cache for media image reads
+    void                      *media_dedup_cache; ///< Persistent dedup block cache for media image reads
     uint64_t                   sub_inode_id;     ///< .sub sidecar inode ID (0 = none)
     struct inode_record        sub_inode;        ///< cached .sub sidecar inode
     int                        sub_inode_dirty;  ///< sidecar inode needs write-back

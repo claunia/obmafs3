@@ -33,6 +33,20 @@
 #include "dedup_internal.h"
 
 /* ------------------------------------------------------------------ */
+/*  Persistent dedup data-block cache (opaque, heap-allocated)         */
+/* ------------------------------------------------------------------ */
+
+/** Cached dedup data block that persists across FUSE read calls. */
+struct media_dedup_block_cache
+{
+    uint8_t *dedup_buf;        ///< Raw on-disk dedup block (dedup_block_size bytes)
+    uint8_t *decomp_buf;      ///< Decompressed payload (lazy, dedup_block_size bytes)
+    uint64_t cached_lba;      ///< LBA of the block currently in dedup_buf (0 = none)
+    int      compressed;      ///< Non-zero when decomp_buf holds decompressed data
+    uint64_t block_size;      ///< Expected dedup_block_size (for validation)
+};
+
+/* ------------------------------------------------------------------ */
 /*  Media image read path                                              */
 /* ------------------------------------------------------------------ */
 
@@ -52,7 +66,8 @@
  * @return OBMAFS3_OK on success, error code otherwise.
  */
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
-                                  size_t size, uint16_t sector_size, void *leaf_cache)
+                                  size_t size, uint16_t sector_size, void *leaf_cache,
+                                  void *dedup_cache)
 {
     if(offset >= inode->file_size) return OBMAFS3_OK;
 
@@ -102,20 +117,39 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         return rc;
     }
 
-    /* Buffer for reading the dedup data block (dedup_block_size bytes) */
-    uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
-    if(!dedup_buf)
+    /* ---- Dedup data-block cache ----
+     * When an external cache is provided (persistent across FUSE read
+     * calls), reuse its buffers and cached LBA; otherwise allocate
+     * per-call buffers that are freed at the end of this function. */
+    struct media_dedup_block_cache *dbc = (struct media_dedup_block_cache *)dedup_cache;
+    int                             owns_dedup_bufs;
+
+    uint8_t *dedup_buf;
+    uint8_t *decomp_buf;
+    uint64_t cached_dedup_lba;
+    int      cached_compressed;
+
+    if(dbc)
     {
-        free(sme_batch);
-        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        dedup_buf        = dbc->dedup_buf;
+        decomp_buf       = dbc->decomp_buf;
+        cached_dedup_lba = dbc->cached_lba;
+        cached_compressed = dbc->compressed;
+        owns_dedup_bufs  = 0;
     }
-
-    /* Decompressed payload buffer (allocated on first compressed block) */
-    uint8_t *decomp_buf = NULL;
-
-    /* Cache the last read dedup block LBA to avoid re-reading */
-    uint64_t cached_dedup_lba  = 0;
-    int      cached_compressed = 0;
+    else
+    {
+        dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
+        if(!dedup_buf)
+        {
+            free(sme_batch);
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        }
+        decomp_buf       = NULL;
+        cached_dedup_lba = 0;
+        cached_compressed = 0;
+        owns_dedup_bufs  = 1;
+    }
 
     /* Leaf-level lookup cache: avoids full tree traversal when
      * consecutive sector hashes land in the same B+Tree leaf.
@@ -164,8 +198,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     rc, sme->hash, sector_num, inode->inode_id);
             if(owns_leaf_cache) free(lc->leaf_buf);
             free(sme_batch);
-            free(decomp_buf);
-            free(dedup_buf);
+            if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
             return rc;
         }
 
@@ -182,8 +215,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                         rc, de.block_lba, sme->hash, sector_num);
                 if(owns_leaf_cache) free(lc->leaf_buf);
                 free(sme_batch);
-                free(decomp_buf);
-                free(dedup_buf);
+                if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
                 return rc;
             }
 
@@ -210,8 +242,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 {
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
-                    free(decomp_buf);
-                    free(dedup_buf);
+                    if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
                     return rc;
                 }
             }
@@ -227,9 +258,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     {
                         if(owns_leaf_cache) free(lc->leaf_buf);
                         free(sme_batch);
-                        free(dedup_buf);
+                        if(owns_dedup_bufs) free(dedup_buf);
                         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
+                    /* Store back into persistent cache so it survives */
+                    if(dbc) dbc->decomp_buf = decomp_buf;
                 }
                 rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr),
                                         (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
@@ -237,8 +270,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 {
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
-                    free(decomp_buf);
-                    free(dedup_buf);
+                    if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
                     return rc;
                 }
                 cached_compressed = 1;
@@ -271,8 +303,19 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
     if(owns_leaf_cache) free(lc->leaf_buf);
     free(sme_batch);
-    free(decomp_buf);
-    free(dedup_buf);
+
+    /* Write back cached state so the next call can reuse the block */
+    if(dbc)
+    {
+        dbc->cached_lba  = cached_dedup_lba;
+        dbc->compressed  = cached_compressed;
+    }
+    else
+    {
+        free(decomp_buf);
+        free(dedup_buf);
+    }
+
     return OBMAFS3_OK;
 }
 
@@ -303,6 +346,51 @@ void *obmafs3_alloc_media_leaf_cache(void)
 {
     struct dedup_leaf_cache *lc = calloc(1, sizeof(*lc));
     return lc;
+}
+
+/**
+ * Allocate a persistent dedup data-block cache for use with
+ * @c obmafs3_read_media_image_data.  Pre-allocates the raw and
+ * decompression buffers so they survive across FUSE read calls.
+ *
+ * The caller must free the cache with @c obmafs3_free_media_dedup_cache
+ * when the file handle is released.
+ *
+ * @param ctx  Filesystem context (used for @c dedup_block_size).
+ * @return Opaque cache pointer, or NULL on allocation failure.
+ */
+void *obmafs3_alloc_media_dedup_cache(struct obmafs3_ctx *ctx)
+{
+    struct media_dedup_block_cache *c = calloc(1, sizeof(*c));
+    if(!c) return NULL;
+
+    c->dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
+    if(!c->dedup_buf)
+    {
+        free(c);
+        return NULL;
+    }
+
+    /* decomp_buf is allocated lazily on first compressed block */
+    c->cached_lba  = 0;
+    c->compressed  = 0;
+    c->block_size  = ctx->sb.dedup_block_size;
+    return c;
+}
+
+/**
+ * Free a persistent dedup data-block cache.
+ * Safe to call with NULL.
+ *
+ * @param cache  Opaque cache pointer (or NULL).
+ */
+void obmafs3_free_media_dedup_cache(void *cache)
+{
+    if(!cache) return;
+    struct media_dedup_block_cache *c = (struct media_dedup_block_cache *)cache;
+    free(c->decomp_buf);
+    free(c->dedup_buf);
+    free(c);
 }
 
 /* ------------------------------------------------------------------ */

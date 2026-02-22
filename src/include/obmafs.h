@@ -302,9 +302,12 @@ int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record 
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
 
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
-                                  size_t size, uint16_t sector_size, void *leaf_cache);
+                                  size_t size, uint16_t sector_size, void *leaf_cache,
+                                  void *dedup_cache);
 void *obmafs3_alloc_media_leaf_cache(void);
 void  obmafs3_free_media_leaf_cache(void *leaf_cache);
+void *obmafs3_alloc_media_dedup_cache(struct obmafs3_ctx *ctx);
+void  obmafs3_free_media_dedup_cache(void *dedup_cache);
 int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
                                size_t size);
 int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode, uint64_t offset,
