@@ -260,7 +260,16 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
             ss = lookup_disk_image_sector_size(name);
         }
         if(ss == 0) FUSE_RETURN(-EINVAL, "");
-        rc = obmafs3_read_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss);
+
+        /* Lazily allocate a persistent leaf cache for this file handle
+         * so that B+Tree leaf lookups survive across FUSE read calls. */
+        if(ffctx && !ffctx->media_leaf_cache)
+        {
+            ffctx->media_leaf_cache = obmafs3_alloc_media_leaf_cache();
+            /* Non-fatal — pass NULL to fall back to a per-call cache */
+        }
+        rc = obmafs3_read_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss,
+                                           ffctx ? ffctx->media_leaf_cache : NULL);
     }
     else if(ip->file_type == kFileTypeCompactDiscImage)
     {

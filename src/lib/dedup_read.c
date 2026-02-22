@@ -52,7 +52,7 @@
  * @return OBMAFS3_OK on success, error code otherwise.
  */
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
-                                  size_t size, uint16_t sector_size)
+                                  size_t size, uint16_t sector_size, void *leaf_cache)
 {
     if(offset >= inode->file_size) return OBMAFS3_OK;
 
@@ -118,8 +118,22 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     int      cached_compressed = 0;
 
     /* Leaf-level lookup cache: avoids full tree traversal when
-     * consecutive sector hashes land in the same B+Tree leaf. */
-    struct dedup_leaf_cache leaf_cache = DEDUP_LEAF_CACHE_INIT;
+     * consecutive sector hashes land in the same B+Tree leaf.
+     * When an external cache is provided (persistent across FUSE read
+     * calls), use it; otherwise fall back to a stack-local cache. */
+    struct dedup_leaf_cache  local_leaf_cache = DEDUP_LEAF_CACHE_INIT;
+    struct dedup_leaf_cache *lc;
+    int                      owns_leaf_cache;
+    if(leaf_cache)
+    {
+        lc              = (struct dedup_leaf_cache *)leaf_cache;
+        owns_leaf_cache = 0;
+    }
+    else
+    {
+        lc              = &local_leaf_cache;
+        owns_leaf_cache = 1;
+    }
 
     uint8_t *out        = (uint8_t *)buf;
     size_t   bytes_read = 0;
@@ -141,14 +155,14 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
         /* Look up the hash in the dedup tree (using leaf cache) */
         struct dedup_entry de;
-        rc = dedup_lookup_cached(ctx, &dedup_hdr, sme->hash, &de, &leaf_cache);
+        rc = dedup_lookup_cached(ctx, &dedup_hdr, sme->hash, &de, lc);
         if(rc != OBMAFS3_OK)
         {
             fprintf(stderr,
                     "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sector=%" PRId64 " inode=%" PRIu64
                     "\n",
                     rc, sme->hash, sector_num, inode->inode_id);
-            free(leaf_cache.leaf_buf);
+            if(owns_leaf_cache) free(lc->leaf_buf);
             free(sme_batch);
             free(decomp_buf);
             free(dedup_buf);
@@ -166,7 +180,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                         "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64 " hash=%" PRIu64
                         " sector=%" PRId64 "\n",
                         rc, de.block_lba, sme->hash, sector_num);
-                free(leaf_cache.leaf_buf);
+                if(owns_leaf_cache) free(lc->leaf_buf);
                 free(sme_batch);
                 free(decomp_buf);
                 free(dedup_buf);
@@ -194,7 +208,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs, (size_t)((needed_std - 1) * bs));
                 if(rc != OBMAFS3_OK)
                 {
-                    free(leaf_cache.leaf_buf);
+                    if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
                     free(decomp_buf);
                     free(dedup_buf);
@@ -211,7 +225,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     decomp_buf = malloc((size_t)ctx->sb.dedup_block_size);
                     if(!decomp_buf)
                     {
-                        free(leaf_cache.leaf_buf);
+                        if(owns_leaf_cache) free(lc->leaf_buf);
                         free(sme_batch);
                         free(dedup_buf);
                         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
@@ -221,7 +235,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                                         (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
-                    free(leaf_cache.leaf_buf);
+                    if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
                     free(decomp_buf);
                     free(dedup_buf);
@@ -237,7 +251,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             /* Speculatively prefetch the next sector's dedup block.
              * Uses the leaf cache so the lookup is typically free. */
             if(sme_idx + 1 < sme_count)
-                dedup_readahead_next(ctx, &dedup_hdr, sme_batch[sme_idx + 1].hash, cached_dedup_lba, &leaf_cache);
+                dedup_readahead_next(ctx, &dedup_hdr, sme_batch[sme_idx + 1].hash, cached_dedup_lba, lc);
         }
 
         /* Copy sector data from the dedup block at the stored offset.
@@ -255,11 +269,40 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         bytes_read += chunk;
     }
 
-    free(leaf_cache.leaf_buf);
+    if(owns_leaf_cache) free(lc->leaf_buf);
     free(sme_batch);
     free(decomp_buf);
     free(dedup_buf);
     return OBMAFS3_OK;
+}
+
+/**
+ * Free a persistent dedup leaf cache previously passed to
+ * @c obmafs3_read_media_image_data as the @c leaf_cache parameter.
+ *
+ * Safe to call with NULL.
+ *
+ * @param lc  Opaque leaf cache pointer (or NULL).
+ */
+void obmafs3_free_media_leaf_cache(void *lc)
+{
+    if(!lc) return;
+    struct dedup_leaf_cache *cache = (struct dedup_leaf_cache *)lc;
+    free(cache->leaf_buf);
+    free(cache);
+}
+
+/**
+ * Allocate an opaque persistent dedup leaf cache for use with
+ * @c obmafs3_read_media_image_data.  The caller must free it with
+ * @c obmafs3_free_media_leaf_cache when done.
+ *
+ * @return Opaque leaf cache pointer, or NULL on allocation failure.
+ */
+void *obmafs3_alloc_media_leaf_cache(void)
+{
+    struct dedup_leaf_cache *lc = calloc(1, sizeof(*lc));
+    return lc;
 }
 
 /* ------------------------------------------------------------------ */
