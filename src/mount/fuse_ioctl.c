@@ -283,9 +283,13 @@ cache_and_done:
         cache->entries[cache->count++] = sme;
     }
 
-    /* Update inode sector count */
+    /* Update inode sector count and virtual file size.
+     * The virtual size of an ioctl-written CD image is always
+     * sector_count * CD_RAW_SECTOR_SIZE (2352), regardless of the
+     * per-mode data size used for dedup storage. */
     if((uint64_t)(sector_lba + 1) > ffctx->inode.sector_count)
         ffctx->inode.sector_count = (uint64_t)(sector_lba + 1);
+    ffctx->inode.file_size = ffctx->inode.sector_count * CD_RAW_SECTOR_SIZE;
     ffctx->inode_dirty = 1;
 
     return 0;

@@ -248,6 +248,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
  *    (if applicable) + user data (from appropriately-sized dedup tree)
  *    + suffix (generated or from suffix tree).
  *
+ * The virtual file size is @c sector_count * @c CD_RAW_SECTOR_SIZE.
+ * Sectors that do not have a corresponding entry in the sector map
+ * (gaps between tracks) are returned as zero-filled 2352-byte buffers.
+ * Reading beyond @c sector_count is not allowed (caller must clamp).
+ *
  * @param ctx    Filesystem context.
  * @param inode  Inode record describing the CD image file.
  * @param offset Byte offset into the virtual 2352-byte-per-sector image.
@@ -258,35 +263,32 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode,
                                uint64_t offset, void *buf, size_t size)
 {
-    if(offset >= inode->file_size) return OBMAFS3_OK;
-    if(offset + size > inode->file_size) size = (size_t)(inode->file_size - offset);
+    /* Virtual file size: sector_count * 2352 */
+    uint64_t virtual_size = inode->sector_count * CD_RAW_SECTOR_SIZE;
+    if(offset >= virtual_size) return OBMAFS3_OK;
+    if(offset + size > virtual_size) size = (size_t)(virtual_size - offset);
     if(size == 0) return OBMAFS3_OK;
 
-    /* ---- Batch-read all needed cd_sector_map_entries ---- */
-    int64_t  first_sector = (int64_t)(offset / CD_RAW_SECTOR_SIZE);
-    int64_t  last_sector  = (int64_t)((offset + size - 1) / CD_RAW_SECTOR_SIZE);
-    uint64_t sme_count    = (uint64_t)(last_sector - first_sector + 1);
+    /* ---- Read ALL cd_sector_map_entries (sparse — indexed by sector field) ---- */
+    uint64_t total_entries = inode->sector_map_size;
 
-    struct cd_sector_map_entry *sme_batch = malloc((size_t)(sme_count * sizeof(struct cd_sector_map_entry)));
-    if(!sme_batch) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
-
-    struct inode_record map_inode;
-    memcpy(&map_inode, inode, sizeof(map_inode));
-    map_inode.file_size = inode->sector_map_size * sizeof(struct cd_sector_map_entry);
-
-    uint64_t sme_offset = (uint64_t)first_sector * sizeof(struct cd_sector_map_entry);
-    int rc = obmafs3_read_file_data(ctx, &map_inode, sme_offset, sme_batch,
-                                    (size_t)(sme_count * sizeof(struct cd_sector_map_entry)));
-    if(rc != OBMAFS3_OK)
+    struct cd_sector_map_entry *sme_all = NULL;
+    if(total_entries > 0)
     {
-        fprintf(stderr, "[read_cd_image] batch read_file_data(cd_sme) FAILED rc=%d "
-                "first_sector=%" PRId64 " count=%" PRIu64 " sme_offset=%" PRIu64
-                " map_file_size=%" PRIu64 " sector_map_size=%" PRIu64
-                " inode=%" PRIu64 "\n",
-                rc, first_sector, sme_count, sme_offset, map_inode.file_size,
-                inode->sector_map_size, inode->inode_id);
-        free(sme_batch);
-        return rc;
+        sme_all = malloc((size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
+        if(!sme_all) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+        struct inode_record map_inode;
+        memcpy(&map_inode, inode, sizeof(map_inode));
+        map_inode.file_size = total_entries * sizeof(struct cd_sector_map_entry);
+
+        int rc = obmafs3_read_file_data(ctx, &map_inode, 0, sme_all,
+                                        (size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
+        if(rc != OBMAFS3_OK)
+        {
+            free(sme_all);
+            return rc;
+        }
     }
 
     /* ECC context for suffix reconstruction — lazy-allocated on first use */
@@ -294,7 +296,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
     /* Dedup block cache — shared across all sectors in this read */
     uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
-    if(!dedup_buf) { free(sme_batch); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
+    if(!dedup_buf) { free(sme_all); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
     uint8_t *decomp_buf       = NULL;
     uint64_t cached_dedup_lba = 0;
     int      cached_compressed = 0;
@@ -306,6 +308,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
     struct btree_header cached_dedup_hdr;
     uint16_t            cached_data_size = 0;
 
+    int rc = OBMAFS3_OK;
     uint8_t *out        = (uint8_t *)buf;
     size_t   bytes_read = 0;
 
@@ -321,8 +324,31 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                                          ? remaining_in_read
                                          : remaining_in_sector;
 
-        uint64_t                    sme_idx = (uint64_t)(sector_num - first_sector);
-        struct cd_sector_map_entry *sme     = &sme_batch[sme_idx];
+        /* Binary search the sector map for this LBA.  Entries are
+         * sorted by sector number (written in track order). */
+        struct cd_sector_map_entry *sme = NULL;
+        if(sme_all && total_entries > 0)
+        {
+            int64_t lo = 0, hi = (int64_t)total_entries - 1;
+            while(lo <= hi)
+            {
+                int64_t mid = lo + (hi - lo) / 2;
+                if(sme_all[mid].sector == sector_num) { sme = &sme_all[mid]; break; }
+                else if(sme_all[mid].sector < sector_num) lo = mid + 1;
+                else hi = mid - 1;
+            }
+        }
+
+        /* Sector not found in the map — gap between tracks.
+         * Return a zero-filled 2352-byte buffer. */
+        if(!sme)
+        {
+            uint8_t zero_sector[CD_RAW_SECTOR_SIZE];
+            memset(zero_sector, 0, CD_RAW_SECTOR_SIZE);
+            memcpy(out + bytes_read, zero_sector + offset_in_sector, chunk);
+            bytes_read += chunk;
+            continue;
+        }
 
         /* Determine the data_size (= dedup sector size) for this sector */
         uint16_t data_size;
@@ -408,13 +434,6 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
             {
                 cached_compressed = 0;
             }
-
-            /* Speculatively prefetch the next sector's dedup block.
-             * Uses the leaf cache so the lookup is typically free. */
-            if(sme_idx + 1 < sme_count)
-                dedup_readahead_next(ctx, &cached_dedup_hdr,
-                                     sme_batch[sme_idx + 1].hash,
-                                     cached_dedup_lba, &leaf_cache);
         }
 
         /* ---- Reconstruct the full 2352-byte raw sector ---- */
@@ -500,7 +519,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
     free(leaf_cache.leaf_buf);
     free(decomp_buf);
     free(dedup_buf);
-    free(sme_batch);
+    free(sme_all);
     return OBMAFS3_OK;
 
 fail:
@@ -508,7 +527,7 @@ fail:
     free(leaf_cache.leaf_buf);
     free(decomp_buf);
     free(dedup_buf);
-    free(sme_batch);
+    free(sme_all);
     return rc;
 }
 
