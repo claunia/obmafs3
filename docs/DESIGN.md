@@ -220,6 +220,23 @@ enum obmafs3_cd_sector_mode {
     kCdSectorMode2Form1 = 3,
     kCdSectorMode2Form2 = 4
 };
+
+enum obmafs3_query_op {
+    kQueryOpEqual      = 0,   /* strcmp == 0 */
+    kQueryOpNotEqual   = 1,   /* strcmp != 0 */
+    kQueryOpGreater    = 2,   /* strcmp > 0 (lexicographic) */
+    kQueryOpLess       = 3,   /* strcmp < 0 */
+    kQueryOpGreaterEq  = 4,   /* strcmp >= 0 */
+    kQueryOpLessEq     = 5,   /* strcmp <= 0 */
+    kQueryOpContains   = 6,   /* strstr != NULL */
+    kQueryOpStartsWith = 7,   /* strncmp prefix == 0 */
+    kQueryOpExists     = 8    /* key exists, value ignored */
+};
+
+enum obmafs3_query_combine {
+    kQueryCombineAnd = 0,     /* All filters must match */
+    kQueryCombineOr  = 1      /* At least one filter must match */
+};
 ```
 
 ### Catalog Tree (directory entries)
@@ -437,6 +454,24 @@ struct metadata_idx_index_entry {            /* packed, index payload */
 ```
 
 Both metadata trees use 8-block nodes and support full CRUD operations plus paginated key listing and reverse queries.
+
+#### Multi-filter Metadata Queries
+
+The `OBMAFS3_IOC_QUERY_METADATA` ioctl accepts up to 4 filter conditions combined with AND or OR logic. Each filter specifies a key, a comparison operator (`enum obmafs3_query_op`), and a value. The query walks the reverse-index tree once per filter, collecting all inode IDs whose key matches and whose value satisfies the operator (lexicographic comparison for all ordered operators, `strstr` for contains, prefix `strncmp` for starts-with). Per-filter result sets are then intersected (AND) or unioned (OR) and resolved to filesystem paths.
+
+```c
+#define OBMAFS3_QUERY_MAX_FILTERS 4
+
+struct obmafs3_query_filter {
+    char    key[256];     /* Metadata key to match ("*" = any key) */
+    char    value[1025];  /* Value operand (ignored for kQueryOpExists) */
+    uint8_t op;           /* enum obmafs3_query_op */
+};
+```
+
+#### Wildcard Key Queries
+
+When the filter key is set to `"*"` (a single asterisk), the query matches across **all** metadata keys. Instead of navigating the reverse-index B+Tree to a specific key range, the engine descends to the leftmost leaf and scans the entire leaf chain, applying only the value operator against every record regardless of key. This enables cross-key searches such as "find all images where any metadata field contains 'maiden'". Wildcard key queries work with all operators but are most useful with `=` (equal), `CONTAINS`, and `STARTSWITH`.
 
 ### CD Prefix / Suffix / Subchannel B+Trees
 
@@ -1071,9 +1106,9 @@ Options:
 | `utimens` | Update modification and access timestamps |
 | `chmod`   | Change file/directory permissions |
 | `chown`   | Change file/directory owner and group |
-| `statfs`  | Return filesystem statistics (total/free blocks, inodes) |
+| `statfs`  | Return filesystem statistics (total/free blocks, inodes); sets `f_fsid` to `OBMAFS3_SB_MAGIC` |
 | `statx`   | Return extended file attributes |
-| `getxattr`  | Read extended attributes (media tags as `user.mediatag.*`, metadata as `user.metadata.*`) |
+| `getxattr`  | Read extended attributes (media tags as `user.mediatag.*`, metadata as `user.metadata.*`, filesystem identity as `system.obmafs3.fstype` on root) |
 | `setxattr`  | Write extended attributes |
 | `listxattr` | List extended attribute names |
 | `removexattr` | Remove an extended attribute |
@@ -1096,9 +1131,10 @@ Options:
 - `sub_inode_dirty` — Flag indicating the sidecar inode needs write-back
 
 **Extended attributes (xattr):** Media tags and image metadata are exposed as extended attributes:
+- `system.obmafs3.fstype` — Filesystem identity xattr, returned only on the root directory (`/`). Value: `"obmafs3"`. Used by tools like `obmafs-query` to confirm the mount is OBMAFS3.
 - `user.mediatag.<name>` — Binary media tags (e.g., `user.mediatag.cd_toc`, `user.mediatag.dvd_pfi`). Read returns binary data; write sets the tag.
 - `user.metadata.<key>` — String key-value metadata (e.g., `user.metadata.dumper`, `user.metadata.serial`). Read returns UTF-8 value; write sets the key.
-- `listxattr` enumerates all media tag and metadata xattr names for the file.
+- `listxattr` enumerates `system.obmafs3.fstype` on the root directory, and all media tag and metadata xattr names on image files.
 - `removexattr` deletes the corresponding media tag or metadata entry.
 
 **Custom ioctls:**
@@ -1114,7 +1150,7 @@ Options:
 | `OBMAFS3_IOC_GET_METADATA` | Get a metadata value by key for an image |
 | `OBMAFS3_IOC_DELETE_METADATA` | Delete a metadata entry by key |
 | `OBMAFS3_IOC_LIST_METADATA` | List metadata keys for an image (paginated) |
-| `OBMAFS3_IOC_QUERY_METADATA` | Query which images have a given key=value pair (paginated paths) |
+| `OBMAFS3_IOC_QUERY_METADATA` | Multi-filter metadata query with AND/OR combination (up to 4 filters, paginated paths). Supports operators: equal, not-equal, greater, less, greater-or-equal, less-or-equal, contains, starts-with, and exists. All comparisons are lexicographic. Setting the key to `"*"` performs a wildcard query across all metadata keys. |
 | `OBMAFS3_IOC_SET_MEDIA_IMAGE` | Convert an empty regular file to a MediaImage with a given sector size |
 
 **Media image detection**: The extension-to-sector-size mapping is configurable via `--disk-images`. Up to 32 mappings are supported (`OBMAFS3_MAX_DISK_IMAGE_MAPS`). Each mapping associates a file extension with a sector size. The default mapping is `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`. Extension matching is **case-insensitive** (`strcasecmp`), so `.DSK`, `.Dsk`, and `.dsk` all match the same mapping. CD images (`kFileTypeCompactDiscImage`) use the CD sector map format with prefix/suffix/subchannel splitting and ECC/EDC reconstruction.
@@ -1165,6 +1201,52 @@ Options:
 | `sidecar.c` | CICM XML, Aaru JSON, and dump hardware JSON export (`export_sidecar_files`) |
 
 **Dependencies:** Links only against `libaaruformat` (shared library). Includes OBMAFS3 headers (`enums.h`, `obmafs3_ioctl.h`, `tags.h`) but does not link `libobmafs`.
+
+### `obmafs-query` — Interactive metadata query tool
+
+Interactive command-line tool for querying image metadata on a live OBMAFS3 mount. Communicates entirely through `getxattr()` (for mount validation) and `ioctl()` (for queries). Does not link `libobmafs`.
+
+Usage: `obmafs-query <mountpoint>`
+
+The tool validates the mount point by: (1) checking `statfs` reports `FUSE_SUPER_MAGIC`, and (2) reading the `system.obmafs3.fstype` xattr on the root directory. If either check fails, it exits with an error.
+
+Once connected, it presents an interactive `>` prompt. Commands:
+- `help` — Show available commands and query syntax
+- `quit` / `exit` — Exit the tool (Ctrl-D also works)
+
+**Query syntax:**
+
+| Syntax | Description |
+|--------|-------------|
+| `<key> = "<value>"` | Exact match |
+| `<key> != "<value>"` | Not equal |
+| `<key> > "<value>"` | Greater than (lexicographic) |
+| `<key> < "<value>"` | Less than (lexicographic) |
+| `<key> >= "<value>"` | Greater or equal |
+| `<key> <= "<value>"` | Less or equal |
+| `<key> CONTAINS "<value>"` | Substring match |
+| `<key> STARTSWITH "<value>"` | Prefix match |
+| `<key> EXISTS` | Key exists (any value) |
+| `* = "<value>"` | Any key equals value |
+| `* CONTAINS "<value>"` | Any key's value contains substring |
+| `* STARTSWITH "<value>"` | Any key's value starts with prefix |
+
+Multiple conditions can be joined with `AND` or `OR` (up to 4 filters, cannot mix `AND` and `OR` in a single query):
+
+```
+artist = "Iron Maiden" AND year > "1985"
+genre = "Rock" OR genre = "Metal"
+* CONTAINS "maiden"
+```
+
+Values may be quoted (`"..."`) or unquoted single words. Use `\"` for literal quotes inside quoted strings.
+
+**Result export:** After each query that returns results, the tool offers to export:
+- `txt <path>` — One path per line, plain text
+- `json <path>` — JSON object with `count` and `results` array (properly escaped)
+- Press Enter to skip
+
+**Implementation notes:** The tool creates a temporary sentinel file on the mount (immediately unlinked) to obtain a FUSE file descriptor for ioctl calls. Query parsing translates the human-friendly syntax into `obmafs3_ioctl_metadata_query_arg` structs, and results are paginated automatically (8 paths per ioctl call) until all matches are collected.
 
 ### `obmafsck` — Filesystem checker
 
@@ -1248,7 +1330,7 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Sector map cache: `obmafs3_flush_sector_map_cache`, `obmafs3_free_sector_map_cache`
 - CD sector map cache: `obmafs3_flush_cd_sector_map_cache`, `obmafs3_free_cd_sector_map_cache`
 - Media tags: `obmafs3_media_tag_get`, `obmafs3_media_tag_data_free`, `obmafs3_media_tag_put`, `obmafs3_media_tag_delete`, `obmafs3_media_tag_delete_all`, `obmafs3_media_tag_list`, `obmafs3_media_tag_list_free`
-- Image metadata: `obmafs3_metadata_get`, `obmafs3_metadata_put`, `obmafs3_metadata_delete`, `obmafs3_metadata_delete_all`, `obmafs3_metadata_list`, `obmafs3_metadata_list_free`, `obmafs3_metadata_query`, `obmafs3_metadata_query_free`
+- Image metadata: `obmafs3_metadata_get`, `obmafs3_metadata_put`, `obmafs3_metadata_delete`, `obmafs3_metadata_delete_all`, `obmafs3_metadata_list`, `obmafs3_metadata_list_free`, `obmafs3_metadata_query`, `obmafs3_metadata_query_filtered`, `obmafs3_metadata_query_free`
 - CD B+Trees: `obmafs3_cd_prefix_get/put/delete`, `obmafs3_cd_suffix_get/put/delete`, `obmafs3_cd_subchannel_get/put/delete`
 - ECC/EDC: `ecc_cd_init`, `ecc_cd_free`, `ecc_cd_is_suffix_correct`, `ecc_cd_is_suffix_correct_mode2`, `ecc_cd_reconstruct`, `ecc_cd_reconstruct_prefix`, `cd_lba_to_msf`
 - Checksum: `obmafs3_checksum_xxh64`, `obmafs3_checksum_block`
