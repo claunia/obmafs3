@@ -70,9 +70,20 @@ static int obmafs3_fuse_getattr_impl(const char *path, struct stat *stbuf, struc
     stbuf->st_nlink   = ip->ref_count;
     stbuf->st_uid     = ip->uid;
     stbuf->st_gid     = ip->gid;
-    stbuf->st_size    = (off_t)ip->file_size;
+
+    /* For subchannel files, compute file_size from the parent CD image's
+     * sector_count since the sidecar stores no data of its own. */
+    uint64_t reported_size = ip->file_size;
+    if(ip->file_type == kFileTypeSubchannelFile)
+    {
+        struct inode_record parent_inode;
+        if(obmafs3_inode_get(g_ctx, ip->sector_count, &parent_inode) == OBMAFS3_OK)
+            reported_size = parent_inode.sector_count * CD_SUBCHANNEL_SIZE;
+    }
+
+    stbuf->st_size    = (off_t)reported_size;
     stbuf->st_blksize = (blksize_t)g_ctx->sb.block_size;
-    stbuf->st_blocks  = (blkcnt_t)((ip->file_size + 511) / 512);
+    stbuf->st_blocks  = (blkcnt_t)((reported_size + 511) / 512);
     stbuf->st_atime   = (time_t)ip->access_time;
     stbuf->st_mtime   = (time_t)ip->modification_time;
     stbuf->st_ctime   = (time_t)ip->creation_time;
@@ -224,6 +235,10 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
     else if(ip->file_type == kFileTypeCompactDiscImage)
     {
         rc = obmafs3_read_cd_image_data(g_ctx, ip, (uint64_t)offset, buf, size);
+    }
+    else if(ip->file_type == kFileTypeSubchannelFile)
+    {
+        rc = obmafs3_read_subchannel_data(g_ctx, ip, (uint64_t)offset, buf, size);
     }
     else
     {

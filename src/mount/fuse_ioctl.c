@@ -8,6 +8,8 @@
 #include "obmafs3_ioctl.h"
 #include "debug.h"
 
+#include <limits.h>
+
 /* ------------------------------------------------------------------ */
 /*  CD image helpers                                                   */
 /* ------------------------------------------------------------------ */
@@ -65,7 +67,8 @@ static bool cd_prefix_is_generatable(const uint8_t *sector, int64_t lba, uint8_t
  * @param arg    CD write argument containing buffer, size, and sector mode.
  * @return 0 on success, negative errno on failure.
  */
-static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmafs3_ioctl_cd_write_arg *arg)
+static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
+                                 const struct obmafs3_ioctl_cd_write_arg *arg)
 {
     if(!arg) FUSE_RETURN(-EINVAL, "");
 
@@ -104,6 +107,77 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
         }
         else if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
         pthread_rwlock_unlock(&g_ctx->tree_lock);
+
+        /* --- Create .sub sidecar file (kFileTypeSubchannelFile) on first subchannel --- */
+        if(ffctx->sub_inode_id == 0 && path)
+        {
+            /* Build the .sub sidecar path: replace the extension with .sub */
+            char sub_path[PATH_MAX];
+            strncpy(sub_path, path, sizeof(sub_path) - 1);
+            sub_path[sizeof(sub_path) - 1] = '\0';
+            char *dot = strrchr(sub_path, '.');
+            char *slash = strrchr(sub_path, '/');
+            if(dot && (!slash || dot > slash))
+                strcpy(dot, ".sub");
+            else
+                strncat(sub_path, ".sub", sizeof(sub_path) - strlen(sub_path) - 1);
+
+            /* Resolve parent directory and sidecar name */
+            uint64_t    sub_parent_id;
+            const char *sub_name;
+            rc = resolve_path(sub_path, &sub_parent_id, &sub_name);
+            if(rc == 0)
+            {
+                struct catalog_record sub_cat;
+                rc = obmafs3_catalog_lookup(g_ctx, sub_parent_id, sub_name, &sub_cat);
+                if(rc == OBMAFS3_OK)
+                {
+                    /* Sidecar already exists — load its inode */
+                    ffctx->sub_inode_id = sub_cat.inode_id;
+                    obmafs3_inode_get(g_ctx, sub_cat.inode_id, &ffctx->sub_inode);
+                }
+                else if(rc == OBMAFS3_ERR_NOTFOUND)
+                {
+                    /* Create the subchannel sidecar file.
+                     * file_type = kFileTypeSubchannelFile
+                     * sector_count = parent CD image inode_id (to find the sector map)
+                     * file_size = parent sector_count * CD_SUBCHANNEL_SIZE (updated below) */
+                    uint64_t             sub_id  = obmafs3_alloc_inode_id(g_ctx);
+                    uint64_t             now     = (uint64_t)time(NULL);
+                    struct fuse_context  *fusectx = fuse_get_context();
+
+                    memset(&ffctx->sub_inode, 0, sizeof(ffctx->sub_inode));
+                    ffctx->sub_inode.inode_id          = sub_id;
+                    ffctx->sub_inode.uid               = fusectx->uid;
+                    ffctx->sub_inode.gid               = fusectx->gid;
+                    ffctx->sub_inode.mode              = ffctx->inode.mode;
+                    ffctx->sub_inode.creation_time     = now;
+                    ffctx->sub_inode.modification_time = now;
+                    ffctx->sub_inode.access_time       = now;
+                    ffctx->sub_inode.file_size         = 0;
+                    ffctx->sub_inode.file_type         = kFileTypeSubchannelFile;
+                    ffctx->sub_inode.sector_count      = ffctx->inode_id; /* parent CD inode */
+                    ffctx->sub_inode.ref_count         = 1;
+
+                    rc = obmafs3_inode_put(g_ctx, &ffctx->sub_inode);
+                    if(rc == OBMAFS3_OK)
+                    {
+                        memset(&sub_cat, 0, sizeof(sub_cat));
+                        sub_cat.inode_id       = sub_id;
+                        sub_cat.parent_id      = sub_parent_id;
+                        sub_cat.directory_flag  = 0;
+                        strncpy(sub_cat.name, sub_name, sizeof(sub_cat.name) - 1);
+                        rc = obmafs3_catalog_insert(g_ctx, &sub_cat);
+                        if(rc == OBMAFS3_OK) { ffctx->sub_inode_id = sub_id; }
+                        else
+                        {
+                            /* Roll back orphan inode */
+                            obmafs3_inode_delete(g_ctx, sub_id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /* --- Audio mode: entire 2352 bytes stored as data, no prefix/suffix --- */
@@ -291,6 +365,15 @@ cache_and_done:
         ffctx->inode.sector_count = (uint64_t)(sector_lba + 1);
     ffctx->inode.file_size = ffctx->inode.sector_count * CD_RAW_SECTOR_SIZE;
     ffctx->inode_dirty = 1;
+
+    /* Keep the .sub sidecar file_size in sync with the parent's sector_count.
+     * The sidecar has no data of its own — its read path fetches subchannel
+     * data from the parent's cd_sector_map_entries via the subchannel B+Tree. */
+    if(ffctx->sub_inode_id != 0)
+    {
+        ffctx->sub_inode.file_size = ffctx->inode.sector_count * CD_SUBCHANNEL_SIZE;
+        ffctx->sub_inode_dirty = 1;
+    }
 
     return 0;
 }
@@ -498,7 +581,6 @@ static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx, struct obmafs3_
 static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi, unsigned int flags,
                        void *data)
 {
-    (void)path;
     (void)arg;
     (void)flags;
 
@@ -561,7 +643,7 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
         case OBMAFS3_IOC_CD_WRITE_LONG:
         {
             if(ffctx->inode.file_type != kFileTypeCompactDiscImage) FUSE_RETURN(-ENOTTY, "");
-            return obmafs3_cd_write_long(ffctx, (const struct obmafs3_ioctl_cd_write_arg *)data);
+            return obmafs3_cd_write_long(ffctx, path, (const struct obmafs3_ioctl_cd_write_arg *)data);
         }
 
         case OBMAFS3_IOC_CD_READ_LONG:

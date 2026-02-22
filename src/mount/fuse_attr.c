@@ -180,6 +180,14 @@ static int obmafs3_fuse_flush_impl(const char *path, struct fuse_file_info *fi)
         ffctx->inode_dirty = 0;
     }
 
+    /* Write back the .sub sidecar inode if dirty */
+    if(ffctx->sub_inode_dirty)
+    {
+        int put_rc = obmafs3_inode_put(g_ctx, &ffctx->sub_inode);
+        if(rc == OBMAFS3_OK) rc = put_rc;
+        ffctx->sub_inode_dirty = 0;
+    }
+
     /* Persist the allocation bitmap (deferred from alloc/free paths) */
     {
         int brc = obmafs3_bitmap_write(g_ctx);
@@ -234,6 +242,13 @@ static int obmafs3_fuse_release_impl(const char *path, struct fuse_file_info *fi
     if(ffctx->inode_dirty)
     {
         int put_rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
+        if(rc == OBMAFS3_OK) rc = put_rc;
+    }
+
+    /* Write back the .sub sidecar inode if dirty */
+    if(ffctx->sub_inode_dirty)
+    {
+        int put_rc = obmafs3_inode_put(g_ctx, &ffctx->sub_inode);
         if(rc == OBMAFS3_OK) rc = put_rc;
     }
 

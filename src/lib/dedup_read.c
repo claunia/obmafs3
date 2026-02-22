@@ -531,6 +531,109 @@ fail:
     return rc;
 }
 
+/**
+ * Read subchannel data from a kFileTypeSubchannelFile.
+ *
+ * The subchannel file has no data of its own.  Its @c sector_count field
+ * stores the parent CD image's inode_id.  This function loads the parent
+ * inode, reads its CD sector map, and for each requested 96-byte sector
+ * offset, looks up the subchannel hash via binary search and fetches the
+ * 96-byte subchannel data from the CD subchannel B+Tree.  Sectors
+ * without subchannel data are zero-filled.
+ *
+ * @param ctx        Filesystem context.
+ * @param sub_inode  Inode of the subchannel sidecar file.
+ * @param offset     Byte offset into the virtual subchannel stream.
+ * @param buf        Output buffer.
+ * @param size       Number of bytes to read.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode,
+                                 uint64_t offset, void *buf, size_t size)
+{
+    /* The parent CD image inode_id is stored in sector_count */
+    uint64_t parent_inode_id = sub_inode->sector_count;
+
+    struct inode_record parent_inode;
+    int rc = obmafs3_inode_get(ctx, parent_inode_id, &parent_inode);
+    if(rc != OBMAFS3_OK) return rc;
+
+    /* Virtual size: parent's sector_count * 96 */
+    uint64_t virtual_size = parent_inode.sector_count * CD_SUBCHANNEL_SIZE;
+    if(offset >= virtual_size) return OBMAFS3_OK;
+    if(offset + size > virtual_size) size = (size_t)(virtual_size - offset);
+    if(size == 0) return OBMAFS3_OK;
+
+    /* Read all cd_sector_map_entries from the parent */
+    uint64_t total_entries = parent_inode.sector_map_size;
+    struct cd_sector_map_entry *sme_all = NULL;
+    if(total_entries > 0)
+    {
+        sme_all = malloc((size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
+        if(!sme_all) return OBMAFS3_ERR_NOMEM;
+
+        struct inode_record map_inode;
+        memcpy(&map_inode, &parent_inode, sizeof(map_inode));
+        map_inode.file_size = total_entries * sizeof(struct cd_sector_map_entry);
+
+        rc = obmafs3_read_file_data(ctx, &map_inode, 0, sme_all,
+                                    (size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
+        if(rc != OBMAFS3_OK) { free(sme_all); return rc; }
+    }
+
+    uint8_t *out        = (uint8_t *)buf;
+    size_t   bytes_read = 0;
+
+    while(bytes_read < size)
+    {
+        uint64_t read_pos         = offset + bytes_read;
+        int64_t  sector_num       = (int64_t)(read_pos / CD_SUBCHANNEL_SIZE);
+        size_t   offset_in_sector = (size_t)(read_pos % CD_SUBCHANNEL_SIZE);
+
+        size_t remaining_in_sector = CD_SUBCHANNEL_SIZE - offset_in_sector;
+        size_t remaining_in_read   = size - bytes_read;
+        size_t chunk               = remaining_in_read < remaining_in_sector
+                                         ? remaining_in_read
+                                         : remaining_in_sector;
+
+        /* Binary search for this sector number */
+        uint64_t subchannel_hash = 0;
+        if(sme_all && total_entries > 0)
+        {
+            int64_t lo = 0, hi = (int64_t)total_entries - 1;
+            while(lo <= hi)
+            {
+                int64_t mid = lo + (hi - lo) / 2;
+                if(sme_all[mid].sector == sector_num)
+                {
+                    subchannel_hash = sme_all[mid].subchannel_hash;
+                    break;
+                }
+                else if(sme_all[mid].sector < sector_num) lo = mid + 1;
+                else hi = mid - 1;
+            }
+        }
+
+        /* Fetch subchannel data or zero-fill */
+        uint8_t sub_sector[CD_SUBCHANNEL_DATA_SIZE];
+        if(subchannel_hash != 0)
+        {
+            rc = obmafs3_cd_subchannel_get(ctx, subchannel_hash, sub_sector);
+            if(rc != OBMAFS3_OK) memset(sub_sector, 0, CD_SUBCHANNEL_DATA_SIZE);
+        }
+        else
+        {
+            memset(sub_sector, 0, CD_SUBCHANNEL_DATA_SIZE);
+        }
+
+        memcpy(out + bytes_read, sub_sector + offset_in_sector, chunk);
+        bytes_read += chunk;
+    }
+
+    free(sme_all);
+    return OBMAFS3_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /*  CD sector map cache flush / free                                   */
 /* ------------------------------------------------------------------ */

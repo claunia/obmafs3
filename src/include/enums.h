@@ -53,7 +53,8 @@ enum obmafs3_file_type
     kFileTypeDirectory        = 1,
     kFileTypeMediaImage       = 2,
     kFileTypeSymlink          = 3,
-    kFileTypeCompactDiscImage = 4
+    kFileTypeCompactDiscImage = 4,
+    kFileTypeSubchannelFile   = 5
 };
 
 /// CD sector encoding mode.

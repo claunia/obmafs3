@@ -273,6 +273,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                                   size_t size, uint16_t sector_size);
 int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
                                size_t size);
+int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode, uint64_t offset,
+                                 void *buf, size_t size);
 
 /* --- Media tag operations --- */
 int  obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t tag_type, void **data,
