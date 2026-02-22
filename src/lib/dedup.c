@@ -1745,6 +1745,44 @@ done:
 }
 
 /**
+ * Issue a @c posix_fadvise(POSIX_FADV_WILLNEED) hint for the dedup
+ * data block that the @e next sector will need.
+ *
+ * Called after reading the current dedup block so the kernel can
+ * prefetch the next one into the page cache while we decompress and
+ * copy the current one.  The lookup uses the leaf cache, so in the
+ * common case (next hash in the same leaf) it is a pure in-memory
+ * binary search with no I/O overhead.
+ *
+ * If the next sector's hash resolves to the same block we just read,
+ * or if the lookup fails (e.g. hash outside cached leaf), we skip
+ * the hint — it's purely advisory so errors are silently ignored.
+ *
+ * @param ctx           Filesystem context.
+ * @param hdr           Dedup tree header.
+ * @param next_hash     Hash of the next sector's data.
+ * @param current_lba   LBA of the dedup block we just read.
+ * @param lc            Leaf-level lookup cache.
+ */
+static void dedup_readahead_next(struct obmafs3_ctx *ctx,
+                                 const struct btree_header *hdr,
+                                 uint64_t next_hash,
+                                 uint64_t current_lba,
+                                 struct dedup_leaf_cache *lc)
+{
+    struct dedup_entry de;
+    int rc = dedup_lookup_cached(ctx, hdr, next_hash, &de, lc);
+    if(rc != OBMAFS3_OK || de.block_lba == current_lba) return;
+
+    /* Advise the kernel to prefetch the next dedup block.  We don't
+     * know its on-disk size yet, so use dedup_block_size as the upper
+     * bound — the kernel will clamp to the file size automatically. */
+    off_t    off = (off_t)(de.block_lba * ctx->sb.block_size);
+    off_t    len = (off_t)ctx->sb.dedup_block_size;
+    posix_fadvise(ctx->fd, off, len, POSIX_FADV_WILLNEED);
+}
+
+/**
  * Look up a hash in the given dedup tree.
  * Returns OBMAFS3_OK if found, OBMAFS3_ERR_NOTFOUND if not.
  *
@@ -4919,6 +4957,12 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             {
                 cached_compressed = 0;
             }
+
+            /* Speculatively prefetch the next sector's dedup block.
+             * Uses the leaf cache so the lookup is typically free. */
+            if(sme_idx + 1 < sme_count)
+                dedup_readahead_next(ctx, &dedup_hdr, sme_batch[sme_idx + 1].hash,
+                                     cached_dedup_lba, &leaf_cache);
         }
 
         /* Copy sector data from the dedup block at the stored offset.
@@ -5121,6 +5165,13 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
             {
                 cached_compressed = 0;
             }
+
+            /* Speculatively prefetch the next sector's dedup block.
+             * Uses the leaf cache so the lookup is typically free. */
+            if(sme_idx + 1 < sme_count)
+                dedup_readahead_next(ctx, &cached_dedup_hdr,
+                                     sme_batch[sme_idx + 1].hash,
+                                     cached_dedup_lba, &leaf_cache);
         }
 
         /* ---- Reconstruct the full 2352-byte raw sector ---- */
