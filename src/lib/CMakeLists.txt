@@ -9,7 +9,12 @@ add_library(obmafs STATIC
     bitmap.c
     block.c
     checksum.c
-    dedup.c
+    dedup_cache.c
+    dedup_tree.c
+    dedup_write.c
+    dedup_read.c
+    dedup_persist.c
+    dedup_housekeeping.c
     ecc_cd.c
     refcount.c
     io.c
