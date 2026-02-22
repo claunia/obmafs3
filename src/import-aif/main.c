@@ -710,6 +710,13 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Importing metadata...\n");
     import_metadata(aaruf_ctx, &info, fd);
 
+    /* Compute output base path (without extension) for sidecar files */
+    size_t      base_len = strlen(output_path);
+    const char *dot      = strrchr(output_path, '.');
+    const char *slash    = strrchr(output_path, '/');
+    if(dot && (!slash || dot > slash))
+        base_len = (size_t)(dot - output_path);
+
     /* ---- Export CICM metadata XML if available ---- */
     {
         size_t cicm_len = 0;
@@ -720,13 +727,11 @@ int main(int argc, char *argv[])
             {
                 if(aaruf_get_cicm_metadata(aaruf_ctx, cicm_buf, &cicm_len) == AARUF_STATUS_OK)
                 {
-                    /* Build .metadata.xml path from output_path */
-                    size_t path_len  = strlen(output_path);
-                    char  *xml_path  = malloc(path_len + sizeof(".metadata.xml"));
+                    char *xml_path = malloc(base_len + sizeof(".metadata.xml"));
                     if(xml_path)
                     {
-                        memcpy(xml_path, output_path, path_len);
-                        memcpy(xml_path + path_len, ".metadata.xml", sizeof(".metadata.xml"));
+                        memcpy(xml_path, output_path, base_len);
+                        memcpy(xml_path + base_len, ".metadata.xml", sizeof(".metadata.xml"));
 
                         int xml_fd = open(xml_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
                         if(xml_fd >= 0)
@@ -747,6 +752,45 @@ int main(int argc, char *argv[])
                     }
                 }
                 free(cicm_buf);
+            }
+        }
+    }
+
+    /* ---- Export Aaru JSON metadata if available ---- */
+    {
+        size_t json_len = 0;
+        if(aaruf_get_aaru_json_metadata(aaruf_ctx, NULL, &json_len) == AARUF_ERROR_BUFFER_TOO_SMALL && json_len > 0)
+        {
+            uint8_t *json_buf = malloc(json_len);
+            if(json_buf)
+            {
+                if(aaruf_get_aaru_json_metadata(aaruf_ctx, json_buf, &json_len) == AARUF_STATUS_OK)
+                {
+                    char *json_path = malloc(base_len + sizeof(".metadata.json"));
+                    if(json_path)
+                    {
+                        memcpy(json_path, output_path, base_len);
+                        memcpy(json_path + base_len, ".metadata.json", sizeof(".metadata.json"));
+
+                        int json_fd = open(json_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+                        if(json_fd >= 0)
+                        {
+                            ssize_t written = write(json_fd, json_buf, json_len);
+                            if(written < 0 || (size_t)written != json_len)
+                                fprintf(stderr, "Warning: incomplete write of Aaru JSON metadata\n");
+                            else
+                                fprintf(stderr, "Aaru JSON metadata saved to %s\n", json_path);
+                            close(json_fd);
+                        }
+                        else
+                        {
+                            fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n",
+                                    json_path, errno, strerror(errno));
+                        }
+                        free(json_path);
+                    }
+                }
+                free(json_buf);
             }
         }
     }
