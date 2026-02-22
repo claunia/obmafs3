@@ -1,0 +1,196 @@
+/*
+ * import-aif — Media tag and metadata import.
+ */
+
+#include "import_aif.h"
+
+#include <iconv.h>
+
+/**
+ * Import media tags from an AIF file via ioctl.
+ *
+ * @param aaruf_ctx  libaaruformat context.
+ * @param fd         Open file descriptor on the mounted OBMAFS3 file.
+ * @return 0 on success, negative on error.
+ */
+int import_media_tags(void *aaruf_ctx, int fd)
+{
+    uint8_t tag_buf[4096];
+    size_t  tag_buf_len = sizeof(tag_buf);
+    int     count       = aaruf_get_readable_media_tags(aaruf_ctx, tag_buf, &tag_buf_len);
+
+    if(count <= 0) return 0;
+
+    /* The buffer contains 'count' uint32_t DataType values */
+    for(int i = 0; i < count; i++)
+    {
+        uint32_t dt;
+        memcpy(&dt, tag_buf + i * sizeof(uint32_t), sizeof(uint32_t));
+
+        int obmafs_tag = aaruf_tag_to_obmafs((int)dt);
+        if(obmafs_tag < 0) continue;
+
+        /* Read the media tag data */
+        uint32_t data_len = 0;
+        uint8_t  probe    = 0;
+
+        /* First call to get size */
+        aaruf_read_media_tag(aaruf_ctx, &probe, dt, &data_len);
+        if(data_len == 0) continue;
+
+        if(data_len > OBMAFS3_IOC_MAX_TAG_DATA)
+        {
+            fprintf(stderr, "Warning: media tag %d too large (%u bytes), skipping\n", obmafs_tag, data_len);
+            continue;
+        }
+
+        struct obmafs3_ioctl_tag_arg tag_arg;
+        memset(&tag_arg, 0, sizeof(tag_arg));
+        tag_arg.tag_type    = (uint16_t)obmafs_tag;
+        tag_arg.data_length = data_len;
+
+        int rrc = aaruf_read_media_tag(aaruf_ctx, tag_arg.data, dt, &data_len);
+        if(rrc != 0) continue; /* Skip tags we can't read */
+
+        if(ioctl(fd, OBMAFS3_IOC_SET_MEDIA_TAG, &tag_arg) != 0)
+            fprintf(stderr, "Warning: failed to store media tag %d (errno=%d)\n", obmafs_tag, errno);
+    }
+
+    return 0;
+}
+
+/**
+ * Helper: read a UTF-16LE string metadata field from libaaruformat,
+ * convert it to UTF-8 via iconv, and store it via the SET_METADATA ioctl.
+ *
+ * @param aaruf_ctx  libaaruformat context.
+ * @param fd         Open file descriptor on the mounted OBMAFS3 file.
+ * @param getter     Function pointer to the aaruf_get_* accessor.
+ * @param key        Metadata key name to store.
+ */
+static void import_utf16_metadata(void *aaruf_ctx, int fd,
+                                  int32_t (*getter)(const void *, uint8_t *, int32_t *),
+                                  const char *key)
+{
+    int32_t length = 0;
+    if(getter(aaruf_ctx, NULL, &length) != AARUF_ERROR_BUFFER_TOO_SMALL || length <= 0)
+        return;
+
+    uint8_t *utf16 = malloc((size_t)length);
+    if(!utf16) return;
+
+    if(getter(aaruf_ctx, utf16, &length) != AARUF_STATUS_OK)
+    {
+        free(utf16);
+        return;
+    }
+
+    iconv_t cd = iconv_open("UTF-8", "UTF-16LE");
+    if(cd == (iconv_t)-1)
+    {
+        free(utf16);
+        return;
+    }
+
+    struct obmafs3_ioctl_metadata_set_arg meta;
+    memset(&meta, 0, sizeof(meta));
+    strncpy(meta.key, key, METADATA_KEY_MAX - 1);
+
+    char   *inbuf  = (char *)utf16;
+    size_t  inleft = (size_t)length;
+    char   *outbuf = meta.value;
+    size_t  outleft = METADATA_VALUE_MAX - 1;
+
+    if(iconv(cd, &inbuf, &inleft, &outbuf, &outleft) != (size_t)-1 || errno == E2BIG)
+    {
+        /* outbuf advanced past the converted bytes; meta.value is already NUL-filled */
+        if(meta.value[0])
+        {
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                fprintf(stderr, "Warning: failed to set metadata '%s'\n", key);
+        }
+    }
+
+    iconv_close(cd);
+    free(utf16);
+}
+
+/**
+ * Import metadata strings from the AIF ImageInfo via ioctl.
+ *
+ * @param aaruf_ctx  libaaruformat context.
+ * @param info       ImageInfo struct from libaaruformat.
+ * @param fd         Open file descriptor on the mounted OBMAFS3 file.
+ */
+void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
+{
+    struct obmafs3_ioctl_metadata_set_arg meta;
+
+    if(info->Application[0])
+    {
+        memset(&meta, 0, sizeof(meta));
+        strncpy(meta.key, "application", METADATA_KEY_MAX - 1);
+        strncpy(meta.value, info->Application, METADATA_VALUE_MAX - 1);
+        if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+            fprintf(stderr, "Warning: failed to set metadata 'application'\n");
+    }
+
+    if(info->ApplicationVersion[0])
+    {
+        memset(&meta, 0, sizeof(meta));
+        strncpy(meta.key, "application_version", METADATA_KEY_MAX - 1);
+        strncpy(meta.value, info->ApplicationVersion, METADATA_VALUE_MAX - 1);
+        if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+            fprintf(stderr, "Warning: failed to set metadata 'application_version'\n");
+    }
+
+    /* Store media type as a numeric string */
+    {
+        memset(&meta, 0, sizeof(meta));
+        strncpy(meta.key, "media_type", METADATA_KEY_MAX - 1);
+        snprintf(meta.value, METADATA_VALUE_MAX, "%d", info->MediaType);
+        if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+            fprintf(stderr, "Warning: failed to set metadata 'media_type'\n");
+    }
+
+    /* Store CHS geometry if available */
+    {
+        uint32_t cylinders = 0, heads = 0, sectors_per_track = 0;
+        if(aaruf_get_geometry(aaruf_ctx, &cylinders, &heads, &sectors_per_track) == AARUF_STATUS_OK)
+        {
+            memset(&meta, 0, sizeof(meta));
+            strncpy(meta.key, "geometry", METADATA_KEY_MAX - 1);
+            snprintf(meta.value, METADATA_VALUE_MAX, "%" PRIu32 "/%" PRIu32 "/%" PRIu32, cylinders, heads,
+                     sectors_per_track);
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                fprintf(stderr, "Warning: failed to set metadata 'geometry'\n");
+        }
+    }
+
+    /* Store media sequence if available (multi-volume sets) */
+    {
+        int32_t sequence = 0, last_sequence = 0;
+        if(aaruf_get_media_sequence(aaruf_ctx, &sequence, &last_sequence) == AARUF_STATUS_OK && sequence > 0)
+        {
+            memset(&meta, 0, sizeof(meta));
+            strncpy(meta.key, "media_sequence", METADATA_KEY_MAX - 1);
+            snprintf(meta.value, METADATA_VALUE_MAX, "%" PRId32 "/%" PRId32, sequence, last_sequence);
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                fprintf(stderr, "Warning: failed to set metadata 'media_sequence'\n");
+        }
+    }
+
+    /* Store UTF-16LE string metadata fields (converted to UTF-8) */
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_creator, "dumper");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_comments, "comments");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_title, "title");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_manufacturer, "manufacturer");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_model, "model");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_serial_number, "serial_number");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_barcode, "barcode");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_part_number, "part_number");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_manufacturer, "drive_manufacturer");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_model, "drive_model");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_serial_number, "drive_serial_number");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_firmware_revision, "drive_firmware_revision");
+}
