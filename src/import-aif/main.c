@@ -210,7 +210,7 @@ static int import_media_tags(void *aaruf_ctx, int fd)
  * @param info  ImageInfo struct from libaaruformat.
  * @param fd    Open file descriptor on the mounted OBMAFS3 file.
  */
-static void import_metadata(const ImageInfo *info, int fd)
+static void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
 {
     struct obmafs3_ioctl_metadata_set_arg meta;
 
@@ -239,6 +239,20 @@ static void import_metadata(const ImageInfo *info, int fd)
         snprintf(meta.value, METADATA_VALUE_MAX, "%d", info->MediaType);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
             fprintf(stderr, "Warning: failed to set metadata 'media_type'\n");
+    }
+
+    /* Store CHS geometry if available */
+    {
+        uint32_t cylinders = 0, heads = 0, sectors_per_track = 0;
+        if(aaruf_get_geometry(aaruf_ctx, &cylinders, &heads, &sectors_per_track) == AARUF_STATUS_OK)
+        {
+            memset(&meta, 0, sizeof(meta));
+            strncpy(meta.key, "geometry", METADATA_KEY_MAX - 1);
+            snprintf(meta.value, METADATA_VALUE_MAX, "%" PRIu32 "/%" PRIu32 "/%" PRIu32, cylinders, heads,
+                     sectors_per_track);
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                fprintf(stderr, "Warning: failed to set metadata 'geometry'\n");
+        }
     }
 }
 
@@ -610,7 +624,7 @@ int main(int argc, char *argv[])
 
     /* ---- Import metadata ---- */
     fprintf(stderr, "Importing metadata...\n");
-    import_metadata(&info, fd);
+    import_metadata(aaruf_ctx, &info, fd);
 
     /* ---- Cleanup ---- */
     close(fd);
