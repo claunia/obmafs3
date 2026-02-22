@@ -254,6 +254,19 @@ static void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
                 fprintf(stderr, "Warning: failed to set metadata 'geometry'\n");
         }
     }
+
+    /* Store media sequence if available (multi-volume sets) */
+    {
+        int32_t sequence = 0, last_sequence = 0;
+        if(aaruf_get_media_sequence(aaruf_ctx, &sequence, &last_sequence) == AARUF_STATUS_OK && sequence > 0)
+        {
+            memset(&meta, 0, sizeof(meta));
+            strncpy(meta.key, "media_sequence", METADATA_KEY_MAX - 1);
+            snprintf(meta.value, METADATA_VALUE_MAX, "%" PRId32 "/%" PRId32, sequence, last_sequence);
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                fprintf(stderr, "Warning: failed to set metadata 'media_sequence'\n");
+        }
+    }
 }
 
 /**
