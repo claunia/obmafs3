@@ -89,13 +89,63 @@ static uint16_t cd_mode_sector_size(int mode)
 }
 
 /**
- * Check if the image is an optical disc.
+ * Check if the media type represents a compact disc variant.
  *
- * libaaruformat's ImageInfo.MetadataMediaType == 0 indicates optical media.
+ * Covers standard CD formats, gaming CDs, and specialty disc formats.
  */
-static int is_optical_media(const ImageInfo *info)
+static int is_compact_disc_media(uint32_t media_type)
 {
-    return info->MetadataMediaType == 0;
+    switch(media_type)
+    {
+        // Standard Compact Disc formats (10–35)
+        case 10:   // CD
+        case 11:   // CDDA
+        case 12:   // CDG
+        case 13:   // CDEG
+        case 14:   // CDI
+        case 15:   // CDROM
+        case 16:   // CDROMXA
+        case 17:   // CDPLUS
+        case 18:   // CDMO
+        case 19:   // CDR
+        case 20:   // CDRW
+        case 21:   // CDMRW
+        case 22:   // VCD
+        case 23:   // SVCD
+        case 24:   // PCD
+        case 29:   // DTSCD
+        case 30:   // CDMIDI
+        case 31:   // CDV
+        case 34:   // CDIREADY
+        case 35:   // FMTOWNS
+
+        // Gaming console CDs
+        case 112:  // PS1CD
+        case 113:  // PS2CD
+        case 150:  // MEGACD
+        case 151:  // SATURNCD
+        case 152:  // GDROM
+        case 153:  // GDR
+        case 155:  // MilCD
+        case 171:  // SuperCDROM2
+        case 172:  // JaguarCD
+        case 173:  // ThreeDO
+        case 174:  // PCFX
+        case 175:  // NeoGeoCD
+        case 176:  // CDTV
+        case 177:  // CD32
+        case 179:  // Playdia
+        case 694:  // Pippin
+
+        // VideoNow
+        case 740:  // VideoNow
+        case 741:  // VideoNowColor
+        case 742:  // VideoNowXp
+            return 1;
+
+        default:
+            return 0;
+    }
 }
 
 /**
@@ -409,7 +459,7 @@ static int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 }
 
 /**
- * Import a CD/optical image with track-aware sector handling via ioctls.
+ * Import a compact disc image with track-aware sector handling via ioctls.
  *
  * Reads track information from the AIF, then reads each raw sector
  * (optionally with subchannel data) and sends it through the
@@ -636,8 +686,8 @@ int main(int argc, char *argv[])
     fprintf(stderr, "  SectorSize: %u\n", info.SectorSize);
     fprintf(stderr, "  MediaType:  %d\n", info.MediaType);
 
-    int optical = is_optical_media(&info);
-    fprintf(stderr, "  Image type: %s\n", optical ? "Optical (CD/DVD/BD)" : "Flat media image");
+    int is_cd = is_compact_disc_media(info.MediaType);
+    fprintf(stderr, "  Image type: %s\n", is_cd ? "Compact Disc" : "Flat media image");
 
     /* ---- Create parent directories ---- */
     if(mkdirs(output_path) != 0)
@@ -658,7 +708,7 @@ int main(int argc, char *argv[])
     }
 
     /* ---- Convert to appropriate file type ---- */
-    if(optical)
+    if(is_cd)
     {
         if(ioctl(fd, OBMAFS3_IOC_SET_CD_IMAGE) != 0)
         {
@@ -689,7 +739,7 @@ int main(int argc, char *argv[])
 
     /* ---- Import sector data ---- */
     int rc;
-    if(optical)
+    if(is_cd)
         rc = import_cd_image(aaruf_ctx, fd, &info);
     else
         rc = import_flat_image(aaruf_ctx, fd, &info);
