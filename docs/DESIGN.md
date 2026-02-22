@@ -1096,8 +1096,57 @@ Options:
 | `OBMAFS3_IOC_GET_METADATA` | Get a metadata value by key for an image |
 | `OBMAFS3_IOC_DELETE_METADATA` | Delete a metadata entry by key |
 | `OBMAFS3_IOC_LIST_METADATA` | List metadata keys for an image (paginated) |
+| `OBMAFS3_IOC_QUERY_METADATA` | Query which images have a given key=value pair (paginated paths) |
+| `OBMAFS3_IOC_SET_MEDIA_IMAGE` | Convert an empty regular file to a MediaImage with a given sector size |
 
 **Media image detection**: The extension-to-sector-size mapping is configurable via `--disk-images`. Up to 32 mappings are supported (`OBMAFS3_MAX_DISK_IMAGE_MAPS`). Each mapping associates a file extension with a sector size. The default mapping (`dsk=512;iso=2048`) creates files with `.dsk` as `kFileTypeMediaImage` with 512-byte sectors, and `.iso` as `kFileTypeMediaImage` with 2048-byte sectors. CD images (`kFileTypeCompactDiscImage`) use the CD sector map format with prefix/suffix/subchannel splitting and ECC/EDC reconstruction.
+
+### `import-aif` — Aaru Image Format importer
+
+Imports an Aaru Image Format (.aif) disk image file into a mounted OBMAFS3 filesystem via standard POSIX I/O and ioctls. This tool does not link against `libobmafs`; it communicates with the mounted filesystem entirely through `open()`, `write()`, and `ioctl()` system calls.
+
+Usage: `import-aif [options] <aif-file> <output-path>`
+
+Arguments:
+- `<aif-file>` — Path to the source `.aif` file
+- `<output-path>` — Full path for the image within the mounted filesystem (e.g. `/mnt/obmafs/images/myimage`)
+
+Options:
+- `-h, --help` — Show help
+
+**Import pipeline:**
+
+1. Opens the AIF file via `libaaruformat` (`aaruf_open`).
+2. Reads `ImageInfo` (sector count, sector size, media type).
+3. Determines if the image is a Compact Disc using `is_compact_disc_media()` (39 known CD media types).
+4. Creates parent directories on the mounted filesystem (`mkdir -p` style).
+5. Creates the output file and converts it to the appropriate type:
+   - **Compact Disc**: `OBMAFS3_IOC_SET_CD_IMAGE` ioctl.
+   - **Other media**: `OBMAFS3_IOC_SET_MEDIA_IMAGE` ioctl with the image's sector size.
+6. Imports sector data:
+   - **Flat images** (`import_flat_image`): Reads each sector via `aaruf_read_sector`, handles variable sector sizes via `AARUF_ERROR_BUFFER_TOO_SMALL` + realloc, writes sequentially.
+   - **CD images** (`import_cd_image`): Reads tracks via `aaruf_get_tracks`, detects subchannel availability, reads raw sectors via `aaruf_read_sector_long` (with optional subchannel via `aaruf_read_sector_tag`), falls back to cooked reads with ECC reconstruction when raw reads fail, writes via `OBMAFS3_IOC_CD_WRITE_LONG` ioctl.
+7. Imports all media tags (`import_media_tags`): Enumerates available tags via `aaruf_get_readable_media_tags`, reads each tag, stores via `OBMAFS3_IOC_SET_MEDIA_TAG` ioctl.
+8. Imports image metadata (`import_metadata`): Stores application name/version, media type string, disk geometry, media sequence, and 12 UTF-16LE metadata fields (converted to UTF-8 via `iconv`) including: creator, comments, media title, manufacturer, model, serial number, barcode, part number, drive manufacturer/model/serial/firmware.
+9. Generates a CDRWin-format cue sheet (`.cue`) for Compact Disc images (`write_cue_file`): Includes `REM ORIGINAL MEDIA-TYPE`, `REM METADATA AARU MEDIA-TYPE`, ripping tool info, `CATALOG` (MCN), per-session markers, and per-track `TRACK`/`FLAGS`/`ISRC`/`INDEX` entries.
+10. Exports sidecar files:
+    - CICM XML metadata (`.metadata.xml`)
+    - Aaru JSON metadata (`.metadata.json`)
+    - Dump hardware JSON (`.dumphw.json`) — parsed from binary format (18-byte header, 36-byte per-entry records with strings and extent arrays)
+
+**Source files:**
+
+| File | Contents |
+|------|----------|
+| `import_aif.h` | Shared header with all includes and function declarations |
+| `main.c` | Entry point, argument parsing, `mkdirs()`, orchestration |
+| `convert.c` | Tag/type mapping helpers (`aaruf_tag_to_obmafs`, `aaruf_track_type_to_cd_mode`, `cd_mode_sector_size`), `is_compact_disc_media()` |
+| `cuesheet.c` | CDRWin cue sheet generation (`write_cue_file`) |
+| `metadata.c` | Media tag import (`import_media_tags`), metadata import with UTF-16LE→UTF-8 conversion (`import_metadata`) |
+| `import.c` | Sector data import for flat images (`import_flat_image`) and CD images (`import_cd_image`) |
+| `sidecar.c` | CICM XML, Aaru JSON, and dump hardware JSON export (`export_sidecar_files`) |
+
+**Dependencies:** Links only against `libaaruformat` (shared library). Includes OBMAFS3 headers (`enums.h`, `obmafs3_ioctl.h`, `tags.h`) but does not link `libobmafs`.
 
 ### `obmafsck` — Filesystem checker
 
@@ -1169,7 +1218,7 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - File data: `obmafs3_read_file_data`, `obmafs3_write_file_data`
 - Clone/reflink: `obmafs3_clone_file_range`, `obmafs3_free_file_blocks`, `obmafs3_truncate_file_blocks`
 - Refcount: `obmafs3_refcount_get`, `obmafs3_refcount_set`, `obmafs3_refcount_inc`, `obmafs3_refcount_dec`
-- Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`
+- Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`, `obmafs3_read_cd_image_data`
 - Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_dedup_node_cache_free`, `obmafs3_dedup_key_set_free`
 - Dedup key set: `obmafs3_dedup_keyset_save`, `obmafs3_dedup_keyset_load`
 - Dedup pending buffer: `obmafs3_dedup_pending_save`, `obmafs3_dedup_pending_load`, `obmafs3_dedup_pending_flush_and_free`
@@ -1234,13 +1283,14 @@ Initialised by calling `obmafs3_debug_init()` at startup (done automatically by 
 
 ## Dependencies
 
-| Library | Purpose |
-|---------|---------|
-| xxHash  | XXH64 checksums for all integrity verification |
-| ZSTD    | Zstandard compression for data blocks |
-| libfuse3| FUSE 3 user-space filesystem interface (mount.obmafs only) |
+| Library | Purpose | Used by |
+|---------|---------|--------|
+| xxHash  | XXH64 checksums for all integrity verification | libobmafs |
+| ZSTD    | Zstandard compression for data blocks | libobmafs |
+| libfuse3| FUSE 3 user-space filesystem interface | mount.obmafs only |
+| libaaruformat | Read Aaru Image Format (.aif) disk image files | import-aif only |
 
-Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build time.
+xxHash, ZSTD, and libaaruformat are fetched automatically via CMake `FetchContent` at build time. libfuse3 is a system dependency located via `pkg-config`.
 
 ---
 
@@ -1283,6 +1333,7 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | `mkobmafs` (create filesystem) | Complete |
 | `mount.obmafs` (FUSE mount) | Complete |
 | `obmafsck` (filesystem checker + scrub) | Complete |
+| `import-aif` (Aaru Image Format importer) | Complete |
 | Filesystem repair in `obmafsck` | Partial (superblock + backup, superblock fields, B+Tree ordering/siblings/checksums/free-node-chain, bitmap, refcounts, orphan inodes, metadata bidirectional consistency) |
 | B+Tree defragmentation in `obmafsck` | Complete |
 | Clump allocation (HFS+-style B+Tree growth) | Complete |
@@ -1292,6 +1343,8 @@ Both xxHash and ZSTD are fetched automatically via CMake `FetchContent` at build
 | Background warmup thread | Complete |
 | Persisted key set / pending buffer | Complete |
 | Rename / move | Complete |
+| `import-aif` CD cue sheet generation | Complete |
+| `import-aif` sidecar file export (CICM XML, Aaru JSON, dump hardware) | Complete |
 
 ---
 
