@@ -36,8 +36,8 @@
  * into separate files by category.
  */
 
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 
 struct obmafs3_ctx *g_ctx = NULL;
 

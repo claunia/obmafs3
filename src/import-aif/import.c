@@ -91,7 +91,8 @@ int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
         /* Progress every 10000 sectors */
         if((s % 10000) == 0 && s > 0)
-            fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (%.1f%%)", s, sectors, (double)s / (double)sectors * 100.0);
+            fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (%.1f%%)", s, sectors,
+                    (double)s / (double)sectors * 100.0);
     }
 
     fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (100.0%%)\n", sectors, sectors);
@@ -134,13 +135,12 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
     for(int t = 0; t < track_count; t++)
     {
         int64_t first = tracks[t].start - tracks[t].pregap;
-        if(tracks[t].end >= first)
-            total_sectors += (uint64_t)(tracks[t].end - first + 1);
+        if(tracks[t].end >= first) total_sectors += (uint64_t)(tracks[t].end - first + 1);
     }
     uint64_t imported = 0;
 
-    fprintf(stderr, "  Image reports %" PRIu64 " sectors, %" PRIu64 " belong to tracks\n",
-            info->Sectors, total_sectors);
+    fprintf(stderr, "  Image reports %" PRIu64 " sectors, %" PRIu64 " belong to tracks\n", info->Sectors,
+            total_sectors);
 
     /* Initialize ECC context for prefix/suffix reconstruction */
     void *ecc_ctx = aaruf_ecc_cd_init();
@@ -158,8 +158,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
         uint8_t stag_buf[22];
         size_t  stag_len = sizeof(stag_buf);
         int     strc     = aaruf_get_readable_sector_tags(aaruf_ctx, stag_buf, &stag_len);
-        if(strc == 0 && stag_len >= 9 && stag_buf[8])
-            has_subchannel = 1;
+        if(strc == 0 && stag_len >= 9 && stag_buf[8]) has_subchannel = 1;
     }
     fprintf(stderr, "  Subchannel: %s\n", has_subchannel ? "available" : "not available");
 
@@ -179,18 +178,18 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
         if(mode < 0 || ss == 0)
         {
-            fprintf(stderr, "Warning: unknown track type %d for track %d, skipping\n",
-                    trk->type, trk->sequence);
+            fprintf(stderr, "Warning: unknown track type %d for track %d, skipping\n", trk->type, trk->sequence);
             continue;
         }
 
         fprintf(stderr, "  Track %d: sectors %" PRId64 "-%" PRId64 " (pregap %" PRId64 ", %s, %u bytes/sector)\n",
                 trk->sequence, start, end, trk->pregap,
-                mode == kCdSectorModeAudio ? "Audio" :
-                mode == kCdSectorMode1 ? "Mode1" :
-                mode == kCdSectorMode2 ? "Mode2" :
-                mode == kCdSectorMode2Form1 ? "Mode2Form1" :
-                mode == kCdSectorMode2Form2 ? "Mode2Form2" : "Unknown",
+                mode == kCdSectorModeAudio    ? "Audio"
+                : mode == kCdSectorMode1      ? "Mode1"
+                : mode == kCdSectorMode2      ? "Mode2"
+                : mode == kCdSectorMode2Form1 ? "Mode2Form1"
+                : mode == kCdSectorMode2Form2 ? "Mode2Form2"
+                                              : "Unknown",
                 ss);
 
         for(int64_t s = start; s <= end; s++)
@@ -204,8 +203,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
             uint32_t length = CD_RAW_SECTOR_SIZE;
             uint8_t  status = 0;
 
-            int rrc = aaruf_read_sector_long(aaruf_ctx, (uint64_t)s, false,
-                                             cd_arg.buffer, &length, &status);
+            int rrc = aaruf_read_sector_long(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer, &length, &status);
 
             if(rrc == 0 && length == CD_RAW_SECTOR_SIZE)
             {
@@ -240,22 +238,19 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
                 }
 
                 length = ss;
-                rrc    = aaruf_read_sector(aaruf_ctx, (uint64_t)s, false,
-                                           cd_arg.buffer + data_offset, &length, &status);
+                rrc = aaruf_read_sector(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer + data_offset, &length, &status);
                 if(rrc != 0)
                 {
-                    fprintf(stderr, "Warning: failed to read sector %" PRId64
-                            " (rc=%d), filling with zeroes\n", s, rrc);
+                    fprintf(stderr, "Warning: failed to read sector %" PRId64 " (rc=%d), filling with zeroes\n", s,
+                            rrc);
                     memset(cd_arg.buffer, 0, CD_RAW_SECTOR_SIZE);
                 }
 
                 /* Reconstruct sync+header prefix from LBA and track type */
-                if(mode != kCdSectorModeAudio)
-                    aaruf_ecc_cd_reconstruct_prefix(cd_arg.buffer, trk->type, s);
+                if(mode != kCdSectorModeAudio) aaruf_ecc_cd_reconstruct_prefix(cd_arg.buffer, trk->type, s);
 
                 /* Reconstruct EDC/ECC suffix (Mode1, Mode2Form1, Mode2Form2) */
-                if(mode == kCdSectorMode1 || mode == kCdSectorMode2Form1 ||
-                   mode == kCdSectorMode2Form2)
+                if(mode == kCdSectorMode1 || mode == kCdSectorMode2Form1 || mode == kCdSectorMode2Form2)
                     aaruf_ecc_cd_reconstruct(ecc_ctx, cd_arg.buffer, trk->type);
 
                 cd_arg.buffer_size = CD_RAW_SECTOR_SIZE;
@@ -265,11 +260,9 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
             if(has_subchannel)
             {
                 uint32_t sub_len = 96;
-                int      src     = aaruf_read_sector_tag(aaruf_ctx, (uint64_t)s, false,
-                                                         cd_arg.buffer + CD_RAW_SECTOR_SIZE,
-                                                         &sub_len, 8 /* CdSectorSubchannelAaru */);
-                if(src == 0 && sub_len == 96)
-                    cd_arg.buffer_size = CD_RAW_PLUS_SUB;
+                int      src = aaruf_read_sector_tag(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer + CD_RAW_SECTOR_SIZE,
+                                                     &sub_len, 8 /* CdSectorSubchannelAaru */);
+                if(src == 0 && sub_len == 96) cd_arg.buffer_size = CD_RAW_PLUS_SUB;
             }
 
             if(ioctl(fd, OBMAFS3_IOC_CD_WRITE_LONG, &cd_arg) != 0)
@@ -281,8 +274,8 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
             imported++;
             if(imported > 0 && (imported % 10000) == 0)
-                fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (%.1f%%)",
-                        imported, total_sectors, (double)imported / (double)total_sectors * 100.0);
+                fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (%.1f%%)", imported, total_sectors,
+                        (double)imported / (double)total_sectors * 100.0);
         }
     }
 

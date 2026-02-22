@@ -203,7 +203,7 @@ int obmafs3_btree_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, 
 
         /* Read the free node to get the next pointer (stored as uint64_t at offset 0) */
         uint8_t *buf = obmafs3_get_thread_bufs(ctx)->hdr_buf;
-        int rc = obmafs3_block_read(ctx, hdr->free_node_lba, buf, bsz);
+        int      rc  = obmafs3_block_read(ctx, hdr->free_node_lba, buf, bsz);
         if(rc != OBMAFS3_OK) return rc;
 
         uint64_t next_free;
@@ -216,13 +216,9 @@ int obmafs3_btree_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, 
     }
 
     /* ---- Free list empty: allocate a clump ---- */
-    uint32_t clump = (hdr->tree_type == kBtreeTypeDeduplication)
-                         ? ctx->sb.dedup_clump_size
-                         : ctx->sb.btree_clump_size;
+    uint32_t clump = (hdr->tree_type == kBtreeTypeDeduplication) ? ctx->sb.dedup_clump_size : ctx->sb.btree_clump_size;
     if(clump == 0)
-        clump = (hdr->tree_type == kBtreeTypeDeduplication)
-                    ? OBMAFS3_DEDUP_CLUMP_SIZE
-                    : OBMAFS3_DEFAULT_CLUMP_SIZE;
+        clump = (hdr->tree_type == kBtreeTypeDeduplication) ? OBMAFS3_DEDUP_CLUMP_SIZE : OBMAFS3_DEFAULT_CLUMP_SIZE;
 
     uint64_t alloc_blocks = (uint64_t)clump * blocks_per_node;
     uint64_t start_lba;

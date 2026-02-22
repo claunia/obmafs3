@@ -34,9 +34,9 @@
  * Implements: media tag, CD image, media image, and metadata ioctls
  */
 
+#include "debug.h"
 #include "fuse_ops_internal.h"
 #include "obmafs3_ioctl.h"
-#include "debug.h"
 
 #include <limits.h>
 
@@ -133,9 +133,17 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_subchannel_put(g_ctx, sub_hash, sub);
-            if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
+            if(rc != OBMAFS3_OK)
+            {
+                pthread_rwlock_unlock(&g_ctx->tree_lock);
+                FUSE_RETURN(-EIO, "");
+            }
         }
-        else if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
+        else if(rc != OBMAFS3_OK)
+        {
+            pthread_rwlock_unlock(&g_ctx->tree_lock);
+            FUSE_RETURN(-EIO, "");
+        }
         pthread_rwlock_unlock(&g_ctx->tree_lock);
 
         /* --- Create .sub sidecar file (kFileTypeSubchannelFile) on first subchannel --- */
@@ -145,8 +153,8 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
             char sub_path[PATH_MAX];
             strncpy(sub_path, path, sizeof(sub_path) - 1);
             sub_path[sizeof(sub_path) - 1] = '\0';
-            char *dot = strrchr(sub_path, '.');
-            char *slash = strrchr(sub_path, '/');
+            char *dot                      = strrchr(sub_path, '.');
+            char *slash                    = strrchr(sub_path, '/');
             if(dot && (!slash || dot > slash))
                 strcpy(dot, ".sub");
             else
@@ -174,7 +182,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
                      * file_size = parent sector_count * CD_SUBCHANNEL_SIZE (updated below) */
                     uint64_t             sub_id  = obmafs3_alloc_inode_id(g_ctx);
                     uint64_t             now     = (uint64_t)time(NULL);
-                    struct fuse_context  *fusectx = fuse_get_context();
+                    struct fuse_context *fusectx = fuse_get_context();
 
                     memset(&ffctx->sub_inode, 0, sizeof(ffctx->sub_inode));
                     ffctx->sub_inode.inode_id          = sub_id;
@@ -195,7 +203,7 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
                         memset(&sub_cat, 0, sizeof(sub_cat));
                         sub_cat.inode_id       = sub_id;
                         sub_cat.parent_id      = sub_parent_id;
-                        sub_cat.directory_flag  = 0;
+                        sub_cat.directory_flag = 0;
                         strncpy(sub_cat.name, sub_name, sizeof(sub_cat.name) - 1);
                         rc = obmafs3_catalog_insert(g_ctx, &sub_cat);
                         if(rc == OBMAFS3_OK) { ffctx->sub_inode_id = sub_id; }
@@ -230,8 +238,8 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
          * avoiding the overhead of a separate dedup_get_tree + dedup_lookup.
          * Pass NULL cache: CD images use cd_sector_map_entries instead. */
         uint64_t offset = (uint64_t)sector_lba * CD_RAW_SECTOR_SIZE;
-        int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
-                                                CD_RAW_SECTOR_SIZE, NULL, dbc);
+        int      rc     = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
+                                                         CD_RAW_SECTOR_SIZE, NULL, dbc);
         if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
         goto cache_and_done;
@@ -262,9 +270,17 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_prefix_put(g_ctx, pfx_hash, raw);
-            if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
+            if(rc != OBMAFS3_OK)
+            {
+                pthread_rwlock_unlock(&g_ctx->tree_lock);
+                FUSE_RETURN(-EIO, "");
+            }
         }
-        else if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
+        else if(rc != OBMAFS3_OK)
+        {
+            pthread_rwlock_unlock(&g_ctx->tree_lock);
+            FUSE_RETURN(-EIO, "");
+        }
         pthread_rwlock_unlock(&g_ctx->tree_lock);
     }
 
@@ -303,9 +319,17 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_suffix_put(g_ctx, sfx_hash, suffix);
-            if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
+            if(rc != OBMAFS3_OK)
+            {
+                pthread_rwlock_unlock(&g_ctx->tree_lock);
+                FUSE_RETURN(-EIO, "");
+            }
         }
-        else if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&g_ctx->tree_lock); FUSE_RETURN(-EIO, ""); }
+        else if(rc != OBMAFS3_OK)
+        {
+            pthread_rwlock_unlock(&g_ctx->tree_lock);
+            FUSE_RETURN(-EIO, "");
+        }
         pthread_rwlock_unlock(&g_ctx->tree_lock);
     }
 
@@ -363,8 +387,8 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
          * avoiding the overhead of a separate dedup_get_tree + dedup_lookup.
          * Pass NULL cache: CD images use cd_sector_map_entries instead. */
         uint64_t offset = (uint64_t)sector_lba * data_size;
-        int rc = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size,
-                                                NULL, dbc);
+        int      rc =
+            obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size, NULL, dbc);
         if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
     }
 
@@ -391,10 +415,9 @@ cache_and_done:
      * The virtual size of an ioctl-written CD image is always
      * sector_count * CD_RAW_SECTOR_SIZE (2352), regardless of the
      * per-mode data size used for dedup storage. */
-    if((uint64_t)(sector_lba + 1) > ffctx->inode.sector_count)
-        ffctx->inode.sector_count = (uint64_t)(sector_lba + 1);
+    if((uint64_t)(sector_lba + 1) > ffctx->inode.sector_count) ffctx->inode.sector_count = (uint64_t)(sector_lba + 1);
     ffctx->inode.file_size = ffctx->inode.sector_count * CD_RAW_SECTOR_SIZE;
-    ffctx->inode_dirty = 1;
+    ffctx->inode_dirty     = 1;
 
     /* Keep the .sub sidecar file_size in sync with the parent's sector_count.
      * The sidecar has no data of its own — its read path fetches subchannel
@@ -402,7 +425,7 @@ cache_and_done:
     if(ffctx->sub_inode_id != 0)
     {
         ffctx->sub_inode.file_size = ffctx->inode.sector_count * CD_SUBCHANNEL_SIZE;
-        ffctx->sub_inode_dirty = 1;
+        ffctx->sub_inode_dirty     = 1;
     }
 
     return 0;
@@ -608,8 +631,8 @@ static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx, struct obmafs3_
  * @param data   Pointer to the ioctl data structure.
  * @return 0 on success, negative errno on failure.
  */
-static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi, unsigned int flags,
-                       void *data)
+static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg, struct fuse_file_info *fi,
+                                   unsigned int flags, void *data)
 {
     (void)arg;
     (void)flags;
@@ -754,10 +777,9 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
                 lib_filters[f].op = qa->filters[f].op;
             }
 
-            char    **paths;
-            uint32_t  total;
-            int       rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count, qa->combine, &paths,
-                                                           &total);
+            char   **paths;
+            uint32_t total;
+            int rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count, qa->combine, &paths, &total);
             if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
             uint32_t start = qa->offset;
@@ -805,8 +827,7 @@ int obmafs3_fuse_ioctl(const char *path, unsigned int cmd, void *arg, struct fus
      * obmafs3_cd_write_long — skip the blanket serialisation so
      * writes to different CD images can overlap their hashing and
      * ECC computations. */
-    if(cmd == OBMAFS3_IOC_CD_WRITE_LONG)
-        return obmafs3_fuse_ioctl_impl(path, cmd, arg, fi, flags, data);
+    if(cmd == OBMAFS3_IOC_CD_WRITE_LONG) return obmafs3_fuse_ioctl_impl(path, cmd, arg, fi, flags, data);
 
     pthread_rwlock_wrlock(&g_ctx->tree_lock);
     int rc = obmafs3_fuse_ioctl_impl(path, cmd, arg, fi, flags, data);

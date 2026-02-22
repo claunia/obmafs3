@@ -46,8 +46,7 @@ void init_color(void)
     if(getenv("NO_COLOR")) return;
 
     /* Only enable when both stdout and stderr are terminals */
-    if(isatty(STDOUT_FILENO) && isatty(STDERR_FILENO))
-        g_use_color = 1;
+    if(isatty(STDOUT_FILENO) && isatty(STDERR_FILENO)) g_use_color = 1;
 }
 
 /* ------------------------------------------------------------------ */

@@ -100,8 +100,8 @@ static int mkdirs(const char *path)
 int main(int argc, char *argv[])
 {
     static struct option long_opts[] = {
-        { "help", no_argument, NULL, 'h'},
-        {  NULL,            0, NULL,   0}
+        {"help", no_argument, NULL, 'h'},
+        {  NULL,           0, NULL,   0}
     };
 
     int opt;
@@ -223,8 +223,7 @@ int main(int argc, char *argv[])
     size_t      base_len = strlen(output_path);
     const char *dot      = strrchr(output_path, '.');
     const char *slash    = strrchr(output_path, '/');
-    if(dot && (!slash || dot > slash))
-        base_len = (size_t)(dot - output_path);
+    if(dot && (!slash || dot > slash)) base_len = (size_t)(dot - output_path);
 
     /* ---- Write cue sheet for compact disc images ---- */
     if(is_cd)

@@ -53,9 +53,9 @@
 #ifndef OBMAFS3_DEBUG_H
 #define OBMAFS3_DEBUG_H
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <string.h>
 
 /** Global debug flag — non-zero when debug output is enabled. */
@@ -74,12 +74,11 @@ static inline void obmafs3_debug_init(void)
  * Includes file name, line number and function for instant
  * identification of the call-site.
  */
-#define OBMAFS3_DBG(fmt, ...)                                                 \
-    do                                                                        \
-    {                                                                         \
-        if(obmafs3_debug)                                                     \
-            fprintf(stderr, "OBMAFS3 [%s:%d %s] " fmt "\n", __FILE__,        \
-                    __LINE__, __func__, ##__VA_ARGS__);                       \
+#define OBMAFS3_DBG(fmt, ...)                                                                             \
+    do                                                                                                    \
+    {                                                                                                     \
+        if(obmafs3_debug)                                                                                 \
+            fprintf(stderr, "OBMAFS3 [%s:%d %s] " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
     } while(0)
 
 /**
@@ -88,13 +87,13 @@ static inline void obmafs3_debug_init(void)
  * @param err  OBMAFS3_ERR_* code to return.
  * @param fmt  printf format string describing the failure context.
  */
-#define DBG_RETURN(err, fmt, ...)                                             \
-    do                                                                        \
-    {                                                                         \
-        if(obmafs3_debug)                                                     \
-            fprintf(stderr, "OBMAFS3 ERR %d [%s:%d %s] " fmt "\n", (err),    \
-                    __FILE__, __LINE__, __func__, ##__VA_ARGS__);             \
-        return (err);                                                         \
+#define DBG_RETURN(err, fmt, ...)                                                                       \
+    do                                                                                                  \
+    {                                                                                                   \
+        if(obmafs3_debug)                                                                               \
+            fprintf(stderr, "OBMAFS3 ERR %d [%s:%d %s] " fmt "\n", (err), __FILE__, __LINE__, __func__, \
+                    ##__VA_ARGS__);                                                                     \
+        return (err);                                                                                   \
     } while(0)
 
 /**
@@ -105,16 +104,14 @@ static inline void obmafs3_debug_init(void)
  * @param err  OBMAFS3_ERR_* code to return.
  * @param fmt  printf format string (may reference @c _saved_errno).
  */
-#define DBG_RETURN_ERRNO(err, fmt, ...)                                       \
-    do                                                                        \
-    {                                                                         \
-        int _saved_errno = errno;                                             \
-        if(obmafs3_debug)                                                     \
-            fprintf(stderr,                                                   \
-                    "OBMAFS3 ERR %d [%s:%d %s] " fmt " (errno=%d %s)\n",     \
-                    (err), __FILE__, __LINE__, __func__, ##__VA_ARGS__,       \
-                    _saved_errno, strerror(_saved_errno));                    \
-        return (err);                                                         \
+#define DBG_RETURN_ERRNO(err, fmt, ...)                                                                               \
+    do                                                                                                                \
+    {                                                                                                                 \
+        int _saved_errno = errno;                                                                                     \
+        if(obmafs3_debug)                                                                                             \
+            fprintf(stderr, "OBMAFS3 ERR %d [%s:%d %s] " fmt " (errno=%d %s)\n", (err), __FILE__, __LINE__, __func__, \
+                    ##__VA_ARGS__, _saved_errno, strerror(_saved_errno));                                             \
+        return (err);                                                                                                 \
     } while(0)
 
 /**
@@ -123,13 +120,12 @@ static inline void obmafs3_debug_init(void)
  * @param err  Negative errno value (e.g. -EIO) to return.
  * @param fmt  printf format string describing the failure context.
  */
-#define FUSE_RETURN(err, fmt, ...)                                            \
-    do                                                                        \
-    {                                                                         \
-        if(obmafs3_debug)                                                     \
-            fprintf(stderr, "FUSE ERR %d [%s:%d %s] " fmt "\n", (err),       \
-                    __FILE__, __LINE__, __func__, ##__VA_ARGS__);             \
-        return (err);                                                         \
+#define FUSE_RETURN(err, fmt, ...)                                                                                   \
+    do                                                                                                               \
+    {                                                                                                                \
+        if(obmafs3_debug)                                                                                            \
+            fprintf(stderr, "FUSE ERR %d [%s:%d %s] " fmt "\n", (err), __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
+        return (err);                                                                                                \
     } while(0)
 
 /**
@@ -140,14 +136,13 @@ static inline void obmafs3_debug_init(void)
  *
  * @param rc  The return code to propagate.
  */
-#define DBG_PROPAGATE(rc)                                                     \
-    do                                                                        \
-    {                                                                         \
-        int _prop_rc = (rc);                                                  \
-        if(_prop_rc != 0 && obmafs3_debug)                                    \
-            fprintf(stderr, "OBMAFS3 PROP %d [%s:%d %s]\n", _prop_rc,        \
-                    __FILE__, __LINE__, __func__);                            \
-        return _prop_rc;                                                      \
+#define DBG_PROPAGATE(rc)                                                                            \
+    do                                                                                               \
+    {                                                                                                \
+        int _prop_rc = (rc);                                                                         \
+        if(_prop_rc != 0 && obmafs3_debug)                                                           \
+            fprintf(stderr, "OBMAFS3 PROP %d [%s:%d %s]\n", _prop_rc, __FILE__, __LINE__, __func__); \
+        return _prop_rc;                                                                             \
     } while(0)
 
 #endif /* OBMAFS3_DEBUG_H */

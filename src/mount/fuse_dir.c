@@ -34,8 +34,8 @@
  * Implements: mkdir, rmdir
  */
 
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 
 /**
  * FUSE callback: create a directory.

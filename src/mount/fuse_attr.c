@@ -34,8 +34,8 @@
  * Implements: utimens, chmod, chown, flush, release, statfs, statx
  */
 
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 
 /**
  * FUSE callback: set file access and modification times.
@@ -385,7 +385,8 @@ static int obmafs3_fuse_statfs_impl(const char *path, struct statvfs *stbuf)
  * @c STATX_ATTR_COMPRESSED flag for media image files stored with
  * compression.
  */
-static int obmafs3_fuse_statx_impl(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi)
+static int obmafs3_fuse_statx_impl(const char *path, int flags, int mask, struct statx *stxbuf,
+                                   struct fuse_file_info *fi)
 {
     struct inode_record  inode;
     struct inode_record *ip;

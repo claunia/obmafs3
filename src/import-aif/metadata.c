@@ -96,13 +96,11 @@ int import_media_tags(void *aaruf_ctx, int fd)
  * @param getter     Function pointer to the aaruf_get_* accessor.
  * @param key        Metadata key name to store.
  */
-static void import_utf16_metadata(void *aaruf_ctx, int fd,
-                                  int32_t (*getter)(const void *, uint8_t *, int32_t *),
+static void import_utf16_metadata(void *aaruf_ctx, int fd, int32_t (*getter)(const void *, uint8_t *, int32_t *),
                                   const char *key)
 {
     int32_t length = 0;
-    if(getter(aaruf_ctx, NULL, &length) != AARUF_ERROR_BUFFER_TOO_SMALL || length <= 0)
-        return;
+    if(getter(aaruf_ctx, NULL, &length) != AARUF_ERROR_BUFFER_TOO_SMALL || length <= 0) return;
 
     uint8_t *utf16 = malloc((size_t)length);
     if(!utf16) return;
@@ -124,10 +122,10 @@ static void import_utf16_metadata(void *aaruf_ctx, int fd,
     memset(&meta, 0, sizeof(meta));
     strncpy(meta.key, key, METADATA_KEY_MAX - 1);
 
-    char   *inbuf  = (char *)utf16;
-    size_t  inleft = (size_t)length;
-    char   *outbuf = meta.value;
-    size_t  outleft = METADATA_VALUE_MAX - 1;
+    char  *inbuf   = (char *)utf16;
+    size_t inleft  = (size_t)length;
+    char  *outbuf  = meta.value;
+    size_t outleft = METADATA_VALUE_MAX - 1;
 
     if(iconv(cd, &inbuf, &inleft, &outbuf, &outleft) != (size_t)-1 || errno == E2BIG)
     {

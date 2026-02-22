@@ -89,23 +89,26 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     map_inode.file_size = inode->sector_map_size * sizeof(struct sector_map_entry);
 
     uint64_t sme_offset = (uint64_t)first_sector * sizeof(struct sector_map_entry);
-    rc = obmafs3_read_file_data(ctx, &map_inode, sme_offset, sme_batch,
-                                (size_t)(sme_count * sizeof(struct sector_map_entry)));
+    rc                  = obmafs3_read_file_data(ctx, &map_inode, sme_offset, sme_batch,
+                                                 (size_t)(sme_count * sizeof(struct sector_map_entry)));
     if(rc != OBMAFS3_OK)
     {
-        fprintf(stderr, "[read_media_image] batch read_file_data(sme) FAILED rc=%d "
-                "first_sector=%" PRId64 " count=%" PRIu64 " sme_offset=%" PRIu64
-                " map_file_size=%" PRIu64 " sector_map_size=%" PRIu64
-                " inode=%" PRIu64 "\n",
-                rc, first_sector, sme_count, sme_offset, map_inode.file_size,
-                inode->sector_map_size, inode->inode_id);
+        fprintf(stderr,
+                "[read_media_image] batch read_file_data(sme) FAILED rc=%d "
+                "first_sector=%" PRId64 " count=%" PRIu64 " sme_offset=%" PRIu64 " map_file_size=%" PRIu64
+                " sector_map_size=%" PRIu64 " inode=%" PRIu64 "\n",
+                rc, first_sector, sme_count, sme_offset, map_inode.file_size, inode->sector_map_size, inode->inode_id);
         free(sme_batch);
         return rc;
     }
 
     /* Buffer for reading the dedup data block (dedup_block_size bytes) */
     uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
-    if(!dedup_buf) { free(sme_batch); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
+    if(!dedup_buf)
+    {
+        free(sme_batch);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
 
     /* Decompressed payload buffer (allocated on first compressed block) */
     uint8_t *decomp_buf = NULL;
@@ -133,16 +136,17 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         size_t chunk               = remaining_in_read < remaining_in_sector ? remaining_in_read : remaining_in_sector;
 
         /* Index into the pre-fetched batch */
-        uint64_t sme_idx = (uint64_t)(sector_num - first_sector);
-        struct sector_map_entry *sme = &sme_batch[sme_idx];
+        uint64_t                 sme_idx = (uint64_t)(sector_num - first_sector);
+        struct sector_map_entry *sme     = &sme_batch[sme_idx];
 
         /* Look up the hash in the dedup tree (using leaf cache) */
         struct dedup_entry de;
         rc = dedup_lookup_cached(ctx, &dedup_hdr, sme->hash, &de, &leaf_cache);
         if(rc != OBMAFS3_OK)
         {
-            fprintf(stderr, "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64
-                    " sector=%" PRId64 " inode=%" PRIu64 "\n",
+            fprintf(stderr,
+                    "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sector=%" PRId64 " inode=%" PRIu64
+                    "\n",
                     rc, sme->hash, sector_num, inode->inode_id);
             free(leaf_cache.leaf_buf);
             free(sme_batch);
@@ -158,8 +162,9 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             rc = obmafs3_block_read(ctx, de.block_lba, dedup_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK)
             {
-                fprintf(stderr, "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64
-                        " hash=%" PRIu64 " sector=%" PRId64 "\n",
+                fprintf(stderr,
+                        "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64 " hash=%" PRIu64
+                        " sector=%" PRId64 "\n",
                         rc, de.block_lba, sme->hash, sector_num);
                 free(leaf_cache.leaf_buf);
                 free(sme_batch);
@@ -212,8 +217,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
                 }
-                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
-                                        decomp_buf, (size_t)bhdr.original_size);
+                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr),
+                                        (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
                     free(leaf_cache.leaf_buf);
@@ -232,8 +237,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             /* Speculatively prefetch the next sector's dedup block.
              * Uses the leaf cache so the lookup is typically free. */
             if(sme_idx + 1 < sme_count)
-                dedup_readahead_next(ctx, &dedup_hdr, sme_batch[sme_idx + 1].hash,
-                                     cached_dedup_lba, &leaf_cache);
+                dedup_readahead_next(ctx, &dedup_hdr, sme_batch[sme_idx + 1].hash, cached_dedup_lba, &leaf_cache);
         }
 
         /* Copy sector data from the dedup block at the stored offset.
@@ -288,8 +292,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
  * @param size   Number of bytes to read.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
-int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode,
-                               uint64_t offset, void *buf, size_t size)
+int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
+                               size_t size)
 {
     /* Virtual file size: sector_count * 2352 */
     uint64_t virtual_size = inode->sector_count * CD_RAW_SECTOR_SIZE;
@@ -324,9 +328,13 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
     /* Dedup block cache — shared across all sectors in this read */
     uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
-    if(!dedup_buf) { free(sme_all); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
-    uint8_t *decomp_buf       = NULL;
-    uint64_t cached_dedup_lba = 0;
+    if(!dedup_buf)
+    {
+        free(sme_all);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+    uint8_t *decomp_buf        = NULL;
+    uint64_t cached_dedup_lba  = 0;
     int      cached_compressed = 0;
 
     /* Leaf-level lookup cache — amortises tree traversals across sectors */
@@ -336,7 +344,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
     struct btree_header cached_dedup_hdr;
     uint16_t            cached_data_size = 0;
 
-    int rc = OBMAFS3_OK;
+    int      rc         = OBMAFS3_OK;
     uint8_t *out        = (uint8_t *)buf;
     size_t   bytes_read = 0;
 
@@ -348,9 +356,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
         size_t remaining_in_sector = CD_RAW_SECTOR_SIZE - offset_in_sector;
         size_t remaining_in_read   = size - bytes_read;
-        size_t chunk               = remaining_in_read < remaining_in_sector
-                                         ? remaining_in_read
-                                         : remaining_in_sector;
+        size_t chunk               = remaining_in_read < remaining_in_sector ? remaining_in_read : remaining_in_sector;
 
         /* Binary search the sector map for this LBA.  Entries are
          * sorted by sector number (written in track order). */
@@ -361,9 +367,15 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
             while(lo <= hi)
             {
                 int64_t mid = lo + (hi - lo) / 2;
-                if(sme_all[mid].sector == sector_num) { sme = &sme_all[mid]; break; }
-                else if(sme_all[mid].sector < sector_num) lo = mid + 1;
-                else hi = mid - 1;
+                if(sme_all[mid].sector == sector_num)
+                {
+                    sme = &sme_all[mid];
+                    break;
+                }
+                else if(sme_all[mid].sector < sector_num)
+                    lo = mid + 1;
+                else
+                    hi = mid - 1;
             }
         }
 
@@ -382,11 +394,21 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
         uint16_t data_size;
         switch((enum obmafs3_cd_sector_mode)sme->sector_mode)
         {
-            case kCdSectorModeAudio:  data_size = CD_RAW_SECTOR_SIZE; break;
-            case kCdSectorMode1:      data_size = CD_DATA_SIZE;       break;
-            case kCdSectorMode2:      data_size = 2336;               break;
-            case kCdSectorMode2Form1: data_size = CD_DATA_SIZE;       break;
-            case kCdSectorMode2Form2: data_size = 2328;               break;
+            case kCdSectorModeAudio:
+                data_size = CD_RAW_SECTOR_SIZE;
+                break;
+            case kCdSectorMode1:
+                data_size = CD_DATA_SIZE;
+                break;
+            case kCdSectorMode2:
+                data_size = 2336;
+                break;
+            case kCdSectorMode2Form1:
+                data_size = CD_DATA_SIZE;
+                break;
+            case kCdSectorMode2Form2:
+                data_size = 2328;
+                break;
             default:
                 rc = OBMAFS3_ERR_INVAL;
                 goto fail;
@@ -414,8 +436,8 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
         rc = dedup_lookup_cached(ctx, &cached_dedup_hdr, sme->hash, &de, &leaf_cache);
         if(rc != OBMAFS3_OK)
         {
-            fprintf(stderr, "[read_cd_image] dedup_lookup FAILED rc=%d hash=%" PRIu64
-                    " sector=%" PRId64 " inode=%" PRIu64 "\n",
+            fprintf(stderr,
+                    "[read_cd_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sector=%" PRId64 " inode=%" PRIu64 "\n",
                     rc, sme->hash, sector_num, inode->inode_id);
             goto fail;
         }
@@ -429,17 +451,15 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
             struct block_header bhdr;
             memcpy(&bhdr, dedup_buf, sizeof(bhdr));
 
-            uint64_t payload_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
-                                        ? bhdr.compressed_size
-                                        : bhdr.original_size;
+            uint64_t payload_size =
+                (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? bhdr.compressed_size : bhdr.original_size;
             uint64_t total_on_disk = sizeof(bhdr) + payload_size;
             uint64_t bs            = ctx->sb.block_size;
             uint64_t needed_std    = (total_on_disk + bs - 1) / bs;
 
             if(needed_std > 1)
             {
-                rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs,
-                                        (size_t)((needed_std - 1) * bs));
+                rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs, (size_t)((needed_std - 1) * bs));
                 if(rc != OBMAFS3_OK) goto fail;
             }
 
@@ -450,11 +470,14 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                 if(!decomp_buf)
                 {
                     decomp_buf = malloc((size_t)ctx->sb.dedup_block_size);
-                    if(!decomp_buf) { rc = OBMAFS3_ERR_NOMEM; goto fail; }
+                    if(!decomp_buf)
+                    {
+                        rc = OBMAFS3_ERR_NOMEM;
+                        goto fail;
+                    }
                 }
-                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx,
-                                        dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
-                                        decomp_buf, (size_t)bhdr.original_size);
+                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr),
+                                        (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) goto fail;
                 cached_compressed = 1;
             }
@@ -473,7 +496,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
         if(cached_compressed)
         {
             size_t decomp_off = de.block_offset - sizeof(struct block_header);
-            src_data = decomp_buf + decomp_off;
+            src_data          = decomp_buf + decomp_off;
         }
         else
         {
@@ -487,14 +510,10 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
         }
         else
         {
-            int has_subheader = (sme->sector_mode == kCdSectorMode2Form1 ||
-                                sme->sector_mode == kCdSectorMode2Form2);
+            int has_subheader = (sme->sector_mode == kCdSectorMode2Form1 || sme->sector_mode == kCdSectorMode2Form2);
 
             /* 1. Prefix (bytes 0-15) */
-            if(sme->generated_prefix)
-            {
-                ecc_cd_reconstruct_prefix(sector_buf, sme->sector_mode, sector_num);
-            }
+            if(sme->generated_prefix) { ecc_cd_reconstruct_prefix(sector_buf, sme->sector_mode, sector_num); }
             else
             {
                 uint8_t pfx[CD_PREFIX_DATA_SIZE];
@@ -517,16 +536,17 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
             }
 
             /* 4. Suffix */
-            if(sme->sector_mode == kCdSectorMode2)
-            {
-                /* Raw Mode 2 has no suffix */
-            }
+            if(sme->sector_mode == kCdSectorMode2) { /* Raw Mode 2 has no suffix */ }
             else if(sme->generated_suffix)
             {
                 if(!ecc_ctx)
                 {
                     ecc_ctx = ecc_cd_init();
-                    if(!ecc_ctx) { rc = OBMAFS3_ERR_NOMEM; goto fail; }
+                    if(!ecc_ctx)
+                    {
+                        rc = OBMAFS3_ERR_NOMEM;
+                        goto fail;
+                    }
                 }
                 ecc_cd_reconstruct(ecc_ctx, sector_buf, sme->sector_mode);
             }
@@ -576,14 +596,14 @@ fail:
  * @param size       Number of bytes to read.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
-int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode,
-                                 uint64_t offset, void *buf, size_t size)
+int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode, uint64_t offset,
+                                 void *buf, size_t size)
 {
     /* The parent CD image inode_id is stored in sector_count */
     uint64_t parent_inode_id = sub_inode->sector_count;
 
     struct inode_record parent_inode;
-    int rc = obmafs3_inode_get(ctx, parent_inode_id, &parent_inode);
+    int                 rc = obmafs3_inode_get(ctx, parent_inode_id, &parent_inode);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Virtual size: parent's sector_count * 96 */
@@ -593,8 +613,8 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
     if(size == 0) return OBMAFS3_OK;
 
     /* Read all cd_sector_map_entries from the parent */
-    uint64_t total_entries = parent_inode.sector_map_size;
-    struct cd_sector_map_entry *sme_all = NULL;
+    uint64_t                    total_entries = parent_inode.sector_map_size;
+    struct cd_sector_map_entry *sme_all       = NULL;
     if(total_entries > 0)
     {
         sme_all = malloc((size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
@@ -606,7 +626,11 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
 
         rc = obmafs3_read_file_data(ctx, &map_inode, 0, sme_all,
                                     (size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
-        if(rc != OBMAFS3_OK) { free(sme_all); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            free(sme_all);
+            return rc;
+        }
     }
 
     uint8_t *out        = (uint8_t *)buf;
@@ -620,9 +644,7 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
 
         size_t remaining_in_sector = CD_SUBCHANNEL_SIZE - offset_in_sector;
         size_t remaining_in_read   = size - bytes_read;
-        size_t chunk               = remaining_in_read < remaining_in_sector
-                                         ? remaining_in_read
-                                         : remaining_in_sector;
+        size_t chunk               = remaining_in_read < remaining_in_sector ? remaining_in_read : remaining_in_sector;
 
         /* Binary search for this sector number */
         uint64_t subchannel_hash = 0;
@@ -637,8 +659,10 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
                     subchannel_hash = sme_all[mid].subchannel_hash;
                     break;
                 }
-                else if(sme_all[mid].sector < sector_num) lo = mid + 1;
-                else hi = mid - 1;
+                else if(sme_all[mid].sector < sector_num)
+                    lo = mid + 1;
+                else
+                    hi = mid - 1;
             }
         }
 

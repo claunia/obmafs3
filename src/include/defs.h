@@ -126,11 +126,11 @@ struct __attribute__((packed)) extent_run
  */
 struct __attribute__((packed)) overflow_extent
 {
-    uint64_t inode_id;       ///< Inode this extent belongs to
-    uint64_t logical_offset; ///< First logical block covered by this extent (sort key)
-    uint64_t start_block;    ///< Starting physical LBA of the extent run
-    uint64_t block_count;    ///< Number of physical blocks in the extent run
-    uint64_t logical_count;  ///< Number of logical blocks this extent covers
+    uint64_t inode_id;        ///< Inode this extent belongs to
+    uint64_t logical_offset;  ///< First logical block covered by this extent (sort key)
+    uint64_t start_block;     ///< Starting physical LBA of the extent run
+    uint64_t block_count;     ///< Number of physical blocks in the extent run
+    uint64_t logical_count;   ///< Number of logical blocks this extent covers
 };
 
 /**

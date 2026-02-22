@@ -30,8 +30,8 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
-#include "fuse_ops.h"
 #include "debug.h"
+#include "fuse_ops.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -139,7 +139,8 @@ int main(int argc, char *argv[])
 
     /* Parse disk image extension mappings */
     {
-        const char *spec = opts.disk_images ? opts.disk_images : "dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512";
+        const char *spec =
+            opts.disk_images ? opts.disk_images : "dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512";
         if(parse_disk_image_maps(spec) != 0)
         {
             fprintf(stderr, "Error: invalid --disk-images specification\n");
@@ -163,13 +164,15 @@ int main(int argc, char *argv[])
         /* fuse_main restores the default signal handlers before returning,
          * so a stray ^C during obmafs3_close would kill the process mid-save.
          * Ignore SIGINT/SIGTERM/SIGHUP to let the close path complete. */
-        signal(SIGINT,  SIG_IGN);
+        signal(SIGINT, SIG_IGN);
         signal(SIGTERM, SIG_IGN);
-        signal(SIGHUP,  SIG_IGN);
+        signal(SIGHUP, SIG_IGN);
 
-        fprintf(stderr, "[obmafs3] shutting down — persisting keyset and metadata...\n");        fflush(stderr);
+        fprintf(stderr, "[obmafs3] shutting down — persisting keyset and metadata...\n");
+        fflush(stderr);
         fprintf(stderr, "[obmafs3] calling obmafs3_close...\n");
-        fflush(stderr);        obmafs3_close(g_ctx);
+        fflush(stderr);
+        obmafs3_close(g_ctx);
         fprintf(stderr, "[obmafs3] shutdown complete.\n");
     }
     fuse_opt_free_args(&args);

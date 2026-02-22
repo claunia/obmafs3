@@ -30,8 +30,8 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
-#include "obmafs.h"
 #include "debug.h"
+#include "obmafs.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -46,26 +46,26 @@
 /* Forward declarations for functions defined later in this file */
 static int compression_worthwhile(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t dst_cap,
                                   int level);
-int obmafs3_compress(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size, int level);
+int        obmafs3_compress(ZSTD_CCtx *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size, int level);
 
 /** Per-group compression job – filled by the caller, executed by a worker. */
 struct compress_job
 {
     /* Input — set by caller before launching workers */
-    const uint8_t *group_data;     ///< pointer to assembled group data
-    size_t         grp_bytes;      ///< input size in bytes
-    uint64_t       grp_count;      ///< logical blocks in this group
-    int            level;          ///< ZSTD compression level
-    uint64_t       block_size;     ///< filesystem block size
+    const uint8_t *group_data;  ///< pointer to assembled group data
+    size_t         grp_bytes;   ///< input size in bytes
+    uint64_t       grp_count;   ///< logical blocks in this group
+    int            level;       ///< ZSTD compression level
+    uint64_t       block_size;  ///< filesystem block size
 
     /* Per-job resources — allocated by caller */
-    uint8_t *comp_buf;             ///< output buffer (must be large enough)
-    size_t   comp_buf_size;        ///< capacity of comp_buf
+    uint8_t *comp_buf;       ///< output buffer (must be large enough)
+    size_t   comp_buf_size;  ///< capacity of comp_buf
 
     /* Results — set by the worker */
-    int      use_compressed;       ///< non-zero if compressed output should be used
-    uint64_t phys_needed;          ///< number of physical blocks for compressed output
-    size_t   compressed_size;      ///< compressed data size (excl. header)
+    int      use_compressed;   ///< non-zero if compressed output should be used
+    uint64_t phys_needed;      ///< number of physical blocks for compressed output
+    size_t   compressed_size;  ///< compressed data size (excl. header)
 };
 
 /** Shared batch context for the worker threads. */
@@ -73,8 +73,8 @@ struct compress_batch
 {
     struct compress_job *jobs;
     int                  total;
-    atomic_int           next;     ///< next job index to claim
-    atomic_int           done;     ///< completed job count
+    atomic_int           next;  ///< next job index to claim
+    atomic_int           done;  ///< completed job count
 };
 
 /**
@@ -86,15 +86,14 @@ struct compress_batch
  * Sharing a single context between the two causes a stale-window
  * assertion in ZSTD's btopt match finder (ZSTD debug builds).
  */
-static int compress_worker_run(struct compress_batch *batch,
-                               ZSTD_CCtx *probe_cctx, ZSTD_CCtx *cctx)
+static int compress_worker_run(struct compress_batch *batch, ZSTD_CCtx *probe_cctx, ZSTD_CCtx *cctx)
 {
     int idx, processed = 0;
     while((idx = atomic_fetch_add(&batch->next, 1)) < batch->total)
     {
         struct compress_job *job = &batch->jobs[idx];
         job->use_compressed      = 0;
-        processed++;  /* count every claimed job for batch completion tracking */
+        processed++; /* count every claimed job for batch completion tracking */
 
         /* Skip groups that weren't set up for compression (e.g. partial tail groups) */
         if(!job->comp_buf || job->grp_bytes == 0) continue;
@@ -106,8 +105,8 @@ static int compress_worker_run(struct compress_batch *batch,
         if(!worth) continue;
 
         size_t comp_size = job->comp_buf_size - sizeof(struct block_header);
-        int    rc        = obmafs3_compress(cctx, job->group_data, job->grp_bytes,
-                                            job->comp_buf + sizeof(struct block_header), &comp_size, job->level);
+        int    rc = obmafs3_compress(cctx, job->group_data, job->grp_bytes, job->comp_buf + sizeof(struct block_header),
+                                     &comp_size, job->level);
         if(rc != OBMAFS3_OK) continue;
 
         uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
@@ -125,12 +124,12 @@ static int compress_worker_run(struct compress_batch *batch,
         obmafs3_checksum_block(job->comp_buf + sizeof(bhdr), comp_size, bhdr.checksum);
         memcpy(job->comp_buf, &bhdr, sizeof(bhdr));
 
-        size_t used            = sizeof(bhdr) + comp_size;
+        size_t used             = sizeof(bhdr) + comp_size;
         size_t total_phys_bytes = (size_t)(phys_needed * job->block_size);
         if(used < total_phys_bytes) memset(job->comp_buf + used, 0, total_phys_bytes - used);
 
-        job->use_compressed = 1;
-        job->phys_needed    = phys_needed;
+        job->use_compressed  = 1;
+        job->phys_needed     = phys_needed;
         job->compressed_size = comp_size;
     }
     return processed;
@@ -142,23 +141,23 @@ static int compress_worker_run(struct compress_batch *batch,
 
 struct compress_pool
 {
-    pthread_t      *threads;        ///< worker thread array
-    int             num_threads;    ///< number of worker threads
-    pthread_mutex_t mutex;          ///< protects batch, shutdown, generation, async_queue
-    pthread_cond_t  work_avail;     ///< signalled when a new batch or async job is ready
-    pthread_cond_t  batch_done;     ///< signalled when all jobs complete
-    struct compress_batch  batch_data;  ///< embedded batch (lives as long as the pool)
-    int             batch_active;   ///< non-zero when a batch is in progress
-    int             shutdown;       ///< non-zero → workers should exit
-    unsigned int    generation;     ///< incremented for each batch submission
-    struct pool_async_job *async_queue; ///< FIFO of pending async jobs
+    pthread_t             *threads;       ///< worker thread array
+    int                    num_threads;   ///< number of worker threads
+    pthread_mutex_t        mutex;         ///< protects batch, shutdown, generation, async_queue
+    pthread_cond_t         work_avail;    ///< signalled when a new batch or async job is ready
+    pthread_cond_t         batch_done;    ///< signalled when all jobs complete
+    struct compress_batch  batch_data;    ///< embedded batch (lives as long as the pool)
+    int                    batch_active;  ///< non-zero when a batch is in progress
+    int                    shutdown;      ///< non-zero → workers should exit
+    unsigned int           generation;    ///< incremented for each batch submission
+    struct pool_async_job *async_queue;   ///< FIFO of pending async jobs
 };
 
 /** Pool worker thread main loop. */
 static void *pool_worker_main(void *arg)
 {
-    struct compress_pool *pool = arg;
-    unsigned int my_gen = 0;
+    struct compress_pool *pool   = arg;
+    unsigned int          my_gen = 0;
 
     /* Persistent ZSTD contexts – created once per worker thread,
      * reused across all batches, freed on pool shutdown. */
@@ -182,7 +181,7 @@ static void *pool_worker_main(void *arg)
         if(aj)
         {
             pool->async_queue = aj->next;
-            aj->next = NULL;
+            aj->next          = NULL;
             pthread_mutex_unlock(&pool->mutex);
 
             aj->result = aj->fn(aj->arg, cctx);
@@ -199,9 +198,9 @@ static void *pool_worker_main(void *arg)
             continue; /* back to top — don't update my_gen, may have batch too */
         }
 
-        my_gen = pool->generation;
-        int has_batch = pool->batch_active;
-        struct compress_batch *batch = has_batch ? &pool->batch_data : NULL;
+        my_gen                           = pool->generation;
+        int                    has_batch = pool->batch_active;
+        struct compress_batch *batch     = has_batch ? &pool->batch_data : NULL;
         pthread_mutex_unlock(&pool->mutex);
 
         /* The submitter may have already completed the batch and set
@@ -209,8 +208,7 @@ static void *pool_worker_main(void *arg)
         if(!batch) continue;
 
         int n = 0;
-        if(cctx && probe_cctx)
-            n = compress_worker_run(batch, probe_cctx, cctx);
+        if(cctx && probe_cctx) n = compress_worker_run(batch, probe_cctx, cctx);
 
         /* Only participate in completion signalling if we did real work */
         if(n > 0)
@@ -226,7 +224,7 @@ static void *pool_worker_main(void *arg)
     }
 
     if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
-    if(cctx)       ZSTD_freeCCtx(cctx);
+    if(cctx) ZSTD_freeCCtx(cctx);
     return NULL;
 }
 
@@ -239,20 +237,24 @@ int obmafs3_compress_pool_init(struct obmafs3_ctx *ctx)
     int ncpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
     int n     = ncpus;
     if(n > 32) n = 32;
-    if(n < 1)  n = 1;
+    if(n < 1) n = 1;
 
     struct compress_pool *pool = calloc(1, sizeof(*pool));
     if(!pool) return OBMAFS3_ERR_NOMEM;
 
     pool->threads = malloc((size_t)n * sizeof(pthread_t));
-    if(!pool->threads) { free(pool); return OBMAFS3_ERR_NOMEM; }
+    if(!pool->threads)
+    {
+        free(pool);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->work_avail, NULL);
     pthread_cond_init(&pool->batch_done, NULL);
-    pool->num_threads = 0;
+    pool->num_threads  = 0;
     pool->batch_active = 0;
-    pool->shutdown    = 0;
+    pool->shutdown     = 0;
 
     for(int i = 0; i < n; i++)
     {
@@ -327,8 +329,7 @@ void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx)
     pthread_cond_broadcast(&pool->work_avail);
     pthread_mutex_unlock(&pool->mutex);
 
-    for(int i = 0; i < pool->num_threads; i++)
-        pthread_join(pool->threads[i], NULL);
+    for(int i = 0; i < pool->num_threads; i++) pthread_join(pool->threads[i], NULL);
 
     free(pool->threads);
     pthread_mutex_destroy(&pool->mutex);
@@ -345,8 +346,7 @@ void obmafs3_compress_pool_destroy(struct obmafs3_ctx *ctx)
  * The batch is stored inside the pool (pool->batch_data) so that
  * late-waking worker threads never access freed stack memory.
  */
-static void compress_pool_submit(struct compress_pool *pool,
-                                 struct compress_job *jobs, int total)
+static void compress_pool_submit(struct compress_pool *pool, struct compress_job *jobs, int total)
 {
     if(!pool)
     {
@@ -358,19 +358,16 @@ static void compress_pool_submit(struct compress_pool *pool,
         atomic_init(&batch.done, 0);
         ZSTD_CCtx *probe_cctx = ZSTD_createCCtx();
         ZSTD_CCtx *cctx       = ZSTD_createCCtx();
-        if(cctx && probe_cctx)
-        {
-            compress_worker_run(&batch, probe_cctx, cctx);
-        }
+        if(cctx && probe_cctx) { compress_worker_run(&batch, probe_cctx, cctx); }
         if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
-        if(cctx)       ZSTD_freeCCtx(cctx);
+        if(cctx) ZSTD_freeCCtx(cctx);
         return;
     }
 
     /* Fill the pool-owned batch so workers always reference valid memory */
     struct compress_batch *batch = &pool->batch_data;
-    batch->jobs  = jobs;
-    batch->total = total;
+    batch->jobs                  = jobs;
+    batch->total                 = total;
     atomic_init(&batch->next, 0);
     atomic_init(&batch->done, 0);
 
@@ -401,13 +398,12 @@ static void compress_pool_submit(struct compress_pool *pool,
             }
         }
         if(probe_cctx) ZSTD_freeCCtx(probe_cctx);
-        if(cctx)       ZSTD_freeCCtx(cctx);
+        if(cctx) ZSTD_freeCCtx(cctx);
     }
 
     /* Wait for all jobs to complete (may already be done) */
     pthread_mutex_lock(&pool->mutex);
-    while(atomic_load(&batch->done) < batch->total)
-        pthread_cond_wait(&pool->batch_done, &pool->mutex);
+    while(atomic_load(&batch->done) < batch->total) pthread_cond_wait(&pool->batch_done, &pool->mutex);
 
     pool->batch_active = 0;
     pthread_mutex_unlock(&pool->mutex);
@@ -463,7 +459,7 @@ void obmafs3_pool_submit_async(struct compress_pool *pool, struct pool_async_job
     {
         /* Inline fallback */
         ZSTD_CCtx *cctx = ZSTD_createCCtx();
-        job->result = job->fn(job->arg, cctx);
+        job->result     = job->fn(job->arg, cctx);
         if(cctx) ZSTD_freeCCtx(cctx);
         atomic_store(&job->done, 1);
         return;
@@ -472,10 +468,7 @@ void obmafs3_pool_submit_async(struct compress_pool *pool, struct pool_async_job
     pthread_mutex_lock(&pool->mutex);
     /* Append to queue tail to preserve FIFO order */
     job->next = NULL;
-    if(!pool->async_queue)
-    {
-        pool->async_queue = job;
-    }
+    if(!pool->async_queue) { pool->async_queue = job; }
     else
     {
         struct pool_async_job *tail = pool->async_queue;
@@ -493,8 +486,7 @@ int obmafs3_pool_wait_async(struct pool_async_job *job)
 {
     if(!job) return OBMAFS3_OK;
     pthread_mutex_lock(&job->mtx);
-    while(!atomic_load(&job->done))
-        pthread_cond_wait(&job->cond, &job->mtx);
+    while(!atomic_load(&job->done)) pthread_cond_wait(&job->cond, &job->mtx);
     pthread_mutex_unlock(&job->mtx);
     return job->result;
 }
@@ -629,12 +621,11 @@ static uint16_t overflow_index_find(const uint8_t *buf, uint16_t node_keys, uint
 
     while(lo <= hi)
     {
-        int                          mid = lo + (hi - lo) / 2;
-        struct overflow_index_entry  ie;
+        int                         mid = lo + (hi - lo) / 2;
+        struct overflow_index_entry ie;
         memcpy(&ie, data + (size_t)mid * sizeof(ie), sizeof(ie));
 
-        if(ie.inode_id < inode_id ||
-           (ie.inode_id == inode_id && ie.logical_offset <= logical_offset))
+        if(ie.inode_id < inode_id || (ie.inode_id == inode_id && ie.logical_offset <= logical_offset))
         {
             result = (uint16_t)mid;
             lo     = mid + 1;
@@ -668,8 +659,8 @@ static uint16_t overflow_index_find_left(const uint8_t *buf, uint16_t node_keys,
 
     while(lo <= hi)
     {
-        int                          mid = lo + (hi - lo) / 2;
-        struct overflow_index_entry  ie;
+        int                         mid = lo + (hi - lo) / 2;
+        struct overflow_index_entry ie;
         memcpy(&ie, data + (size_t)mid * sizeof(ie), sizeof(ie));
         if(ie.inode_id < inode_id)
         {
@@ -768,9 +759,9 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
     struct btree_node_header leaf_hdr;
     memcpy(&leaf_hdr, buf, sizeof(leaf_hdr));
 
-    int      idx        = overflow_leaf_find(buf, leaf_hdr.node_keys, entry->inode_id, entry->logical_offset);
-    uint16_t max_leaf   = overflow_leaf_max_keys(ctx);
-    size_t   rec_sz     = sizeof(struct overflow_extent);
+    int      idx      = overflow_leaf_find(buf, leaf_hdr.node_keys, entry->inode_id, entry->logical_offset);
+    uint16_t max_leaf = overflow_leaf_max_keys(ctx);
+    size_t   rec_sz   = sizeof(struct overflow_extent);
 
     /* Exact match — update the existing record in place (no duplicate) */
     if(idx >= 0)
@@ -1278,8 +1269,8 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
         /* Uncompressed: read blocks directly into out_buf */
         for(uint64_t i = 0; i < logical_count; i++)
         {
-            int rc = obmafs3_block_read(ctx, ext->phys_start + offset_in_ext + i,
-                                        out_buf + i * (size_t)block_size, (size_t)block_size);
+            int rc = obmafs3_block_read(ctx, ext->phys_start + offset_in_ext + i, out_buf + i * (size_t)block_size,
+                                        (size_t)block_size);
             if(rc != OBMAFS3_OK) return rc;
         }
     }
@@ -1300,8 +1291,8 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
         if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
 
         /* Verify checksum */
-        size_t  check_size = (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? (size_t)bhdr.compressed_size
-                                                                          : (size_t)bhdr.original_size;
+        size_t check_size =
+            (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? (size_t)bhdr.compressed_size : (size_t)bhdr.original_size;
         uint8_t computed[32];
         obmafs3_checksum_block(phys_buf + sizeof(bhdr), check_size, computed);
         if(memcmp(computed, bhdr.checksum, 32) != 0) DBG_RETURN(OBMAFS3_ERR_CHECKSUM, "checksum mismatch");
@@ -1311,8 +1302,8 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
             /* Full extent read → decompress directly into out_buf */
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
-                                            out_buf, (size_t)bhdr.original_size);
+                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
+                                            (size_t)bhdr.compressed_size, out_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) return rc;
             }
             else
@@ -1326,8 +1317,8 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
             uint8_t *decomp = obmafs3_get_thread_bufs(ctx)->io_buf2;
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr), (size_t)bhdr.compressed_size,
-                                            decomp, (size_t)bhdr.original_size);
+                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
+                                            (size_t)bhdr.compressed_size, decomp, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) return rc;
             }
             else
@@ -1392,20 +1383,19 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
         size_t   off_in_block = (size_t)(read_pos % block_size);
 
         struct extent_descriptor ext;
-        if(!find_extent(ctx, inode, logical_blk, &ext))
-            DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
+        if(!find_extent(ctx, inode, logical_blk, &ext)) DBG_RETURN(OBMAFS3_ERR_IO, "I/O error");
 
         if(ext.logical_count == ext.phys_count)
         {
             /* Uncompressed extent — read as many blocks as we need in one pass */
-            uint64_t blk_in_ext   = logical_blk - ext.logical_start;
-            uint64_t blks_left    = ext.logical_count - blk_in_ext;
-            uint8_t *block_buf    = obmafs3_get_thread_bufs(ctx)->io_buf;
+            uint64_t blk_in_ext = logical_blk - ext.logical_start;
+            uint64_t blks_left  = ext.logical_count - blk_in_ext;
+            uint8_t *block_buf  = obmafs3_get_thread_bufs(ctx)->io_buf;
 
             /* How many bytes remain in this extent from the current read position */
-            size_t ext_avail   = (size_t)(blks_left * block_size) - off_in_block;
-            size_t want        = size - bytes_read;
-            size_t to_consume  = (want < ext_avail) ? want : ext_avail;
+            size_t ext_avail  = (size_t)(blks_left * block_size) - off_in_block;
+            size_t want       = size - bytes_read;
+            size_t to_consume = (want < ext_avail) ? want : ext_avail;
 
             /* Read block by block and copy the relevant portion.
              * For the first block, skip off_in_block bytes.  For internal
@@ -1428,9 +1418,8 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
                 if(blk_off == 0 && chunk == block_size)
                 {
                     /* Full-block read directly into output buffer */
-                    int rc = obmafs3_block_read(ctx, phys_lba,
-                                                (uint8_t *)buf + bytes_read + consumed,
-                                                (size_t)block_size);
+                    int rc =
+                        obmafs3_block_read(ctx, phys_lba, (uint8_t *)buf + bytes_read + consumed, (size_t)block_size);
                     if(rc != OBMAFS3_OK) return rc;
                 }
                 else
@@ -1471,8 +1460,7 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
                 if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
                 {
                     int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
-                                                (size_t)bhdr.compressed_size, decomp_buf,
-                                                (size_t)bhdr.original_size);
+                                                (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                     if(rc != OBMAFS3_OK) return rc;
                 }
                 else
@@ -1518,7 +1506,7 @@ static int overflow_collect_extents(struct obmafs3_ctx *ctx, uint64_t inode_id, 
     uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
     if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
-    struct extent_descriptor *exts = NULL;
+    struct extent_descriptor *exts  = NULL;
     uint64_t                  count = 0, cap = 0;
 
     /* Navigate to first relevant leaf */
@@ -1564,7 +1552,7 @@ static int overflow_collect_extents(struct obmafs3_ctx *ctx, uint64_t inode_id, 
 
             if(count >= cap)
             {
-                cap                          = (cap == 0) ? 64 : cap * 2;
+                cap                           = (cap == 0) ? 64 : cap * 2;
                 struct extent_descriptor *tmp = realloc(exts, (size_t)cap * sizeof(*tmp));
                 if(!tmp)
                 {
@@ -1700,7 +1688,7 @@ static int collect_all_extents(struct obmafs3_ctx *ctx, const struct inode_recor
     /* Collect overflow extents */
     struct extent_descriptor *ovf_exts  = NULL;
     uint64_t                  ovf_count = 0;
-    int rc = overflow_collect_extents(ctx, inode->inode_id, &ovf_exts, &ovf_count);
+    int                       rc        = overflow_collect_extents(ctx, inode->inode_id, &ovf_exts, &ovf_count);
     if(rc != OBMAFS3_OK) return rc;
 
     uint64_t total = inline_count + ovf_count;
@@ -1854,8 +1842,8 @@ static int write_extent_list(struct obmafs3_ctx *ctx, struct inode_record *inode
  *
  * This turns sequential file writes from O(n²) to O(n).
  */
-static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *inode, uint64_t offset,
-                                  const void *buf, size_t size)
+static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *inode, uint64_t offset, const void *buf,
+                                  size_t size)
 {
     uint64_t block_size  = ctx->sb.block_size;
     uint64_t group_size  = OBMAFS3_COMPRESS_GROUP_BLOCKS;
@@ -1907,7 +1895,7 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
         uint64_t grp_start = g * group_size;
         uint64_t grp_end   = (g + 1) * group_size;
         if(grp_end > total_logical) grp_end = total_logical;
-        uint64_t grp_count = grp_end - grp_start;
+        uint64_t grp_count   = grp_end - grp_start;
         size_t   grp_bytes_i = (size_t)(grp_count * block_size);
 
         grp_counts[gi] = grp_count;
@@ -1987,10 +1975,7 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
         }
     }
 
-    if(any_compressible && jobs)
-    {
-        compress_pool_submit(ctx->compress_pool, jobs, num_groups);
-    }
+    if(any_compressible && jobs) { compress_pool_submit(ctx->compress_pool, jobs, num_groups); }
 
     /* -------------------------------------------------------------- */
     /*  Phase 3 — allocate blocks, write data, record extents          */
@@ -2000,7 +1985,7 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
 
     for(int gi = 0; gi < num_groups; gi++)
     {
-        uint64_t grp_count = grp_counts[gi];
+        uint64_t grp_count  = grp_counts[gi];
         uint64_t phys_start = 0;
         uint64_t phys_count = 0;
 
@@ -2008,7 +1993,7 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
         if(jobs && jobs[gi].use_compressed)
         {
             uint64_t phys_needed = jobs[gi].phys_needed;
-            rc = obmafs3_alloc_blocks(ctx, phys_needed, &phys_start);
+            rc                   = obmafs3_alloc_blocks(ctx, phys_needed, &phys_start);
             if(rc != OBMAFS3_OK) goto cleanup;
 
             for(uint64_t b = 0; b < phys_needed; b++)
@@ -2027,8 +2012,8 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
 
             for(uint64_t b = 0; b < grp_count; b++)
             {
-                rc = obmafs3_block_write(ctx, phys_start + b, grp_bufs[gi] + b * (size_t)block_size,
-                                         (size_t)block_size);
+                rc =
+                    obmafs3_block_write(ctx, phys_start + b, grp_bufs[gi] + b * (size_t)block_size, (size_t)block_size);
                 if(rc != OBMAFS3_OK) goto cleanup;
             }
             phys_count = grp_count;
@@ -2125,9 +2110,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
     uint64_t last_group  = last_block / group_size;
 
     /* Collect all existing extents */
-    struct extent_descriptor *ext_list = NULL;
+    struct extent_descriptor *ext_list  = NULL;
     uint64_t                  ext_count = 0;
-    rc = collect_all_extents(ctx, inode, &ext_list, &ext_count);
+    rc                                  = collect_all_extents(ctx, inode, &ext_list, &ext_count);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Pre-size the extent list for the new extents we'll add */
@@ -2166,7 +2151,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         /* Read existing data from extents that overlap this group */
         for(uint64_t ei = 0; ei < ext_count; ei++)
         {
-            struct extent_descriptor *e = &ext_list[ei];
+            struct extent_descriptor *e     = &ext_list[ei];
             uint64_t                  e_end = e->logical_start + e->logical_count;
 
             /* Check for overlap with [grp_start, grp_end) */
@@ -2206,7 +2191,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
          * Compressed extents that straddle (shouldn't happen by design) are freed entirely. */
         for(uint64_t ei = 0; ei < ext_count;)
         {
-            struct extent_descriptor *e = &ext_list[ei];
+            struct extent_descriptor *e     = &ext_list[ei];
             uint64_t                  e_end = e->logical_start + e->logical_count;
 
             if(e_end <= grp_start || e->logical_start >= grp_end)
@@ -2265,7 +2250,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                 /* Insert the right residual part */
                 if(ext_count >= ext_cap)
                 {
-                    ext_cap                       = ext_cap * 2 + 16;
+                    ext_cap                        = ext_cap * 2 + 16;
                     struct extent_descriptor *tmp2 = realloc(ext_list, (size_t)ext_cap * sizeof(*tmp2));
                     if(!tmp2)
                     {
@@ -2294,16 +2279,16 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         }
 
         /* ---- Compress and write the group ---- */
-        uint64_t phys_start    = 0;
-        uint64_t phys_count    = 0;
+        uint64_t phys_start     = 0;
+        uint64_t phys_count     = 0;
         int      use_compressed = 0;
 
         /* Only attempt compression for full groups */
         if(ctx->compression && grp_count == group_size && grp_bytes > 0)
         {
-            uint8_t *comp_out     = obmafs3_get_thread_bufs(ctx)->comp_buf;
-            size_t   comp_cap     = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
-            size_t   comp_size    = comp_cap;
+            uint8_t *comp_out  = obmafs3_get_thread_bufs(ctx)->comp_buf;
+            size_t   comp_cap  = obmafs3_get_thread_bufs(ctx)->comp_buf_size - sizeof(struct block_header);
+            size_t   comp_size = comp_cap;
 
             /* Fast probe: skip expensive compression if data is incompressible.
              * Use a SEPARATE ZSTD context for the probe — sharing the same
@@ -2311,9 +2296,9 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
              * triggers a stale-window assertion in ZSTD's btopt match finder. */
             int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_probe_cctx, group_data, grp_bytes,
                                                comp_out + sizeof(struct block_header), comp_cap, ctx->zstd_level);
-            rc = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes, comp_out + sizeof(struct block_header),
-                                          &comp_size, ctx->zstd_level)
-                       : OBMAFS3_ERR_IO;
+            rc        = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
+                                                 comp_out + sizeof(struct block_header), &comp_size, ctx->zstd_level)
+                              : OBMAFS3_ERR_IO;
             if(rc == OBMAFS3_OK)
             {
                 uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
@@ -2342,7 +2327,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     memcpy(comp_out, &bhdr, sizeof(bhdr));
 
                     /* Zero-pad the last physical block */
-                    size_t used            = sizeof(bhdr) + comp_size;
+                    size_t used             = sizeof(bhdr) + comp_size;
                     size_t total_phys_bytes = (size_t)(phys_needed * block_size);
                     if(used < total_phys_bytes) memset(comp_out + used, 0, total_phys_bytes - used);
 
@@ -2391,7 +2376,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
         /* Add the new extent to the list (sorted insert) */
         if(ext_count >= ext_cap)
         {
-            ext_cap                       = ext_cap * 2 + 16;
+            ext_cap                        = ext_cap * 2 + 16;
             struct extent_descriptor *tmp2 = realloc(ext_list, (size_t)ext_cap * sizeof(*tmp2));
             if(!tmp2)
             {
@@ -2404,8 +2389,7 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
 
         uint64_t ins = 0;
         while(ins < ext_count && ext_list[ins].logical_start < grp_start) ins++;
-        if(ins < ext_count)
-            memmove(&ext_list[ins + 1], &ext_list[ins], (size_t)(ext_count - ins) * sizeof(*ext_list));
+        if(ins < ext_count) memmove(&ext_list[ins + 1], &ext_list[ins], (size_t)(ext_count - ins) * sizeof(*ext_list));
         ext_list[ins].logical_start = grp_start;
         ext_list[ins].logical_count = grp_count;
         ext_list[ins].phys_start    = phys_start;
@@ -2453,7 +2437,7 @@ int obmafs3_free_file_blocks(struct obmafs3_ctx *ctx, struct inode_record *inode
     /* Free overflow extent blocks */
     struct extent_descriptor *ovf_exts  = NULL;
     uint64_t                  ovf_count = 0;
-    int rc = overflow_collect_extents(ctx, inode->inode_id, &ovf_exts, &ovf_count);
+    int                       rc        = overflow_collect_extents(ctx, inode->inode_id, &ovf_exts, &ovf_count);
     if(rc != OBMAFS3_OK) return rc;
 
     for(uint64_t i = 0; i < ovf_count; i++) free_extent_phys(ctx, &ovf_exts[i]);
@@ -2480,7 +2464,7 @@ int obmafs3_truncate_file_blocks(struct obmafs3_ctx *ctx, struct inode_record *i
 {
     struct extent_descriptor *list  = NULL;
     uint64_t                  count = 0;
-    int rc = collect_all_extents(ctx, inode, &list, &count);
+    int                       rc    = collect_all_extents(ctx, inode, &list, &count);
     if(rc != OBMAFS3_OK) return rc;
 
     /* Sum total logical blocks */
@@ -2494,7 +2478,7 @@ int obmafs3_truncate_file_blocks(struct obmafs3_ctx *ctx, struct inode_record *i
     }
 
     /* Walk extents, trim at the truncation point */
-    uint64_t keep_count = 0;
+    uint64_t keep_count  = 0;
     uint64_t logical_pos = 0;
 
     for(uint64_t i = 0; i < count; i++)
@@ -2629,15 +2613,15 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
     uint64_t dst_log_start = dst_offset / block_size;
 
     /* ---- Collect source extents ---- */
-    struct extent_descriptor *src_exts     = NULL;
+    struct extent_descriptor *src_exts      = NULL;
     uint64_t                  src_ext_count = 0;
-    rc = collect_all_extents(ctx, src_inode, &src_exts, &src_ext_count);
+    rc                                      = collect_all_extents(ctx, src_inode, &src_exts, &src_ext_count);
     if(rc != OBMAFS3_OK) return rc;
 
     /* ---- Collect destination extents ---- */
-    struct extent_descriptor *dst_exts     = NULL;
+    struct extent_descriptor *dst_exts      = NULL;
     uint64_t                  dst_ext_count = 0;
-    rc = collect_all_extents(ctx, dst_inode, &dst_exts, &dst_ext_count);
+    rc                                      = collect_all_extents(ctx, dst_inode, &dst_exts, &dst_ext_count);
     if(rc != OBMAFS3_OK)
     {
         free(src_exts);
@@ -2659,7 +2643,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
 
     for(uint64_t i = 0; i < src_ext_count; i++)
     {
-        struct extent_descriptor *se = &src_exts[i];
+        struct extent_descriptor *se     = &src_exts[i];
         uint64_t                  se_end = se->logical_start + se->logical_count;
 
         if(se_end <= src_log_start || se->logical_start >= src_range_end) continue;
@@ -2688,7 +2672,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
         if(se->logical_count == se->phys_count)
         {
             /* Uncompressed: share the overlapping physical blocks */
-            uint64_t phys_off = overlap_start - se->logical_start;
+            uint64_t phys_off                     = overlap_start - se->logical_start;
             clone_exts[clone_count].logical_start = dst_log;
             clone_exts[clone_count].logical_count = overlap_count;
             clone_exts[clone_count].phys_start    = se->phys_start + phys_off;
@@ -2789,7 +2773,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
     uint64_t dst_range_end = dst_log_start + num_logical;
     for(uint64_t i = 0; i < dst_ext_count; i++)
     {
-        struct extent_descriptor *de = &dst_exts[i];
+        struct extent_descriptor *de     = &dst_exts[i];
         uint64_t                  de_end = de->logical_start + de->logical_count;
 
         if(de_end <= dst_log_start || de->logical_start >= dst_range_end) continue;
@@ -2825,7 +2809,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
     /* Add surviving destination extents before the clone range */
     for(uint64_t i = 0; i < dst_ext_count; i++)
     {
-        struct extent_descriptor *de = &dst_exts[i];
+        struct extent_descriptor *de     = &dst_exts[i];
         uint64_t                  de_end = de->logical_start + de->logical_count;
 
         if(de_end <= dst_log_start)
@@ -2851,7 +2835,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
     /* Add surviving destination extents after the clone range */
     for(uint64_t i = 0; i < dst_ext_count; i++)
     {
-        struct extent_descriptor *de = &dst_exts[i];
+        struct extent_descriptor *de     = &dst_exts[i];
         uint64_t                  de_end = de->logical_start + de->logical_count;
 
         if(de->logical_start >= dst_range_end)
@@ -2863,7 +2847,7 @@ int obmafs3_clone_file_range(struct obmafs3_ctx *ctx, const struct inode_record 
         /* Keep the right part of an uncompressed extent that straddles the end */
         if(de_end > dst_range_end && de->logical_count == de->phys_count)
         {
-            uint64_t skip                         = dst_range_end - de->logical_start;
+            uint64_t skip                     = dst_range_end - de->logical_start;
             new_list[new_count].logical_start = dst_range_end;
             new_list[new_count].logical_count = de->logical_count - skip;
             new_list[new_count].phys_start    = de->phys_start + skip;

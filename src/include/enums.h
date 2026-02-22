@@ -102,22 +102,22 @@ enum obmafs3_cd_sector_mode
 /// Metadata query comparison operators (lexicographic).
 enum obmafs3_query_op
 {
-    kQueryOpEqual      = 0, ///< strcmp == 0
-    kQueryOpNotEqual   = 1, ///< strcmp != 0
-    kQueryOpGreater    = 2, ///< strcmp > 0
-    kQueryOpLess       = 3, ///< strcmp < 0
-    kQueryOpGreaterEq  = 4, ///< strcmp >= 0
-    kQueryOpLessEq     = 5, ///< strcmp <= 0
-    kQueryOpContains   = 6, ///< strstr != NULL
-    kQueryOpStartsWith = 7, ///< strncmp prefix == 0
-    kQueryOpExists     = 8  ///< key exists, value ignored
+    kQueryOpEqual      = 0,  ///< strcmp == 0
+    kQueryOpNotEqual   = 1,  ///< strcmp != 0
+    kQueryOpGreater    = 2,  ///< strcmp > 0
+    kQueryOpLess       = 3,  ///< strcmp < 0
+    kQueryOpGreaterEq  = 4,  ///< strcmp >= 0
+    kQueryOpLessEq     = 5,  ///< strcmp <= 0
+    kQueryOpContains   = 6,  ///< strstr != NULL
+    kQueryOpStartsWith = 7,  ///< strncmp prefix == 0
+    kQueryOpExists     = 8   ///< key exists, value ignored
 };
 
 /// How to combine multiple query filters.
 enum obmafs3_query_combine
 {
-    kQueryCombineAnd = 0, ///< All filters must match
-    kQueryCombineOr  = 1  ///< At least one filter must match
+    kQueryCombineAnd = 0,  ///< All filters must match
+    kQueryCombineOr  = 1   ///< At least one filter must match
 };
 
 #endif /* OBMAFS3_ENUMS_H */

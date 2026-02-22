@@ -227,12 +227,11 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
             nodes_visited++;
             {
                 char pfx[80];
-                snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] nodes",
-                         t + 1, tree_count);
+                snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] nodes", t + 1, tree_count);
                 print_bar(pfx, nodes_visited, (uint64_t)thdr.total_nodes);
             }
 
-            rc           = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
+            rc = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
             if(rc != OBMAFS3_OK) break;
 
             struct btree_node_header nhdr;
@@ -309,8 +308,8 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
                 {
                     {
                         char pfx[80];
-                        snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] blocks",
-                                 t + 1, tree_count);
+                        snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] blocks", t + 1,
+                                 tree_count);
                         print_bar(pfx, b + 1, base_count);
                     }
 
@@ -364,14 +363,14 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
     print_human_size(ctx->sb.dedup_block_size);
     printf("\n");
 
-    uint64_t grand_dedup_entries     = 0;
-    uint64_t grand_unique_blocks     = 0;
+    uint64_t grand_dedup_entries       = 0;
+    uint64_t grand_unique_blocks       = 0;
     uint64_t grand_unique_sector_bytes = 0;
-    uint64_t grand_original          = 0;
-    uint64_t grand_compressed        = 0;
-    uint64_t grand_physical          = 0;
-    uint64_t grand_compressed_blks   = 0;
-    uint64_t grand_uncompressed_blks = 0;
+    uint64_t grand_original            = 0;
+    uint64_t grand_compressed          = 0;
+    uint64_t grand_physical            = 0;
+    uint64_t grand_compressed_blks     = 0;
+    uint64_t grand_uncompressed_blks   = 0;
 
     for(uint64_t t = 0; t < tree_count; t++)
     {

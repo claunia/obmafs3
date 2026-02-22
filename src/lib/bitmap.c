@@ -39,8 +39,8 @@
  * The first bitmap block starts with a bitmap_header (magic + checksum),
  * followed by bitmap data. Subsequent blocks contain only bitmap data.
  */
-#include "obmafs.h"
 #include "debug.h"
+#include "obmafs.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -347,7 +347,7 @@ int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *
             {
                 /* Entire word is allocated – skip it */
                 run_len = 0;
-                bit = (word_idx + 1) * 64;
+                bit     = (word_idx + 1) * 64;
                 continue;
             }
 
@@ -355,7 +355,7 @@ int obmafs3_bitmap_find_free(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *
             uint64_t free_mask = ~word; /* 1-bits mark free blocks */
             while(free_mask)
             {
-                unsigned pos = (unsigned)__builtin_ctzll(free_mask);
+                unsigned pos     = (unsigned)__builtin_ctzll(free_mask);
                 uint64_t abs_bit = word_idx * 64 + pos;
 
                 if(abs_bit >= scan_end) break;

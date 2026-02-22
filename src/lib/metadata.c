@@ -1979,7 +1979,11 @@ static int idset_intersect(const struct inode_id_set *a, const struct inode_id_s
     {
         if(a->ids[i] == b->ids[j])
         {
-            if(idset_add(out, a->ids[i])) { idset_free(out); return -1; }
+            if(idset_add(out, a->ids[i]))
+            {
+                idset_free(out);
+                return -1;
+            }
             i++;
             j++;
         }
@@ -2000,28 +2004,48 @@ static int idset_union(const struct inode_id_set *a, const struct inode_id_set *
     {
         if(a->ids[i] == b->ids[j])
         {
-            if(idset_add(out, a->ids[i])) { idset_free(out); return -1; }
+            if(idset_add(out, a->ids[i]))
+            {
+                idset_free(out);
+                return -1;
+            }
             i++;
             j++;
         }
         else if(a->ids[i] < b->ids[j])
         {
-            if(idset_add(out, a->ids[i])) { idset_free(out); return -1; }
+            if(idset_add(out, a->ids[i]))
+            {
+                idset_free(out);
+                return -1;
+            }
             i++;
         }
         else
         {
-            if(idset_add(out, b->ids[j])) { idset_free(out); return -1; }
+            if(idset_add(out, b->ids[j]))
+            {
+                idset_free(out);
+                return -1;
+            }
             j++;
         }
     }
     while(i < a->count)
     {
-        if(idset_add(out, a->ids[i++])) { idset_free(out); return -1; }
+        if(idset_add(out, a->ids[i++]))
+        {
+            idset_free(out);
+            return -1;
+        }
     }
     while(j < b->count)
     {
-        if(idset_add(out, b->ids[j++])) { idset_free(out); return -1; }
+        if(idset_add(out, b->ids[j++]))
+        {
+            idset_free(out);
+            return -1;
+        }
     }
     return 0;
 }
@@ -2038,19 +2062,26 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
 {
     switch(op)
     {
-        case kQueryOpEqual: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) == 0;
+        case kQueryOpEqual:
+            return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) == 0;
 
-        case kQueryOpNotEqual: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) != 0;
+        case kQueryOpNotEqual:
+            return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) != 0;
 
-        case kQueryOpGreater: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) > 0;
+        case kQueryOpGreater:
+            return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) > 0;
 
-        case kQueryOpLess: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) < 0;
+        case kQueryOpLess:
+            return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) < 0;
 
-        case kQueryOpGreaterEq: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) >= 0;
+        case kQueryOpGreaterEq:
+            return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) >= 0;
 
-        case kQueryOpLessEq: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) <= 0;
+        case kQueryOpLessEq:
+            return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) <= 0;
 
-        case kQueryOpContains: return strstr(rec_value, flt_value) != NULL;
+        case kQueryOpContains:
+            return strstr(rec_value, flt_value) != NULL;
 
         case kQueryOpStartsWith:
         {
@@ -2058,9 +2089,11 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
             return strncmp(rec_value, flt_value, plen) == 0;
         }
 
-        case kQueryOpExists: return 1; /* key exists — always matches */
+        case kQueryOpExists:
+            return 1; /* key exists — always matches */
 
-        default: return 0;
+        default:
+            return 0;
     }
 }
 
@@ -2097,11 +2130,19 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
         while(1)
         {
             int rc = meta_node_read(ctx, lba, buf);
-            if(rc != OBMAFS3_OK) { free(buf); return rc; }
+            if(rc != OBMAFS3_OK)
+            {
+                free(buf);
+                return rc;
+            }
 
             struct btree_node_header hdr;
             memcpy(&hdr, buf, sizeof(hdr));
-            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+            {
+                free(buf);
+                DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
+            }
             if(hdr.level == 0) break;
 
             struct metadata_idx_index_entry ie;
@@ -2116,11 +2157,19 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
         while(1)
         {
             int rc = meta_node_read(ctx, lba, buf);
-            if(rc != OBMAFS3_OK) { free(buf); return rc; }
+            if(rc != OBMAFS3_OK)
+            {
+                free(buf);
+                return rc;
+            }
 
             struct btree_node_header hdr;
             memcpy(&hdr, buf, sizeof(hdr));
-            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+            {
+                free(buf);
+                DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
+            }
             if(hdr.level == 0) break;
 
             uint16_t                        slot = midx_index_find(buf, hdr.node_keys, flt->key, empty_val, 0);
@@ -2145,8 +2194,8 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
             if(!wildcard)
             {
                 int kcmp = strncmp(rec.key, flt->key, METADATA_KEY_MAX);
-                if(kcmp < 0) continue;           /* haven't reached the key yet */
-                if(kcmp > 0) goto collect_done;   /* past the key — done */
+                if(kcmp < 0) continue;          /* haven't reached the key yet */
+                if(kcmp > 0) goto collect_done; /* past the key — done */
             }
 
             /* Key matches (or wildcard) — apply the operator against the value */
@@ -2162,7 +2211,11 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
 
         if(hdr.right_link == 0) break;
         int rc = meta_node_read(ctx, hdr.right_link, buf);
-        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            return rc;
+        }
     }
 
 collect_done:
@@ -2227,7 +2280,7 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
         for(uint8_t f = 1; f < filter_count; f++)
         {
             struct inode_id_set combined;
-            int rc;
+            int                 rc;
             if(combine == kQueryCombineAnd)
                 rc = idset_intersect(&result, &sets[f], &combined);
             else

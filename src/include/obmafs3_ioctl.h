@@ -212,13 +212,13 @@ struct obmafs3_ioctl_query_filter
  */
 struct obmafs3_ioctl_metadata_query_arg
 {
-    uint8_t                    combine;                                        /**< enum obmafs3_query_combine */
-    uint8_t                          filter_count;                                   /**< 1..OBMAFS3_QUERY_MAX_FILTERS */
-    uint8_t                          _pad[6];                                        /**< Alignment padding */
-    struct obmafs3_ioctl_query_filter filters[OBMAFS3_QUERY_MAX_FILTERS];             /**< Filter conditions */
-    uint32_t                   offset;                                         /**< Input: starting offset */
-    uint32_t                   count;                                          /**< Output: paths returned */
-    char                       paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX]; /**< Output: up to 8 paths */
+    uint8_t                           combine;                            /**< enum obmafs3_query_combine */
+    uint8_t                           filter_count;                       /**< 1..OBMAFS3_QUERY_MAX_FILTERS */
+    uint8_t                           _pad[6];                            /**< Alignment padding */
+    struct obmafs3_ioctl_query_filter filters[OBMAFS3_QUERY_MAX_FILTERS]; /**< Filter conditions */
+    uint32_t                          offset;                             /**< Input: starting offset */
+    uint32_t                          count;                              /**< Output: paths returned */
+    char paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX];      /**< Output: up to 8 paths */
 };
 
 #define OBMAFS3_IOC_QUERY_METADATA _IOWR('O', 11, struct obmafs3_ioctl_metadata_query_arg)

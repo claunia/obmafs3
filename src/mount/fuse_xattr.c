@@ -34,8 +34,8 @@
  * Implements: getxattr, setxattr, listxattr, removexattr
  */
 
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 #include "tags.h"
 
 /* ------------------------------------------------------------------ */

@@ -30,9 +30,10 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
-#include "obmafs.h"
 #include "debug.h"
+#include "obmafs.h"
 
+#include <execinfo.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -42,7 +43,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
-#include <execinfo.h>
 
 /* Global debug flag (default off; set OBMAFS3_DEBUG=1 to enable). */
 int obmafs3_debug = 0;
@@ -64,7 +64,7 @@ static void thread_bufs_destroy(void *ptr)
     free(tb->io_buf);
     free(tb->io_buf2);
     free(tb->comp_buf);
-    if(tb->zstd_cctx)       ZSTD_freeCCtx(tb->zstd_cctx);
+    if(tb->zstd_cctx) ZSTD_freeCCtx(tb->zstd_cctx);
     if(tb->zstd_probe_cctx) ZSTD_freeCCtx(tb->zstd_probe_cctx);
     if(tb->zstd_dctx) ZSTD_freeDCtx(tb->zstd_dctx);
     free(tb);
@@ -91,15 +91,15 @@ struct obmafs3_thread_bufs *obmafs3_get_thread_bufs(struct obmafs3_ctx *ctx)
     size_t comp_need   = sizeof(struct block_header) + ZSTD_compressBound(group_bytes);
     if(comp_need < group_bytes) comp_need = group_bytes;
 
-    tb->hdr_buf       = malloc(bs);
-    tb->node_buf      = malloc(bs);
-    tb->io_buf        = malloc(group_bytes);
-    tb->io_buf2       = malloc(group_bytes);
-    tb->comp_buf      = malloc(comp_need);
-    tb->comp_buf_size = comp_need;
-    tb->zstd_cctx     = ZSTD_createCCtx();
+    tb->hdr_buf         = malloc(bs);
+    tb->node_buf        = malloc(bs);
+    tb->io_buf          = malloc(group_bytes);
+    tb->io_buf2         = malloc(group_bytes);
+    tb->comp_buf        = malloc(comp_need);
+    tb->comp_buf_size   = comp_need;
+    tb->zstd_cctx       = ZSTD_createCCtx();
     tb->zstd_probe_cctx = ZSTD_createCCtx();
-    tb->zstd_dctx     = ZSTD_createDCtx();
+    tb->zstd_dctx       = ZSTD_createDCtx();
 
     if(!tb->hdr_buf || !tb->node_buf || !tb->io_buf || !tb->io_buf2 || !tb->comp_buf || !tb->zstd_cctx ||
        !tb->zstd_probe_cctx || !tb->zstd_dctx)
@@ -159,9 +159,8 @@ int obmafs3_block_read(struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t 
     off_t   offset = (off_t)(lba * ctx->sb.block_size);
     ssize_t n      = pread(ctx->fd, buf, size, offset);
     if(n < 0 || (size_t)n != size)
-        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                         "pread lba=%" PRIu64 " offset=%" PRId64 " size=%zu got=%zd",
-                         lba, (int64_t)offset, size, n);
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "pread lba=%" PRIu64 " offset=%" PRId64 " size=%zu got=%zd", lba,
+                         (int64_t)offset, size, n);
     return OBMAFS3_OK;
 }
 
@@ -179,9 +178,8 @@ int obmafs3_block_write(struct obmafs3_ctx *ctx, uint64_t lba, const void *buf, 
     off_t   offset = (off_t)(lba * ctx->sb.block_size);
     ssize_t n      = pwrite(ctx->fd, buf, size, offset);
     if(n < 0 || (size_t)n != size)
-        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                         "pwrite lba=%" PRIu64 " offset=%" PRId64 " size=%zu got=%zd",
-                         lba, (int64_t)offset, size, n);
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "pwrite lba=%" PRIu64 " offset=%" PRId64 " size=%zu got=%zd", lba,
+                         (int64_t)offset, size, n);
     return OBMAFS3_OK;
 }
 
@@ -219,8 +217,7 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     obmafs3_debug_init();
 
     int fd = open(path, O_RDWR);
-    if(fd < 0)
-        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "open(\"%s\", O_RDWR) failed", path);
+    if(fd < 0) DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "open(\"%s\", O_RDWR) failed", path);
 
     struct obmafs3_ctx *c = calloc(1, sizeof(*c));
     if(!c)
@@ -563,8 +560,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     fprintf(stderr, "[obmafs3] close: step 3 — warmup thread join\n");
     fflush(stderr);
     obmafs3_dedup_warmup_wait(ctx);
-    if(ctx->warmup_started)
-        pthread_join(ctx->warmup_thread, NULL);
+    if(ctx->warmup_started) pthread_join(ctx->warmup_thread, NULL);
     pthread_mutex_destroy(&ctx->warmup_mutex);
     pthread_cond_destroy(&ctx->warmup_cond);
 
@@ -576,8 +572,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
      * the B+Tree by the housekeeping thread on the next mount. */
     obmafs3_dedup_pending_flush_and_free(ctx);
 
-    fprintf(stderr, "[obmafs3] close: step 5 — keyset save (warmup_done=%d)\n",
-            ctx->warmup_done);
+    fprintf(stderr, "[obmafs3] close: step 5 — keyset save (warmup_done=%d)\n", ctx->warmup_done);
     fflush(stderr);
 
     /* Persist the dedup key set to disk before freeing it.
@@ -585,12 +580,10 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
      * and updates sb.keyset_lba / sb.keyset_blocks.
      * Only save if warmup completed — a partial keyset is worse than
      * none because the next mount would skip the tree scan. */
-    if(ctx->bitmap && ctx->fd >= 0 && ctx->dedup_key_set && ctx->warmup_done
-       && !ctx->warmup_running)
+    if(ctx->bitmap && ctx->fd >= 0 && ctx->dedup_key_set && ctx->warmup_done && !ctx->warmup_running)
     {
         int ks_rc = obmafs3_dedup_keyset_save(ctx);
-        if(ks_rc != OBMAFS3_OK)
-            fprintf(stderr, "[dedup-keyset] save failed (rc=%d)\n", ks_rc);
+        if(ks_rc != OBMAFS3_OK) fprintf(stderr, "[dedup-keyset] save failed (rc=%d)\n", ks_rc);
     }
     else if(ctx->dedup_key_set && (!ctx->warmup_done || ctx->warmup_running))
     {
@@ -746,7 +739,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
 
     sb.bitmap_lba    = 14; /* bitmap starts at block 14 */
     sb.bitmap_blocks = bitmap_blks;
-    sb.next_inode_id = 3;                /* root inode is 2, next is 3 */
+    sb.next_inode_id = 3; /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label, sizeof(sb.volume_label) - 1);
 
     /* Compute superblock checksum (checksum field is already zeroed) */

@@ -261,17 +261,41 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
     *need_value = 1;
 
     /* Two-character operators first */
-    if(p[0] == '!' && p[1] == '=') { *op = kQueryOpNotEqual; return p + 2; }
-    if(p[0] == '>' && p[1] == '=') { *op = kQueryOpGreaterEq; return p + 2; }
-    if(p[0] == '<' && p[1] == '=') { *op = kQueryOpLessEq; return p + 2; }
+    if(p[0] == '!' && p[1] == '=')
+    {
+        *op = kQueryOpNotEqual;
+        return p + 2;
+    }
+    if(p[0] == '>' && p[1] == '=')
+    {
+        *op = kQueryOpGreaterEq;
+        return p + 2;
+    }
+    if(p[0] == '<' && p[1] == '=')
+    {
+        *op = kQueryOpLessEq;
+        return p + 2;
+    }
 
     /* Single-character operators */
-    if(p[0] == '=') { *op = kQueryOpEqual; return p + 1; }
-    if(p[0] == '>') { *op = kQueryOpGreater; return p + 1; }
-    if(p[0] == '<') { *op = kQueryOpLess; return p + 1; }
+    if(p[0] == '=')
+    {
+        *op = kQueryOpEqual;
+        return p + 1;
+    }
+    if(p[0] == '>')
+    {
+        *op = kQueryOpGreater;
+        return p + 1;
+    }
+    if(p[0] == '<')
+    {
+        *op = kQueryOpLess;
+        return p + 1;
+    }
 
     /* Keyword operators */
-    char kw[32];
+    char        kw[32];
     const char *after = parse_token(p, kw, sizeof(kw));
     if(!after)
     {
@@ -279,9 +303,22 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
         return NULL;
     }
 
-    if(strcasecmp(kw, "CONTAINS") == 0)   { *op = kQueryOpContains; return after; }
-    if(strcasecmp(kw, "STARTSWITH") == 0)  { *op = kQueryOpStartsWith; return after; }
-    if(strcasecmp(kw, "EXISTS") == 0)      { *op = kQueryOpExists; *need_value = 0; return after; }
+    if(strcasecmp(kw, "CONTAINS") == 0)
+    {
+        *op = kQueryOpContains;
+        return after;
+    }
+    if(strcasecmp(kw, "STARTSWITH") == 0)
+    {
+        *op = kQueryOpStartsWith;
+        return after;
+    }
+    if(strcasecmp(kw, "EXISTS") == 0)
+    {
+        *op         = kQueryOpExists;
+        *need_value = 0;
+        return after;
+    }
 
     fprintf(stderr, "Error: unknown operator '%s'\n", kw);
     return NULL;
@@ -320,15 +357,12 @@ static const char *parse_one_filter(const char *p, struct obmafs3_ioctl_query_fi
     p = parse_operator(p, &flt->op, &need_value);
     if(!p) return NULL;
 
-    if(!need_value) return p;  /* EXISTS — no value */
+    if(!need_value) return p; /* EXISTS — no value */
 
     p = skip_ws(p);
 
     /* Parse value — quoted or unquoted */
-    if(*p == '"')
-    {
-        p = parse_quoted(p, flt->value, sizeof(flt->value));
-    }
+    if(*p == '"') { p = parse_quoted(p, flt->value, sizeof(flt->value)); }
     else
     {
         /* Allow unquoted single-word values */
@@ -362,8 +396,8 @@ static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_ar
 {
     memset(qa, 0, sizeof(*qa));
 
-    const char *p = input;
-    uint8_t     nf = 0;
+    const char *p           = input;
+    uint8_t     nf          = 0;
     int         combine_set = 0;
 
     while(1)
@@ -379,10 +413,10 @@ static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_ar
         nf++;
 
         p = skip_ws(p);
-        if(!*p) break;  /* end of input */
+        if(!*p) break; /* end of input */
 
         /* Expect AND or OR */
-        char kw[8];
+        char        kw[8];
         const char *after = parse_token(p, kw, sizeof(kw));
         if(!after)
         {
@@ -423,9 +457,9 @@ static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_ar
 /** Growable array of path strings collected from paginated queries. */
 struct result_set
 {
-    char   **paths;  /**< Heap-allocated array of strdup'd paths */
-    uint32_t count;  /**< Number of entries */
-    uint32_t cap;    /**< Allocated capacity */
+    char   **paths; /**< Heap-allocated array of strdup'd paths */
+    uint32_t count; /**< Number of entries */
+    uint32_t cap;   /**< Allocated capacity */
 };
 
 static void rs_init(struct result_set *rs)
@@ -448,12 +482,20 @@ static int rs_add(struct result_set *rs, const char *path)
     {
         uint32_t newcap = rs->cap ? rs->cap * 2 : 64;
         char   **tmp    = realloc(rs->paths, newcap * sizeof(char *));
-        if(!tmp) { fprintf(stderr, "Error: out of memory\n"); return -1; }
+        if(!tmp)
+        {
+            fprintf(stderr, "Error: out of memory\n");
+            return -1;
+        }
         rs->paths = tmp;
         rs->cap   = newcap;
     }
     rs->paths[rs->count] = strdup(path);
-    if(!rs->paths[rs->count]) { fprintf(stderr, "Error: out of memory\n"); return -1; }
+    if(!rs->paths[rs->count])
+    {
+        fprintf(stderr, "Error: out of memory\n");
+        return -1;
+    }
     rs->count++;
     return 0;
 }
@@ -472,13 +514,27 @@ static void json_escape(FILE *fp, const char *s)
     {
         switch(*s)
         {
-            case '"':  fputs("\\\"", fp); break;
-            case '\\': fputs("\\\\", fp); break;
-            case '\b': fputs("\\b", fp);  break;
-            case '\f': fputs("\\f", fp);  break;
-            case '\n': fputs("\\n", fp);  break;
-            case '\r': fputs("\\r", fp);  break;
-            case '\t': fputs("\\t", fp);  break;
+            case '"':
+                fputs("\\\"", fp);
+                break;
+            case '\\':
+                fputs("\\\\", fp);
+                break;
+            case '\b':
+                fputs("\\b", fp);
+                break;
+            case '\f':
+                fputs("\\f", fp);
+                break;
+            case '\n':
+                fputs("\\n", fp);
+                break;
+            case '\r':
+                fputs("\\r", fp);
+                break;
+            case '\t':
+                fputs("\\t", fp);
+                break;
             default:
                 if((unsigned char)*s < 0x20)
                     fprintf(fp, "\\u%04x", (unsigned char)*s);
@@ -562,9 +618,9 @@ static void offer_export(const struct result_set *rs)
     while(len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
 
     const char *p = skip_ws(line);
-    if(*p == '\0') return;  /* skip */
+    if(*p == '\0') return; /* skip */
 
-    char fmt[8];
+    char        fmt[8];
     const char *after = parse_token(p, fmt, sizeof(fmt));
     if(!after) return;
 
@@ -576,7 +632,7 @@ static void offer_export(const struct result_set *rs)
     }
 
     /* The rest of the line is the file path (may contain spaces) */
-    char filepath[4096];
+    char   filepath[4096];
     size_t flen = strlen(after);
     if(flen >= sizeof(filepath)) flen = sizeof(filepath) - 1;
     memcpy(filepath, after, flen);
@@ -693,10 +749,7 @@ static void print_help(void)
 /*  Usage                                                              */
 /* ------------------------------------------------------------------ */
 
-static void usage(const char *prog)
-{
-    fprintf(stderr, "Usage: %s <mountpoint>\n", prog);
-}
+static void usage(const char *prog) { fprintf(stderr, "Usage: %s <mountpoint>\n", prog); }
 
 /* ------------------------------------------------------------------ */
 /*  Read-eval-print loop                                               */
@@ -732,8 +785,7 @@ static void repl(const char *mountpoint, int query_fd)
         /* Skip empty lines */
         if(*cmd == '\0') continue;
 
-        if(strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "exit") == 0)
-            break;
+        if(strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "exit") == 0) break;
 
         if(strcasecmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0)
         {
@@ -743,8 +795,7 @@ static void repl(const char *mountpoint, int query_fd)
 
         /* Parse and execute as a query */
         struct obmafs3_ioctl_metadata_query_arg qa;
-        if(parse_query(cmd, &qa) == 0)
-            execute_query(query_fd, &qa);
+        if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa);
     }
 }
 

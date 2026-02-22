@@ -40,8 +40,8 @@
  * copy-on-write in the write path (see block.c).
  */
 
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 
 /**
  * FUSE callback: copy a range of data from one file to another by
@@ -62,8 +62,8 @@
  * @return Number of bytes cloned on success, or a negative errno.
  */
 static ssize_t obmafs3_fuse_copy_file_range_impl(const char *path_in, struct fuse_file_info *fi_in, off_t offset_in,
-                                     const char *path_out, struct fuse_file_info *fi_out, off_t offset_out, size_t size,
-                                     int flags)
+                                                 const char *path_out, struct fuse_file_info *fi_out, off_t offset_out,
+                                                 size_t size, int flags)
 {
     (void)path_in;
     (void)path_out;
@@ -78,7 +78,8 @@ static ssize_t obmafs3_fuse_copy_file_range_impl(const char *path_in, struct fus
     if(!src_ctx || !dst_ctx) FUSE_RETURN(-EBADF, "");
 
     /* Only regular files may be cloned */
-    if(src_ctx->inode.file_type != kFileTypeRegular || dst_ctx->inode.file_type != kFileTypeRegular) FUSE_RETURN(-EINVAL, "");
+    if(src_ctx->inode.file_type != kFileTypeRegular || dst_ctx->inode.file_type != kFileTypeRegular)
+        FUSE_RETURN(-EINVAL, "");
 
     /* Clamp size to source file bounds */
     if((uint64_t)offset_in >= src_ctx->inode.file_size) return 0;
@@ -118,7 +119,8 @@ ssize_t obmafs3_fuse_copy_file_range(const char *path_in, struct fuse_file_info 
                                      int flags)
 {
     pthread_rwlock_wrlock(&g_ctx->tree_lock);
-    ssize_t rc = obmafs3_fuse_copy_file_range_impl(path_in, fi_in, offset_in, path_out, fi_out, offset_out, size, flags);
+    ssize_t rc =
+        obmafs3_fuse_copy_file_range_impl(path_in, fi_in, offset_in, path_out, fi_out, offset_out, size, flags);
     pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }

@@ -34,8 +34,8 @@
  * Implements: getattr, readdir, open, read
  */
 
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 
 /**
  * FUSE callback: get file/directory attributes.
@@ -97,9 +97,9 @@ static int obmafs3_fuse_getattr_impl(const char *path, struct stat *stbuf, struc
         stbuf->st_mode = S_IFLNK | 0777;
     else
         stbuf->st_mode = S_IFREG | ip->mode;
-    stbuf->st_nlink   = ip->ref_count;
-    stbuf->st_uid     = ip->uid;
-    stbuf->st_gid     = ip->gid;
+    stbuf->st_nlink = ip->ref_count;
+    stbuf->st_uid   = ip->uid;
+    stbuf->st_gid   = ip->gid;
 
     /* For subchannel files, compute file_size from the parent CD image's
      * sector_count since the sidecar stores no data of its own. */
@@ -277,8 +277,8 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
 
     if(rc != OBMAFS3_OK)
     {
-        fprintf(stderr, "[fuse_read] RETURNING -EIO rc=%d path=%s offset=%ld size=%zu file_type=%u\n",
-                rc, path ? path : "(null)", (long)offset, size, ip->file_type);
+        fprintf(stderr, "[fuse_read] RETURNING -EIO rc=%d path=%s offset=%ld size=%zu file_type=%u\n", rc,
+                path ? path : "(null)", (long)offset, size, ip->file_type);
         FUSE_RETURN(-EIO, "");
     }
 

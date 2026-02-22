@@ -44,12 +44,12 @@
 struct dedup_compress_arg
 {
     struct obmafs3_ctx *ctx;
-    uint8_t  *data;        /**< Buffer to compress and write (owned) */
-    uint64_t  block_lba;   /**< Destination LBA */
-    uint64_t  offset;      /**< Byte offset (end of payload) */
-    uint64_t  capacity;    /**< Full dedup block size */
-    uint64_t  free_lba;    /**< Trailing blocks to free (set by worker) */
-    uint64_t  free_count;  /**< Number of trailing blocks (set by worker) */
+    uint8_t            *data;       /**< Buffer to compress and write (owned) */
+    uint64_t            block_lba;  /**< Destination LBA */
+    uint64_t            offset;     /**< Byte offset (end of payload) */
+    uint64_t            capacity;   /**< Full dedup block size */
+    uint64_t            free_lba;   /**< Trailing blocks to free (set by worker) */
+    uint64_t            free_count; /**< Number of trailing blocks (set by worker) */
 };
 
 /**
@@ -83,8 +83,8 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, ZSTD_CCtx *cctx, ui
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc       = obmafs3_compress(cctx, data + sizeof(bhdr), (size_t)bhdr.original_size,
-                                                comp_buf, &comp_size, ctx->zstd_level);
+            int    crc = obmafs3_compress(cctx, data + sizeof(bhdr), (size_t)bhdr.original_size, comp_buf, &comp_size,
+                                          ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
                 bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
@@ -201,8 +201,8 @@ int dedup_bg_wait(struct obmafs3_ctx *ctx, void **pjob)
  * @param capacity   Full dedup block size.
  * @return OBMAFS3_OK on success, or error code on allocation failure.
  */
-int dedup_bg_submit(struct compress_pool *pool, void **pjob, struct obmafs3_ctx *ctx, uint8_t *data,
-                           uint64_t block_lba, uint64_t offset, uint64_t capacity)
+int dedup_bg_submit(struct compress_pool *pool, void **pjob, struct obmafs3_ctx *ctx, uint8_t *data, uint64_t block_lba,
+                    uint64_t offset, uint64_t capacity)
 {
     struct dedup_compress_arg *da = calloc(1, sizeof(*da));
     if(!da) return OBMAFS3_ERR_NOMEM;
@@ -215,7 +215,7 @@ int dedup_bg_submit(struct compress_pool *pool, void **pjob, struct obmafs3_ctx 
     struct pool_async_job *job = obmafs3_pool_async_job_create(dedup_async_compress_fn, da);
     if(!job)
     {
-        free(da->data);  /* da took ownership of the data buffer */
+        free(da->data); /* da took ownership of the data buffer */
         free(da);
         return OBMAFS3_ERR_NOMEM;
     }
@@ -224,7 +224,6 @@ int dedup_bg_submit(struct compress_pool *pool, void **pjob, struct obmafs3_ctx 
     *pjob = job;
     return OBMAFS3_OK;
 }
-
 
 /* ------------------------------------------------------------------ */
 /*  Dedup data block management                                        */
@@ -272,8 +271,8 @@ int dedup_block_init(struct obmafs3_ctx *ctx, const struct btree_header *hdr, st
                 db->data = NULL;
                 DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
-            rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, db->data + sizeof(bhdr), (size_t)bhdr.compressed_size, temp,
-                                    (size_t)bhdr.original_size);
+            rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, db->data + sizeof(bhdr),
+                                    (size_t)bhdr.compressed_size, temp, (size_t)bhdr.original_size);
             if(rc != OBMAFS3_OK)
             {
                 free(temp);
@@ -328,8 +327,8 @@ int dedup_block_flush(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db)
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc = obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, db->data + sizeof(bhdr), (size_t)bhdr.original_size,
-                                          comp_buf, &comp_size, ctx->zstd_level);
+            int    crc       = obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, db->data + sizeof(bhdr),
+                                                (size_t)bhdr.original_size, comp_buf, &comp_size, ctx->zstd_level);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
                 bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
@@ -415,9 +414,8 @@ int dedup_block_new(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db)
  *
  * @param pending_job  Pointer to the pending async job slot (in db_cache).
  */
-int dedup_block_store(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db, const void *sector_data,
-                             size_t sector_len, uint64_t *out_lba, uint64_t *out_offset, struct compress_pool *pool,
-                             void **pending_job)
+int dedup_block_store(struct obmafs3_ctx *ctx, struct dedup_block_ctx *db, const void *sector_data, size_t sector_len,
+                      uint64_t *out_lba, uint64_t *out_offset, struct compress_pool *pool, void **pending_job)
 {
     int rc;
 
@@ -502,8 +500,8 @@ void dedup_block_free(struct dedup_block_ctx *db)
  * Writing all entries in one call avoids interleaving block allocations
  * with dedup tree node allocations, preventing inode extent fragmentation.
  */
-int write_sector_map_batch(struct obmafs3_ctx *ctx, struct inode_record *inode,
-                                  const struct sector_map_entry *entries, uint64_t count)
+int write_sector_map_batch(struct obmafs3_ctx *ctx, struct inode_record *inode, const struct sector_map_entry *entries,
+                           uint64_t count)
 {
     if(count == 0) return OBMAFS3_OK;
 
@@ -528,7 +526,6 @@ int write_sector_map_batch(struct obmafs3_ctx *ctx, struct inode_record *inode,
 
     return rc;
 }
-
 
 /* ------------------------------------------------------------------ */
 /*  Media image write path                                             */
@@ -584,7 +581,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     else
     {
         rc = obmafs3_dedup_get_tree(ctx, sector_size, &dedup_hdr, &dedup_hdr_lba);
-        if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&ctx->tree_lock); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            pthread_rwlock_unlock(&ctx->tree_lock);
+            return rc;
+        }
         if(db_cache)
         {
             db_cache->dedup_hdr     = dedup_hdr;
@@ -612,7 +613,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             db_local.std_blocks = 0;
             db_local.dirty      = 0;
             rc                  = dedup_block_init(ctx, &dedup_hdr, &db_local);
-            if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&ctx->tree_lock); return rc; }
+            if(rc != OBMAFS3_OK)
+            {
+                pthread_rwlock_unlock(&ctx->tree_lock);
+                return rc;
+            }
             /* Migrate into the persistent cache struct */
             db_cache->data        = db_local.data;
             db_cache->block_lba   = db_local.block_lba;
@@ -636,7 +641,11 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     else
     {
         rc = dedup_block_init(ctx, &dedup_hdr, &db_local);
-        if(rc != OBMAFS3_OK) { pthread_rwlock_unlock(&ctx->tree_lock); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            pthread_rwlock_unlock(&ctx->tree_lock);
+            return rc;
+        }
         db = &db_local;
     }
 
@@ -648,13 +657,13 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      * the caller manages its own sector map — skip entirely.
      * Maximum number of sectors in this write = size / sector_size + 1.
      */
-    int                      skip_sme = (cache == NULL && db_cache != NULL);
-    struct sector_map_entry *sme_buf  = NULL;
+    int                      skip_sme  = (cache == NULL && db_cache != NULL);
+    struct sector_map_entry *sme_buf   = NULL;
     uint64_t                 sme_count = 0;
     if(!skip_sme)
     {
         uint64_t max_sectors = size / sector_size + 1;
-        sme_buf = malloc((size_t)(max_sectors * sizeof(struct sector_map_entry)));
+        sme_buf              = malloc((size_t)(max_sectors * sizeof(struct sector_map_entry)));
         if(!sme_buf)
         {
             if(!db_is_cached) dedup_block_free(db);
@@ -692,8 +701,8 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     struct timespec t_phase1_start, t_phase1_end;
     struct timespec t_phase2_start;
     struct timespec t_bgwait_end, t_flush_end, t_ncflush_end, t_hdr_end, t_sme_end;
-    uint64_t dedup_hits = 0, dedup_misses = 0;
-    uint64_t prefetch_advised = 0;
+    uint64_t        dedup_hits = 0, dedup_misses = 0;
+    uint64_t        prefetch_advised = 0;
 
     /*
      * Pre-compute per-sector metadata: hash, data pointer, length,
@@ -719,7 +728,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     }
 
     {
-        size_t bp = 0;
+        size_t   bp = 0;
         uint64_t si = 0;
         while(bp < size && si < num_sectors)
         {
@@ -782,13 +791,12 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      */
     uint64_t keyset_fast_hits = 0;
     {
-        const struct dedup_key_set    *ks = (const struct dedup_key_set *)ctx->dedup_key_set;
-        const struct dedup_pending_buf *pb = (const struct dedup_pending_buf *)ctx->dedup_pending;
+        const struct dedup_key_set     *ks       = (const struct dedup_key_set *)ctx->dedup_key_set;
+        const struct dedup_pending_buf *pb       = (const struct dedup_pending_buf *)ctx->dedup_pending;
         const struct dedup_pending_buf *drain_pb = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
         for(uint64_t i = 0; i < num_sectors; i++)
         {
-            if((ks && keyset_contains(ks, sw[i].hash)) ||
-               pending_lookup(pb, sw[i].hash) ||
+            if((ks && keyset_contains(ks, sw[i].hash)) || pending_lookup(pb, sw[i].hash) ||
                pending_lookup(drain_pb, sw[i].hash))
                 keyset_fast_hits++;
         }
@@ -810,7 +818,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      * and root_node_lba could be stale. */
     {
         struct btree_header fresh_hdr;
-        int rrc = obmafs3_btree_header_read(ctx, dedup_hdr_lba, &fresh_hdr);
+        int                 rrc = obmafs3_btree_header_read(ctx, dedup_hdr_lba, &fresh_hdr);
         if(rrc == OBMAFS3_OK)
         {
             dedup_hdr.root_node_lba = fresh_hdr.root_node_lba;
@@ -830,8 +838,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      *  - both keyset and pending buffer are available (Phase 1 will
      *    use the deferred-insert path for misses — no tree I/O).
      */
-    const int have_deferred_path =
-        (ctx->dedup_pending != NULL && ctx->dedup_key_set != NULL);
+    const int have_deferred_path = (ctx->dedup_pending != NULL && ctx->dedup_key_set != NULL);
     if(keyset_fast_hits < num_sectors && !have_deferred_path)
     {
         struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
@@ -856,8 +863,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                     if(pf_lbas[i] == 0 || pf_lbas[i] == prev_lba) continue;
                     prev_lba = pf_lbas[i];
                     if(cache_find_slot(nc, pf_lbas[i])) continue;
-                    posix_fadvise(ctx->fd, (off_t)(pf_lbas[i] * bsz),
-                                  (off_t)bsz, POSIX_FADV_WILLNEED);
+                    posix_fadvise(ctx->fd, (off_t)(pf_lbas[i] * bsz), (off_t)bsz, POSIX_FADV_WILLNEED);
                     prefetch_advised++;
                 }
 
@@ -865,7 +871,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 for(uint64_t i = 0; i < num_sectors; i++)
                 {
                     if(pf_lbas[i] == 0 || pf_lbas[i] == prev_lba) continue;
-                    prev_lba = pf_lbas[i];
+                    prev_lba                      = pf_lbas[i];
                     struct dedup_cache_slot *slot = cache_find_slot(nc, pf_lbas[i]);
                     if(slot)
                     {
@@ -905,27 +911,22 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
      *          sector_map_entries are filled at their original index
      *          to preserve positional ordering for reads.
      */
-    sme_count = num_sectors; /* all slots will be filled */
-    uint64_t pending_deferred = 0;
-    struct dedup_pending_buf *pb = (struct dedup_pending_buf *)ctx->dedup_pending;
+    sme_count                                  = num_sectors; /* all slots will be filled */
+    uint64_t                  pending_deferred = 0;
+    struct dedup_pending_buf *pb               = (struct dedup_pending_buf *)ctx->dedup_pending;
     for(uint64_t si = 0; si < num_sectors; si++)
     {
-        uint32_t idx = sorted_idx[si];
-        uint64_t hash       = sw[idx].hash;
+        uint32_t       idx   = sorted_idx[si];
+        uint64_t       hash  = sw[idx].hash;
         const uint8_t *sdata = sw[idx].data;
         size_t         slen  = sw[idx].len;
         int64_t        snum  = sw[idx].sector_num;
 
         /* Fast path: if the key set or pending buffer confirms this
          * hash exists, skip tree traversal — zero disk I/O. */
-        struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
-        const struct dedup_pending_buf *drain_pb2 =
-            (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
-        if(keyset_contains(ks, hash) || pending_lookup(pb, hash) ||
-           pending_lookup(drain_pb2, hash))
-        {
-            dedup_hits++;
-        }
+        struct dedup_key_set           *ks        = (struct dedup_key_set *)ctx->dedup_key_set;
+        const struct dedup_pending_buf *drain_pb2 = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
+        if(keyset_contains(ks, hash) || pending_lookup(pb, hash) || pending_lookup(drain_pb2, hash)) { dedup_hits++; }
         else if(pb && ks)
         {
             /* If sector_size changed (different dedup tree), flush first. */
@@ -933,23 +934,26 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             {
                 struct btree_header flush_hdr;
                 uint64_t            flush_hdr_lba;
-                int frc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &flush_hdr, &flush_hdr_lba);
-                if(frc == OBMAFS3_OK)
-                    frc = pending_flush(pb, ctx, &flush_hdr, flush_hdr_lba);
+                int                 frc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &flush_hdr, &flush_hdr_lba);
+                if(frc == OBMAFS3_OK) frc = pending_flush(pb, ctx, &flush_hdr, flush_hdr_lba);
                 /* Only reset sector_size when flush succeeded;
                  * otherwise keep old entries for retry / persistence. */
-                if(frc == OBMAFS3_OK || pb->count == 0)
-                    pb->sector_size = 0;
+                if(frc == OBMAFS3_OK || pb->count == 0) pb->sector_size = 0;
             }
 
             /* Keyset says "miss" and pending buffer is available.
              * Store the data and defer the B+Tree insert. */
             dedup_misses++;
-            uint64_t             stored_lba, stored_offset;
+            uint64_t              stored_lba, stored_offset;
             struct compress_pool *pool = db_cache ? ctx->compress_pool : NULL;
             void                **pjob = db_cache ? &db_cache->pending_job : NULL;
             rc = dedup_block_store(ctx, db, sdata, slen, &stored_lba, &stored_offset, pool, pjob);
-            if(rc != OBMAFS3_OK) { free(sw); free(sorted_idx); goto out; }
+            if(rc != OBMAFS3_OK)
+            {
+                free(sw);
+                free(sorted_idx);
+                goto out;
+            }
 
             struct dedup_entry new_entry;
             new_entry.hash         = hash;
@@ -969,17 +973,22 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             struct dedup_entry       existing;
             struct dedup_upsert_ctx  uctx;
             struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
-            rc = dedup_upsert_find(ctx, &dedup_hdr, hash, &existing, &uctx, tree_buf, nc);
+            rc                          = dedup_upsert_find(ctx, &dedup_hdr, hash, &existing, &uctx, tree_buf, nc);
 
             if(rc == OBMAFS3_OK) { dedup_hits++; }
             else if(rc == OBMAFS3_ERR_NOTFOUND)
             {
                 dedup_misses++;
-                uint64_t             stored_lba, stored_offset;
+                uint64_t              stored_lba, stored_offset;
                 struct compress_pool *pool = db_cache ? ctx->compress_pool : NULL;
                 void                **pjob = db_cache ? &db_cache->pending_job : NULL;
                 rc = dedup_block_store(ctx, db, sdata, slen, &stored_lba, &stored_offset, pool, pjob);
-                if(rc != OBMAFS3_OK) { free(sw); free(sorted_idx); goto out; }
+                if(rc != OBMAFS3_OK)
+                {
+                    free(sw);
+                    free(sorted_idx);
+                    goto out;
+                }
 
                 struct dedup_entry new_entry;
                 new_entry.hash         = hash;
@@ -987,14 +996,21 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 new_entry.block_offset = stored_offset;
 
                 rc = dedup_upsert_insert(ctx, &dedup_hdr, &new_entry, &uctx, tree_buf, nc);
-                if(rc != OBMAFS3_OK) { free(sw); free(sorted_idx); goto out; }
+                if(rc != OBMAFS3_OK)
+                {
+                    free(sw);
+                    free(sorted_idx);
+                    goto out;
+                }
 
                 /* Add the newly inserted key to the set for future lookups */
                 if(ks) keyset_insert(ks, hash);
             }
             else
             {
-                free(sw); free(sorted_idx); goto out;
+                free(sw);
+                free(sorted_idx);
+                goto out;
             }
         }
 
@@ -1058,9 +1074,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         struct dedup_node_cache *nc_flush = (struct dedup_node_cache *)ctx->dedup_node_cache;
         if(nc_flush->dirty_count > 0)
         {
-            int must_flush = (dedup_hdr.root_node_lba != original_root)
-                          || (nc_flush->writes_since_flush >= DEDUP_NC_FLUSH_INTERVAL)
-                          || (nc_flush->dirty_count >= DEDUP_NC_DIRTY_THRESHOLD);
+            int must_flush = (dedup_hdr.root_node_lba != original_root) ||
+                             (nc_flush->writes_since_flush >= DEDUP_NC_FLUSH_INTERVAL) ||
+                             (nc_flush->dirty_count >= DEDUP_NC_DIRTY_THRESHOLD);
             if(must_flush)
             {
                 int nc_rc = dedup_cache_flush(nc_flush, ctx);
@@ -1132,34 +1148,26 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
 
     /* Print timing instrumentation */
     {
-        struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
-        struct dedup_key_set    *ks = (struct dedup_key_set *)ctx->dedup_key_set;
-        uint32_t nc_count = nc ? nc->count : 0;
-        uint32_t nc_cap   = nc ? nc->capacity : 0;
-        uint32_t ks_count = ks ? ks->count : 0;
-        uint32_t ks_cap   = ks ? ks->capacity : 0;
+        struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        struct dedup_key_set    *ks       = (struct dedup_key_set *)ctx->dedup_key_set;
+        uint32_t                 nc_count = nc ? nc->count : 0;
+        uint32_t                 nc_cap   = nc ? nc->capacity : 0;
+        uint32_t                 ks_count = ks ? ks->count : 0;
+        uint32_t                 ks_cap   = ks ? ks->capacity : 0;
         fprintf(stderr,
                 "[dedup-timing] write %zu bytes @ %" PRIu64 ": "
                 "lock_wait=%.1fms  "
                 "prefetch=%.1fms(%" PRIu64 " leaves)  "
                 "phase1=%.1fms  bg_wait=%.1fms  blk_flush=%.1fms  "
                 "nc_flush=%.1fms  hdr=%.1fms  sme=%.1fms  TOTAL=%.1fms  "
-                "hits=%" PRIu64 " misses=%" PRIu64
-                " pending=%" PRIu64
-                " nc_count=%u/%u ks=%u/%u ks_fast=%" PRIu64 "\n",
-                size, offset,
-                timespec_diff_ms(&t_lock_start, &t_lock_end),
+                "hits=%" PRIu64 " misses=%" PRIu64 " pending=%" PRIu64 " nc_count=%u/%u ks=%u/%u ks_fast=%" PRIu64 "\n",
+                size, offset, timespec_diff_ms(&t_lock_start, &t_lock_end),
                 timespec_diff_ms(&t_prefetch_start, &t_prefetch_end), prefetch_advised,
-                timespec_diff_ms(&t_phase1_start, &t_phase1_end),
-                timespec_diff_ms(&t_phase2_start, &t_bgwait_end),
-                timespec_diff_ms(&t_bgwait_end, &t_flush_end),
-                timespec_diff_ms(&t_flush_end, &t_ncflush_end),
-                timespec_diff_ms(&t_ncflush_end, &t_hdr_end),
-                timespec_diff_ms(&t_hdr_end, &t_sme_end),
-                timespec_diff_ms(&t_lock_start, &t_sme_end),
-                dedup_hits, dedup_misses, pending_deferred,
-                nc_count, nc_cap,
-                ks_count, ks_cap, keyset_fast_hits);
+                timespec_diff_ms(&t_phase1_start, &t_phase1_end), timespec_diff_ms(&t_phase2_start, &t_bgwait_end),
+                timespec_diff_ms(&t_bgwait_end, &t_flush_end), timespec_diff_ms(&t_flush_end, &t_ncflush_end),
+                timespec_diff_ms(&t_ncflush_end, &t_hdr_end), timespec_diff_ms(&t_hdr_end, &t_sme_end),
+                timespec_diff_ms(&t_lock_start, &t_sme_end), dedup_hits, dedup_misses, pending_deferred, nc_count,
+                nc_cap, ks_count, ks_cap, keyset_fast_hits);
     }
 
     /* Copy updated state back to the persistent cache if used */
@@ -1205,7 +1213,7 @@ out:
         else
         {
             fprintf(stderr, "ERROR: cache flush failed on error path — "
-                    "skipping header write to preserve on-disk consistency\n");
+                            "skipping header write to preserve on-disk consistency\n");
         }
     }
 
@@ -1230,7 +1238,6 @@ out:
     }
     return rc;
 }
-
 
 /* ------------------------------------------------------------------ */
 
@@ -1267,4 +1274,3 @@ void obmafs3_free_sector_map_cache(struct sector_map_cache *cache)
     cache->count    = 0;
     cache->capacity = 0;
 }
-

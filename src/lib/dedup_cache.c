@@ -139,8 +139,7 @@ static int cache_grow(struct dedup_node_cache *nc)
     nc->dirty_count = 0;
     for(uint32_t i = 0; i < new_cap; i++)
     {
-        if(ns[i].buf && ns[i].dirty)
-            dirty_list_add(nc, i);
+        if(ns[i].buf && ns[i].dirty) dirty_list_add(nc, i);
     }
 
     return OBMAFS3_OK;
@@ -219,8 +218,7 @@ int dedup_cache_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint6
  * The data is stored in the cache and marked dirty; no disk I/O
  * happens until dedup_cache_flush().
  */
-int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint64_t lba, const void *buf,
-                             size_t bsz)
+int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint64_t lba, const void *buf, size_t bsz)
 {
     (void)ctx;
     (void)bsz; /* used only for fallback / symmetry */
@@ -270,7 +268,11 @@ int dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint
  *  kernel elevator-sort the resulting I/O. */
 int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
 {
-    if(nc->dirty_count == 0) { nc->writes_since_flush = 0; return OBMAFS3_OK; }
+    if(nc->dirty_count == 0)
+    {
+        nc->writes_since_flush = 0;
+        return OBMAFS3_OK;
+    }
 
     /* Sort dirty list by LBA for sequential disk access (insertion sort). */
     for(uint32_t i = 1; i < nc->dirty_count; i++)
@@ -303,8 +305,7 @@ int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
             uint32_t i = nc->dirty_list[d];
             if(nc->slots[i].buf && nc->slots[i].dirty)
             {
-                int rc = obmafs3_block_write(ctx, nc->slots[i].lba,
-                                             nc->slots[i].buf, nc->block_size);
+                int rc = obmafs3_block_write(ctx, nc->slots[i].lba, nc->slots[i].buf, nc->block_size);
                 if(rc != OBMAFS3_OK) return rc;
                 nc->slots[i].dirty = 0;
             }
@@ -319,7 +320,11 @@ int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
     {
         /* Skip already-clean slots (shouldn't happen, but be safe). */
         uint32_t si = nc->dirty_list[d];
-        if(!nc->slots[si].buf || !nc->slots[si].dirty) { d++; continue; }
+        if(!nc->slots[si].buf || !nc->slots[si].dirty)
+        {
+            d++;
+            continue;
+        }
 
         /* Start a new run at this slot's LBA. */
         uint64_t run_start_lba = nc->slots[si].lba;
@@ -330,7 +335,11 @@ int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
         while(d < nc->dirty_count && iov_count < iov_cap)
         {
             uint32_t ci = nc->dirty_list[d];
-            if(!nc->slots[ci].buf || !nc->slots[ci].dirty) { d++; continue; }
+            if(!nc->slots[ci].buf || !nc->slots[ci].dirty)
+            {
+                d++;
+                continue;
+            }
             if(nc->slots[ci].lba != expect_lba) break;
             iov[iov_count].iov_base = nc->slots[ci].buf;
             iov[iov_count].iov_len  = nc->block_size;
@@ -349,18 +358,17 @@ int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
         {
             /* pwritev failed — fall back to writing each block in
              * this chunk individually so we save as much as possible. */
-            fprintf(stderr, "WARNING: pwritev lba=%" PRIu64 " count=%u "
+            fprintf(stderr,
+                    "WARNING: pwritev lba=%" PRIu64 " count=%u "
                     "expect=%zu got=%zd (errno=%d %s) — falling back to "
                     "individual writes\n",
-                    run_start_lba, iov_count, expected, n,
-                    errno, strerror(errno));
+                    run_start_lba, iov_count, expected, n, errno, strerror(errno));
 
             int any_failed = 0;
             for(uint32_t r = 0; r < iov_count; r++)
             {
                 uint64_t blk_lba = run_start_lba + r;
-                int wrc = obmafs3_block_write(ctx, blk_lba,
-                                              iov[r].iov_base, nc->block_size);
+                int      wrc     = obmafs3_block_write(ctx, blk_lba, iov[r].iov_base, nc->block_size);
                 if(wrc == OBMAFS3_OK)
                 {
                     struct dedup_cache_slot *s = cache_find_slot(nc, blk_lba);
@@ -368,8 +376,7 @@ int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
                 }
                 else
                 {
-                    fprintf(stderr, "ERROR: fallback write lba=%" PRIu64
-                            " failed (rc=%d)\n", blk_lba, wrc);
+                    fprintf(stderr, "ERROR: fallback write lba=%" PRIu64 " failed (rc=%d)\n", blk_lba, wrc);
                     any_failed = 1;
                 }
             }
@@ -380,8 +387,8 @@ int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx)
         /* Mark all slots in this chunk as clean. */
         for(uint32_t r = 0; r < iov_count; r++)
         {
-            uint64_t lba = run_start_lba + r;
-            struct dedup_cache_slot *s = cache_find_slot(nc, lba);
+            uint64_t                 lba = run_start_lba + r;
+            struct dedup_cache_slot *s   = cache_find_slot(nc, lba);
             if(s) s->dirty = 0;
         }
     }
@@ -399,8 +406,7 @@ flush_rebuild:
     nc->dirty_count = 0;
     for(uint32_t i = 0; i < nc->capacity; i++)
     {
-        if(nc->slots[i].buf && nc->slots[i].dirty)
-            dirty_list_add(nc, i);
+        if(nc->slots[i].buf && nc->slots[i].dirty) dirty_list_add(nc, i);
     }
     return OBMAFS3_ERR_IO;
 }
@@ -427,15 +433,16 @@ struct dedup_key_set *keyset_create(void)
     if(!ks) return NULL;
     ks->capacity = KEYSET_INIT_CAP;
     ks->keys     = calloc(ks->capacity, sizeof(uint64_t)); /* 0 = empty */
-    if(!ks->keys) { free(ks); return NULL; }
+    if(!ks->keys)
+    {
+        free(ks);
+        return NULL;
+    }
     return ks;
 }
 
 /** Fibonacci-hashing of a key to a table index. */
-uint32_t keyset_hash(uint64_t key, uint32_t mask)
-{
-    return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
-}
+uint32_t keyset_hash(uint64_t key, uint32_t mask) { return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask; }
 
 /** Grow the key set (double capacity, re-insert all entries). */
 static int keyset_grow(struct dedup_key_set *ks)
@@ -452,7 +459,11 @@ static int keyset_grow(struct dedup_key_set *ks)
         for(uint32_t j = 0; j < new_cap; j++)
         {
             uint32_t s = (idx + j) & new_mask;
-            if(new_keys[s] == KEYSET_EMPTY) { new_keys[s] = ks->keys[i]; break; }
+            if(new_keys[s] == KEYSET_EMPTY)
+            {
+                new_keys[s] = ks->keys[i];
+                break;
+            }
         }
     }
     free(ks->keys);
@@ -477,7 +488,12 @@ void keyset_insert(struct dedup_key_set *ks, uint64_t key)
     for(uint32_t i = 0; i < ks->capacity; i++)
     {
         uint32_t s = (idx + i) & mask;
-        if(ks->keys[s] == KEYSET_EMPTY) { ks->keys[s] = key; ks->count++; return; }
+        if(ks->keys[s] == KEYSET_EMPTY)
+        {
+            ks->keys[s] = key;
+            ks->count++;
+            return;
+        }
         if(ks->keys[s] == key) return; /* already present */
     }
 }
@@ -559,14 +575,18 @@ struct dedup_pending_buf *pending_create(void)
     if(!pb) return NULL;
     pb->capacity = PENDING_INIT_CAP;
     pb->slots    = calloc(pb->capacity, sizeof(struct dedup_entry));
-    if(!pb->slots) { free(pb); return NULL; }
+    if(!pb->slots)
+    {
+        free(pb);
+        return NULL;
+    }
     return pb;
 }
 
 /** Grow the pending buffer (double capacity, re-insert all entries). */
 static int pending_grow(struct dedup_pending_buf *pb)
 {
-    uint32_t new_cap  = pb->capacity * 2;
+    uint32_t            new_cap   = pb->capacity * 2;
     struct dedup_entry *new_slots = calloc(new_cap, sizeof(struct dedup_entry));
     if(!new_slots) return OBMAFS3_ERR_NOMEM;
 
@@ -578,7 +598,11 @@ static int pending_grow(struct dedup_pending_buf *pb)
         for(uint32_t j = 0; j < new_cap; j++)
         {
             uint32_t s = (idx + j) & new_mask;
-            if(new_slots[s].hash == KEYSET_EMPTY) { new_slots[s] = pb->slots[i]; break; }
+            if(new_slots[s].hash == KEYSET_EMPTY)
+            {
+                new_slots[s] = pb->slots[i];
+                break;
+            }
         }
     }
     free(pb->slots);
@@ -603,8 +627,13 @@ void pending_insert(struct dedup_pending_buf *pb, const struct dedup_entry *entr
     for(uint32_t i = 0; i < pb->capacity; i++)
     {
         uint32_t s = (idx + i) & mask;
-        if(pb->slots[s].hash == KEYSET_EMPTY) { pb->slots[s] = *entry; pb->count++; return; }
-        if(pb->slots[s].hash == entry->hash)   return; /* already present */
+        if(pb->slots[s].hash == KEYSET_EMPTY)
+        {
+            pb->slots[s] = *entry;
+            pb->count++;
+            return;
+        }
+        if(pb->slots[s].hash == entry->hash) return; /* already present */
     }
 }
 
@@ -619,7 +648,7 @@ const struct dedup_entry *pending_lookup(const struct dedup_pending_buf *pb, uin
     {
         uint32_t s = (idx + i) & mask;
         if(pb->slots[s].hash == KEYSET_EMPTY) return NULL;
-        if(pb->slots[s].hash == hash)         return &pb->slots[s];
+        if(pb->slots[s].hash == hash) return &pb->slots[s];
     }
     return NULL;
 }
@@ -638,10 +667,9 @@ int pending_entry_cmp(const void *a, const void *b)
     const struct dedup_entry *ea = a;
     const struct dedup_entry *eb = b;
     if(ea->hash < eb->hash) return -1;
-    if(ea->hash > eb->hash) return  1;
+    if(ea->hash > eb->hash) return 1;
     return 0;
 }
-
 
 /**
  * Flush all pending inserts into the B+Tree using leaf prefetch.
@@ -663,8 +691,8 @@ int pending_entry_cmp(const void *a, const void *b)
  * Clears the buffer afterwards.
  * Must be called under tree_lock (or single-threaded context).
  */
-int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
-                         struct btree_header *dedup_hdr, uint64_t dedup_hdr_lba)
+int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx, struct btree_header *dedup_hdr,
+                  uint64_t dedup_hdr_lba)
 {
     if(!pb || pb->count == 0) return OBMAFS3_OK;
 
@@ -679,20 +707,23 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
     uint32_t n = 0;
     for(uint32_t i = 0; i < pb->capacity; i++)
     {
-        if(pb->slots[i].hash != KEYSET_EMPTY)
-            sorted[n++] = pb->slots[i];
+        if(pb->slots[i].hash != KEYSET_EMPTY) sorted[n++] = pb->slots[i];
     }
     qsort(sorted, n, sizeof(struct dedup_entry), pending_entry_cmp);
 
     /* ---- Phase 2: find target leaf LBAs via cached index nodes ---- */
 
-    uint8_t *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
-    struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
-    size_t bsz = (size_t)ctx->sb.block_size;
-    int rc = OBMAFS3_OK;
+    uint8_t                 *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
+    struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    size_t                   bsz      = (size_t)ctx->sb.block_size;
+    int                      rc       = OBMAFS3_OK;
 
     uint64_t *leaf_lbas = malloc((size_t)n * sizeof(uint64_t));
-    if(!leaf_lbas) { free(sorted); return OBMAFS3_ERR_NOMEM; }
+    if(!leaf_lbas)
+    {
+        free(sorted);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     for(uint32_t i = 0; i < n; i++)
     {
@@ -711,7 +742,7 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
         {
             if(leaf_lbas[i] == 0 || leaf_lbas[i] == prev) continue;
             leaf_lbas[unique_leaves++] = leaf_lbas[i];
-            prev = leaf_lbas[i];
+            prev                       = leaf_lbas[i];
         }
     }
 
@@ -721,8 +752,7 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
     for(uint32_t i = 0; i < unique_leaves; i++)
     {
         if(cache_find_slot(nc, leaf_lbas[i])) continue;
-        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
-                      (off_t)bsz, POSIX_FADV_WILLNEED);
+        posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz), (off_t)bsz, POSIX_FADV_WILLNEED);
     }
 
     /* Pre-read all leaves into the node cache (sequential from page cache). */
@@ -750,10 +780,7 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
             rc = dedup_upsert_insert(ctx, dedup_hdr, &sorted[i], &uctx, tree_buf, nc);
             if(rc != OBMAFS3_OK) break;
         }
-        else if(rc != OBMAFS3_OK)
-        {
-            break; /* I/O error */
-        }
+        else if(rc != OBMAFS3_OK) { break; /* I/O error */ }
         /* else: duplicate found — skip */
     }
 
@@ -792,15 +819,12 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx,
     fprintf(stderr,
             "[dedup-pending] flushed %u entries (%u unique leaves, %u reads) "
             "prefetch=%.1fms insert=%.1fms flush=%.1fms TOTAL=%.1fms\n",
-            n, unique_leaves, leaf_reads,
-            timespec_diff_ms(&t_start, &t_prefetch),
-            timespec_diff_ms(&t_prefetch, &t_insert),
-            timespec_diff_ms(&t_insert, &t_end),
+            n, unique_leaves, leaf_reads, timespec_diff_ms(&t_start, &t_prefetch),
+            timespec_diff_ms(&t_prefetch, &t_insert), timespec_diff_ms(&t_insert, &t_end),
             timespec_diff_ms(&t_start, &t_end));
 
     return rc;
 }
-
 
 /* ------------------------------------------------------------------ */
 /*  Dedup block cache flush / free                                     */
@@ -921,11 +945,12 @@ void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx)
 {
     if(!ctx || !ctx->dedup_node_cache) return;
-    struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
     /* Flush any dirty entries before releasing the cache. */
-    int flush_rc = dedup_cache_flush(nc, ctx);
+    int                      flush_rc = dedup_cache_flush(nc, ctx);
     if(flush_rc != OBMAFS3_OK)
-        fprintf(stderr, "WARNING: dedup node cache flush failed at unmount "
+        fprintf(stderr,
+                "WARNING: dedup node cache flush failed at unmount "
                 "(rc=%d) — %u dirty entries lost\n",
                 flush_rc, nc->dirty_count);
     dedup_cache_free(nc);
@@ -955,10 +980,8 @@ void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx)
 {
     if(!ctx) return;
 
-    const struct dedup_pending_buf *pb1 =
-        (const struct dedup_pending_buf *)ctx->dedup_pending;
-    const struct dedup_pending_buf *pb2 =
-        (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
+    const struct dedup_pending_buf *pb1 = (const struct dedup_pending_buf *)ctx->dedup_pending;
+    const struct dedup_pending_buf *pb2 = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
 
     uint32_t total = 0;
     if(pb1) total += pb1->count;
@@ -967,14 +990,9 @@ void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx)
     if(total > 0 && ctx->bitmap && ctx->fd >= 0)
     {
         int rc = obmafs3_dedup_pending_save(ctx);
-        if(rc != OBMAFS3_OK)
-            fprintf(stderr, "[dedup-pending] save failed (rc=%d) — %u entries lost\n",
-                    rc, total);
+        if(rc != OBMAFS3_OK) fprintf(stderr, "[dedup-pending] save failed (rc=%d) — %u entries lost\n", rc, total);
     }
-    else if(total > 0)
-    {
-        fprintf(stderr, "[dedup-pending] %u entries lost (no bitmap or fd)\n", total);
-    }
+    else if(total > 0) { fprintf(stderr, "[dedup-pending] %u entries lost (no bitmap or fd)\n", total); }
 
     /* Free both buffers. */
     if(ctx->dedup_pending)
@@ -988,4 +1006,3 @@ void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx)
         ctx->dedup_pending_draining = NULL;
     }
 }
-

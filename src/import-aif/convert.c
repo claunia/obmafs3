@@ -84,12 +84,18 @@ uint16_t cd_mode_sector_size(int mode)
 {
     switch(mode)
     {
-        case kCdSectorModeAudio:  return CD_RAW_SECTOR_SIZE; /* 2352 */
-        case kCdSectorMode1:      return 2048;               /* CD_DATA_SIZE */
-        case kCdSectorMode2:      return 2336;
-        case kCdSectorMode2Form1: return 2048;               /* CD_DATA_SIZE */
-        case kCdSectorMode2Form2: return 2328;
-        default:                  return 0;
+        case kCdSectorModeAudio:
+            return CD_RAW_SECTOR_SIZE; /* 2352 */
+        case kCdSectorMode1:
+            return 2048; /* CD_DATA_SIZE */
+        case kCdSectorMode2:
+            return 2336;
+        case kCdSectorMode2Form1:
+            return 2048; /* CD_DATA_SIZE */
+        case kCdSectorMode2Form2:
+            return 2328;
+        default:
+            return 0;
     }
 }
 
@@ -103,26 +109,26 @@ int is_compact_disc_media(uint32_t media_type)
     switch(media_type)
     {
         // Standard Compact Disc formats (10–35)
-        case 10:   // CD
-        case 11:   // CDDA
-        case 12:   // CDG
-        case 13:   // CDEG
-        case 14:   // CDI
-        case 15:   // CDROM
-        case 16:   // CDROMXA
-        case 17:   // CDPLUS
-        case 18:   // CDMO
-        case 19:   // CDR
-        case 20:   // CDRW
-        case 21:   // CDMRW
-        case 22:   // VCD
-        case 23:   // SVCD
-        case 24:   // PCD
-        case 29:   // DTSCD
-        case 30:   // CDMIDI
-        case 31:   // CDV
-        case 34:   // CDIREADY
-        case 35:   // FMTOWNS
+        case 10:  // CD
+        case 11:  // CDDA
+        case 12:  // CDG
+        case 13:  // CDEG
+        case 14:  // CDI
+        case 15:  // CDROM
+        case 16:  // CDROMXA
+        case 17:  // CDPLUS
+        case 18:  // CDMO
+        case 19:  // CDR
+        case 20:  // CDRW
+        case 21:  // CDMRW
+        case 22:  // VCD
+        case 23:  // SVCD
+        case 24:  // PCD
+        case 29:  // DTSCD
+        case 30:  // CDMIDI
+        case 31:  // CDV
+        case 34:  // CDIREADY
+        case 35:  // FMTOWNS
 
         // Gaming console CDs
         case 112:  // PS1CD

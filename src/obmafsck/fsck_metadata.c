@@ -67,8 +67,7 @@ static int cmp_meta_triple(const void *a, const void *b)
  * @param out_count Output: number of elements.
  * @return @c OBMAFS3_OK on success.
  */
-static int collect_metadata_records(struct obmafs3_ctx *ctx,
-                                    struct meta_triple **out, uint64_t *out_count)
+static int collect_metadata_records(struct obmafs3_ctx *ctx, struct meta_triple **out, uint64_t *out_count)
 {
     *out       = NULL;
     *out_count = 0;
@@ -80,12 +79,16 @@ static int collect_metadata_records(struct obmafs3_ctx *ctx,
     uint8_t *buf     = calloc(1, node_sz);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    struct meta_triple *recs = NULL;
-    uint64_t count = 0, cap = 0;
+    struct meta_triple *recs  = NULL;
+    uint64_t            count = 0, cap = 0;
 
     uint64_t *stack    = malloc(64 * sizeof(uint64_t));
     uint64_t  stk_size = 0, stk_cap = 64;
-    if(!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    if(!stack)
+    {
+        free(buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     stack[stk_size++] = root_lba;
 
@@ -94,11 +97,23 @@ static int collect_metadata_records(struct obmafs3_ctx *ctx,
         uint64_t lba = stack[--stk_size];
 
         int rc = obmafs3_block_read(ctx, lba, buf, node_sz);
-        if(rc != OBMAFS3_OK) { free(buf); free(stack); free(recs); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            free(stack);
+            free(recs);
+            return rc;
+        }
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); free(stack); free(recs); return OBMAFS3_ERR_BADMAGIC; }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            free(buf);
+            free(stack);
+            free(recs);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
 
         if(hdr.level > 0)
         {
@@ -110,7 +125,13 @@ static int collect_metadata_records(struct obmafs3_ctx *ctx,
                 {
                     stk_cap *= 2;
                     uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(stack); free(recs); return OBMAFS3_ERR_NOMEM; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(stack);
+                        free(recs);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
                     stack = tmp;
                 }
                 stack[stk_size++] = ie.child_lba;
@@ -123,9 +144,15 @@ static int collect_metadata_records(struct obmafs3_ctx *ctx,
         {
             if(count >= cap)
             {
-                cap = cap == 0 ? 256 : cap * 2;
+                cap                     = cap == 0 ? 256 : cap * 2;
                 struct meta_triple *tmp = realloc(recs, cap * sizeof(*tmp));
-                if(!tmp) { free(buf); free(stack); free(recs); return OBMAFS3_ERR_NOMEM; }
+                if(!tmp)
+                {
+                    free(buf);
+                    free(stack);
+                    free(recs);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 recs = tmp;
             }
             struct metadata_record mrec;
@@ -152,8 +179,7 @@ static int collect_metadata_records(struct obmafs3_ctx *ctx,
  * @param out_count Output: number of elements.
  * @return @c OBMAFS3_OK on success.
  */
-static int collect_metadata_idx_records(struct obmafs3_ctx *ctx,
-                                        struct meta_triple **out, uint64_t *out_count)
+static int collect_metadata_idx_records(struct obmafs3_ctx *ctx, struct meta_triple **out, uint64_t *out_count)
 {
     *out       = NULL;
     *out_count = 0;
@@ -165,12 +191,16 @@ static int collect_metadata_idx_records(struct obmafs3_ctx *ctx,
     uint8_t *buf     = calloc(1, node_sz);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    struct meta_triple *recs = NULL;
-    uint64_t count = 0, cap = 0;
+    struct meta_triple *recs  = NULL;
+    uint64_t            count = 0, cap = 0;
 
     uint64_t *stack    = malloc(64 * sizeof(uint64_t));
     uint64_t  stk_size = 0, stk_cap = 64;
-    if(!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    if(!stack)
+    {
+        free(buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     stack[stk_size++] = root_lba;
 
@@ -179,11 +209,23 @@ static int collect_metadata_idx_records(struct obmafs3_ctx *ctx,
         uint64_t lba = stack[--stk_size];
 
         int rc = obmafs3_block_read(ctx, lba, buf, node_sz);
-        if(rc != OBMAFS3_OK) { free(buf); free(stack); free(recs); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            free(stack);
+            free(recs);
+            return rc;
+        }
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); free(stack); free(recs); return OBMAFS3_ERR_BADMAGIC; }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            free(buf);
+            free(stack);
+            free(recs);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
 
         if(hdr.level > 0)
         {
@@ -195,7 +237,13 @@ static int collect_metadata_idx_records(struct obmafs3_ctx *ctx,
                 {
                     stk_cap *= 2;
                     uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(stack); free(recs); return OBMAFS3_ERR_NOMEM; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(stack);
+                        free(recs);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
                     stack = tmp;
                 }
                 stack[stk_size++] = ie.child_lba;
@@ -208,9 +256,15 @@ static int collect_metadata_idx_records(struct obmafs3_ctx *ctx,
         {
             if(count >= cap)
             {
-                cap = cap == 0 ? 256 : cap * 2;
+                cap                     = cap == 0 ? 256 : cap * 2;
                 struct meta_triple *tmp = realloc(recs, cap * sizeof(*tmp));
-                if(!tmp) { free(buf); free(stack); free(recs); return OBMAFS3_ERR_NOMEM; }
+                if(!tmp)
+                {
+                    free(buf);
+                    free(stack);
+                    free(recs);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 recs = tmp;
             }
             struct metadata_idx_record irec;
@@ -237,17 +291,19 @@ static int collect_metadata_idx_records(struct obmafs3_ctx *ctx,
  * @param t      Triple to search for.
  * @return Non-zero if found.
  */
-static int meta_triple_sorted_contains(const struct meta_triple *arr, uint64_t count,
-                                       const struct meta_triple *t)
+static int meta_triple_sorted_contains(const struct meta_triple *arr, uint64_t count, const struct meta_triple *t)
 {
     uint64_t lo = 0, hi = count;
     while(lo < hi)
     {
         uint64_t mid = lo + (hi - lo) / 2;
-        int c = cmp_meta_triple(&arr[mid], t);
-        if(c < 0)      lo = mid + 1;
-        else if(c > 0)  hi = mid;
-        else             return 1;
+        int      c   = cmp_meta_triple(&arr[mid], t);
+        if(c < 0)
+            lo = mid + 1;
+        else if(c > 0)
+            hi = mid;
+        else
+            return 1;
     }
     return 0;
 }
@@ -270,7 +326,7 @@ static int meta_triple_sorted_contains(const struct meta_triple *arr, uint64_t c
 void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, int *errors)
 {
     struct meta_triple *meta_recs = NULL, *idx_recs = NULL;
-    uint64_t meta_count = 0, idx_count = 0;
+    uint64_t            meta_count = 0, idx_count = 0;
 
     printf("\n  %sMetadata consistency%s\n", CLR_BOLD, CLR_RESET);
 
@@ -293,14 +349,13 @@ void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int aut
 
     /* Sort both arrays by (inode_id, key, value) */
     if(meta_count > 0) qsort(meta_recs, (size_t)meta_count, sizeof(meta_recs[0]), cmp_meta_triple);
-    if(idx_count > 0)  qsort(idx_recs,  (size_t)idx_count,  sizeof(idx_recs[0]),  cmp_meta_triple);
+    if(idx_count > 0) qsort(idx_recs, (size_t)idx_count, sizeof(idx_recs[0]), cmp_meta_triple);
 
     /* ---- Phase 1: entries in metadata but not in index ---- */
     uint64_t missing_from_idx = 0, fixed_idx = 0;
     for(uint64_t i = 0; i < meta_count; i++)
     {
-        if(!meta_triple_sorted_contains(idx_recs, idx_count, &meta_recs[i]))
-            missing_from_idx++;
+        if(!meta_triple_sorted_contains(idx_recs, idx_count, &meta_recs[i])) missing_from_idx++;
     }
 
     if(missing_from_idx > 0)
@@ -314,8 +369,7 @@ void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int aut
             {
                 if(!meta_triple_sorted_contains(idx_recs, idx_count, &meta_recs[i]))
                 {
-                    rc = obmafs3_metadata_put(ctx, meta_recs[i].inode_id,
-                                              meta_recs[i].key, meta_recs[i].value);
+                    rc = obmafs3_metadata_put(ctx, meta_recs[i].inode_id, meta_recs[i].key, meta_recs[i].value);
                     if(rc == OBMAFS3_OK)
                         fixed_idx++;
                     else
@@ -330,8 +384,7 @@ void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int aut
             }
             else
             {
-                result_fixed("Index entries:", "%" PRIu64 " of %" PRIu64 " fixed",
-                             fixed_idx, missing_from_idx);
+                result_fixed("Index entries:", "%" PRIu64 " of %" PRIu64 " fixed", fixed_idx, missing_from_idx);
             }
         }
     }
@@ -340,8 +393,7 @@ void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int aut
     uint64_t missing_from_meta = 0, fixed_meta = 0;
     for(uint64_t i = 0; i < idx_count; i++)
     {
-        if(!meta_triple_sorted_contains(meta_recs, meta_count, &idx_recs[i]))
-            missing_from_meta++;
+        if(!meta_triple_sorted_contains(meta_recs, meta_count, &idx_recs[i])) missing_from_meta++;
     }
 
     if(missing_from_meta > 0)
@@ -355,13 +407,12 @@ void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int aut
             {
                 if(!meta_triple_sorted_contains(meta_recs, meta_count, &idx_recs[i]))
                 {
-                    rc = obmafs3_metadata_put(ctx, idx_recs[i].inode_id,
-                                              idx_recs[i].key, idx_recs[i].value);
+                    rc = obmafs3_metadata_put(ctx, idx_recs[i].inode_id, idx_recs[i].key, idx_recs[i].value);
                     if(rc == OBMAFS3_OK)
                         fixed_meta++;
                     else
-                        printf("    Error: could not re-insert inode %" PRIu64 " key '%s' (%d)\n",
-                               idx_recs[i].inode_id, idx_recs[i].key, rc);
+                        printf("    Error: could not re-insert inode %" PRIu64 " key '%s' (%d)\n", idx_recs[i].inode_id,
+                               idx_recs[i].key, rc);
                 }
             }
             if(fixed_meta == missing_from_meta)
@@ -371,15 +422,13 @@ void check_metadata_bidirectional(struct obmafs3_ctx *ctx, int auto_yes, int aut
             }
             else
             {
-                result_fixed("Meta entries:", "%" PRIu64 " of %" PRIu64 " fixed",
-                             fixed_meta, missing_from_meta);
+                result_fixed("Meta entries:", "%" PRIu64 " of %" PRIu64 " fixed", fixed_meta, missing_from_meta);
             }
         }
     }
 
     /* ---- Summary ---- */
-    if(missing_from_idx == 0 && missing_from_meta == 0)
-        result_ok("Status:", "%" PRIu64 " record(s)", meta_count);
+    if(missing_from_idx == 0 && missing_from_meta == 0) result_ok("Status:", "%" PRIu64 " record(s)", meta_count);
 
     free(meta_recs);
     free(idx_recs);

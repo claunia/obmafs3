@@ -34,8 +34,8 @@
 #include "fsck.h"
 
 /* Context for qsort comparator (file-scope; obmafsck is single-threaded). */
-static int  s_ord_key_type;
-static int  s_ord_is_leaf;
+static int s_ord_key_type;
+static int s_ord_is_leaf;
 
 /** qsort comparator that delegates to ordering_key_cmp(). */
 static int ordering_qsort_cmp(const void *a, const void *b)
@@ -67,9 +67,8 @@ static int ordering_qsort_cmp(const void *a, const void *b)
  * @param label            Tree label for progress display (NULL to disable).
  * @return @c OBMAFS3_OK on success.
  */
-int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size,
-                                  size_t child_lba_off, uint64_t **out_lbas, uint64_t *out_count,
-                                  uint32_t total_nodes, const char *label)
+int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size, size_t child_lba_off,
+                           uint64_t **out_lbas, uint64_t *out_count, uint32_t total_nodes, const char *label)
 {
     *out_lbas  = NULL;
     *out_count = 0;
@@ -177,10 +176,7 @@ int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t in
     free(buf);
     free(stack);
 
-    if(show_progress)
-    {
-        bar_clear();
-    }
+    if(show_progress) { bar_clear(); }
 
     *out_lbas  = lbas;
     *out_count = count;
@@ -204,8 +200,7 @@ int walk_inode_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t in
  * @param out_count  Output: number of elements in @p out_lbas.
  * @return @c OBMAFS3_OK on success.
  */
-int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, uint64_t **out_lbas,
-                                    uint64_t *out_count)
+int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, uint64_t **out_lbas, uint64_t *out_count)
 {
     *out_lbas  = NULL;
     *out_count = 0;
@@ -326,8 +321,8 @@ int walk_catalog_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, uint64_
  * @return @c OBMAFS3_OK on success.
  */
 int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count,
-                                       const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
-                                       uint64_t *fixed_count)
+                                const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
+                                uint64_t *fixed_count)
 {
     *bad_count   = 0;
     *fixed_count = 0;
@@ -382,9 +377,14 @@ int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lb
             fprintf(stderr, "\n  %s node at LBA %" PRIu64 ": checksum mismatch\n", tree_name, lba);
             if(bad >= bad_cap)
             {
-                bad_cap = bad_cap ? bad_cap * 2 : 16;
+                bad_cap       = bad_cap ? bad_cap * 2 : 16;
                 uint64_t *tmp = realloc(bad_lbas, bad_cap * sizeof(uint64_t));
-                if(!tmp) { free(buf); free(bad_lbas); return OBMAFS3_ERR_NOMEM; }
+                if(!tmp)
+                {
+                    free(buf);
+                    free(bad_lbas);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 bad_lbas = tmp;
             }
             bad_lbas[bad] = lba;
@@ -392,18 +392,14 @@ int verify_btree_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lb
         }
     }
 
-    if(node_count > 10)
-    {
-        bar_clear();
-    }
+    if(node_count > 10) { bar_clear(); }
 
     /* Offer to fix */
     uint64_t fixes = 0;
     if(bad > 0)
     {
         char prompt[128];
-        snprintf(prompt, sizeof(prompt), "  Fix %" PRIu64 " %s node checksum%s?", bad, tree_name,
-                 bad == 1 ? "" : "s");
+        snprintf(prompt, sizeof(prompt), "  Fix %" PRIu64 " %s node checksum%s?", bad, tree_name, bad == 1 ? "" : "s");
         if(ask_fix(auto_yes, auto_no, prompt))
         {
             for(uint64_t i = 0; i < bad; i++)
@@ -456,120 +452,120 @@ int ordering_key_cmp(const uint8_t *a, const uint8_t *b, int type, int is_leaf)
 
     switch(type)
     {
-    case ORD_UINT64_KEY:
-        memcpy(&ua, a, 8);
-        memcpy(&ub, b, 8);
-        return (ua < ub) ? -1 : (ua > ub) ? 1 : 0;
+        case ORD_UINT64_KEY:
+            memcpy(&ua, a, 8);
+            memcpy(&ub, b, 8);
+            return (ua < ub) ? -1 : (ua > ub) ? 1 : 0;
 
-    case ORD_CATALOG:
-        if(is_leaf)
-        {
-            /* catalog_record: inode_id(8), parent_id(8), directory_flag(1), name[256] */
-            uint64_t pid_a, pid_b;
-            memcpy(&pid_a, a + 8, 8);
-            memcpy(&pid_b, b + 8, 8);
-            if(pid_a != pid_b) return (pid_a < pid_b) ? -1 : 1;
-            return strcmp((const char *)(a + 17), (const char *)(b + 17));
-        }
-        else
-        {
-            /* catalog_index_entry: parent_id(8), name[256], child_lba(8) */
-            uint64_t pid_a, pid_b;
-            memcpy(&pid_a, a, 8);
-            memcpy(&pid_b, b, 8);
-            if(pid_a != pid_b) return (pid_a < pid_b) ? -1 : 1;
-            return strcmp((const char *)(a + 8), (const char *)(b + 8));
-        }
+        case ORD_CATALOG:
+            if(is_leaf)
+            {
+                /* catalog_record: inode_id(8), parent_id(8), directory_flag(1), name[256] */
+                uint64_t pid_a, pid_b;
+                memcpy(&pid_a, a + 8, 8);
+                memcpy(&pid_b, b + 8, 8);
+                if(pid_a != pid_b) return (pid_a < pid_b) ? -1 : 1;
+                return strcmp((const char *)(a + 17), (const char *)(b + 17));
+            }
+            else
+            {
+                /* catalog_index_entry: parent_id(8), name[256], child_lba(8) */
+                uint64_t pid_a, pid_b;
+                memcpy(&pid_a, a, 8);
+                memcpy(&pid_b, b, 8);
+                if(pid_a != pid_b) return (pid_a < pid_b) ? -1 : 1;
+                return strcmp((const char *)(a + 8), (const char *)(b + 8));
+            }
 
-    case ORD_OVERFLOW:
-        if(is_leaf)
+        case ORD_OVERFLOW:
+            if(is_leaf)
+            {
+                /* overflow_extent: inode_id(8), logical_offset(8), ... */
+                uint64_t id_a, id_b;
+                memcpy(&id_a, a, 8);
+                memcpy(&id_b, b, 8);
+                if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+                uint64_t off_a, off_b;
+                memcpy(&off_a, a + 8, 8);
+                memcpy(&off_b, b + 8, 8);
+                return (off_a < off_b) ? -1 : (off_a > off_b) ? 1 : 0;
+            }
+            else
+            {
+                /* overflow_index_entry: inode_id(8), logical_offset(8), child_lba(8) */
+                uint64_t id_a, id_b;
+                memcpy(&id_a, a, 8);
+                memcpy(&id_b, b, 8);
+                if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+                uint64_t off_a, off_b;
+                memcpy(&off_a, a + 8, 8);
+                memcpy(&off_b, b + 8, 8);
+                return (off_a < off_b) ? -1 : (off_a > off_b) ? 1 : 0;
+            }
+
+        case ORD_MEDIA_TAG:
         {
-            /* overflow_extent: inode_id(8), logical_offset(8), ... */
+            /* Both leaf and index begin with inode_id(8), tag_type(2) */
             uint64_t id_a, id_b;
             memcpy(&id_a, a, 8);
             memcpy(&id_b, b, 8);
             if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
-            uint64_t off_a, off_b;
-            memcpy(&off_a, a + 8, 8);
-            memcpy(&off_b, b + 8, 8);
-            return (off_a < off_b) ? -1 : (off_a > off_b) ? 1 : 0;
-        }
-        else
-        {
-            /* overflow_index_entry: inode_id(8), logical_offset(8), child_lba(8) */
-            uint64_t id_a, id_b;
-            memcpy(&id_a, a, 8);
-            memcpy(&id_b, b, 8);
-            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
-            uint64_t off_a, off_b;
-            memcpy(&off_a, a + 8, 8);
-            memcpy(&off_b, b + 8, 8);
-            return (off_a < off_b) ? -1 : (off_a > off_b) ? 1 : 0;
+            uint16_t ta, tb;
+            memcpy(&ta, a + 8, 2);
+            memcpy(&tb, b + 8, 2);
+            return (ta < tb) ? -1 : (ta > tb) ? 1 : 0;
         }
 
-    case ORD_MEDIA_TAG:
-    {
-        /* Both leaf and index begin with inode_id(8), tag_type(2) */
-        uint64_t id_a, id_b;
-        memcpy(&id_a, a, 8);
-        memcpy(&id_b, b, 8);
-        if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
-        uint16_t ta, tb;
-        memcpy(&ta, a + 8, 2);
-        memcpy(&tb, b + 8, 2);
-        return (ta < tb) ? -1 : (ta > tb) ? 1 : 0;
-    }
+        case ORD_METADATA:
+            if(is_leaf)
+            {
+                /* metadata_record: inode_id(8), key[256], value[1025] */
+                uint64_t id_a, id_b;
+                memcpy(&id_a, a, 8);
+                memcpy(&id_b, b, 8);
+                if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+                return strncmp((const char *)(a + 8), (const char *)(b + 8), METADATA_KEY_MAX);
+            }
+            else
+            {
+                /* metadata_index_entry: inode_id(8), key[256], child_lba(8) */
+                uint64_t id_a, id_b;
+                memcpy(&id_a, a, 8);
+                memcpy(&id_b, b, 8);
+                if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
+                return strncmp((const char *)(a + 8), (const char *)(b + 8), METADATA_KEY_MAX);
+            }
 
-    case ORD_METADATA:
-        if(is_leaf)
-        {
-            /* metadata_record: inode_id(8), key[256], value[1025] */
-            uint64_t id_a, id_b;
-            memcpy(&id_a, a, 8);
-            memcpy(&id_b, b, 8);
-            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
-            return strncmp((const char *)(a + 8), (const char *)(b + 8), METADATA_KEY_MAX);
-        }
-        else
-        {
-            /* metadata_index_entry: inode_id(8), key[256], child_lba(8) */
-            uint64_t id_a, id_b;
-            memcpy(&id_a, a, 8);
-            memcpy(&id_b, b, 8);
-            if(id_a != id_b) return (id_a < id_b) ? -1 : 1;
-            return strncmp((const char *)(a + 8), (const char *)(b + 8), METADATA_KEY_MAX);
-        }
+        case ORD_METADATA_IDX:
+            if(is_leaf)
+            {
+                /* metadata_idx_record: key[256], value[1025], inode_id(8) */
+                int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
+                if(r != 0) return r;
+                r = strncmp((const char *)(a + METADATA_KEY_MAX), (const char *)(b + METADATA_KEY_MAX),
+                            METADATA_VALUE_MAX);
+                if(r != 0) return r;
+                uint64_t id_a, id_b;
+                memcpy(&id_a, a + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+                memcpy(&id_b, b + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+                return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
+            }
+            else
+            {
+                /* metadata_idx_index_entry: key[256], value[1025], inode_id(8), child_lba(8) */
+                int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
+                if(r != 0) return r;
+                r = strncmp((const char *)(a + METADATA_KEY_MAX), (const char *)(b + METADATA_KEY_MAX),
+                            METADATA_VALUE_MAX);
+                if(r != 0) return r;
+                uint64_t id_a, id_b;
+                memcpy(&id_a, a + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+                memcpy(&id_b, b + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
+                return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
+            }
 
-    case ORD_METADATA_IDX:
-        if(is_leaf)
-        {
-            /* metadata_idx_record: key[256], value[1025], inode_id(8) */
-            int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
-            if(r != 0) return r;
-            r = strncmp((const char *)(a + METADATA_KEY_MAX), (const char *)(b + METADATA_KEY_MAX),
-                        METADATA_VALUE_MAX);
-            if(r != 0) return r;
-            uint64_t id_a, id_b;
-            memcpy(&id_a, a + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
-            memcpy(&id_b, b + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
-            return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
-        }
-        else
-        {
-            /* metadata_idx_index_entry: key[256], value[1025], inode_id(8), child_lba(8) */
-            int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
-            if(r != 0) return r;
-            r = strncmp((const char *)(a + METADATA_KEY_MAX), (const char *)(b + METADATA_KEY_MAX),
-                        METADATA_VALUE_MAX);
-            if(r != 0) return r;
-            uint64_t id_a, id_b;
-            memcpy(&id_a, a + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
-            memcpy(&id_b, b + METADATA_KEY_MAX + METADATA_VALUE_MAX, 8);
-            return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
-        }
-
-    default:
-        return 0;
+        default:
+            return 0;
     }
 }
 
@@ -593,7 +589,7 @@ int ordering_key_cmp(const uint8_t *a, const uint8_t *b, int type, int is_leaf)
  * @return @c OBMAFS3_OK on successful write.
  */
 int fix_node_ordering(struct obmafs3_ctx *ctx, uint8_t *buf, size_t buf_size, uint64_t lba, int nblocks,
-                             struct btree_node_header *hdr, int key_type, int is_leaf, size_t stride)
+                      struct btree_node_header *hdr, int key_type, int is_leaf, size_t stride)
 {
     /* Set file-scope qsort context */
     s_ord_key_type = key_type;
@@ -633,9 +629,8 @@ int fix_node_ordering(struct obmafs3_ctx *ctx, uint8_t *buf, size_t buf_size, ui
  * @param auto_no    If non-zero, never repair.
  * @param errors     Pointer to the cumulative error counter.
  */
-void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
-                                   uint64_t actual, const char *tree_name, const char *indent, int auto_yes,
-                                   int auto_no, int *errors)
+void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t actual,
+                            const char *tree_name, const char *indent, int auto_yes, int auto_no, int *errors)
 {
     if((uint64_t)hdr->total_nodes == actual)
     {
@@ -649,7 +644,7 @@ void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
     if(ask_fix(auto_yes, auto_no, "Fix total_nodes in header?"))
     {
         hdr->total_nodes = (uint32_t)actual;
-        int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+        int rc           = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
         if(rc == OBMAFS3_OK)
         {
             result_fixed("Total nodes:", "%" PRIu64, actual);
@@ -684,8 +679,8 @@ void verify_fix_total_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
  * @param auto_no    If non-zero, never repair.
  * @param errors     Pointer to the cumulative error counter.
  */
-void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
-                                  const char *tree_name, const char *indent, int auto_yes, int auto_no, int *errors)
+void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, const char *tree_name,
+                           const char *indent, int auto_yes, int auto_no, int *errors)
 {
     if(hdr->free_node_lba == 0 && hdr->free_nodes == 0)
     {
@@ -696,16 +691,15 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
     /* Both must be zero together or both non-zero */
     if((hdr->free_node_lba == 0) != (hdr->free_nodes == 0))
     {
-        result_bad("Free node chain:",
-                   "inconsistent: free_node_lba=%" PRIu64 ", free_nodes=%u",
-                   hdr->free_node_lba, hdr->free_nodes);
+        result_bad("Free node chain:", "inconsistent: free_node_lba=%" PRIu64 ", free_nodes=%u", hdr->free_node_lba,
+                   hdr->free_nodes);
         (*errors)++;
 
         if(ask_fix(auto_yes, auto_no, "Reset free node chain in header?"))
         {
             hdr->free_node_lba = 0;
             hdr->free_nodes    = 0;
-            int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+            int rc             = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
             if(rc == OBMAFS3_OK)
             {
                 result_fixed("Free node chain:", "reset to 0");
@@ -718,9 +712,9 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
     }
 
     /* Walk the chain and count nodes */
-    size_t   bsz       = (size_t)ctx->sb.block_size;
-    uint64_t max_lba   = ctx->sb.total_bytes / ctx->sb.block_size;
-    uint8_t *buf       = calloc(1, bsz);
+    size_t   bsz     = (size_t)ctx->sb.block_size;
+    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
+    uint8_t *buf     = calloc(1, bsz);
     if(!buf)
     {
         result_bad("Free node chain:", "out of memory");
@@ -728,17 +722,16 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
         return;
     }
 
-    uint32_t walked    = 0;
-    uint64_t cur       = hdr->free_node_lba;
-    int      chain_ok  = 1;
+    uint32_t walked   = 0;
+    uint64_t cur      = hdr->free_node_lba;
+    int      chain_ok = 1;
 
     while(cur != 0)
     {
         if(cur >= max_lba)
         {
-            result_bad("Free node chain:",
-                       "LBA %" PRIu64 " out of bounds (max %" PRIu64 ") at position %u",
-                       cur, max_lba - 1, walked);
+            result_bad("Free node chain:", "LBA %" PRIu64 " out of bounds (max %" PRIu64 ") at position %u", cur,
+                       max_lba - 1, walked);
             chain_ok = 0;
             break;
         }
@@ -746,8 +739,7 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
         if(walked >= hdr->free_nodes + 1)
         {
             /* More nodes than declared — likely a cycle */
-            result_bad("Free node chain:",
-                       "chain longer than declared free_nodes=%u (possible cycle)",
+            result_bad("Free node chain:", "chain longer than declared free_nodes=%u (possible cycle)",
                        hdr->free_nodes);
             chain_ok = 0;
             break;
@@ -756,9 +748,7 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
         int rc = obmafs3_block_read(ctx, cur, buf, bsz);
         if(rc != OBMAFS3_OK)
         {
-            result_bad("Free node chain:",
-                       "read error at LBA %" PRIu64 " (position %u): %d",
-                       cur, walked, rc);
+            result_bad("Free node chain:", "read error at LBA %" PRIu64 " (position %u): %d", cur, walked, rc);
             chain_ok = 0;
             break;
         }
@@ -773,17 +763,13 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
 
     if(chain_ok && walked == hdr->free_nodes)
     {
-        result_ok("Free node chain:",
-                  "free_node_lba=%" PRIu64 ", free_nodes=%u",
-                  hdr->free_node_lba, hdr->free_nodes);
+        result_ok("Free node chain:", "free_node_lba=%" PRIu64 ", free_nodes=%u", hdr->free_node_lba, hdr->free_nodes);
         return;
     }
 
     if(chain_ok && walked != hdr->free_nodes)
     {
-        result_bad("Free node chain:",
-                   "declared free_nodes=%u but walked %u",
-                   hdr->free_nodes, walked);
+        result_bad("Free node chain:", "declared free_nodes=%u but walked %u", hdr->free_nodes, walked);
     }
 
     (*errors)++;
@@ -792,7 +778,7 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
     {
         hdr->free_node_lba = 0;
         hdr->free_nodes    = 0;
-        int rc = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+        int rc             = obmafs3_btree_header_write(ctx, hdr_lba, hdr);
         if(rc == OBMAFS3_OK)
         {
             result_fixed("Free node chain:", "reset to 0");
@@ -820,8 +806,7 @@ void verify_fix_free_nodes(struct obmafs3_ctx *ctx, struct btree_header *hdr, ui
  * @param nblocks     Number of contiguous blocks per node (1 or METADATA_NODE_BLOCKS).
  * @return @c OBMAFS3_OK on success.
  */
-int patch_sibling_links(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t new_left, uint64_t new_right,
-                               int nblocks)
+int patch_sibling_links(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t new_left, uint64_t new_right, int nblocks)
 {
     size_t   node_sz = (size_t)nblocks * ctx->sb.block_size;
     uint8_t *buf     = calloc(1, node_sz);
@@ -888,9 +873,9 @@ int patch_sibling_links(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t new_left
  * @param fixed_count      Output: number of nodes whose links were repaired.
  * @return @c OBMAFS3_OK on success (even if violations were found).
  */
-int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size,
-                                    size_t child_lba_off, int nblocks, const char *tree_name, int auto_yes,
-                                    int auto_no, uint64_t *bad_count, uint64_t *fixed_count)
+int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size, size_t child_lba_off,
+                             int nblocks, const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
+                             uint64_t *fixed_count)
 {
     *bad_count   = 0;
     *fixed_count = 0;
@@ -905,11 +890,15 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
      * before children and enumerates children left-to-right, nodes at
      * each level appear in the correct left-to-right order.
      */
-    uint64_t *queue    = malloc(64 * sizeof(uint64_t));
-    uint64_t  q_head   = 0;
-    uint64_t  q_tail   = 0;
-    uint64_t  q_cap    = 64;
-    if(!queue) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    uint64_t *queue  = malloc(64 * sizeof(uint64_t));
+    uint64_t  q_head = 0;
+    uint64_t  q_tail = 0;
+    uint64_t  q_cap  = 64;
+    if(!queue)
+    {
+        free(buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     /* Per-node metadata gathered during BFS */
     typedef struct
@@ -923,7 +912,12 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
     node_info_t *infos    = malloc(64 * sizeof(node_info_t));
     uint64_t     info_cnt = 0;
     uint64_t     info_cap = 64;
-    if(!infos) { free(buf); free(queue); return OBMAFS3_ERR_NOMEM; }
+    if(!infos)
+    {
+        free(buf);
+        free(queue);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     /* Enqueue root */
     queue[q_tail++] = root_lba;
@@ -938,7 +932,11 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
         {
             int rc = obmafs3_block_read(ctx, lba + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
                                         (size_t)ctx->sb.block_size);
-            if(rc != OBMAFS3_OK) { read_ok = 0; break; }
+            if(rc != OBMAFS3_OK)
+            {
+                read_ok = 0;
+                break;
+            }
         }
         if(!read_ok) continue;
 
@@ -951,7 +949,13 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
         {
             info_cap *= 2;
             node_info_t *tmp = realloc(infos, info_cap * sizeof(node_info_t));
-            if(!tmp) { free(buf); free(queue); free(infos); return OBMAFS3_ERR_NOMEM; }
+            if(!tmp)
+            {
+                free(buf);
+                free(queue);
+                free(infos);
+                return OBMAFS3_ERR_NOMEM;
+            }
             infos = tmp;
         }
         infos[info_cnt++] = (node_info_t){lba, hdr.left_link, hdr.right_link, hdr.level};
@@ -970,7 +974,13 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
                 {
                     q_cap *= 2;
                     uint64_t *tmp = realloc(queue, q_cap * sizeof(uint64_t));
-                    if(!tmp) { free(buf); free(queue); free(infos); return OBMAFS3_ERR_NOMEM; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(queue);
+                        free(infos);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
                     queue = tmp;
                 }
                 queue[q_tail++] = child_lba;
@@ -994,8 +1004,7 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
     {
         uint8_t  cur_level = infos[run_start].level;
         uint64_t run_end   = run_start + 1;
-        while(run_end < info_cnt && infos[run_end].level == cur_level)
-            run_end++;
+        while(run_end < info_cnt && infos[run_end].level == cur_level) run_end++;
 
         /* run_start..run_end-1 are all nodes at cur_level in L→R order */
         uint64_t run_len = run_end - run_start;
@@ -1010,9 +1019,8 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
             if(infos[i].left_link != expect_left || infos[i].right_link != expect_right)
             {
                 if(!level_bad)
-                    fprintf(stderr,
-                            "\n  %s: sibling-link violations at level %u (%" PRIu64 " node%s):\n",
-                            tree_name, cur_level, run_len, run_len == 1 ? "" : "s");
+                    fprintf(stderr, "\n  %s: sibling-link violations at level %u (%" PRIu64 " node%s):\n", tree_name,
+                            cur_level, run_len, run_len == 1 ? "" : "s");
                 level_bad = 1;
                 violations++;
 
@@ -1074,9 +1082,9 @@ int verify_fix_sibling_links(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t 
  * @param fixed_count      Output: number of nodes successfully repaired.
  * @return @c OBMAFS3_OK on success (even if ordering errors were found).
  */
-int verify_btree_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count,
-                                 int key_type, size_t leaf_rec_size, size_t idx_entry_size, const char *tree_name,
-                                 int auto_yes, int auto_no, uint64_t *bad_count, uint64_t *fixed_count)
+int verify_btree_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count, int key_type,
+                          size_t leaf_rec_size, size_t idx_entry_size, const char *tree_name, int auto_yes, int auto_no,
+                          uint64_t *bad_count, uint64_t *fixed_count)
 {
     *bad_count   = 0;
     *fixed_count = 0;
@@ -1162,10 +1170,7 @@ int verify_btree_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, ui
         }
     }
 
-    if(node_count > 10)
-    {
-        bar_clear();
-    }
+    if(node_count > 10) { bar_clear(); }
 
     free(buf);
     return OBMAFS3_OK;
@@ -1190,8 +1195,8 @@ int verify_btree_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, ui
  * @return @c OBMAFS3_OK on success (even if ordering errors were found).
  */
 int verify_meta_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count, int key_type,
-                                size_t leaf_rec_size, size_t idx_entry_size, const char *tree_name, int auto_yes,
-                                int auto_no, uint64_t *bad_count, uint64_t *fixed_count)
+                         size_t leaf_rec_size, size_t idx_entry_size, const char *tree_name, int auto_yes, int auto_no,
+                         uint64_t *bad_count, uint64_t *fixed_count)
 {
     *bad_count   = 0;
     *fixed_count = 0;
@@ -1215,7 +1220,11 @@ int verify_meta_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uin
         {
             int rc = obmafs3_block_read(ctx, node_lbas[n] + (uint64_t)b, buf + (size_t)b * ctx->sb.block_size,
                                         (size_t)ctx->sb.block_size);
-            if(rc != OBMAFS3_OK) { ok = 0; break; }
+            if(rc != OBMAFS3_OK)
+            {
+                ok = 0;
+                break;
+            }
         }
         if(!ok) continue;
 
@@ -1284,10 +1293,7 @@ int verify_meta_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uin
         }
     }
 
-    if(node_count > 10)
-    {
-        bar_clear();
-    }
+    if(node_count > 10) { bar_clear(); }
 
     free(buf);
     return OBMAFS3_OK;
@@ -1315,8 +1321,8 @@ int verify_meta_ordering(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uin
  * @param out_count         Output: number of elements in @p out_lbas.
  * @return @c OBMAFS3_OK on success.
  */
-int walk_meta_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size,
-                                 size_t child_lba_off, uint64_t **out_lbas, uint64_t *out_count)
+int walk_meta_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t index_entry_size, size_t child_lba_off,
+                          uint64_t **out_lbas, uint64_t *out_count)
 {
     *out_lbas  = NULL;
     *out_count = 0;
@@ -1436,8 +1442,8 @@ int walk_meta_btree_nodes(struct obmafs3_ctx *ctx, uint64_t root_lba, size_t ind
  * @return @c OBMAFS3_OK on success.
  */
 int verify_meta_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lbas, uint64_t node_count,
-                                      const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
-                                      uint64_t *fixed_count)
+                               const char *tree_name, int auto_yes, int auto_no, uint64_t *bad_count,
+                               uint64_t *fixed_count)
 {
     *bad_count   = 0;
     *fixed_count = 0;
@@ -1485,9 +1491,14 @@ int verify_meta_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lba
             fprintf(stderr, "  %s node at LBA %" PRIu64 ": checksum mismatch\n", tree_name, lba);
             if(bad >= bad_cap)
             {
-                bad_cap = bad_cap ? bad_cap * 2 : 16;
+                bad_cap       = bad_cap ? bad_cap * 2 : 16;
                 uint64_t *tmp = realloc(bad_lbas, bad_cap * sizeof(uint64_t));
-                if(!tmp) { free(buf); free(bad_lbas); return OBMAFS3_ERR_NOMEM; }
+                if(!tmp)
+                {
+                    free(buf);
+                    free(bad_lbas);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 bad_lbas = tmp;
             }
             bad_lbas[bad] = lba;
@@ -1500,8 +1511,7 @@ int verify_meta_node_checksums(struct obmafs3_ctx *ctx, const uint64_t *node_lba
     if(bad > 0)
     {
         char prompt[128];
-        snprintf(prompt, sizeof(prompt), "  Fix %" PRIu64 " %s node checksum%s?", bad, tree_name,
-                 bad == 1 ? "" : "s");
+        snprintf(prompt, sizeof(prompt), "  Fix %" PRIu64 " %s node checksum%s?", bad, tree_name, bad == 1 ? "" : "s");
         if(ask_fix(auto_yes, auto_no, prompt))
         {
             for(uint64_t i = 0; i < bad; i++)

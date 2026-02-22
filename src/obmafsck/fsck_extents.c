@@ -56,13 +56,12 @@
 static void validate_extent(const struct extent_run *ext, uint64_t total_blocks, uint64_t inode_id, int slot,
                             const char *label, uint64_t *bad_count)
 {
-    if(ext->block_count == 0 && ext->start_block == 0 && ext->logical_blocks == 0)
-        return; /* unused slot — OK */
+    if(ext->block_count == 0 && ext->start_block == 0 && ext->logical_blocks == 0) return; /* unused slot — OK */
 
     if(ext->block_count == 0)
     {
-        printf("    inode %" PRIu64 " %s extent %d: block_count=0 but start_block=%" PRIu64
-               " logical_blocks=%" PRIu64 "\n",
+        printf("    inode %" PRIu64 " %s extent %d: block_count=0 but start_block=%" PRIu64 " logical_blocks=%" PRIu64
+               "\n",
                inode_id, label, slot, ext->start_block, ext->logical_blocks);
         (*bad_count)++;
         return;
@@ -87,8 +86,7 @@ static void validate_extent(const struct extent_run *ext, uint64_t total_blocks,
 
     if(ext->logical_blocks < ext->block_count)
     {
-        printf("    inode %" PRIu64 " %s extent %d: logical_blocks (%" PRIu64
-               ") < block_count (%" PRIu64 ")\n",
+        printf("    inode %" PRIu64 " %s extent %d: logical_blocks (%" PRIu64 ") < block_count (%" PRIu64 ")\n",
                inode_id, label, slot, ext->logical_blocks, ext->block_count);
         (*bad_count)++;
     }
@@ -124,7 +122,11 @@ static void validate_inline_extents(struct obmafs3_ctx *ctx, uint64_t total_bloc
 
     uint64_t *stack    = malloc(64 * sizeof(uint64_t));
     uint64_t  stk_size = 0, stk_cap = 64;
-    if(!stack) { free(buf); return; }
+    if(!stack)
+    {
+        free(buf);
+        return;
+    }
 
     stack[stk_size++] = root_lba;
 
@@ -148,7 +150,12 @@ static void validate_inline_extents(struct obmafs3_ctx *ctx, uint64_t total_bloc
                 {
                     stk_cap *= 2;
                     uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(stack); return; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(stack);
+                        return;
+                    }
                     stack = tmp;
                 }
                 stack[stk_size++] = ie.child_lba;
@@ -176,10 +183,9 @@ static void validate_inline_extents(struct obmafs3_ctx *ctx, uint64_t total_bloc
                     for(int e = 0; e < 8; e++)
                     {
                         struct extent_run *ext = &rec.extents[e];
-                        int bad = 0;
+                        int                bad = 0;
 
-                        if(ext->block_count == 0 && ext->start_block == 0 && ext->logical_blocks == 0)
-                            continue;
+                        if(ext->block_count == 0 && ext->start_block == 0 && ext->logical_blocks == 0) continue;
                         if(ext->block_count == 0) bad = 1;
                         if(ext->start_block == 0 && ext->block_count != 0) bad = 1;
                         if(ext->block_count != 0 && ext->start_block + ext->block_count > total_blocks) bad = 1;
@@ -196,8 +202,7 @@ static void validate_inline_extents(struct obmafs3_ctx *ctx, uint64_t total_bloc
                     {
                         /* Re-compute file_size from remaining valid extents */
                         uint64_t logical_total = 0;
-                        for(int e = 0; e < 8; e++)
-                            logical_total += rec.extents[e].logical_blocks;
+                        for(int e = 0; e < 8; e++) logical_total += rec.extents[e].logical_blocks;
                         rec.file_size = logical_total * ctx->sb.block_size;
 
                         obmafs3_inode_put(ctx, &rec);
@@ -233,7 +238,11 @@ static void validate_overflow_extents(struct obmafs3_ctx *ctx, uint64_t total_bl
 
     uint64_t *stack    = malloc(64 * sizeof(uint64_t));
     uint64_t  stk_size = 0, stk_cap = 64;
-    if(!stack) { free(buf); return; }
+    if(!stack)
+    {
+        free(buf);
+        return;
+    }
 
     stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
 
@@ -257,7 +266,12 @@ static void validate_overflow_extents(struct obmafs3_ctx *ctx, uint64_t total_bl
                 {
                     stk_cap *= 2;
                     uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(stack); return; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(stack);
+                        return;
+                    }
                     stack = tmp;
                 }
                 stack[stk_size++] = ie.child_lba;
@@ -321,15 +335,14 @@ static uint64_t lba_map_add(struct lba_count **map, uint64_t *cap, uint64_t *len
     /* Insert new entry */
     if(*len >= *cap)
     {
-        uint64_t new_cap         = *cap ? *cap * 2 : 4096;
-        struct lba_count *tmp    = realloc(*map, (size_t)(new_cap * sizeof(struct lba_count)));
+        uint64_t          new_cap = *cap ? *cap * 2 : 4096;
+        struct lba_count *tmp     = realloc(*map, (size_t)(new_cap * sizeof(struct lba_count)));
         if(!tmp) return 0;
         *map = tmp;
         *cap = new_cap;
     }
 
-    if(lo < *len)
-        memmove(&(*map)[lo + 1], &(*map)[lo], (size_t)(*len - lo) * sizeof(struct lba_count));
+    if(lo < *len) memmove(&(*map)[lo + 1], &(*map)[lo], (size_t)(*len - lo) * sizeof(struct lba_count));
 
     (*map)[lo].lba   = lba;
     (*map)[lo].count = 1;
@@ -375,8 +388,7 @@ static uint64_t lba_map_find(const struct lba_count *map, uint64_t len, uint64_t
  * @param bad_count  Output: number of mismatches found.
  * @param fix_count  Output: number of mismatches repaired.
  */
-void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, uint64_t *bad_count,
-                                 uint64_t *fix_count)
+void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, uint64_t *bad_count, uint64_t *fix_count)
 {
     *bad_count = 0;
     *fix_count = 0;
@@ -389,15 +401,19 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
     if(!buf) return;
 
     /* ---- Phase 1: build expected refcount map from all inode extents ---- */
-    struct lba_count *expected   = NULL;
-    uint64_t          exp_cap    = 0;
-    uint64_t          exp_len    = 0;
+    struct lba_count *expected = NULL;
+    uint64_t          exp_cap  = 0;
+    uint64_t          exp_len  = 0;
 
     /* 1a: Inline extents from inode tree */
     {
         uint64_t *stack    = malloc(64 * sizeof(uint64_t));
         uint64_t  stk_size = 0, stk_cap = 64;
-        if(!stack) { free(buf); return; }
+        if(!stack)
+        {
+            free(buf);
+            return;
+        }
 
         stack[stk_size++] = root_lba;
 
@@ -420,7 +436,13 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
                     {
                         stk_cap *= 2;
                         uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                        if(!tmp) { free(buf); free(stack); free(expected); return; }
+                        if(!tmp)
+                        {
+                            free(buf);
+                            free(stack);
+                            free(expected);
+                            return;
+                        }
                         stack = tmp;
                     }
                     stack[stk_size++] = ie.child_lba;
@@ -460,7 +482,12 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
     {
         uint64_t *stack    = malloc(64 * sizeof(uint64_t));
         uint64_t  stk_size = 0, stk_cap = 64;
-        if(!stack) { free(buf); free(expected); return; }
+        if(!stack)
+        {
+            free(buf);
+            free(expected);
+            return;
+        }
 
         stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
 
@@ -483,7 +510,13 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
                     {
                         stk_cap *= 2;
                         uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                        if(!tmp) { free(buf); free(stack); free(expected); return; }
+                        if(!tmp)
+                        {
+                            free(buf);
+                            free(stack);
+                            free(expected);
+                            return;
+                        }
                         stack = tmp;
                     }
                     stack[stk_size++] = ie.child_lba;
@@ -516,9 +549,9 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
     }
 
     /* ---- Phase 2: collect stored refcount records ---- */
-    struct lba_count *stored     = NULL;
-    uint64_t          sto_cap    = 0;
-    uint64_t          sto_len    = 0;
+    struct lba_count *stored  = NULL;
+    uint64_t          sto_cap = 0;
+    uint64_t          sto_len = 0;
 
     if(ctx->refcount_hdr.root_node_lba != 0)
     {
@@ -556,7 +589,7 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
 
                         if(sto_len >= sto_cap)
                         {
-                            sto_cap = sto_cap ? sto_cap * 2 : 256;
+                            sto_cap               = sto_cap ? sto_cap * 2 : 256;
                             struct lba_count *tmp = realloc(stored, (size_t)(sto_cap * sizeof(*tmp)));
                             if(!tmp)
                             {
@@ -592,8 +625,7 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
         if(si == UINT64_MAX)
         {
             /* Should be in tree but is not */
-            printf("    LBA %" PRIu64 ": expected refcount %" PRIu32 ", not in tree\n",
-                   expected[i].lba, exp_rc);
+            printf("    LBA %" PRIu64 ": expected refcount %" PRIu32 ", not in tree\n", expected[i].lba, exp_rc);
             (*bad_count)++;
             if(ask_fix(auto_yes, auto_no, "    Insert correct refcount?"))
             {
@@ -606,8 +638,8 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
         }
         else if(stored[si].count != exp_rc)
         {
-            printf("    LBA %" PRIu64 ": stored refcount %" PRIu32 ", expected %" PRIu32 "\n",
-                   expected[i].lba, stored[si].count, exp_rc);
+            printf("    LBA %" PRIu64 ": stored refcount %" PRIu32 ", expected %" PRIu32 "\n", expected[i].lba,
+                   stored[si].count, exp_rc);
             (*bad_count)++;
             if(ask_fix(auto_yes, auto_no, "    Fix refcount?"))
             {
@@ -634,14 +666,13 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
         if(stored[i].count == 0) continue; /* Already verified in 3a */
 
         /* This entry exists in the tree but shouldn't (block isn't shared) */
-        uint64_t ei = lba_map_find(expected, exp_len, stored[i].lba);
+        uint64_t ei     = lba_map_find(expected, exp_len, stored[i].lba);
         uint32_t actual = (ei != UINT64_MAX) ? expected[ei].count : 0;
 
         if(actual <= 1)
         {
-            printf("    LBA %" PRIu64 ": stale refcount %" PRIu32 " in tree (actual %s)\n",
-                   stored[i].lba, stored[i].count,
-                   actual == 0 ? "unallocated/unreferenced" : "1");
+            printf("    LBA %" PRIu64 ": stale refcount %" PRIu32 " in tree (actual %s)\n", stored[i].lba,
+                   stored[i].count, actual == 0 ? "unallocated/unreferenced" : "1");
             (*bad_count)++;
             if(ask_fix(auto_yes, auto_no, "    Remove stale refcount entry?"))
             {
@@ -706,7 +737,11 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
     {
         uint64_t *stack    = malloc(64 * sizeof(uint64_t));
         uint64_t  stk_size = 0, stk_cap = 64;
-        if(!stack) { free(buf); return; }
+        if(!stack)
+        {
+            free(buf);
+            return;
+        }
 
         stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
 
@@ -730,7 +765,13 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                     {
                         stk_cap *= 2;
                         uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                        if(!tmp) { free(buf); free(stack); free(ovf_map); return; }
+                        if(!tmp)
+                        {
+                            free(buf);
+                            free(stack);
+                            free(ovf_map);
+                            return;
+                        }
                         stack = tmp;
                     }
                     stack[stk_size++] = ie.child_lba;
@@ -759,9 +800,15 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                 {
                     if(ovf_count >= ovf_cap)
                     {
-                        ovf_cap = ovf_cap ? ovf_cap * 2 : 64;
+                        ovf_cap          = ovf_cap ? ovf_cap * 2 : 64;
                         ovf_entry_t *tmp = realloc(ovf_map, ovf_cap * sizeof(*tmp));
-                        if(!tmp) { free(buf); free(stack); free(ovf_map); return; }
+                        if(!tmp)
+                        {
+                            free(buf);
+                            free(stack);
+                            free(ovf_map);
+                            return;
+                        }
                         ovf_map = tmp;
                     }
                     ovf_map[ovf_count].inode_id    = oe.inode_id;
@@ -778,7 +825,12 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
     {
         uint64_t *stack    = malloc(64 * sizeof(uint64_t));
         uint64_t  stk_size = 0, stk_cap = 64;
-        if(!stack) { free(buf); free(ovf_map); return; }
+        if(!stack)
+        {
+            free(buf);
+            free(ovf_map);
+            return;
+        }
 
         stack[stk_size++] = root_lba;
 
@@ -802,7 +854,13 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                     {
                         stk_cap *= 2;
                         uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                        if(!tmp) { free(buf); free(stack); free(ovf_map); return; }
+                        if(!tmp)
+                        {
+                            free(buf);
+                            free(stack);
+                            free(ovf_map);
+                            return;
+                        }
                         stack = tmp;
                     }
                     stack[stk_size++] = ie.child_lba;
@@ -825,8 +883,7 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
 
                 /* Sum inline extents */
                 uint64_t logical_sum = 0;
-                for(int e = 0; e < 8; e++)
-                    logical_sum += rec.extents[e].logical_blocks;
+                for(int e = 0; e < 8; e++) logical_sum += rec.extents[e].logical_blocks;
 
                 /* Add overflow extents for this inode */
                 for(uint64_t j = 0; j < ovf_count; j++)
@@ -853,8 +910,7 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                 {
                     if(rec.file_size != 0)
                     {
-                        printf("    inode %" PRIu64 ": file_size=%" PRIu64
-                               " but no extents (expected 0)\n",
+                        printf("    inode %" PRIu64 ": file_size=%" PRIu64 " but no extents (expected 0)\n",
                                rec.inode_id, rec.file_size);
                         (*bad_count)++;
                         if(ask_fix(auto_yes, auto_no, "    Set file_size to 0?"))
@@ -869,8 +925,8 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
 
                 if(rec.file_size > expected_size)
                 {
-                    printf("    inode %" PRIu64 ": file_size=%" PRIu64
-                           " exceeds extent capacity %" PRIu64 " (%" PRIu64 " logical blocks)\n",
+                    printf("    inode %" PRIu64 ": file_size=%" PRIu64 " exceeds extent capacity %" PRIu64 " (%" PRIu64
+                           " logical blocks)\n",
                            rec.inode_id, rec.file_size, expected_size, logical_sum);
                     (*bad_count)++;
                     if(ask_fix(auto_yes, auto_no, "    Clamp file_size to extent capacity?"))
@@ -882,8 +938,8 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                 }
                 else if(rec.file_size == 0 && logical_sum > 0)
                 {
-                    printf("    inode %" PRIu64 ": file_size=0 but has %" PRIu64
-                           " logical blocks (capacity %" PRIu64 ")\n",
+                    printf("    inode %" PRIu64 ": file_size=0 but has %" PRIu64 " logical blocks (capacity %" PRIu64
+                           ")\n",
                            rec.inode_id, logical_sum, expected_size);
                     (*bad_count)++;
                     if(ask_fix(auto_yes, auto_no, "    Set file_size to extent capacity?"))
@@ -921,10 +977,7 @@ void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, i
     uint64_t inline_bad = 0, inline_fixed = 0;
     validate_inline_extents(ctx, total_blocks, auto_yes, auto_no, &inline_bad, &inline_fixed);
 
-    if(inline_bad == 0)
-    {
-        result_ok("Inline extents:", "");
-    }
+    if(inline_bad == 0) { result_ok("Inline extents:", ""); }
     else
     {
         if(inline_fixed > 0)
@@ -938,10 +991,7 @@ void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, i
     uint64_t overflow_bad = 0;
     validate_overflow_extents(ctx, total_blocks, &overflow_bad);
 
-    if(overflow_bad == 0)
-    {
-        result_ok("Overflow extents:", "");
-    }
+    if(overflow_bad == 0) { result_ok("Overflow extents:", ""); }
     else
     {
         result_bad("Overflow extents:", "%" PRIu64 " bad", overflow_bad);
@@ -952,10 +1002,7 @@ void check_extent_validity(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, i
     uint64_t sz_bad = 0, sz_fixed = 0;
     check_file_size_vs_extents(ctx, auto_yes, auto_no, &sz_bad, &sz_fixed);
 
-    if(sz_bad == 0)
-    {
-        result_ok("File size check:", "");
-    }
+    if(sz_bad == 0) { result_ok("File size check:", ""); }
     else
     {
         if(sz_fixed > 0)

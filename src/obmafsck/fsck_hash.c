@@ -51,7 +51,7 @@
  * @return Number of hash mismatches detected.
  */
 uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btree_header *hdr, const char *label,
-                                      size_t rec_size, size_t data_size)
+                               size_t rec_size, size_t data_size)
 {
     printf("\n  %s%s hash verification%s\n", CLR_BOLD, label, CLR_RESET);
 
@@ -116,9 +116,9 @@ uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btree_heade
     result_info("Entries to verify:", "%" PRIu64, total_entries);
 
     /* Second pass: verify hashes */
-    uint64_t checked   = 0;
-    uint64_t bad       = 0;
-    uint64_t lba       = hdr->root_node_lba;
+    uint64_t checked = 0;
+    uint64_t bad     = 0;
+    uint64_t lba     = hdr->root_node_lba;
 
     /* Descend to left-most leaf */
     while(lba != 0)
@@ -157,7 +157,8 @@ uint64_t verify_cd_tree_hashes(struct obmafs3_ctx *ctx, const struct btree_heade
                     if(computed != stored_hash) bad++;
 
                     checked++;
-                    if(checked % 256 == 0 || checked == total_entries) print_progress("CD hash verify", checked, total_entries, bad);
+                    if(checked % 256 == 0 || checked == total_entries)
+                        print_progress("CD hash verify", checked, total_entries, bad);
                 }
 
                 lba = nhdr.right_link;
@@ -305,10 +306,10 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
         return 0;
     }
 
-    uint64_t checked         = 0;
-    uint64_t bad             = 0;
-    uint64_t read_errors     = 0;
-    uint64_t cached_dedup_lba = 0;
+    uint64_t checked           = 0;
+    uint64_t bad               = 0;
+    uint64_t read_errors       = 0;
+    uint64_t cached_dedup_lba  = 0;
     int      cached_compressed = 0;
 
     /* Second pass: verify each entry */
@@ -369,7 +370,8 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                                 bad++;
                                 checked++;
                                 cached_dedup_lba = 0;
-                                if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
+                                if(checked % 256 == 0 || checked == total_entries)
+                                    print_progress("Dedup hash verify", checked, total_entries, bad);
                                 continue;
                             }
 
@@ -388,14 +390,16 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
 
                             if(needed_std > 1)
                             {
-                                rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs, (size_t)((needed_std - 1) * bs));
+                                rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs,
+                                                        (size_t)((needed_std - 1) * bs));
                                 if(rc != OBMAFS3_OK)
                                 {
                                     read_errors++;
                                     bad++;
                                     checked++;
                                     cached_dedup_lba = 0;
-                                    if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
+                                    if(checked % 256 == 0 || checked == total_entries)
+                                        print_progress("Dedup hash verify", checked, total_entries, bad);
                                     continue;
                                 }
                             }
@@ -421,8 +425,9 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                                     goto done;
                                 }
 
-                                size_t dret = ZSTD_decompressDCtx(dctx, decomp_buf, dedup_size,
-                                                                  dedup_buf + sizeof(bhdr), (size_t)bhdr.compressed_size);
+                                size_t dret =
+                                    ZSTD_decompressDCtx(dctx, decomp_buf, dedup_size, dedup_buf + sizeof(bhdr),
+                                                        (size_t)bhdr.compressed_size);
                                 ZSTD_freeDCtx(dctx);
 
                                 if(ZSTD_isError(dret))
@@ -431,7 +436,8 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                                     bad++;
                                     checked++;
                                     cached_dedup_lba = 0;
-                                    if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
+                                    if(checked % 256 == 0 || checked == total_entries)
+                                        print_progress("Dedup hash verify", checked, total_entries, bad);
                                     continue;
                                 }
                                 cached_compressed = 1;
@@ -447,7 +453,7 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                         if(cached_compressed)
                         {
                             size_t decomp_off = (size_t)(de.block_offset - sizeof(struct block_header));
-                            sector_data = decomp_buf + decomp_off;
+                            sector_data       = decomp_buf + decomp_off;
                         }
                         else
                         {
@@ -458,7 +464,8 @@ uint64_t verify_dedup_hashes(struct obmafs3_ctx *ctx)
                         if(computed != de.hash) bad++;
 
                         checked++;
-                        if(checked % 256 == 0 || checked == total_entries) print_progress("Dedup hash verify", checked, total_entries, bad);
+                        if(checked % 256 == 0 || checked == total_entries)
+                            print_progress("Dedup hash verify", checked, total_entries, bad);
                     }
 
                     lba = nhdr.right_link;

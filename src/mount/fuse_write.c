@@ -35,8 +35,8 @@
  */
 
 #include <linux/fs.h> /* RENAME_NOREPLACE, RENAME_EXCHANGE */
-#include "fuse_ops_internal.h"
 #include "debug.h"
+#include "fuse_ops_internal.h"
 
 /**
  * FUSE callback: create a new file.
@@ -124,7 +124,8 @@ static int obmafs3_fuse_create_impl(const char *path, mode_t mode, struct fuse_f
  * files the write is dispatched through the dedup-aware media image
  * write path with background compression.
  */
-static int obmafs3_fuse_write_impl(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+static int obmafs3_fuse_write_impl(const char *path, const char *buf, size_t size, off_t offset,
+                                   struct fuse_file_info *fi)
 {
     struct inode_record  inode;
     struct inode_record *ip;
@@ -176,10 +177,7 @@ static int obmafs3_fuse_write_impl(const char *path, const char *buf, size_t siz
     /* Defer inode persistence to flush/release.  The in-memory cached
      * copy in ffctx keeps our own reads consistent and flush/release
      * will call obmafs3_inode_put() when the file is closed. */
-    if(ffctx)
-    {
-        ffctx->inode_dirty = 1;
-    }
+    if(ffctx) { ffctx->inode_dirty = 1; }
     else
     {
         rc = obmafs3_inode_put(g_ctx, &inode);
@@ -747,8 +745,8 @@ int obmafs3_fuse_write(const char *path, const char *buf, size_t size, off_t off
     if(ffctx && ffctx->sector_size > 0)
     {
         struct inode_record *ip = &ffctx->inode;
-        int rc = obmafs3_write_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size,
-                                                ffctx->sector_size, &ffctx->sme_cache, &ffctx->db_cache);
+        int rc = obmafs3_write_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ffctx->sector_size,
+                                                &ffctx->sme_cache, &ffctx->db_cache);
         if(rc == OBMAFS3_ERR_NOSPC) return -ENOSPC;
         if(rc != OBMAFS3_OK) return -EIO;
         ffctx->inode_dirty = 1;

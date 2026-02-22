@@ -63,11 +63,11 @@ void print_bar(const char *prefix, uint64_t done, uint64_t total)
     {
         /* Unicode block-drawing progress bar */
         /* Each cell can show 8 sub-positions via block chars ▏▎▍▌▋▊▉█ */
-        static const char *blocks[] = { " ", "\u258F", "\u258E", "\u258D",
-                                        "\u258C", "\u258B", "\u258A", "\u2589", "\u2588" };
-        double filled_f = frac * bar_width;
-        int    filled_i = (int)filled_f;
-        int    sub      = (int)((filled_f - filled_i) * 8.0);
+        static const char *blocks[] = {" ",      "\u258F", "\u258E", "\u258D", "\u258C",
+                                       "\u258B", "\u258A", "\u2589", "\u2588"};
+        double             filled_f = frac * bar_width;
+        int                filled_i = (int)filled_f;
+        int                sub      = (int)((filled_f - filled_i) * 8.0);
 
         fprintf(stderr, "\r  \033[36m%-24s\033[0m ", prefix);
         for(int i = 0; i < bar_width; i++)
@@ -88,9 +88,12 @@ void print_bar(const char *prefix, uint64_t done, uint64_t total)
         fprintf(stderr, "\r  %-24s [", prefix);
         for(int i = 0; i < bar_width; i++)
         {
-            if(i < filled)       fputc('=', stderr);
-            else if(i == filled) fputc('>', stderr);
-            else                 fputc(' ', stderr);
+            if(i < filled)
+                fputc('=', stderr);
+            else if(i == filled)
+                fputc('>', stderr);
+            else
+                fputc(' ', stderr);
         }
         fprintf(stderr, "] %3d%% %" PRIu64 "/%" PRIu64 "   ", pct, done, total);
     }

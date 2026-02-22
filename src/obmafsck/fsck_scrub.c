@@ -55,11 +55,11 @@ void print_progress(const char *label, uint64_t done, uint64_t total, uint64_t b
 
     if(g_use_color)
     {
-        static const char *blocks[] = { " ", "\u258F", "\u258E", "\u258D",
-                                        "\u258C", "\u258B", "\u258A", "\u2589", "\u2588" };
-        double filled_f = frac * bar_width;
-        int    filled_i = (int)filled_f;
-        int    sub      = (int)((filled_f - filled_i) * 8.0);
+        static const char *blocks[] = {" ",      "\u258F", "\u258E", "\u258D", "\u258C",
+                                       "\u258B", "\u258A", "\u2589", "\u2588"};
+        double             filled_f = frac * bar_width;
+        int                filled_i = (int)filled_f;
+        int                sub      = (int)((filled_f - filled_i) * 8.0);
 
         fprintf(stderr, "\r  \033[36m%-24s\033[0m ", label);
         for(int i = 0; i < bar_width; i++)
@@ -72,8 +72,7 @@ void print_progress(const char *label, uint64_t done, uint64_t total, uint64_t b
                 fprintf(stderr, "\033[2m\u2591\033[0m");
         }
         fprintf(stderr, " %3d%% \033[2m\u00B7\033[0m %" PRIu64 "/%" PRIu64, pct, done, total);
-        if(bad > 0)
-            fprintf(stderr, " \033[31m\u00B7 %" PRIu64 " error%s\033[0m", bad, bad == 1 ? "" : "s");
+        if(bad > 0) fprintf(stderr, " \033[31m\u00B7 %" PRIu64 " error%s\033[0m", bad, bad == 1 ? "" : "s");
         fprintf(stderr, "  ");
     }
     else
@@ -82,13 +81,15 @@ void print_progress(const char *label, uint64_t done, uint64_t total, uint64_t b
         fprintf(stderr, "\r  %-24s [", label);
         for(int i = 0; i < bar_width; i++)
         {
-            if(i < filled)       fputc('=', stderr);
-            else if(i == filled) fputc('>', stderr);
-            else                 fputc(' ', stderr);
+            if(i < filled)
+                fputc('=', stderr);
+            else if(i == filled)
+                fputc('>', stderr);
+            else
+                fputc(' ', stderr);
         }
         fprintf(stderr, "] %3d%% %" PRIu64 "/%" PRIu64, pct, done, total);
-        if(bad > 0)
-            fprintf(stderr, " | %" PRIu64 " error%s", bad, bad == 1 ? "" : "s");
+        if(bad > 0) fprintf(stderr, " | %" PRIu64 " error%s", bad, bad == 1 ? "" : "s");
         fprintf(stderr, "   ");
     }
     fflush(stderr);

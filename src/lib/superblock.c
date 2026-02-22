@@ -30,8 +30,8 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
-#include "obmafs.h"
 #include "debug.h"
+#include "obmafs.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -52,8 +52,7 @@ int obmafs3_sb_read(int fd, struct obmafs3_sb *sb)
 {
     ssize_t n = pread(fd, sb, sizeof(*sb), 0);
     if(n < 0 || (size_t)n != sizeof(*sb))
-        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                         "sb pread expected=%zu got=%zd", sizeof(*sb), n);
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "sb pread expected=%zu got=%zd", sizeof(*sb), n);
     return OBMAFS3_OK;
 }
 
@@ -77,8 +76,7 @@ int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb)
     /* Write the primary superblock at LBA 0 */
     ssize_t n = pwrite(fd, &tmp, sizeof(tmp), 0);
     if(n < 0 || (size_t)n != sizeof(tmp))
-        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                         "sb pwrite expected=%zu got=%zd", sizeof(tmp), n);
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "sb pwrite expected=%zu got=%zd", sizeof(tmp), n);
 
     /* Write the backup superblock at the last block */
     if(tmp.total_bytes > 0 && tmp.block_size > 0)
@@ -89,9 +87,8 @@ int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb)
             off_t   backup_off = (off_t)(backup_lba * tmp.block_size);
             ssize_t nb         = pwrite(fd, &tmp, sizeof(tmp), backup_off);
             if(nb < 0 || (size_t)nb != sizeof(tmp))
-                DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                                 "backup sb pwrite lba=%" PRIu64 " expected=%zu got=%zd",
-                                 backup_lba, sizeof(tmp), nb);
+                DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "backup sb pwrite lba=%" PRIu64 " expected=%zu got=%zd", backup_lba,
+                                 sizeof(tmp), nb);
         }
     }
 
@@ -138,19 +135,14 @@ int obmafs3_sb_read_lenient(int fd, struct obmafs3_sb *sb, int *checksum_ok)
 int obmafs3_sb_validate(const struct obmafs3_sb *sb)
 {
     if(sb->magic != OBMAFS3_SB_MAGIC)
-        DBG_RETURN(OBMAFS3_ERR_BADMAGIC,
-                   "bad magic 0x%" PRIx64 " expected 0x%" PRIx64,
-                   sb->magic, (uint64_t)OBMAFS3_SB_MAGIC);
+        DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic 0x%" PRIx64 " expected 0x%" PRIx64, sb->magic,
+                   (uint64_t)OBMAFS3_SB_MAGIC);
     if(sb->block_size == 0 || sb->dedup_block_size == 0)
-        DBG_RETURN(OBMAFS3_ERR_INVAL,
-                   "bad block_size=%" PRIu64 " dedup_block_size=%" PRIu64,
-                   sb->block_size, sb->dedup_block_size);
-    if(sb->total_bytes == 0)
-        DBG_RETURN(OBMAFS3_ERR_INVAL, "total_bytes=0");
+        DBG_RETURN(OBMAFS3_ERR_INVAL, "bad block_size=%" PRIu64 " dedup_block_size=%" PRIu64, sb->block_size,
+                   sb->dedup_block_size);
+    if(sb->total_bytes == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "total_bytes=0");
     if(sb->catalog_lba == 0 || sb->inode_lba == 0)
-        DBG_RETURN(OBMAFS3_ERR_INVAL,
-                   "catalog_lba=%" PRIu64 " inode_lba=%" PRIu64,
-                   sb->catalog_lba, sb->inode_lba);
+        DBG_RETURN(OBMAFS3_ERR_INVAL, "catalog_lba=%" PRIu64 " inode_lba=%" PRIu64, sb->catalog_lba, sb->inode_lba);
     return OBMAFS3_OK;
 }
 
@@ -169,19 +161,16 @@ int obmafs3_sb_validate(const struct obmafs3_sb *sb)
  */
 int obmafs3_sb_read_backup(int fd, uint64_t block_size, uint64_t total_bytes, struct obmafs3_sb *sb)
 {
-    if(block_size == 0 || total_bytes == 0)
-        DBG_RETURN(OBMAFS3_ERR_INVAL, "block_size or total_bytes is 0");
+    if(block_size == 0 || total_bytes == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "block_size or total_bytes is 0");
 
     uint64_t backup_lba = OBMAFS3_BACKUP_SB_LBA(total_bytes, block_size);
-    if(backup_lba == 0)
-        DBG_RETURN(OBMAFS3_ERR_INVAL, "backup lba would be 0");
+    if(backup_lba == 0) DBG_RETURN(OBMAFS3_ERR_INVAL, "backup lba would be 0");
 
     off_t   offset = (off_t)(backup_lba * block_size);
     ssize_t n      = pread(fd, sb, sizeof(*sb), offset);
     if(n < 0 || (size_t)n != sizeof(*sb))
-        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                         "backup sb pread lba=%" PRIu64 " expected=%zu got=%zd",
-                         backup_lba, sizeof(*sb), n);
+        DBG_RETURN_ERRNO(OBMAFS3_ERR_IO, "backup sb pread lba=%" PRIu64 " expected=%zu got=%zd", backup_lba,
+                         sizeof(*sb), n);
     return OBMAFS3_OK;
 }
 

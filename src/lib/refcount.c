@@ -152,9 +152,7 @@ int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_co
         if(idx >= 0)
         {
             struct refcount_record rec;
-            memcpy(&rec,
-                   ctx->rc_leaf_buf + sizeof(struct btree_node_header) + (size_t)idx * sizeof(rec),
-                   sizeof(rec));
+            memcpy(&rec, ctx->rc_leaf_buf + sizeof(struct btree_node_header) + (size_t)idx * sizeof(rec), sizeof(rec));
             *ref_count = rec.ref_count;
         }
         else
@@ -630,7 +628,7 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     memset(buf, 0, bsz);
     struct btree_node_header rhdr;
     memset(&rhdr, 0, sizeof(rhdr));
-    rhdr.level       = old_root_hdr.level + 1;
+    rhdr.level = old_root_hdr.level + 1;
 
     rhdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
     rhdr.record_type = kBtreeDataTypeRefcountEntry;

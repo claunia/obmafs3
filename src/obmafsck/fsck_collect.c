@@ -49,7 +49,7 @@
  * @return @c OBMAFS3_OK on success.
  */
 int collect_inode_data_blocks(struct obmafs3_ctx *ctx, uint64_t inode_root_lba, uint64_t **out_lbas,
-                                     uint64_t *out_count)
+                              uint64_t *out_count)
 {
     *out_lbas  = NULL;
     *out_count = 0;
@@ -528,8 +528,7 @@ int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, uint64_t 
             nodes_visited++;
             {
                 char pfx[80];
-                snprintf(pfx, sizeof(pfx), "Collecting dedup [tree %" PRIu64 "/%" PRIu64 "]",
-                         t + 1, tree_count);
+                snprintf(pfx, sizeof(pfx), "Collecting dedup [tree %" PRIu64 "/%" PRIu64 "]", t + 1, tree_count);
                 print_bar(pfx, nodes_visited, (uint64_t)thdr.total_nodes);
             }
 
@@ -633,9 +632,7 @@ int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, uint64_t 
                      * intentionally does not free trailing blocks so the
                      * block can be resumed on next mount.  Account for
                      * that here so the expected bitmap matches. */
-                    uint64_t mark_std = (de.block_lba == thdr.last_block_lba)
-                                            ? std_per_dedup
-                                            : used_std;
+                    uint64_t mark_std = (de.block_lba == thdr.last_block_lba) ? std_per_dedup : used_std;
                     for(uint64_t s = 0; s < mark_std; s++) PUSH_LBA(de.block_lba + s);
                 }
             }
@@ -677,7 +674,7 @@ int collect_dedup_blocks(struct obmafs3_ctx *ctx, uint64_t **out_lbas, uint64_t 
  * @return @c OBMAFS3_OK on success.
  */
 int collect_free_chain_blocks(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t blocks_per_node,
-                                     uint64_t **out_lbas, uint64_t *out_count)
+                              uint64_t **out_lbas, uint64_t *out_count)
 {
     *out_lbas  = NULL;
     *out_count = 0;
@@ -689,7 +686,7 @@ int collect_free_chain_blocks(struct obmafs3_ctx *ctx, const struct btree_header
     uint8_t *buf     = calloc(1, bsz);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    uint64_t *lbas = NULL;
+    uint64_t *lbas  = NULL;
     uint64_t  count = 0;
     uint64_t  cap   = 0;
     uint64_t  cur   = hdr->free_node_lba;
@@ -704,9 +701,14 @@ int collect_free_chain_blocks(struct obmafs3_ctx *ctx, const struct btree_header
         {
             if(count >= cap)
             {
-                cap          = (cap == 0) ? 64 : cap * 2;
-                uint64_t *t  = realloc(lbas, cap * sizeof(*t));
-                if(!t) { free(buf); free(lbas); return OBMAFS3_ERR_NOMEM; }
+                cap         = (cap == 0) ? 64 : cap * 2;
+                uint64_t *t = realloc(lbas, cap * sizeof(*t));
+                if(!t)
+                {
+                    free(buf);
+                    free(lbas);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 lbas = t;
             }
             lbas[count++] = cur + b;
@@ -745,8 +747,7 @@ int collect_free_chain_blocks(struct obmafs3_ctx *ctx, const struct btree_header
  * @param out_error     Output: set to non-zero on allocation failure.
  * @return Heap-allocated expected bitmap, or @c NULL on error.
  */
-uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, uint64_t bitmap_bytes,
-                                      int *out_error)
+uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, uint64_t bitmap_bytes, int *out_error)
 {
     uint8_t *expected = calloc(1, (size_t)bitmap_bytes);
     if(!expected)
@@ -756,18 +757,16 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
     }
 
     /* Progress reporting — 19 discrete steps */
-    int         step       = 0;
-    const int   total_steps = 19;
+    int       step        = 0;
+    const int total_steps = 19;
 
-
-#define PROGRESS(desc)                                                         \
-    do                                                                         \
-    {                                                                          \
-        step++;                                                                \
-        char _p_pfx[64];                                                       \
-        snprintf(_p_pfx, sizeof(_p_pfx), "Bitmap [%2d/%d] %s",                \
-                 step, total_steps, (desc));                                    \
-        print_bar(_p_pfx, (uint64_t)step, (uint64_t)total_steps);             \
+#define PROGRESS(desc)                                                                     \
+    do                                                                                     \
+    {                                                                                      \
+        step++;                                                                            \
+        char _p_pfx[64];                                                                   \
+        snprintf(_p_pfx, sizeof(_p_pfx), "Bitmap [%2d/%d] %s", step, total_steps, (desc)); \
+        print_bar(_p_pfx, (uint64_t)step, (uint64_t)total_steps);                          \
     } while(0)
 
 /* Helper to set a bit */
@@ -805,7 +804,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
     {
         uint64_t *ino_nodes = NULL;
         uint64_t  ino_count = 0;
-        int       rc        = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &ino_nodes, &ino_count, 0, NULL);
+        int       rc = walk_inode_btree_nodes(ctx, ctx->inode_hdr.root_node_lba, sizeof(struct btree_index_entry),
+                                              __builtin_offsetof(struct btree_index_entry, child_lba), &ino_nodes, &ino_count,
+                                              0, NULL);
         if(rc == OBMAFS3_OK)
         {
             for(uint64_t i = 0; i < ino_count; i++) MARK(ino_nodes[i]);
@@ -826,7 +827,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         {
             uint64_t *ovf_nodes = NULL;
             uint64_t  ovf_count = 0;
-            int       rc        = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct overflow_index_entry), __builtin_offsetof(struct overflow_index_entry, child_lba), &ovf_nodes, &ovf_count, 0, NULL);
+            int rc = walk_inode_btree_nodes(ctx, ctx->overflow_hdr.root_node_lba, sizeof(struct overflow_index_entry),
+                                            __builtin_offsetof(struct overflow_index_entry, child_lba), &ovf_nodes,
+                                            &ovf_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < ovf_count; i++) MARK(ovf_nodes[i]);
@@ -848,7 +851,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         {
             uint64_t *mt_nodes = NULL;
             uint64_t  mt_count = 0;
-            int       rc       = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, sizeof(struct media_tag_index_entry), __builtin_offsetof(struct media_tag_index_entry, child_lba), &mt_nodes, &mt_count, 0, NULL);
+            int rc = walk_inode_btree_nodes(ctx, ctx->media_tag_hdr.root_node_lba, sizeof(struct media_tag_index_entry),
+                                            __builtin_offsetof(struct media_tag_index_entry, child_lba), &mt_nodes,
+                                            &mt_count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < mt_count; i++) MARK(mt_nodes[i]);
@@ -866,7 +871,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
+            int rc = walk_inode_btree_nodes(ctx, ctx->cd_prefix_hdr.root_node_lba, sizeof(struct btree_index_entry),
+                                            __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0,
+                                            NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -884,7 +891,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
+            int rc = walk_inode_btree_nodes(ctx, ctx->cd_suffix_hdr.root_node_lba, sizeof(struct btree_index_entry),
+                                            __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0,
+                                            NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -902,7 +911,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
+            int rc = walk_inode_btree_nodes(ctx, ctx->cd_subchannel_hdr.root_node_lba, sizeof(struct btree_index_entry),
+                                            __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0,
+                                            NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -961,7 +972,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         {
             uint64_t *nodes = NULL;
             uint64_t  count = 0;
-            int       rc    = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0, NULL);
+            int rc = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, sizeof(struct btree_index_entry),
+                                            __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0,
+                                            NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
@@ -1059,7 +1072,8 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
             if(rc == OBMAFS3_OK)
             {
                 /* Validate pending persist header */
-                struct {
+                struct
+                {
                     uint64_t magic;
                     uint64_t count;
                     uint16_t sector_size;
@@ -1071,8 +1085,7 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
                 if(pb_hdr.magic == 0x474E49444E455055ULL /* PENDING_PERSIST_MAGIC */
                    && sizeof(pb_hdr) + pb_hdr.count * sizeof(struct dedup_entry) <= pb_buf_size)
                 {
-                    const struct dedup_entry *pb_entries =
-                        (const struct dedup_entry *)(pb_buf + sizeof(pb_hdr));
+                    const struct dedup_entry *pb_entries = (const struct dedup_entry *)(pb_buf + sizeof(pb_hdr));
 
                     /* Collect unique data block base LBAs */
                     uint64_t *pb_unique  = NULL;
@@ -1089,7 +1102,11 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
                         int dup = 0;
                         for(uint64_t j = 0; j < pb_ucnt; j++)
                         {
-                            if(pb_unique[j] == blba) { dup = 1; break; }
+                            if(pb_unique[j] == blba)
+                            {
+                                dup = 1;
+                                break;
+                            }
                         }
                         if(dup) continue;
 
@@ -1115,9 +1132,7 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
                             if(bh.magic == OBMAFS3_BLOCK_MAGIC)
                             {
                                 uint64_t payload =
-                                    (bh.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
-                                        ? bh.compressed_size
-                                        : bh.original_size;
+                                    (bh.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? bh.compressed_size : bh.original_size;
                                 uint64_t on_disk = sizeof(bh) + payload;
                                 uint64_t bs      = ctx->sb.block_size;
                                 uint64_t used    = (on_disk + bs - 1) / bs;
@@ -1128,7 +1143,7 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
                                  * pool which frees trailing blocks.  Check if
                                  * trailing blocks are still allocated in the
                                  * on-disk bitmap to decide. */
-                                mark_std = used;
+                                mark_std          = used;
                                 /* Also check if the full allocation is present
                                  * by testing the last standard block. */
                                 uint64_t last_blk = blba + std_per_dd - 1;
@@ -1178,18 +1193,17 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
     PROGRESS("free node chains");
     {
         /* Helper macro: walk one tree's free chain and mark blocks */
-#define MARK_FREE_CHAIN(hdr_ptr, bpn)                                        \
-        do                                                                   \
-        {                                                                    \
-            uint64_t *_fc = NULL;                                            \
-            uint64_t  _fn = 0;                                               \
-            if(collect_free_chain_blocks(ctx, (hdr_ptr), (bpn), &_fc, &_fn)  \
-                   == OBMAFS3_OK)                                            \
-            {                                                                \
-                for(uint64_t _i = 0; _i < _fn; _i++) MARK(_fc[_i]);         \
-                free(_fc);                                                   \
-            }                                                                \
-        } while(0)
+#define MARK_FREE_CHAIN(hdr_ptr, bpn)                                                  \
+    do                                                                                 \
+    {                                                                                  \
+        uint64_t *_fc = NULL;                                                          \
+        uint64_t  _fn = 0;                                                             \
+        if(collect_free_chain_blocks(ctx, (hdr_ptr), (bpn), &_fc, &_fn) == OBMAFS3_OK) \
+        {                                                                              \
+            for(uint64_t _i = 0; _i < _fn; _i++) MARK(_fc[_i]);                        \
+            free(_fc);                                                                 \
+        }                                                                              \
+    } while(0)
 
         /* Catalog tree */
         MARK_FREE_CHAIN(&ctx->catalog_hdr, 1);
@@ -1201,32 +1215,25 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         MARK_FREE_CHAIN(&ctx->overflow_hdr, 1);
 
         /* Media tag tree */
-        if(ctx->sb.media_tag_lba != 0)
-            MARK_FREE_CHAIN(&ctx->media_tag_hdr, 1);
+        if(ctx->sb.media_tag_lba != 0) MARK_FREE_CHAIN(&ctx->media_tag_hdr, 1);
 
         /* CD prefix tree */
-        if(ctx->sb.cd_prefix_lba != 0)
-            MARK_FREE_CHAIN(&ctx->cd_prefix_hdr, 1);
+        if(ctx->sb.cd_prefix_lba != 0) MARK_FREE_CHAIN(&ctx->cd_prefix_hdr, 1);
 
         /* CD suffix tree */
-        if(ctx->sb.cd_suffix_lba != 0)
-            MARK_FREE_CHAIN(&ctx->cd_suffix_hdr, 1);
+        if(ctx->sb.cd_suffix_lba != 0) MARK_FREE_CHAIN(&ctx->cd_suffix_hdr, 1);
 
         /* CD subchannel tree */
-        if(ctx->sb.cd_subchannel_lba != 0)
-            MARK_FREE_CHAIN(&ctx->cd_subchannel_hdr, 1);
+        if(ctx->sb.cd_subchannel_lba != 0) MARK_FREE_CHAIN(&ctx->cd_subchannel_hdr, 1);
 
         /* Metadata tree (multi-block nodes) */
-        if(ctx->sb.metadata_lba != 0)
-            MARK_FREE_CHAIN(&ctx->metadata_hdr, METADATA_NODE_BLOCKS);
+        if(ctx->sb.metadata_lba != 0) MARK_FREE_CHAIN(&ctx->metadata_hdr, METADATA_NODE_BLOCKS);
 
         /* Metadata index tree (multi-block nodes) */
-        if(ctx->sb.metadata_idx_lba != 0)
-            MARK_FREE_CHAIN(&ctx->metadata_idx_hdr, METADATA_NODE_BLOCKS);
+        if(ctx->sb.metadata_idx_lba != 0) MARK_FREE_CHAIN(&ctx->metadata_idx_hdr, METADATA_NODE_BLOCKS);
 
         /* Refcount tree */
-        if(ctx->sb.refcount_lba != 0)
-            MARK_FREE_CHAIN(&ctx->refcount_hdr, 1);
+        if(ctx->sb.refcount_lba != 0) MARK_FREE_CHAIN(&ctx->refcount_hdr, 1);
 
         /* Dedup trees (each has its own header and free chain) */
         if(ctx->sb.dedup_lba != 0)
@@ -1268,4 +1275,3 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
     *out_error = 0;
     return expected;
 }
-

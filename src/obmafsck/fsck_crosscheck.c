@@ -64,17 +64,21 @@ int collect_catalog_refs(struct obmafs3_ctx *ctx, struct catalog_ref **out_refs,
     uint64_t root_lba = ctx->catalog_hdr.root_node_lba;
     if(root_lba == 0) return OBMAFS3_OK;
 
-    size_t bsz = (size_t)ctx->sb.block_size;
+    size_t   bsz = (size_t)ctx->sb.block_size;
     uint8_t *buf = calloc(1, bsz);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    struct catalog_ref *refs = NULL;
-    uint64_t count = 0, cap = 0;
+    struct catalog_ref *refs  = NULL;
+    uint64_t            count = 0, cap = 0;
 
     /* Iterative DFS */
-    uint64_t *stack = malloc(64 * sizeof(uint64_t));
-    uint64_t stk_size = 0, stk_cap = 64;
-    if(!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t  stk_size = 0, stk_cap = 64;
+    if(!stack)
+    {
+        free(buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     stack[stk_size++] = root_lba;
 
@@ -83,11 +87,23 @@ int collect_catalog_refs(struct obmafs3_ctx *ctx, struct catalog_ref **out_refs,
         uint64_t lba = stack[--stk_size];
 
         int rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK) { free(buf); free(stack); free(refs); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            free(stack);
+            free(refs);
+            return rc;
+        }
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); free(stack); free(refs); return OBMAFS3_ERR_BADMAGIC; }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            free(buf);
+            free(stack);
+            free(refs);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
 
         if(hdr.level > 0)
         {
@@ -99,7 +115,13 @@ int collect_catalog_refs(struct obmafs3_ctx *ctx, struct catalog_ref **out_refs,
                 {
                     stk_cap *= 2;
                     uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(stack); free(refs); return OBMAFS3_ERR_NOMEM; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(stack);
+                        free(refs);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
                     stack = tmp;
                 }
                 stack[stk_size++] = ie.child_lba;
@@ -112,9 +134,15 @@ int collect_catalog_refs(struct obmafs3_ctx *ctx, struct catalog_ref **out_refs,
         {
             if(count >= cap)
             {
-                cap = cap == 0 ? 256 : cap * 2;
+                cap                     = cap == 0 ? 256 : cap * 2;
                 struct catalog_ref *tmp = realloc(refs, cap * sizeof(*tmp));
-                if(!tmp) { free(buf); free(stack); free(refs); return OBMAFS3_ERR_NOMEM; }
+                if(!tmp)
+                {
+                    free(buf);
+                    free(stack);
+                    free(refs);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 refs = tmp;
             }
             struct catalog_record crec;
@@ -150,16 +178,20 @@ int collect_inode_ids(struct obmafs3_ctx *ctx, uint64_t **out_ids, uint64_t *out
     uint64_t root_lba = ctx->inode_hdr.root_node_lba;
     if(root_lba == 0) return OBMAFS3_OK;
 
-    size_t bsz = (size_t)ctx->sb.block_size;
+    size_t   bsz = (size_t)ctx->sb.block_size;
     uint8_t *buf = calloc(1, bsz);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    uint64_t *ids = NULL;
-    uint64_t count = 0, cap = 0;
+    uint64_t *ids   = NULL;
+    uint64_t  count = 0, cap = 0;
 
-    uint64_t *stack = malloc(64 * sizeof(uint64_t));
-    uint64_t stk_size = 0, stk_cap = 64;
-    if(!stack) { free(buf); return OBMAFS3_ERR_NOMEM; }
+    uint64_t *stack    = malloc(64 * sizeof(uint64_t));
+    uint64_t  stk_size = 0, stk_cap = 64;
+    if(!stack)
+    {
+        free(buf);
+        return OBMAFS3_ERR_NOMEM;
+    }
 
     stack[stk_size++] = root_lba;
 
@@ -168,11 +200,23 @@ int collect_inode_ids(struct obmafs3_ctx *ctx, uint64_t **out_ids, uint64_t *out
         uint64_t lba = stack[--stk_size];
 
         int rc = obmafs3_block_read(ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK) { free(buf); free(stack); free(ids); return rc; }
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            free(stack);
+            free(ids);
+            return rc;
+        }
 
         struct btree_node_header hdr;
         memcpy(&hdr, buf, sizeof(hdr));
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); free(stack); free(ids); return OBMAFS3_ERR_BADMAGIC; }
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            free(buf);
+            free(stack);
+            free(ids);
+            return OBMAFS3_ERR_BADMAGIC;
+        }
 
         if(hdr.level > 0)
         {
@@ -184,7 +228,13 @@ int collect_inode_ids(struct obmafs3_ctx *ctx, uint64_t **out_ids, uint64_t *out
                 {
                     stk_cap *= 2;
                     uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(stack); free(ids); return OBMAFS3_ERR_NOMEM; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(stack);
+                        free(ids);
+                        return OBMAFS3_ERR_NOMEM;
+                    }
                     stack = tmp;
                 }
                 stack[stk_size++] = ie.child_lba;
@@ -197,9 +247,15 @@ int collect_inode_ids(struct obmafs3_ctx *ctx, uint64_t **out_ids, uint64_t *out
         {
             if(count >= cap)
             {
-                cap = cap == 0 ? 256 : cap * 2;
+                cap           = cap == 0 ? 256 : cap * 2;
                 uint64_t *tmp = realloc(ids, cap * sizeof(*tmp));
-                if(!tmp) { free(buf); free(stack); free(ids); return OBMAFS3_ERR_NOMEM; }
+                if(!tmp)
+                {
+                    free(buf);
+                    free(stack);
+                    free(ids);
+                    return OBMAFS3_ERR_NOMEM;
+                }
                 ids = tmp;
             }
             struct inode_record irec;
@@ -238,9 +294,12 @@ static int u64_sorted_contains(const uint64_t *arr, uint64_t count, uint64_t id)
     while(lo < hi)
     {
         uint64_t mid = lo + (hi - lo) / 2;
-        if(arr[mid] < id)      lo = mid + 1;
-        else if(arr[mid] > id) hi = mid;
-        else                   return 1;
+        if(arr[mid] < id)
+            lo = mid + 1;
+        else if(arr[mid] > id)
+            hi = mid;
+        else
+            return 1;
     }
     return 0;
 }
@@ -286,7 +345,7 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
     }
 
     /* Build sorted inode_id set from catalog refs */
-    uint64_t *cat_ids = NULL;
+    uint64_t *cat_ids    = NULL;
     uint64_t  cat_unique = 0;
     if(cat_count > 0)
     {
@@ -300,15 +359,13 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
             cat_unique = 1;
             for(uint64_t i = 1; i < cat_count; i++)
             {
-                if(cat_refs[i].inode_id != cat_ids[cat_unique - 1])
-                    cat_ids[cat_unique++] = cat_refs[i].inode_id;
+                if(cat_refs[i].inode_id != cat_ids[cat_unique - 1]) cat_ids[cat_unique++] = cat_refs[i].inode_id;
             }
         }
     }
 
     /* Sort inode_ids */
-    if(ino_count > 0)
-        qsort(inode_ids, (size_t)ino_count, sizeof(inode_ids[0]), cmp_u64);
+    if(ino_count > 0) qsort(inode_ids, (size_t)ino_count, sizeof(inode_ids[0]), cmp_u64);
 
     /* ---- Detect orphan inodes ---- */
     uint64_t orphan_count = 0;
@@ -318,15 +375,11 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
         {
             uint64_t id = inode_ids[i];
             if(id == OBMAFS3_ROOT_INODE_ID) continue; /* root dir always exists */
-            if(!u64_sorted_contains(cat_ids, cat_unique, id))
-                orphan_count++;
+            if(!u64_sorted_contains(cat_ids, cat_unique, id)) orphan_count++;
         }
     }
 
-    if(orphan_count == 0)
-    {
-        result_ok("Orphan inodes:", "");
-    }
+    if(orphan_count == 0) { result_ok("Orphan inodes:", ""); }
     else
     {
         result_bad("Orphan inodes:", "%" PRIu64 " found", orphan_count);
@@ -336,12 +389,9 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
         {
             /* Ensure lost+found directory exists under root */
             struct catalog_record lf_cat;
-            uint64_t lf_inode_id = 0;
+            uint64_t              lf_inode_id = 0;
             rc = obmafs3_catalog_lookup(ctx, OBMAFS3_ROOT_INODE_ID, "lost+found", &lf_cat);
-            if(rc == OBMAFS3_OK)
-            {
-                lf_inode_id = lf_cat.inode_id;
-            }
+            if(rc == OBMAFS3_OK) { lf_inode_id = lf_cat.inode_id; }
             else
             {
                 /* Create lost+found directory */
@@ -351,7 +401,7 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
                 memset(&new_cat, 0, sizeof(new_cat));
                 new_cat.inode_id       = lf_inode_id;
                 new_cat.parent_id      = OBMAFS3_ROOT_INODE_ID;
-                new_cat.directory_flag  = 1;
+                new_cat.directory_flag = 1;
                 strncpy(new_cat.name, "lost+found", sizeof(new_cat.name) - 1);
                 rc = obmafs3_catalog_insert(ctx, &new_cat);
                 if(rc != OBMAFS3_OK)
@@ -360,7 +410,7 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
                     goto skip_orphan_fix;
                 }
 
-                uint64_t now = (uint64_t)time(NULL);
+                uint64_t            now = (uint64_t)time(NULL);
                 struct inode_record lf_inode;
                 memset(&lf_inode, 0, sizeof(lf_inode));
                 lf_inode.inode_id          = lf_inode_id;
@@ -388,7 +438,7 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
             {
                 uint64_t id = inode_ids[i];
                 if(id == OBMAFS3_ROOT_INODE_ID) continue;
-                if(id == lf_inode_id) continue;  /* skip lost+found itself */
+                if(id == lf_inode_id) continue; /* skip lost+found itself */
                 if(!u64_sorted_contains(cat_ids, cat_unique, id))
                 {
                     /* Read the inode to determine file type */
@@ -402,8 +452,8 @@ void cross_check_inodes_catalog(struct obmafs3_ctx *ctx, int auto_yes, int auto_
 
                     struct catalog_record new_entry;
                     memset(&new_entry, 0, sizeof(new_entry));
-                    new_entry.inode_id      = id;
-                    new_entry.parent_id     = lf_inode_id;
+                    new_entry.inode_id       = id;
+                    new_entry.parent_id      = lf_inode_id;
                     new_entry.directory_flag = (irec.file_type == kFileTypeDirectory) ? 1 : 0;
                     strncpy(new_entry.name, name_buf, sizeof(new_entry.name) - 1);
 
@@ -432,15 +482,11 @@ skip_orphan_fix:
     {
         for(uint64_t i = 0; i < cat_count; i++)
         {
-            if(!u64_sorted_contains(inode_ids, ino_count, cat_refs[i].inode_id))
-                dangling_count++;
+            if(!u64_sorted_contains(inode_ids, ino_count, cat_refs[i].inode_id)) dangling_count++;
         }
     }
 
-    if(dangling_count == 0)
-    {
-        result_ok("Dangling catalog:", "");
-    }
+    if(dangling_count == 0) { result_ok("Dangling catalog:", ""); }
     else
     {
         result_bad("Dangling catalog:", "%" PRIu64 " found", dangling_count);

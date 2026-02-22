@@ -65,9 +65,8 @@ static int defrag_map_cmp(const void *a, const void *b)
  */
 static uint64_t defrag_map_lookup(const struct defrag_map_entry *map, uint64_t map_count, uint64_t old_lba)
 {
-    struct defrag_map_entry key = {.old_lba = old_lba, .new_lba = 0};
-    const struct defrag_map_entry *found =
-        bsearch(&key, map, (size_t)map_count, sizeof(*map), defrag_map_cmp);
+    struct defrag_map_entry        key   = {.old_lba = old_lba, .new_lba = 0};
+    const struct defrag_map_entry *found = bsearch(&key, map, (size_t)map_count, sizeof(*map), defrag_map_cmp);
     return found ? found->new_lba : old_lba;
 }
 
@@ -126,7 +125,11 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
 
     uint64_t *queue  = malloc(64 * sizeof(uint64_t));
     uint64_t  q_head = 0, q_tail = 0, q_cap = 64;
-    if(!queue) { free(buf); return -1; }
+    if(!queue)
+    {
+        free(buf);
+        return -1;
+    }
 
     queue[q_tail++] = hdr->root_node_lba;
 
@@ -137,9 +140,15 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
         /* Grow active array */
         if(active_cnt >= active_cap)
         {
-            active_cap        = active_cap == 0 ? 64 : active_cap * 2;
-            uint64_t *tmp     = realloc(active, active_cap * sizeof(*tmp));
-            if(!tmp) { free(buf); free(queue); free(active); return -1; }
+            active_cap    = active_cap == 0 ? 64 : active_cap * 2;
+            uint64_t *tmp = realloc(active, active_cap * sizeof(*tmp));
+            if(!tmp)
+            {
+                free(buf);
+                free(queue);
+                free(active);
+                return -1;
+            }
             active = tmp;
         }
         active[active_cnt++] = lba;
@@ -148,14 +157,22 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
         for(int b = 0; b < blocks_per_node; b++)
         {
             int rc = obmafs3_block_read(ctx, lba + (uint64_t)b, buf + (size_t)b * bsz, bsz);
-            if(rc != OBMAFS3_OK) { free(buf); free(queue); free(active); return -1; }
+            if(rc != OBMAFS3_OK)
+            {
+                free(buf);
+                free(queue);
+                free(active);
+                return -1;
+            }
         }
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
         if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
         {
-            free(buf); free(queue); free(active);
+            free(buf);
+            free(queue);
+            free(active);
             return -1;
         }
 
@@ -172,7 +189,13 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
                 {
                     q_cap *= 2;
                     uint64_t *tmp = realloc(queue, q_cap * sizeof(*tmp));
-                    if(!tmp) { free(buf); free(queue); free(active); return -1; }
+                    if(!tmp)
+                    {
+                        free(buf);
+                        free(queue);
+                        free(active);
+                        return -1;
+                    }
                     queue = tmp;
                 }
                 queue[q_tail++] = child_lba;
@@ -184,14 +207,20 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
     if(active_cnt == 0)
     {
         printf("    %s: %s no active nodes\n", tree_name, SYM_SKIP);
-        free(buf); free(active);
+        free(buf);
+        free(active);
         return 0;
     }
 
     /* ---- Phase 2: Check if already contiguous ---- */
     {
         uint64_t *sorted = malloc(active_cnt * sizeof(*sorted));
-        if(!sorted) { free(buf); free(active); return -1; }
+        if(!sorted)
+        {
+            free(buf);
+            free(active);
+            return -1;
+        }
         memcpy(sorted, active, active_cnt * sizeof(*sorted));
         qsort(sorted, (size_t)active_cnt, sizeof(*sorted), u64_cmp);
 
@@ -208,9 +237,9 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
 
         if(contiguous)
         {
-            printf("    %s: %s already contiguous (%" PRIu64 " nodes)\n",
-                   tree_name, SYM_OK, active_cnt);
-            free(buf); free(active);
+            printf("    %s: %s already contiguous (%" PRIu64 " nodes)\n", tree_name, SYM_OK, active_cnt);
+            free(buf);
+            free(active);
             return 0;
         }
     }
@@ -221,15 +250,14 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
     int      rc = obmafs3_bitmap_find_free(ctx, needed, &new_start);
     if(rc != OBMAFS3_OK)
     {
-        printf("    %s: %s cannot find %" PRIu64 " contiguous free blocks, skipping\n",
-               tree_name, SYM_WARN, needed);
-        free(buf); free(active);
+        printf("    %s: %s cannot find %" PRIu64 " contiguous free blocks, skipping\n", tree_name, SYM_WARN, needed);
+        free(buf);
+        free(active);
         return 0;
     }
 
     /* ---- Phase 4: Ask user ---- */
-    printf("    %s: %" PRIu64 " active nodes can be packed into %" PRIu64
-           " contiguous blocks at LBA %" PRIu64 "\n",
+    printf("    %s: %" PRIu64 " active nodes can be packed into %" PRIu64 " contiguous blocks at LBA %" PRIu64 "\n",
            tree_name, active_cnt, needed, new_start);
 
     {
@@ -237,14 +265,20 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
         snprintf(prompt, sizeof(prompt), "Defragment %s tree?", tree_name);
         if(!ask_fix(auto_yes, auto_no, prompt))
         {
-            free(buf); free(active);
+            free(buf);
+            free(active);
             return 0;
         }
     }
 
     /* ---- Phase 5: Build old→new LBA relocation map ---- */
     struct defrag_map_entry *map = malloc(active_cnt * sizeof(*map));
-    if(!map) { free(buf); free(active); return -1; }
+    if(!map)
+    {
+        free(buf);
+        free(active);
+        return -1;
+    }
 
     for(uint64_t i = 0; i < active_cnt; i++)
     {
@@ -278,7 +312,9 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
             if(rc != OBMAFS3_OK)
             {
                 fprintf(stderr, "    Error reading LBA %" PRIu64 ": %d\n", old_lba + (uint64_t)b, rc);
-                free(map); free(buf); free(active);
+                free(map);
+                free(buf);
+                free(active);
                 return -1;
             }
         }
@@ -287,12 +323,9 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
         memcpy(&nhdr, buf, sizeof(nhdr));
 
         /* Remap sibling links */
-        if(nhdr.left_link != 0)
-            nhdr.left_link = defrag_map_lookup(map, active_cnt, nhdr.left_link);
-        if(nhdr.right_link != 0)
-            nhdr.right_link = defrag_map_lookup(map, active_cnt, nhdr.right_link);
-        if(nhdr.overflow_link != 0)
-            nhdr.overflow_link = defrag_map_lookup(map, active_cnt, nhdr.overflow_link);
+        if(nhdr.left_link != 0) nhdr.left_link = defrag_map_lookup(map, active_cnt, nhdr.left_link);
+        if(nhdr.right_link != 0) nhdr.right_link = defrag_map_lookup(map, active_cnt, nhdr.right_link);
+        if(nhdr.overflow_link != 0) nhdr.overflow_link = defrag_map_lookup(map, active_cnt, nhdr.overflow_link);
 
         /* Remap child pointers in index nodes */
         if(nhdr.level > 0)
@@ -324,7 +357,9 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
             if(rc != OBMAFS3_OK)
             {
                 fprintf(stderr, "    Error writing LBA %" PRIu64 ": %d\n", new_lba + (uint64_t)b, rc);
-                free(map); free(buf); free(active);
+                free(map);
+                free(buf);
+                free(active);
                 return -1;
             }
         }
@@ -333,8 +368,7 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
     if(active_cnt > 10) bar_clear();
 
     /* ---- Phase 7: Free old blocks in bitmap ---- */
-    for(uint64_t i = 0; i < active_cnt; i++)
-        obmafs3_bitmap_clear(ctx, active[i], (uint64_t)blocks_per_node);
+    for(uint64_t i = 0; i < active_cnt; i++) obmafs3_bitmap_clear(ctx, active[i], (uint64_t)blocks_per_node);
 
     /* Also free any old free-chain blocks */
     {
@@ -361,7 +395,9 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
     if(rc != OBMAFS3_OK)
     {
         fprintf(stderr, "    Error writing %s header: %d\n", tree_name, rc);
-        free(map); free(buf); free(active);
+        free(map);
+        free(buf);
+        free(active);
         return -1;
     }
 
@@ -370,12 +406,14 @@ static int defrag_tree(struct obmafs3_ctx *ctx, const char *tree_name, uint64_t 
     if(rc != OBMAFS3_OK)
     {
         fprintf(stderr, "    Error writing bitmap: %d\n", rc);
-        free(map); free(buf); free(active);
+        free(map);
+        free(buf);
+        free(active);
         return -1;
     }
 
-    result_fixed("Defragment:", "%s — %" PRIu64 " nodes → contiguous at LBA %" PRIu64,
-                 tree_name, active_cnt, new_start);
+    result_fixed("Defragment:", "%s — %" PRIu64 " nodes → contiguous at LBA %" PRIu64, tree_name, active_cnt,
+                 new_start);
 
     free(map);
     free(buf);
@@ -400,76 +438,60 @@ void defrag_all_trees(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
 
     /* Catalog */
     if(ctx->sb.catalog_lba != 0)
-        defrag_tree(ctx, "catalog", ctx->sb.catalog_lba, &ctx->catalog_hdr,
-                    sizeof(struct catalog_index_entry),
-                    __builtin_offsetof(struct catalog_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "catalog", ctx->sb.catalog_lba, &ctx->catalog_hdr, sizeof(struct catalog_index_entry),
+                    __builtin_offsetof(struct catalog_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* Inode */
     if(ctx->sb.inode_lba != 0)
-        defrag_tree(ctx, "inode", ctx->sb.inode_lba, &ctx->inode_hdr,
-                    sizeof(struct btree_index_entry),
-                    __builtin_offsetof(struct btree_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "inode", ctx->sb.inode_lba, &ctx->inode_hdr, sizeof(struct btree_index_entry),
+                    __builtin_offsetof(struct btree_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* Overflow */
     if(ctx->sb.overflow_lba != 0)
-        defrag_tree(ctx, "overflow", ctx->sb.overflow_lba, &ctx->overflow_hdr,
-                    sizeof(struct overflow_index_entry),
-                    __builtin_offsetof(struct overflow_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "overflow", ctx->sb.overflow_lba, &ctx->overflow_hdr, sizeof(struct overflow_index_entry),
+                    __builtin_offsetof(struct overflow_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* Media tag */
     if(ctx->sb.media_tag_lba != 0)
-        defrag_tree(ctx, "media tag", ctx->sb.media_tag_lba, &ctx->media_tag_hdr,
-                    sizeof(struct media_tag_index_entry),
-                    __builtin_offsetof(struct media_tag_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "media tag", ctx->sb.media_tag_lba, &ctx->media_tag_hdr, sizeof(struct media_tag_index_entry),
+                    __builtin_offsetof(struct media_tag_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* CD prefix */
     if(ctx->sb.cd_prefix_lba != 0)
-        defrag_tree(ctx, "CD prefix", ctx->sb.cd_prefix_lba, &ctx->cd_prefix_hdr,
-                    sizeof(struct btree_index_entry),
-                    __builtin_offsetof(struct btree_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "CD prefix", ctx->sb.cd_prefix_lba, &ctx->cd_prefix_hdr, sizeof(struct btree_index_entry),
+                    __builtin_offsetof(struct btree_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* CD suffix */
     if(ctx->sb.cd_suffix_lba != 0)
-        defrag_tree(ctx, "CD suffix", ctx->sb.cd_suffix_lba, &ctx->cd_suffix_hdr,
-                    sizeof(struct btree_index_entry),
-                    __builtin_offsetof(struct btree_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "CD suffix", ctx->sb.cd_suffix_lba, &ctx->cd_suffix_hdr, sizeof(struct btree_index_entry),
+                    __builtin_offsetof(struct btree_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* CD subchannel */
     if(ctx->sb.cd_subchannel_lba != 0)
         defrag_tree(ctx, "CD subchannel", ctx->sb.cd_subchannel_lba, &ctx->cd_subchannel_hdr,
-                    sizeof(struct btree_index_entry),
-                    __builtin_offsetof(struct btree_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+                    sizeof(struct btree_index_entry), __builtin_offsetof(struct btree_index_entry, child_lba), 1,
+                    auto_yes, auto_no);
 
     /* Refcount */
     if(ctx->sb.refcount_lba != 0)
-        defrag_tree(ctx, "refcount", ctx->sb.refcount_lba, &ctx->refcount_hdr,
-                    sizeof(struct btree_index_entry),
-                    __builtin_offsetof(struct btree_index_entry, child_lba),
-                    1, auto_yes, auto_no);
+        defrag_tree(ctx, "refcount", ctx->sb.refcount_lba, &ctx->refcount_hdr, sizeof(struct btree_index_entry),
+                    __builtin_offsetof(struct btree_index_entry, child_lba), 1, auto_yes, auto_no);
 
     /* Multi-block trees */
     printf("  Checking multi-block trees:\n");
 
     /* Metadata (8 blocks per node) */
     if(ctx->sb.metadata_lba != 0)
-        defrag_tree(ctx, "metadata", ctx->sb.metadata_lba, &ctx->metadata_hdr,
-                    sizeof(struct metadata_index_entry),
-                    __builtin_offsetof(struct metadata_index_entry, child_lba),
-                    METADATA_NODE_BLOCKS, auto_yes, auto_no);
+        defrag_tree(ctx, "metadata", ctx->sb.metadata_lba, &ctx->metadata_hdr, sizeof(struct metadata_index_entry),
+                    __builtin_offsetof(struct metadata_index_entry, child_lba), METADATA_NODE_BLOCKS, auto_yes,
+                    auto_no);
 
     /* Metadata index (8 blocks per node) */
     if(ctx->sb.metadata_idx_lba != 0)
         defrag_tree(ctx, "metadata index", ctx->sb.metadata_idx_lba, &ctx->metadata_idx_hdr,
                     sizeof(struct metadata_idx_index_entry),
-                    __builtin_offsetof(struct metadata_idx_index_entry, child_lba),
-                    METADATA_NODE_BLOCKS, auto_yes, auto_no);
+                    __builtin_offsetof(struct metadata_idx_index_entry, child_lba), METADATA_NODE_BLOCKS, auto_yes,
+                    auto_no);
 
     /* Dedup sub-trees */
     if(ctx->sb.dedup_lba != 0)
@@ -486,8 +508,7 @@ void defrag_all_trees(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
                 memcpy(&tlh, list_buf, sizeof(tlh));
                 if(tlh.magic == OBMAFS3_TREELIST_MAGIC && tlh.tree_count > 0)
                 {
-                    struct tree_list_entry *entries =
-                        malloc((size_t)(tlh.tree_count * sizeof(struct tree_list_entry)));
+                    struct tree_list_entry *entries = malloc((size_t)(tlh.tree_count * sizeof(struct tree_list_entry)));
                     if(entries)
                     {
                         memcpy(entries, list_buf + sizeof(struct tree_list_header),
@@ -500,13 +521,10 @@ void defrag_all_trees(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
                             if(rc != OBMAFS3_OK) continue;
 
                             char name[64];
-                            snprintf(name, sizeof(name), "dedup[%" PRIu64 "] (sector %u)",
-                                     t, entries[t].sector_size);
+                            snprintf(name, sizeof(name), "dedup[%" PRIu64 "] (sector %u)", t, entries[t].sector_size);
 
-                            defrag_tree(ctx, name, entries[t].tree_lba, &thdr,
-                                        sizeof(struct btree_index_entry),
-                                        __builtin_offsetof(struct btree_index_entry, child_lba),
-                                        1, auto_yes, auto_no);
+                            defrag_tree(ctx, name, entries[t].tree_lba, &thdr, sizeof(struct btree_index_entry),
+                                        __builtin_offsetof(struct btree_index_entry, child_lba), 1, auto_yes, auto_no);
                         }
                         free(entries);
                     }

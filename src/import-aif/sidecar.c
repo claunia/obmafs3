@@ -40,8 +40,7 @@
  * @param path      Output file path.
  * @param label     Human-readable label for log messages.
  */
-static void write_sidecar(const uint8_t *data, size_t data_len,
-                           const char *path, const char *label)
+static void write_sidecar(const uint8_t *data, size_t data_len, const char *path, const char *label)
 {
     int fd = open(path, O_CREAT | O_WRONLY | O_EXCL, 0644);
     if(fd >= 0)
@@ -55,8 +54,7 @@ static void write_sidecar(const uint8_t *data, size_t data_len,
     }
     else
     {
-        fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n",
-                path, errno, strerror(errno));
+        fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n", path, errno, strerror(errno));
     }
 }
 
@@ -66,8 +64,7 @@ static void write_sidecar(const uint8_t *data, size_t data_len,
 static void export_cicm_metadata(void *aaruf_ctx, const char *output_path, size_t base_len)
 {
     size_t cicm_len = 0;
-    if(aaruf_get_cicm_metadata(aaruf_ctx, NULL, &cicm_len) != AARUF_ERROR_BUFFER_TOO_SMALL || cicm_len == 0)
-        return;
+    if(aaruf_get_cicm_metadata(aaruf_ctx, NULL, &cicm_len) != AARUF_ERROR_BUFFER_TOO_SMALL || cicm_len == 0) return;
 
     uint8_t *cicm_buf = malloc(cicm_len);
     if(!cicm_buf) return;
@@ -121,8 +118,7 @@ static void export_aaru_json_metadata(void *aaruf_ctx, const char *output_path, 
 static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t base_len)
 {
     size_t dumphw_size = 0;
-    if(aaruf_get_dumphw(aaruf_ctx, NULL, &dumphw_size) != AARUF_ERROR_BUFFER_TOO_SMALL || dumphw_size == 0)
-        return;
+    if(aaruf_get_dumphw(aaruf_ctx, NULL, &dumphw_size) != AARUF_ERROR_BUFFER_TOO_SMALL || dumphw_size == 0) return;
 
     uint8_t *dumphw_buf = malloc(dumphw_size);
     if(!dumphw_buf) return;
@@ -150,8 +146,8 @@ static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t 
     size_t off = 18; /* skip header */
 
     /* Build JSON in a dynamic buffer */
-    size_t cap = 4096;
-    size_t pos = 0;
+    size_t cap  = 4096;
+    size_t pos  = 0;
     char  *jbuf = malloc(cap);
 
     if(!jbuf || entries == 0)
@@ -161,20 +157,27 @@ static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t 
         return;
     }
 
-    #define JAPPEND(...)                                                     \
-        do {                                                                 \
-            int _n = snprintf(jbuf + pos, cap - pos, __VA_ARGS__);           \
-            if(_n < 0) break;                                                \
-            while(pos + (size_t)_n >= cap) {                                 \
-                cap *= 2;                                                    \
-                char *_tmp = realloc(jbuf, cap);                             \
-                if(!_tmp) { free(jbuf); jbuf = NULL; break; }                \
-                jbuf = _tmp;                                                 \
-                _n = snprintf(jbuf + pos, cap - pos, __VA_ARGS__);           \
-            }                                                                \
-            if(!jbuf) break;                                                 \
-            pos += (size_t)_n;                                               \
-        } while(0)
+#define JAPPEND(...)                                             \
+    do                                                           \
+    {                                                            \
+        int _n = snprintf(jbuf + pos, cap - pos, __VA_ARGS__);   \
+        if(_n < 0) break;                                        \
+        while(pos + (size_t)_n >= cap)                           \
+        {                                                        \
+            cap *= 2;                                            \
+            char *_tmp = realloc(jbuf, cap);                     \
+            if(!_tmp)                                            \
+            {                                                    \
+                free(jbuf);                                      \
+                jbuf = NULL;                                     \
+                break;                                           \
+            }                                                    \
+            jbuf = _tmp;                                         \
+            _n   = snprintf(jbuf + pos, cap - pos, __VA_ARGS__); \
+        }                                                        \
+        if(!jbuf) break;                                         \
+        pos += (size_t)_n;                                       \
+    } while(0)
 
     JAPPEND("[\n");
     for(uint16_t i = 0; i < entries && jbuf; i++)
@@ -189,10 +192,8 @@ static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t 
            [4]=serial, [5]=softwareName, [6]=softwareVersion,
            [7]=softwareOperatingSystem, [8]=extents (count) */
 
-        static const char *const field_names[] = {
-            "manufacturer", "model", "revision", "firmware",
-            "serial", "software_name", "software_version", "software_os"
-        };
+        static const char *const field_names[] = {"manufacturer", "model",         "revision",         "firmware",
+                                                  "serial",       "software_name", "software_version", "software_os"};
 
         /* Compute pointers to each string in the buffer */
         const uint8_t *strs[8];
@@ -206,9 +207,7 @@ static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t 
 
         for(int f = 0; f < 8 && jbuf; f++)
         {
-            if(strs[f] && lens[f] > 0)
-                JAPPEND("    \"%s\": \"%.*s\",\n", field_names[f],
-                        (int)lens[f], strs[f]);
+            if(strs[f] && lens[f] > 0) JAPPEND("    \"%s\": \"%.*s\",\n", field_names[f], (int)lens[f], strs[f]);
         }
 
         uint32_t n_extents = lens[8];
@@ -221,8 +220,7 @@ static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t 
                 memcpy(&ext_start, dumphw_buf + off, 8);
                 memcpy(&ext_end, dumphw_buf + off + 8, 8);
                 off += 16;
-                JAPPEND("      {\"start\": %" PRIu64 ", \"end\": %" PRIu64 "}%s\n",
-                        ext_start, ext_end,
+                JAPPEND("      {\"start\": %" PRIu64 ", \"end\": %" PRIu64 "}%s\n", ext_start, ext_end,
                         (x + 1 < n_extents) ? "," : "");
             }
             JAPPEND("    ]\n");
@@ -242,7 +240,7 @@ static void export_dumphw_json(void *aaruf_ctx, const char *output_path, size_t 
     }
     if(jbuf) JAPPEND("]\n");
 
-    #undef JAPPEND
+#undef JAPPEND
 
     if(jbuf)
     {

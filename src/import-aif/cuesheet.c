@@ -39,33 +39,33 @@ static const char *media_type_to_cdrwin_string(uint32_t media_type)
 {
     switch(media_type)
     {
-        case 10:  /* CD */
-        case 11:  /* CDDA */
-        case 12:  /* CDG */
-        case 13:  /* CDEG */
-        case 14:  /* CDI */
-        case 15:  /* CDROM */
-        case 16:  /* CDROMXA */
-        case 17:  /* CDPLUS */
-        case 18:  /* CDMO */
-        case 19:  /* CDR */
-        case 22:  /* VCD */
-        case 23:  /* SVCD */
-        case 24:  /* PCD */
-        case 25:  /* SACD */
-        case 26:  /* DDCD */
-        case 27:  /* DDCDR */
-        case 29:  /* DTSCD */
-        case 30:  /* CDMIDI */
-        case 31:  /* CDV */
-        case 34:  /* CDIREADY */
-        case 35:  /* FMTOWNS */
+        case 10: /* CD */
+        case 11: /* CDDA */
+        case 12: /* CDG */
+        case 13: /* CDEG */
+        case 14: /* CDI */
+        case 15: /* CDROM */
+        case 16: /* CDROMXA */
+        case 17: /* CDPLUS */
+        case 18: /* CDMO */
+        case 19: /* CDR */
+        case 22: /* VCD */
+        case 23: /* SVCD */
+        case 24: /* PCD */
+        case 25: /* SACD */
+        case 26: /* DDCD */
+        case 27: /* DDCDR */
+        case 29: /* DTSCD */
+        case 30: /* CDMIDI */
+        case 31: /* CDV */
+        case 34: /* CDIREADY */
+        case 35: /* FMTOWNS */
             return "CD";
-        case 20:  /* CDRW */
+        case 20: /* CDRW */
             return "CD-RW";
-        case 21:  /* CDMRW */
+        case 21: /* CDMRW */
             return "CD-MRW";
-        case 28:  /* DDCDRW */
+        case 28: /* DDCDRW */
             return "CD-RW";
         default:
             return "CD";
@@ -81,52 +81,98 @@ static const char *media_type_to_aaru_string(uint32_t media_type)
 {
     switch(media_type)
     {
-        case 10:  return "CD";
-        case 11:  return "CDDA";
-        case 12:  return "CDG";
-        case 13:  return "CDEG";
-        case 14:  return "CDI";
-        case 15:  return "CDROM";
-        case 16:  return "CDROMXA";
-        case 17:  return "CDPLUS";
-        case 18:  return "CDMO";
-        case 19:  return "CDR";
-        case 20:  return "CDRW";
-        case 21:  return "CDMRW";
-        case 22:  return "VCD";
-        case 23:  return "SVCD";
-        case 24:  return "PCD";
-        case 25:  return "SACD";
-        case 26:  return "DDCD";
-        case 27:  return "DDCDR";
-        case 28:  return "DDCDRW";
-        case 29:  return "DTSCD";
-        case 30:  return "CDMIDI";
-        case 31:  return "CDV";
-        case 32:  return "PD650";
-        case 33:  return "PD650_WORM";
-        case 34:  return "CDIREADY";
-        case 35:  return "FMTOWNS";
-        case 112: return "PS1CD";
-        case 113: return "PS2CD";
-        case 150: return "MEGACD";
-        case 151: return "SATURNCD";
-        case 152: return "GDROM";
-        case 153: return "GDR";
-        case 155: return "MilCD";
-        case 171: return "SuperCDROM2";
-        case 172: return "JaguarCD";
-        case 173: return "ThreeDO";
-        case 174: return "PCFX";
-        case 175: return "NeoGeoCD";
-        case 176: return "CDTV";
-        case 177: return "CD32";
-        case 179: return "Playdia";
-        case 694: return "Pippin";
-        case 740: return "VideoNow";
-        case 741: return "VideoNowColor";
-        case 742: return "VideoNowXp";
-        default:  return "CD";
+        case 10:
+            return "CD";
+        case 11:
+            return "CDDA";
+        case 12:
+            return "CDG";
+        case 13:
+            return "CDEG";
+        case 14:
+            return "CDI";
+        case 15:
+            return "CDROM";
+        case 16:
+            return "CDROMXA";
+        case 17:
+            return "CDPLUS";
+        case 18:
+            return "CDMO";
+        case 19:
+            return "CDR";
+        case 20:
+            return "CDRW";
+        case 21:
+            return "CDMRW";
+        case 22:
+            return "VCD";
+        case 23:
+            return "SVCD";
+        case 24:
+            return "PCD";
+        case 25:
+            return "SACD";
+        case 26:
+            return "DDCD";
+        case 27:
+            return "DDCDR";
+        case 28:
+            return "DDCDRW";
+        case 29:
+            return "DTSCD";
+        case 30:
+            return "CDMIDI";
+        case 31:
+            return "CDV";
+        case 32:
+            return "PD650";
+        case 33:
+            return "PD650_WORM";
+        case 34:
+            return "CDIREADY";
+        case 35:
+            return "FMTOWNS";
+        case 112:
+            return "PS1CD";
+        case 113:
+            return "PS2CD";
+        case 150:
+            return "MEGACD";
+        case 151:
+            return "SATURNCD";
+        case 152:
+            return "GDROM";
+        case 153:
+            return "GDR";
+        case 155:
+            return "MilCD";
+        case 171:
+            return "SuperCDROM2";
+        case 172:
+            return "JaguarCD";
+        case 173:
+            return "ThreeDO";
+        case 174:
+            return "PCFX";
+        case 175:
+            return "NeoGeoCD";
+        case 176:
+            return "CDTV";
+        case 177:
+            return "CD32";
+        case 179:
+            return "Playdia";
+        case 694:
+            return "Pippin";
+        case 740:
+            return "VideoNow";
+        case 741:
+            return "VideoNowColor";
+        case 742:
+            return "VideoNowXp";
+        default:
+            return "CD";
     }
 }
 
@@ -176,8 +222,7 @@ static void lba_to_msf(int64_t lba, int *m, int *s, int *f)
  * @param base_len    Length of output_path without extension.
  * @return 0 on success, -1 on error.
  */
-int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
-                   const char *output_path, size_t base_len)
+int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_path, size_t base_len)
 {
     /* Get track information */
     uint8_t track_buf[4096];
@@ -201,8 +246,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
     FILE *fp = fopen(cue_path, "w");
     if(!fp)
     {
-        fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n",
-                cue_path, errno, strerror(errno));
+        fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n", cue_path, errno, strerror(errno));
         free(cue_path);
         return -1;
     }
@@ -211,10 +255,8 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
     fprintf(fp, "REM ORIGINAL MEDIA-TYPE: %s\n", media_type_to_cdrwin_string(info->MediaType));
     fprintf(fp, "REM METADATA AARU MEDIA-TYPE: %s\n", media_type_to_aaru_string(info->MediaType));
 
-    if(info->Application[0])
-        fprintf(fp, "REM Ripping Tool: %s\n", info->Application);
-    if(info->ApplicationVersion[0])
-        fprintf(fp, "REM Ripping Tool Version: %s\n", info->ApplicationVersion);
+    if(info->Application[0]) fprintf(fp, "REM Ripping Tool: %s\n", info->Application);
+    if(info->ApplicationVersion[0]) fprintf(fp, "REM Ripping Tool Version: %s\n", info->ApplicationVersion);
 
     /* ---- MCN (CATALOG) ---- */
     {
@@ -235,15 +277,14 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
     /* ---- FILE declaration ---- */
     /* Use just the basename of the output path for the FILE line */
     const char *file_basename = strrchr(output_path, '/');
-    file_basename = file_basename ? file_basename + 1 : output_path;
+    file_basename             = file_basename ? file_basename + 1 : output_path;
     fprintf(fp, "FILE \"%s\" BINARY\n", file_basename);
 
     /* ---- Determine how many sessions exist ---- */
     uint8_t max_session = 1;
     for(int t = 0; t < track_count; t++)
     {
-        if(tracks[t].session > max_session)
-            max_session = tracks[t].session;
+        if(tracks[t].session > max_session) max_session = tracks[t].session;
     }
 
     /* ---- TRACK blocks ---- */
@@ -268,8 +309,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
             current_session = trk->session;
 
             /* Emit REM SESSION if multi-session */
-            if(max_session > 1)
-                fprintf(fp, "REM SESSION %d\n", current_session);
+            if(max_session > 1) fprintf(fp, "REM SESSION %d\n", current_session);
         }
 
         /* Determine the cooked sector size for this track */
@@ -284,17 +324,28 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
         {
             /* Flag bits: bit0=Pre-emphasis, bit1=Copy permitted,
              * bit2=Data track, bit3=Four-channel audio */
-            int has_flags = 0;
-            char flags_str[64] = "";
-            size_t fpos = 0;
+            int    has_flags     = 0;
+            char   flags_str[64] = "";
+            size_t fpos          = 0;
 
-            if(trk->flags & 0x02) { fpos += (size_t)snprintf(flags_str + fpos, sizeof(flags_str) - fpos, " DCP"); has_flags = 1; }
-            if(trk->flags & 0x08) { fpos += (size_t)snprintf(flags_str + fpos, sizeof(flags_str) - fpos, " 4CH"); has_flags = 1; }
-            if(trk->flags & 0x01) { fpos += (size_t)snprintf(flags_str + fpos, sizeof(flags_str) - fpos, " PRE"); has_flags = 1; }
+            if(trk->flags & 0x02)
+            {
+                fpos += (size_t)snprintf(flags_str + fpos, sizeof(flags_str) - fpos, " DCP");
+                has_flags = 1;
+            }
+            if(trk->flags & 0x08)
+            {
+                fpos += (size_t)snprintf(flags_str + fpos, sizeof(flags_str) - fpos, " 4CH");
+                has_flags = 1;
+            }
+            if(trk->flags & 0x01)
+            {
+                fpos += (size_t)snprintf(flags_str + fpos, sizeof(flags_str) - fpos, " PRE");
+                has_flags = 1;
+            }
 
             /* Only emit FLAGS if there's something besides DataTrack */
-            if(has_flags)
-                fprintf(fp, "    FLAGS%s\n", flags_str);
+            if(has_flags) fprintf(fp, "    FLAGS%s\n", flags_str);
         }
 
         /* ISRC */
@@ -303,10 +354,13 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info,
             int has_isrc = 0;
             for(int i = 0; i < 13; i++)
             {
-                if(trk->isrc[i] != 0) { has_isrc = 1; break; }
+                if(trk->isrc[i] != 0)
+                {
+                    has_isrc = 1;
+                    break;
+                }
             }
-            if(has_isrc)
-                fprintf(fp, "    ISRC %.13s\n", trk->isrc);
+            if(has_isrc) fprintf(fp, "    ISRC %.13s\n", trk->isrc);
         }
 
         /* INDEX 00 (pregap) — only for tracks that are not the first in their session */

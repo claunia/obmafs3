@@ -50,10 +50,10 @@
  * @param auto_no     If non-zero, never repair.
  * @param errors      In/out: incremented for each unfixed error.
  */
-void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_size,
-                                int auto_yes, int auto_no, int *errors)
+void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_size, int auto_yes, int auto_no,
+                                int *errors)
 {
-    int bad = 0, fixed = 0;
+    int      bad = 0, fixed = 0;
     uint64_t total_blocks = sb->total_bytes / sb->block_size;
 
     /* ---- block_size ---- */
@@ -64,7 +64,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
         if(ask_fix(auto_yes, auto_no, "    Set block_size to 4096?"))
         {
             sb->block_size = 4096;
-            total_blocks = sb->total_bytes / sb->block_size;
+            total_blocks   = sb->total_bytes / sb->block_size;
             fixed++;
         }
     }
@@ -75,7 +75,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
         if(ask_fix(auto_yes, auto_no, "    Set block_size to 4096?"))
         {
             sb->block_size = 4096;
-            total_blocks = sb->total_bytes / sb->block_size;
+            total_blocks   = sb->total_bytes / sb->block_size;
             fixed++;
         }
     }
@@ -93,8 +93,8 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     }
     else if(sb->dedup_block_size < sb->block_size)
     {
-        printf("    dedup_block_size %" PRIu64 " is smaller than block_size %" PRIu64 "\n",
-               sb->dedup_block_size, sb->block_size);
+        printf("    dedup_block_size %" PRIu64 " is smaller than block_size %" PRIu64 "\n", sb->dedup_block_size,
+               sb->block_size);
         bad++;
         if(ask_fix(auto_yes, auto_no, "    Set dedup_block_size to 4194304?"))
         {
@@ -104,8 +104,8 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     }
     else if(sb->dedup_block_size % sb->block_size != 0)
     {
-        printf("    dedup_block_size %" PRIu64 " is not a multiple of block_size %" PRIu64 "\n",
-               sb->dedup_block_size, sb->block_size);
+        printf("    dedup_block_size %" PRIu64 " is not a multiple of block_size %" PRIu64 "\n", sb->dedup_block_size,
+               sb->block_size);
         bad++;
         if(ask_fix(auto_yes, auto_no, "    Set dedup_block_size to 4194304?"))
         {
@@ -117,28 +117,27 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     /* ---- total_bytes ---- */
     if(sb->total_bytes % sb->block_size != 0)
     {
-        printf("    total_bytes %" PRIu64 " is not a multiple of block_size %" PRIu64 "\n",
-               sb->total_bytes, sb->block_size);
+        printf("    total_bytes %" PRIu64 " is not a multiple of block_size %" PRIu64 "\n", sb->total_bytes,
+               sb->block_size);
         bad++;
         uint64_t aligned = (sb->total_bytes / sb->block_size) * sb->block_size;
         printf("    (nearest aligned value: %" PRIu64 ")\n", aligned);
         if(ask_fix(auto_yes, auto_no, "    Round total_bytes down to block boundary?"))
         {
             sb->total_bytes = aligned;
-            total_blocks = sb->total_bytes / sb->block_size;
+            total_blocks    = sb->total_bytes / sb->block_size;
             fixed++;
         }
     }
 
     if(file_size > 0 && sb->total_bytes != file_size)
     {
-        printf("    total_bytes %" PRIu64 " does not match actual file size %" PRIu64 "\n",
-               sb->total_bytes, file_size);
+        printf("    total_bytes %" PRIu64 " does not match actual file size %" PRIu64 "\n", sb->total_bytes, file_size);
         bad++;
         if(ask_fix(auto_yes, auto_no, "    Set total_bytes to match file size?"))
         {
             sb->total_bytes = file_size;
-            total_blocks = sb->total_bytes / sb->block_size;
+            total_blocks    = sb->total_bytes / sb->block_size;
             fixed++;
         }
     }
@@ -146,8 +145,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     /* ---- checksum_type ---- */
     if(sb->checksum_type != kChecksumTypeXXH64)
     {
-        printf("    checksum_type %" PRIu16 " is not supported (expected %d)\n",
-               sb->checksum_type, kChecksumTypeXXH64);
+        printf("    checksum_type %" PRIu16 " is not supported (expected %d)\n", sb->checksum_type, kChecksumTypeXXH64);
         bad++;
         if(ask_fix(auto_yes, auto_no, "    Set checksum_type to XXH64 (0)?"))
         {
@@ -176,8 +174,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     }
     else if(sb->bitmap_lba >= total_blocks)
     {
-        printf("    bitmap_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
-               sb->bitmap_lba, total_blocks);
+        printf("    bitmap_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n", sb->bitmap_lba, total_blocks);
         bad++;
     }
 
@@ -195,8 +192,8 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
 
         if(sb->bitmap_blocks != expected_bitmap_blks)
         {
-            printf("    bitmap_blocks %" PRIu64 " does not match expected %" PRIu64 "\n",
-                   sb->bitmap_blocks, expected_bitmap_blks);
+            printf("    bitmap_blocks %" PRIu64 " does not match expected %" PRIu64 "\n", sb->bitmap_blocks,
+                   expected_bitmap_blks);
             bad++;
             if(ask_fix(auto_yes, auto_no, "    Fix bitmap_blocks?"))
             {
@@ -218,8 +215,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     {
         if(sb->keyset_lba >= total_blocks)
         {
-            printf("    keyset_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
-                   sb->keyset_lba, total_blocks);
+            printf("    keyset_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n", sb->keyset_lba, total_blocks);
             bad++;
         }
         if(sb->keyset_blocks == 0)
@@ -240,8 +236,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     {
         if(sb->pending_lba >= total_blocks)
         {
-            printf("    pending_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
-                   sb->pending_lba, total_blocks);
+            printf("    pending_lba %" PRIu64 " is beyond total blocks %" PRIu64 "\n", sb->pending_lba, total_blocks);
             bad++;
         }
         if(sb->pending_blocks == 0)
@@ -258,19 +253,24 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     }
 
     /* ---- LBA range checks ---- */
-    struct { const char *name; uint64_t lba; } lba_fields[] = {
-        { "catalog_lba",       sb->catalog_lba       },
-        { "inode_lba",         sb->inode_lba         },
-        { "overflow_lba",      sb->overflow_lba      },
-        { "dedup_lba",         sb->dedup_lba         },
-        { "metadata_lba",      sb->metadata_lba      },
-        { "media_tag_lba",     sb->media_tag_lba     },
-        { "cd_prefix_lba",     sb->cd_prefix_lba     },
-        { "cd_suffix_lba",     sb->cd_suffix_lba     },
-        { "cd_subchannel_lba", sb->cd_subchannel_lba },
-        { "metadata_idx_lba",  sb->metadata_idx_lba  },
-        { "refcount_lba",      sb->refcount_lba      },
+    struct
+    {
+        const char *name;
+        uint64_t    lba;
+    } lba_fields[] = {
+        {      "catalog_lba",       sb->catalog_lba},
+        {        "inode_lba",         sb->inode_lba},
+        {     "overflow_lba",      sb->overflow_lba},
+        {        "dedup_lba",         sb->dedup_lba},
+        {     "metadata_lba",      sb->metadata_lba},
+        {    "media_tag_lba",     sb->media_tag_lba},
+        {    "cd_prefix_lba",     sb->cd_prefix_lba},
+        {    "cd_suffix_lba",     sb->cd_suffix_lba},
+        {"cd_subchannel_lba", sb->cd_subchannel_lba},
+        { "metadata_idx_lba",  sb->metadata_idx_lba},
+        {     "refcount_lba",      sb->refcount_lba},
     };
+
     int lba_count = (int)(sizeof(lba_fields) / sizeof(lba_fields[0]));
 
     for(int i = 0; i < lba_count; i++)
@@ -278,8 +278,8 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
         if(lba_fields[i].lba == 0) continue; /* optional field */
         if(lba_fields[i].lba >= total_blocks)
         {
-            printf("    %s %" PRIu64 " is beyond total blocks %" PRIu64 "\n",
-                   lba_fields[i].name, lba_fields[i].lba, total_blocks);
+            printf("    %s %" PRIu64 " is beyond total blocks %" PRIu64 "\n", lba_fields[i].name, lba_fields[i].lba,
+                   total_blocks);
             bad++;
         }
     }
@@ -293,8 +293,8 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
             if(lba_fields[j].lba == 0) continue;
             if(lba_fields[i].lba == lba_fields[j].lba)
             {
-                printf("    %s and %s share the same LBA %" PRIu64 "\n",
-                       lba_fields[i].name, lba_fields[j].name, lba_fields[i].lba);
+                printf("    %s and %s share the same LBA %" PRIu64 "\n", lba_fields[i].name, lba_fields[j].name,
+                       lba_fields[i].lba);
                 bad++;
             }
         }
@@ -326,21 +326,16 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     /* ---- btree_clump_size / dedup_clump_size ---- */
     if(sb->btree_clump_size == 0 || sb->dedup_clump_size == 0)
     {
-        if(sb->btree_clump_size == 0)
-            printf("    btree_clump_size is 0 (no clumping configured)\n");
-        if(sb->dedup_clump_size == 0)
-            printf("    dedup_clump_size is 0 (no clumping configured)\n");
+        if(sb->btree_clump_size == 0) printf("    btree_clump_size is 0 (no clumping configured)\n");
+        if(sb->dedup_clump_size == 0) printf("    dedup_clump_size is 0 (no clumping configured)\n");
         bad++;
         char clump_prompt[128];
-        snprintf(clump_prompt, sizeof(clump_prompt),
-                 "    Set clump sizes to defaults (btree=%d, dedup=%d)?",
+        snprintf(clump_prompt, sizeof(clump_prompt), "    Set clump sizes to defaults (btree=%d, dedup=%d)?",
                  OBMAFS3_DEFAULT_CLUMP_SIZE, OBMAFS3_DEDUP_CLUMP_SIZE);
         if(ask_fix(auto_yes, auto_no, clump_prompt))
         {
-            if(sb->btree_clump_size == 0)
-                sb->btree_clump_size = OBMAFS3_DEFAULT_CLUMP_SIZE;
-            if(sb->dedup_clump_size == 0)
-                sb->dedup_clump_size = OBMAFS3_DEDUP_CLUMP_SIZE;
+            if(sb->btree_clump_size == 0) sb->btree_clump_size = OBMAFS3_DEFAULT_CLUMP_SIZE;
+            if(sb->dedup_clump_size == 0) sb->dedup_clump_size = OBMAFS3_DEDUP_CLUMP_SIZE;
             fixed++;
         }
     }
@@ -356,8 +351,7 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
         uint64_t now = (uint64_t)time(NULL);
         if(sb->creation_time > now)
         {
-            printf("    creation_time %" PRIu64 " is in the future (now %" PRIu64 ")\n",
-                   sb->creation_time, now);
+            printf("    creation_time %" PRIu64 " is in the future (now %" PRIu64 ")\n", sb->creation_time, now);
             bad++;
         }
     }
@@ -379,17 +373,13 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
             if(sb->total_bytes > 0 && sb->block_size > 0)
             {
                 uint64_t blba = OBMAFS3_BACKUP_SB_LBA(sb->total_bytes, sb->block_size);
-                if(blba > 0)
-                    pwrite(fd, sb, sizeof(*sb), (off_t)(blba * sb->block_size));
+                if(blba > 0) pwrite(fd, sb, sizeof(*sb), (off_t)(blba * sb->block_size));
             }
         }
     }
 
     /* ---- Summary ---- */
-    if(bad == 0)
-    {
-        result_ok("Field checks:", "");
-    }
+    if(bad == 0) { result_ok("Field checks:", ""); }
     else
     {
         if(fixed > 0)
