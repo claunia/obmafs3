@@ -1878,3 +1878,344 @@ void obmafs3_metadata_query_free(char **paths, uint32_t count)
     for(uint32_t i = 0; i < count; i++) free(paths[i]);
     free(paths);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Multi-filter metadata query                                        */
+/* ------------------------------------------------------------------ */
+
+/** Dynamic set of uint64_t inode IDs (sorted, deduplicated). */
+struct inode_id_set
+{
+    uint64_t *ids;
+    uint32_t  count;
+    uint32_t  cap;
+};
+
+static int idset_init(struct inode_id_set *s, uint32_t initial_cap)
+{
+    s->count = 0;
+    s->cap   = initial_cap ? initial_cap : 16;
+    s->ids   = malloc(s->cap * sizeof(uint64_t));
+    return s->ids ? 0 : -1;
+}
+
+static void idset_free(struct inode_id_set *s)
+{
+    free(s->ids);
+    s->ids   = NULL;
+    s->count = 0;
+    s->cap   = 0;
+}
+
+/** Append an inode_id (duplicates allowed at this stage). */
+static int idset_add(struct inode_id_set *s, uint64_t id)
+{
+    if(s->count >= s->cap)
+    {
+        uint32_t  nc  = s->cap * 2;
+        uint64_t *tmp = realloc(s->ids, nc * sizeof(uint64_t));
+        if(!tmp) return -1;
+        s->ids = tmp;
+        s->cap = nc;
+    }
+    s->ids[s->count++] = id;
+    return 0;
+}
+
+static int u64_cmp(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+/** Sort and deduplicate in-place. */
+static void idset_sort_dedup(struct inode_id_set *s)
+{
+    if(s->count <= 1) return;
+    qsort(s->ids, s->count, sizeof(uint64_t), u64_cmp);
+    uint32_t w = 1;
+    for(uint32_t r = 1; r < s->count; r++)
+        if(s->ids[r] != s->ids[w - 1]) s->ids[w++] = s->ids[r];
+    s->count = w;
+}
+
+/** Intersect sorted/deduped sets a and b into out. */
+static int idset_intersect(const struct inode_id_set *a, const struct inode_id_set *b, struct inode_id_set *out)
+{
+    if(idset_init(out, (a->count < b->count ? a->count : b->count))) return -1;
+    uint32_t i = 0, j = 0;
+    while(i < a->count && j < b->count)
+    {
+        if(a->ids[i] == b->ids[j])
+        {
+            if(idset_add(out, a->ids[i])) { idset_free(out); return -1; }
+            i++;
+            j++;
+        }
+        else if(a->ids[i] < b->ids[j])
+            i++;
+        else
+            j++;
+    }
+    return 0;
+}
+
+/** Union sorted/deduped sets a and b into out. */
+static int idset_union(const struct inode_id_set *a, const struct inode_id_set *b, struct inode_id_set *out)
+{
+    if(idset_init(out, a->count + b->count)) return -1;
+    uint32_t i = 0, j = 0;
+    while(i < a->count && j < b->count)
+    {
+        if(a->ids[i] == b->ids[j])
+        {
+            if(idset_add(out, a->ids[i])) { idset_free(out); return -1; }
+            i++;
+            j++;
+        }
+        else if(a->ids[i] < b->ids[j])
+        {
+            if(idset_add(out, a->ids[i])) { idset_free(out); return -1; }
+            i++;
+        }
+        else
+        {
+            if(idset_add(out, b->ids[j])) { idset_free(out); return -1; }
+            j++;
+        }
+    }
+    while(i < a->count)
+    {
+        if(idset_add(out, a->ids[i++])) { idset_free(out); return -1; }
+    }
+    while(j < b->count)
+    {
+        if(idset_add(out, b->ids[j++])) { idset_free(out); return -1; }
+    }
+    return 0;
+}
+
+/**
+ * Test whether a single reverse-index record matches a filter operator.
+ *
+ * @param rec_value  The value from the metadata_idx_record.
+ * @param flt_value  The value from the filter.
+ * @param op         The comparison operator.
+ * @return Non-zero if the record matches.
+ */
+static int filter_value_matches(const char *rec_value, const char *flt_value, uint8_t op)
+{
+    switch(op)
+    {
+        case kQueryOpEqual: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) == 0;
+
+        case kQueryOpNotEqual: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) != 0;
+
+        case kQueryOpGreater: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) > 0;
+
+        case kQueryOpLess: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) < 0;
+
+        case kQueryOpGreaterEq: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) >= 0;
+
+        case kQueryOpLessEq: return strncmp(rec_value, flt_value, METADATA_VALUE_MAX) <= 0;
+
+        case kQueryOpContains: return strstr(rec_value, flt_value) != NULL;
+
+        case kQueryOpStartsWith:
+        {
+            size_t plen = strnlen(flt_value, METADATA_VALUE_MAX);
+            return strncmp(rec_value, flt_value, plen) == 0;
+        }
+
+        case kQueryOpExists: return 1; /* key exists — always matches */
+
+        default: return 0;
+    }
+}
+
+/**
+ * Collect all inode IDs from the reverse-index tree whose key matches
+ * @p filter_key and whose value satisfies @p op against @p filter_value.
+ *
+ * Navigates the B+Tree to the first leaf containing @p filter_key and
+ * scans the leaf chain until the key changes.
+ */
+static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *flt,
+                                 struct inode_id_set *out)
+{
+    if(ctx->sb.metadata_idx_lba == 0) return OBMAFS3_OK;
+
+    uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
+    if(lba == 0) return OBMAFS3_OK;
+
+    size_t   nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    /* Navigate to the leaf containing (key, "", 0) — start of key range */
+    static const char empty_val[METADATA_VALUE_MAX] = {0};
+    while(1)
+    {
+        int rc = meta_node_read(ctx, lba, buf);
+        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+        if(hdr.level == 0) break;
+
+        uint16_t                        slot = midx_index_find(buf, hdr.node_keys, flt->key, empty_val, 0);
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain for all entries with matching key */
+    while(1)
+    {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for(uint16_t i = 0; i < hdr.node_keys; i++)
+        {
+            struct metadata_idx_record rec;
+            memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
+
+            int kcmp = strncmp(rec.key, flt->key, METADATA_KEY_MAX);
+            if(kcmp < 0) continue;           /* haven't reached the key yet */
+            if(kcmp > 0) goto collect_done;   /* past the key — done */
+
+            /* Key matches — apply the operator against the value */
+            if(filter_value_matches(rec.value, flt->value, flt->op))
+            {
+                if(idset_add(out, rec.inode_id))
+                {
+                    free(buf);
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                }
+            }
+        }
+
+        if(hdr.right_link == 0) break;
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+    }
+
+collect_done:
+    free(buf);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Query which files match a set of metadata filter conditions.
+ *
+ * Each filter specifies a key, a comparison operator, and a value.
+ * Filters are combined with AND (all must match) or OR (any must match).
+ * The caller must free the returned array with @c obmafs3_metadata_query_free.
+ *
+ * @param ctx          Filesystem context.
+ * @param filters      Array of filter conditions.
+ * @param filter_count Number of filters (1..OBMAFS3_QUERY_MAX_FILTERS).
+ * @param combine      kQueryCombineAnd or kQueryCombineOr.
+ * @param paths        Output array of path strings.
+ * @param count        Output number of matching paths.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
+                                    uint8_t filter_count, uint8_t combine, char ***paths, uint32_t *count)
+{
+    *paths = NULL;
+    *count = 0;
+
+    if(filter_count == 0 || filter_count > OBMAFS3_QUERY_MAX_FILTERS) DBG_RETURN(OBMAFS3_ERR_INVAL, "bad filter count");
+
+    /* Collect matching inode IDs for each filter */
+    struct inode_id_set sets[OBMAFS3_QUERY_MAX_FILTERS];
+    memset(sets, 0, sizeof(sets));
+
+    for(uint8_t f = 0; f < filter_count; f++)
+    {
+        if(idset_init(&sets[f], 16))
+        {
+            for(uint8_t j = 0; j < f; j++) idset_free(&sets[j]);
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        }
+
+        int rc = midx_collect_matching(ctx, &filters[f], &sets[f]);
+        if(rc != OBMAFS3_OK)
+        {
+            for(uint8_t j = 0; j <= f; j++) idset_free(&sets[j]);
+            return rc;
+        }
+        idset_sort_dedup(&sets[f]);
+    }
+
+    /* Combine the per-filter ID sets */
+    struct inode_id_set result;
+    if(filter_count == 1)
+    {
+        result = sets[0];
+        /* Ownership transferred — don't free sets[0] below */
+    }
+    else
+    {
+        result = sets[0];
+        for(uint8_t f = 1; f < filter_count; f++)
+        {
+            struct inode_id_set combined;
+            int rc;
+            if(combine == kQueryCombineAnd)
+                rc = idset_intersect(&result, &sets[f], &combined);
+            else
+                rc = idset_union(&result, &sets[f], &combined);
+
+            if(rc != 0)
+            {
+                idset_free(&result);
+                for(uint8_t j = f; j < filter_count; j++) idset_free(&sets[j]);
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+            }
+
+            /* Free the previous result and the consumed set */
+            if(f > 1 || filter_count > 1) idset_free(&result);
+            idset_free(&sets[f]);
+            result = combined;
+        }
+        /* sets[0] was consumed as the initial result — free it if filter_count > 1 */
+        if(filter_count > 1) idset_free(&sets[0]);
+    }
+
+    /* Resolve inode IDs to paths */
+    uint32_t n   = 0;
+    uint32_t cap = result.count ? result.count : 1;
+    char   **res = malloc(cap * sizeof(char *));
+    if(!res)
+    {
+        idset_free(&result);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    for(uint32_t i = 0; i < result.count; i++)
+    {
+        char path[4096];
+        int  prc = obmafs3_resolve_inode_path(ctx, result.ids[i], path, sizeof(path));
+        if(prc != OBMAFS3_OK) continue; /* skip unresolvable inodes */
+
+        res[n] = strdup(path);
+        if(!res[n])
+        {
+            for(uint32_t j = 0; j < n; j++) free(res[j]);
+            free(res);
+            idset_free(&result);
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        }
+        n++;
+    }
+
+    idset_free(&result);
+    *paths = res;
+    *count = n;
+    return OBMAFS3_OK;
+}

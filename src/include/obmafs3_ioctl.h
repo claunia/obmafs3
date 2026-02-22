@@ -127,17 +127,68 @@ struct obmafs3_ioctl_metadata_list_arg
 
 #define OBMAFS3_IOC_LIST_METADATA _IOWR('O', 10, struct obmafs3_ioctl_metadata_list_arg)
 
+/* ================================================================== */
+/*  Metadata query (multi-filter)                                      */
+/* ================================================================== */
+
+/*
+ * Query operator and combine enums are defined in enums.h when the
+ * full internal headers are available.  For standalone use of this
+ * ioctl header, we define them here with include guards.
+ */
+
+#ifndef OBMAFS3_ENUMS_H
+enum obmafs3_query_op
+{
+    kQueryOpEqual      = 0,
+    kQueryOpNotEqual   = 1,
+    kQueryOpGreater    = 2,
+    kQueryOpLess       = 3,
+    kQueryOpGreaterEq  = 4,
+    kQueryOpLessEq     = 5,
+    kQueryOpContains   = 6,
+    kQueryOpStartsWith = 7,
+    kQueryOpExists     = 8
+};
+
+enum obmafs3_query_combine
+{
+    kQueryCombineAnd = 0,
+    kQueryCombineOr  = 1
+};
+#endif /* OBMAFS3_ENUMS_H */
+
+#ifndef OBMAFS3_QUERY_MAX_FILTERS
+#define OBMAFS3_QUERY_MAX_FILTERS 4
+#endif
+
+/** A single ioctl filter condition: key <op> value. */
+struct obmafs3_ioctl_query_filter
+{
+    char    key[METADATA_KEY_MAX];     /**< Metadata key to match */
+    char    value[METADATA_VALUE_MAX]; /**< Value operand (ignored for kQueryOpExists) */
+    uint8_t op;                        /**< enum obmafs3_query_op */
+    uint8_t _pad[7];                   /**< Alignment padding */
+};
+
 /**
- * Query which images have a given key=value pair.
+ * Query which images match one or more metadata filter conditions.
  * Returns a paginated list of paths.
+ *
+ * Set filter_count to the number of active filters (1..4).
+ * Set combine to kQueryCombineAnd or kQueryCombineOr.
+ * Set offset to 0 for the first page, advance by count for subsequent
+ * pages.  Returns count == 0 when no more results remain.
  */
 struct obmafs3_ioctl_metadata_query_arg
 {
-    char     key[METADATA_KEY_MAX];                                      /**< Input: key */
-    char     value[METADATA_VALUE_MAX];                                  /**< Input: value */
-    uint32_t offset;                                                     /**< Input: starting offset */
-    uint32_t count;                                                      /**< Output: paths returned */
-    char     paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX]; /**< Output: up to 8 paths */
+    uint8_t                    combine;                                        /**< enum obmafs3_query_combine */
+    uint8_t                          filter_count;                                   /**< 1..OBMAFS3_QUERY_MAX_FILTERS */
+    uint8_t                          _pad[6];                                        /**< Alignment padding */
+    struct obmafs3_ioctl_query_filter filters[OBMAFS3_QUERY_MAX_FILTERS];             /**< Filter conditions */
+    uint32_t                   offset;                                         /**< Input: starting offset */
+    uint32_t                   count;                                          /**< Output: paths returned */
+    char                       paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX]; /**< Output: up to 8 paths */
 };
 
 #define OBMAFS3_IOC_QUERY_METADATA _IOWR('O', 11, struct obmafs3_ioctl_metadata_query_arg)

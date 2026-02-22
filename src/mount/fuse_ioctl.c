@@ -709,12 +709,27 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_QUERY_METADATA:
         {
-            /* This query is filesystem-level; works on any open image file */
+            /* Filesystem-level multi-filter query; works on any open image file */
             struct obmafs3_ioctl_metadata_query_arg *qa = (struct obmafs3_ioctl_metadata_query_arg *)data;
-            char                                   **paths;
-            uint32_t                                 total;
-            int rc = obmafs3_metadata_query(g_ctx, qa->key, qa->value, &paths, &total);
+
+            if(qa->filter_count == 0 || qa->filter_count > OBMAFS3_QUERY_MAX_FILTERS) FUSE_RETURN(-EINVAL, "");
+            if(qa->combine != kQueryCombineAnd && qa->combine != kQueryCombineOr) FUSE_RETURN(-EINVAL, "");
+
+            /* Convert ioctl filters to library filters (strip padding) */
+            struct obmafs3_query_filter lib_filters[OBMAFS3_QUERY_MAX_FILTERS];
+            for(uint8_t f = 0; f < qa->filter_count; f++)
+            {
+                memcpy(lib_filters[f].key, qa->filters[f].key, METADATA_KEY_MAX);
+                memcpy(lib_filters[f].value, qa->filters[f].value, METADATA_VALUE_MAX);
+                lib_filters[f].op = qa->filters[f].op;
+            }
+
+            char    **paths;
+            uint32_t  total;
+            int       rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count, qa->combine, &paths,
+                                                           &total);
             if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
             uint32_t start = qa->offset;
             uint32_t n     = 0;
             memset(qa->paths, 0, sizeof(qa->paths));
