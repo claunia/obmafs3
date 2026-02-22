@@ -341,6 +341,10 @@ static int obmafs3_fuse_statfs_impl(const char *path, struct statvfs *stbuf)
     stbuf->f_ffree   = 0; /* inodes allocated on demand, no fixed limit */
     stbuf->f_namemax = 255;
 
+    /* Embed OBMAFS3 magic in f_fsid so tools can identify the filesystem.
+     * f_fsid is two 32-bit ints — we split the 64-bit magic across them. */
+    stbuf->f_fsid = (uint64_t)OBMAFS3_SB_MAGIC;
+
     return 0;
 }
 

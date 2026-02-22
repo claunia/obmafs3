@@ -19,7 +19,7 @@ int                       g_disk_image_map_count = 0;
  * Parse the disk image extension-to-sector-size mapping string.
  *
  * Accepts a semicolon-separated list of "extension=sector_size" pairs
- * (e.g. "dsk=512;iso=2048") and populates @c g_disk_image_maps.
+ * (e.g. "dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512") and populates @c g_disk_image_maps.
  *
  * @param spec  Mapping specification string (may be NULL or empty).
  * @return 0 on success, -1 on parse error.

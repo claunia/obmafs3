@@ -15,6 +15,10 @@
 #define MEDIATAG_XATTR_PREFIX     "user.mediatag."
 #define MEDIATAG_XATTR_PREFIX_LEN 14 /* strlen("user.mediatag.") */
 
+/* Filesystem identity xattr — exposed only on the root directory */
+#define FSTYPE_XATTR_NAME  "system.obmafs3.fstype"
+#define FSTYPE_XATTR_VALUE "obmafs3"
+
 /** Map MediaTagType ordinal to xattr suffix name.  NULL = unused slot. */
 static const char *media_tag_xattr_names[] = {
     [kCdTableOfContents]             = "cd_toc",
@@ -148,6 +152,16 @@ static int is_image_file_type(uint8_t ft) { return ft == kFileTypeMediaImage || 
  */
 static int obmafs3_fuse_getxattr_impl(const char *path, const char *name, char *value, size_t size)
 {
+    /* Root-only system xattr for filesystem identification */
+    if(strcmp(path, "/") == 0 && strcmp(name, FSTYPE_XATTR_NAME) == 0)
+    {
+        size_t vlen = strlen(FSTYPE_XATTR_VALUE);
+        if(size == 0) return (int)vlen;
+        if(size < vlen) FUSE_RETURN(-ERANGE, "");
+        memcpy(value, FSTYPE_XATTR_VALUE, vlen);
+        return (int)vlen;
+    }
+
     int want_mediatag = is_mediatag_xattr(name);
     int want_metadata = is_metadata_xattr(name);
 
@@ -290,7 +304,15 @@ static int obmafs3_fuse_setxattr_impl(const char *path, const char *name, const 
  */
 static int obmafs3_fuse_listxattr_impl(const char *path, char *list, size_t size)
 {
-    if(strcmp(path, "/") == 0) return 0;
+    if(strcmp(path, "/") == 0)
+    {
+        /* Root directory exposes only the filesystem identity xattr */
+        size_t needed = strlen(FSTYPE_XATTR_NAME) + 1; /* include NUL */
+        if(size == 0) return (int)needed;
+        if(size < needed) FUSE_RETURN(-ERANGE, "");
+        memcpy(list, FSTYPE_XATTR_NAME, needed);
+        return (int)needed;
+    }
 
     uint64_t    parent_id;
     const char *fname;

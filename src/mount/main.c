@@ -45,7 +45,7 @@ static void show_help(const char *progname)
            "    --compression=<0|1>    Enable (1) or disable (0) compression (default: 1)\n"
            "    --zstd-level=<1-15>    ZSTD compression level (default: 15)\n"
            "    --disk-images=<spec>   Semicolon-separated ext=sector_size pairs\n"
-           "                           (default: dsk=512;iso=2048)\n"
+           "                           (default: dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512)\n"
            "\n",
            progname);
 }
@@ -111,7 +111,7 @@ int main(int argc, char *argv[])
 
     /* Parse disk image extension mappings */
     {
-        const char *spec = opts.disk_images ? opts.disk_images : "dsk=512;iso=2048";
+        const char *spec = opts.disk_images ? opts.disk_images : "dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512";
         if(parse_disk_image_maps(spec) != 0)
         {
             fprintf(stderr, "Error: invalid --disk-images specification\n");
