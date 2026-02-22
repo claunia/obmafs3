@@ -328,6 +328,12 @@ static void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
     /* Store UTF-16LE string metadata fields (converted to UTF-8) */
     import_utf16_metadata(aaruf_ctx, fd, aaruf_get_creator, "dumper");
     import_utf16_metadata(aaruf_ctx, fd, aaruf_get_comments, "comments");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_title, "title");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_manufacturer, "manufacturer");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_model, "model");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_serial_number, "serial_number");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_barcode, "barcode");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_part_number, "part_number");
 }
 
 /**
