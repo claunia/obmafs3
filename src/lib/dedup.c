@@ -269,6 +269,7 @@ struct dedup_node_cache
 #define DEDUP_CACHE_INIT_CAP        2048 /* power of 2 */
 #define DEDUP_NC_FLUSH_INTERVAL       32 /* max writes between forced flushes */
 #define DEDUP_NC_DIRTY_THRESHOLD     256 /* dirty-count ceiling for forced flush */
+#define DEDUP_NC_IOV_MAX            1024 /* pwritev iovec limit (Linux IOV_MAX) */
 
 /** Allocate and initialise a dedup B+Tree node cache. */
 static struct dedup_node_cache *dedup_cache_create(size_t block_size)
@@ -507,10 +508,15 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
         nc->dirty_list[j + 1] = key;
     }
 
-    /* Coalesce runs of consecutive LBAs into single pwritev() calls.
-     * IOV_MAX is typically 1024; dirty_count rarely exceeds a few
-     * hundred so an array sized to dirty_count suffices. */
-    struct iovec *iov = malloc(nc->dirty_count * sizeof(struct iovec));
+    /* Coalesce runs of consecutive LBAs into pwritev() calls, each
+     * capped at DEDUP_NC_IOV_MAX iovecs to stay within the kernel's
+     * IOV_MAX limit.  With dedup clump sizes of 1024+ nodes, a
+     * single consecutive run can easily exceed IOV_MAX so we split
+     * large runs into multiple syscalls. */
+    uint32_t iov_cap = nc->dirty_count;
+    if(iov_cap > DEDUP_NC_IOV_MAX) iov_cap = DEDUP_NC_IOV_MAX;
+
+    struct iovec *iov = malloc(iov_cap * sizeof(struct iovec));
     if(!iov)
     {
         /* Fallback: write individually if malloc fails. */
@@ -542,8 +548,8 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
         uint32_t iov_count     = 0;
         uint64_t expect_lba    = run_start_lba;
 
-        /* Gather consecutive LBAs into the iovec. */
-        while(d < nc->dirty_count)
+        /* Gather consecutive LBAs into the iovec, capped at IOV_MAX. */
+        while(d < nc->dirty_count && iov_count < iov_cap)
         {
             uint32_t ci = nc->dirty_list[d];
             if(!nc->slots[ci].buf || !nc->slots[ci].dirty) { d++; continue; }
@@ -557,19 +563,43 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
 
         if(iov_count == 0) continue;
 
-        /* Issue a single pwritev for the whole consecutive run. */
+        /* Issue a single pwritev for this chunk of the run. */
         off_t   off      = (off_t)(run_start_lba * ctx->sb.block_size);
         size_t  expected = nc->block_size * iov_count;
         ssize_t n        = pwritev(ctx->fd, iov, (int)iov_count, off);
         if(n < 0 || (size_t)n != expected)
         {
-            free(iov);
-            DBG_RETURN_ERRNO(OBMAFS3_ERR_IO,
-                             "pwritev lba=%" PRIu64 " count=%u expect=%zu got=%zd",
-                             run_start_lba, iov_count, expected, n);
+            /* pwritev failed — fall back to writing each block in
+             * this chunk individually so we save as much as possible. */
+            fprintf(stderr, "WARNING: pwritev lba=%" PRIu64 " count=%u "
+                    "expect=%zu got=%zd (errno=%d %s) — falling back to "
+                    "individual writes\n",
+                    run_start_lba, iov_count, expected, n,
+                    errno, strerror(errno));
+
+            int any_failed = 0;
+            for(uint32_t r = 0; r < iov_count; r++)
+            {
+                uint64_t blk_lba = run_start_lba + r;
+                int wrc = obmafs3_block_write(ctx, blk_lba,
+                                              iov[r].iov_base, nc->block_size);
+                if(wrc == OBMAFS3_OK)
+                {
+                    struct dedup_cache_slot *s = cache_find_slot(nc, blk_lba);
+                    if(s) s->dirty = 0;
+                }
+                else
+                {
+                    fprintf(stderr, "ERROR: fallback write lba=%" PRIu64
+                            " failed (rc=%d)\n", blk_lba, wrc);
+                    any_failed = 1;
+                }
+            }
+            if(any_failed) goto flush_rebuild;
+            continue;
         }
 
-        /* Mark all slots in this run as clean. */
+        /* Mark all slots in this chunk as clean. */
         for(uint32_t r = 0; r < iov_count; r++)
         {
             uint64_t lba = run_start_lba + r;
@@ -582,6 +612,19 @@ static int dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ct
     nc->dirty_count        = 0;
     nc->writes_since_flush = 0;
     return OBMAFS3_OK;
+
+flush_rebuild:
+    /* Some individual writes also failed.  Rebuild the dirty list
+     * from the slot array so dirty_count accurately reflects only
+     * the entries that are still dirty. */
+    free(iov);
+    nc->dirty_count = 0;
+    for(uint32_t i = 0; i < nc->capacity; i++)
+    {
+        if(nc->slots[i].buf && nc->slots[i].dirty)
+            dirty_list_add(nc, i);
+    }
+    return OBMAFS3_ERR_IO;
 }
 
 /** Free all memory held by the node cache. */
@@ -3104,12 +3147,25 @@ out:
     }
     if(db->data && db->dirty) dedup_block_flush(ctx, db);
 
-    /* Flush cached tree nodes even on error to keep disk consistent */
-    if(ctx->dedup_node_cache) dedup_cache_flush((struct dedup_node_cache *)ctx->dedup_node_cache, ctx);
-
-    dedup_hdr.last_block_lba    = db->block_lba;
-    dedup_hdr.last_block_offset = db->offset;
-    obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
+    /* Flush cached tree nodes even on error to keep disk consistent.
+     * Only write the tree header when the cache flush succeeds —
+     * if dirty nodes could not be persisted, writing a header
+     * that references them would leave the on-disk tree broken. */
+    if(ctx->dedup_node_cache)
+    {
+        int flush_rc = dedup_cache_flush((struct dedup_node_cache *)ctx->dedup_node_cache, ctx);
+        if(flush_rc == OBMAFS3_OK)
+        {
+            dedup_hdr.last_block_lba    = db->block_lba;
+            dedup_hdr.last_block_offset = db->offset;
+            obmafs3_btree_header_write(ctx, dedup_hdr_lba, &dedup_hdr);
+        }
+        else
+        {
+            fprintf(stderr, "ERROR: cache flush failed on error path — "
+                    "skipping header write to preserve on-disk consistency\n");
+        }
+    }
 
     /* Keep the cached header in sync */
     if(db_cache) db_cache->dedup_hdr = dedup_hdr;
@@ -3254,7 +3310,11 @@ void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx)
     if(!ctx || !ctx->dedup_node_cache) return;
     struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
     /* Flush any dirty entries before releasing the cache. */
-    dedup_cache_flush(nc, ctx);
+    int flush_rc = dedup_cache_flush(nc, ctx);
+    if(flush_rc != OBMAFS3_OK)
+        fprintf(stderr, "WARNING: dedup node cache flush failed at unmount "
+                "(rc=%d) — %u dirty entries lost\n",
+                flush_rc, nc->dirty_count);
     dedup_cache_free(nc);
     ctx->dedup_node_cache = NULL;
 }
@@ -4000,7 +4060,8 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx,
     }
 
     /* Flush dirty cache entries. */
-    dedup_cache_flush(nc, ctx);
+    int flush_rc = dedup_cache_flush(nc, ctx);
+    if(flush_rc != OBMAFS3_OK) return flush_rc;
 
     /* Write updated header. */
     return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
@@ -4121,6 +4182,7 @@ static void *housekeeping_thread_func(void *arg)
                                            sorted + off, batch);
 
             /* Phase C — insert under lock (page cache should be warm). */
+            int drain_failed = 0;
             pthread_rwlock_wrlock(&ctx->tree_lock);
             {
                 struct btree_header hdr;
@@ -4132,9 +4194,25 @@ static void *housekeeping_thread_func(void *arg)
                     rc = housekeeping_drain_batch(ctx, sorted + off, batch,
                                                  &hdr, hdr_lba);
                     if(rc == OBMAFS3_OK) total_inserted += batch;
+                    else
+                    {
+                        fprintf(stderr, "[housekeeping] drain batch failed "
+                                "(rc=%d) — stopping drain cycle\n", rc);
+                        drain_failed = 1;
+                    }
+                }
+                else
+                {
+                    drain_failed = 1;
                 }
             }
             pthread_rwlock_unlock(&ctx->tree_lock);
+
+            /* Stop processing further batches — the tree's on-disk
+             * state is behind the in-cache state after a flush failure.
+             * Re-reading the header for the next batch would use a
+             * stale root.  The draining buffer is preserved for retry. */
+            if(drain_failed) break;
 
             /* Yield I/O to the write path between batches. */
             if(off + HOUSEKEEPING_BATCH_SIZE < extracted && !ctx->shutdown_requested)
