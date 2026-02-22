@@ -63,6 +63,17 @@
             "problemMatcher": ["$gcc"]
         },
         {
+            "label": "CMake: Build import-aif",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build", "${workspaceFolder}/build",
+                "--target", "import-aif"
+            ],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
             "label": "CMake: Clean",
             "type": "shell",
             "command": "cmake",
