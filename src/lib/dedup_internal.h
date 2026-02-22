@@ -94,6 +94,7 @@ struct dedup_node_cache *dedup_cache_create(size_t block_size);
 struct dedup_cache_slot *cache_find_slot(struct dedup_node_cache *nc, uint64_t lba);
 int  dedup_cache_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx,
                       uint64_t lba, void *buf, size_t bsz);
+void dedup_cache_insert(struct dedup_node_cache *nc, uint64_t lba, const void *data);
 int  dedup_cache_write(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx,
                        uint64_t lba, const void *buf, size_t bsz);
 int  dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx);
@@ -141,6 +142,38 @@ void pending_insert(struct dedup_pending_buf *pb, const struct dedup_entry *entr
 const struct dedup_entry *pending_lookup(const struct dedup_pending_buf *pb, uint64_t hash);
 void pending_free(struct dedup_pending_buf *pb);
 int  pending_entry_cmp(const void *a, const void *b);
+
+/* ------------------------------------------------------------------ */
+/*  Global dedup lookup cache (hash → dedup_entry, immutable entries)   */
+/* ------------------------------------------------------------------ */
+
+/** Slot in the global dedup lookup cache (open-addressing hash table). */
+struct dedup_lc_slot
+{
+    uint64_t hash;          ///< Hash key (0 + !valid = empty sentinel)
+    uint64_t tree_lba;      ///< Dedup tree header LBA (distinguishes trees)
+    uint64_t block_lba;     ///< Dedup block LBA
+    uint64_t block_offset;  ///< Offset within the dedup block
+    uint32_t valid;         ///< Non-zero when slot is occupied
+};
+
+/** Global dedup lookup cache — caches hash→dedup_entry across all FUSE calls. */
+struct dedup_lookup_cache
+{
+    struct dedup_lc_slot *slots;
+    uint32_t              capacity;  ///< Must be power of 2
+    uint32_t              count;
+    uint32_t              max_cap;   ///< Hard ceiling (stop growing beyond this)
+    pthread_mutex_t       lock;
+};
+
+#define DEDUP_LC_INIT_CAP   131072  ///< 128K slots ≈ 4 MB initial
+#define DEDUP_LC_MAX_CAP   4194304  ///< 4M slots ≈ 128 MB hard ceiling
+
+struct dedup_lookup_cache *dedup_lc_create(void);
+void  dedup_lc_free(struct dedup_lookup_cache *lc);
+int   dedup_lc_get(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lba, struct dedup_entry *out);
+void  dedup_lc_put(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lba, const struct dedup_entry *entry);
 
 /* ------------------------------------------------------------------ */
 /*  B+Tree upsert context                                              */
@@ -196,6 +229,7 @@ int collect_all_leaf_lbas(struct obmafs3_ctx *ctx, const struct btree_header *hd
                           uint64_t **out_lbas, uint64_t *out_count);
 void keyset_warmup(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
                    uint8_t *buf, struct dedup_node_cache *nc);
+void dlc_warmup(struct obmafs3_ctx *ctx);
 
 /* ------------------------------------------------------------------ */
 /*  Dedup tree lookup / traversal (dedup_tree.c)                       */
@@ -216,12 +250,17 @@ int  dedup_leaf_cache_search(const struct dedup_leaf_cache *lc, uint64_t hash,
 void dedup_leaf_cache_populate(struct dedup_leaf_cache *lc, const uint8_t *buf,
                                size_t block_size);
 int  dedup_lookup_cached(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
-                         uint64_t hash, struct dedup_entry *entry,
+                         uint64_t tree_lba, uint64_t hash,
+                         struct dedup_entry *entry,
                          struct dedup_leaf_cache *lc);
 void dedup_readahead_next(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
-                          uint64_t next_hash, uint64_t current_lba,
+                          uint64_t tree_lba, uint64_t next_hash,
+                          uint64_t current_lba,
                           struct dedup_leaf_cache *lc);
 int  lba_cmp(const void *a, const void *b);
+int  dedup_batch_find_leaves(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
+                             const uint64_t *hashes, uint64_t count,
+                             uint64_t *leaf_lbas, struct dedup_node_cache *nc);
 int  dedup_find_leaf_lba(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
                          uint64_t hash, uint64_t *out_leaf_lba,
                          uint8_t *buf, struct dedup_node_cache *nc);

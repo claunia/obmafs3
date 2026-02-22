@@ -261,23 +261,17 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
         }
         if(ss == 0) FUSE_RETURN(-EINVAL, "");
 
-        /* Lazily allocate a persistent leaf cache for this file handle
-         * so that B+Tree leaf lookups survive across FUSE read calls. */
-        if(ffctx && !ffctx->media_leaf_cache)
-        {
-            ffctx->media_leaf_cache = obmafs3_alloc_media_leaf_cache();
-            /* Non-fatal — pass NULL to fall back to a per-call cache */
-        }
-        /* Lazily allocate a persistent dedup block cache so that the
-         * last-read 4 MiB dedup block survives across FUSE read calls. */
-        if(ffctx && !ffctx->media_dedup_cache)
-        {
-            ffctx->media_dedup_cache = obmafs3_alloc_media_dedup_cache(g_ctx);
-            /* Non-fatal — pass NULL to fall back to per-call buffers */
-        }
+        /* NOTE: the per-FD dedup caches (media_leaf_cache, media_dedup_cache)
+         * are NOT used here because FUSE dispatches concurrent read()
+         * calls on the same FD from different threads.  Sharing a
+         * single dedup_buf/decomp_buf without a mutex causes data
+         * races (non-deterministic ZSTD decompress failures).
+         *
+         * Passing NULL falls back to per-call malloc/free of the 4 MiB
+         * buffers — negligible compared to actual I/O time now that
+         * the DLC warmup eliminates hash-lookup disk I/O. */
         rc = obmafs3_read_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss,
-                                           ffctx ? ffctx->media_leaf_cache : NULL,
-                                           ffctx ? ffctx->media_dedup_cache : NULL);
+                                           NULL, NULL);
     }
     else if(ip->file_type == kFileTypeCompactDiscImage)
     {

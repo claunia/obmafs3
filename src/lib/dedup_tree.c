@@ -265,6 +265,144 @@ void keyset_warmup(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint
             leaf_count, read_count, cached_count, timespec_diff_ms(&t_start, &t_end), ks->count);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Mount-time DLC warmup: populate the lookup cache from all leaves   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Populate the global dedup lookup cache (DLC) by scanning every leaf
+ * in every dedup B+Tree.  After this, hash→(block_lba, block_offset)
+ * lookups hit the in-memory DLC and never touch disk at all.
+ *
+ * Traverses index nodes (cached — fast) to discover leaf LBAs,
+ * sorts them for sequential disk access, then reads each leaf and
+ * inserts every dedup_entry into the DLC via dedup_lc_put().
+ *
+ * Typical cost on HDD: a few seconds for sequential leaf reads
+ * (once at mount time).  Subsequent reads avoid ~5 seconds of
+ * random leaf I/O per 1 MiB FUSE read.
+ */
+void dlc_warmup(struct obmafs3_ctx *ctx)
+{
+    struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+    struct dedup_node_cache   *nc  = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    if(!dlc) return;
+
+    /* Read the dedup tree list to find all sector-size trees. */
+    struct tree_list_header list_hdr;
+    struct tree_list_entry *entries = NULL;
+    uint64_t                count   = 0;
+
+    if(ctx->sb.dedup_lba == 0) return;
+    int rc = dedup_tree_list_read(ctx, &list_hdr, &entries, &count);
+    if(rc != OBMAFS3_OK || count == 0) { free(entries); return; }
+
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    size_t   bsz        = (size_t)ctx->sb.block_size;
+    uint8_t *buf        = malloc(bsz);
+    uint64_t total_entries = 0;
+    uint64_t total_leaves  = 0;
+
+    if(!buf) { free(entries); return; }
+
+    for(uint64_t t = 0; t < count; t++)
+    {
+        struct btree_header hdr;
+        rc = obmafs3_btree_header_read(ctx, entries[t].tree_lba, &hdr);
+        if(rc != OBMAFS3_OK || hdr.root_node_lba == 0) continue;
+
+        uint64_t *leaf_lbas  = NULL;
+        uint64_t  leaf_count = 0;
+        rc = collect_all_leaf_lbas(ctx, &hdr, buf, nc, &leaf_lbas, &leaf_count);
+        if(rc != OBMAFS3_OK || leaf_count == 0)
+        {
+            free(leaf_lbas);
+            continue;
+        }
+
+        /* Sort for sequential disk access and deduplicate. */
+        qsort(leaf_lbas, (size_t)leaf_count, sizeof(uint64_t), lba_cmp);
+        uint64_t unique = 0;
+        for(uint64_t i = 0; i < leaf_count; i++)
+        {
+            if(unique > 0 && leaf_lbas[i] == leaf_lbas[unique - 1]) continue;
+            leaf_lbas[unique++] = leaf_lbas[i];
+        }
+        leaf_count = unique;
+
+        /* Issue readahead hints for all leaves. */
+        for(uint64_t i = 0; i < leaf_count; i++)
+            posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
+                          (off_t)bsz, POSIX_FADV_WILLNEED);
+
+        /* Read each leaf and insert all its dedup_entry records. */
+        for(uint64_t i = 0; i < leaf_count; i++)
+        {
+            if(ctx->shutdown_requested) { free(leaf_lbas); goto done; }
+
+            /* Try the node cache first. */
+            int got = 0;
+            if(nc)
+            {
+                struct dedup_cache_slot *slot = cache_find_slot(nc, leaf_lbas[i]);
+                if(slot)
+                {
+                    const struct btree_node_header *nhdr =
+                        (const struct btree_node_header *)slot->buf;
+                    if(nhdr->magic == OBMAFS3_BTREE_NODE_MAGIC && nhdr->level == 0)
+                    {
+                        const uint8_t *data = slot->buf + sizeof(struct btree_node_header);
+                        for(uint16_t k = 0; k < nhdr->node_keys; k++)
+                        {
+                            struct dedup_entry de;
+                            memcpy(&de, data + (size_t)k * sizeof(de), sizeof(de));
+                            dedup_lc_put(dlc, de.hash, entries[t].tree_lba, &de);
+                            total_entries++;
+                        }
+                    }
+                    got = 1;
+                }
+            }
+            if(!got)
+            {
+                rc = obmafs3_block_read(ctx, leaf_lbas[i], buf, bsz);
+                if(rc == OBMAFS3_OK)
+                {
+                    const struct btree_node_header *nhdr =
+                        (const struct btree_node_header *)buf;
+                    if(nhdr->magic == OBMAFS3_BTREE_NODE_MAGIC && nhdr->level == 0)
+                    {
+                        const uint8_t *data = buf + sizeof(struct btree_node_header);
+                        for(uint16_t k = 0; k < nhdr->node_keys; k++)
+                        {
+                            struct dedup_entry de;
+                            memcpy(&de, data + (size_t)k * sizeof(de), sizeof(de));
+                            dedup_lc_put(dlc, de.hash, entries[t].tree_lba, &de);
+                            total_entries++;
+                        }
+                    }
+                }
+            }
+        }
+        total_leaves += leaf_count;
+        free(leaf_lbas);
+    }
+
+done:;
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    fprintf(stderr, "[dlc-warmup] scanned %" PRIu64 " leaves, inserted %" PRIu64 " entries "
+            "in %.1fms — DLC now has %u/%u entries\n",
+            total_leaves, total_entries,
+            timespec_diff_ms(&t_start, &t_end),
+            dlc->count, dlc->capacity);
+
+    free(buf);
+    free(entries);
+}
+
 /**
  * Wrappers that dispatch to the cache when available,
  * falling back to direct I/O when nc is NULL.
@@ -561,7 +699,7 @@ void dedup_leaf_cache_populate(struct dedup_leaf_cache *lc, const uint8_t *buf, 
  * hash falls outside the cached key range, then updates the cache
  * with the newly-visited leaf.
  */
-int dedup_lookup_cached(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t hash,
+int dedup_lookup_cached(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t tree_lba, uint64_t hash,
                         struct dedup_entry *entry, struct dedup_leaf_cache *lc)
 {
     /* --- Fast path: check pending buffers first (same as obmafs3_dedup_lookup) --- */
@@ -588,11 +726,20 @@ int dedup_lookup_cached(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
         }
     }
 
+    /* --- Check global lookup cache (immutable hash→entry map) --- */
+    struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+    if(dlc && dedup_lc_get(dlc, hash, tree_lba, entry)) return OBMAFS3_OK;
+
     /* --- Check leaf cache --- */
     if(lc->leaf_buf && lc->num_keys > 0 && hash >= lc->min_key && hash <= lc->max_key)
     {
         int rc = dedup_leaf_cache_search(lc, hash, entry);
-        if(rc == OBMAFS3_OK) return OBMAFS3_OK;
+        if(rc == OBMAFS3_OK)
+        {
+            /* Populate the global lookup cache so future calls are O(1). */
+            if(dlc) dedup_lc_put(dlc, hash, tree_lba, entry);
+            return OBMAFS3_OK;
+        }
         /* Hash was in range but not found — it doesn't exist in this
          * leaf, so a full traversal would land on the same leaf.
          * Return NOTFOUND directly. */
@@ -686,6 +833,9 @@ int dedup_lookup_cached(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
         break;
     }
 done:
+    /* Populate the global lookup cache on successful traversal so
+     * future lookups of this hash are O(1) with no I/O. */
+    if(result == OBMAFS3_OK && dlc) dedup_lc_put(dlc, hash, tree_lba, entry);
     return result;
 }
 
@@ -709,11 +859,11 @@ done:
  * @param current_lba   LBA of the dedup block we just read.
  * @param lc            Leaf-level lookup cache.
  */
-void dedup_readahead_next(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t next_hash,
-                          uint64_t current_lba, struct dedup_leaf_cache *lc)
+void dedup_readahead_next(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t tree_lba,
+                          uint64_t next_hash, uint64_t current_lba, struct dedup_leaf_cache *lc)
 {
     struct dedup_entry de;
-    int                rc = dedup_lookup_cached(ctx, hdr, next_hash, &de, lc);
+    int                rc = dedup_lookup_cached(ctx, hdr, tree_lba, next_hash, &de, lc);
     if(rc != OBMAFS3_OK || de.block_lba == current_lba) return;
 
     /* Advise the kernel to prefetch the next dedup block.  We don't
@@ -892,6 +1042,226 @@ int lba_cmp(const void *a, const void *b)
     uint64_t la = *(const uint64_t *)a;
     uint64_t lb = *(const uint64_t *)b;
     return (la < lb) ? -1 : (la > lb) ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Batch tree descent — find leaf LBAs for many hashes at once        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Binary-search an index node for the child that covers @p hash.
+ */
+static uint64_t index_child_for_hash(const uint8_t *node_buf, uint64_t hash)
+{
+    struct btree_node_header nhdr;
+    memcpy(&nhdr, node_buf, sizeof(nhdr));
+
+    const uint8_t *data = node_buf + sizeof(struct btree_node_header);
+    uint16_t       slot = 0;
+    int            lo = 0, hi = (int)nhdr.node_keys - 1;
+    while(lo <= hi)
+    {
+        int      mid = lo + (hi - lo) / 2;
+        uint64_t mid_key;
+        memcpy(&mid_key, data + (size_t)mid * sizeof(struct btree_index_entry), sizeof(mid_key));
+        if(mid_key <= hash) { slot = (uint16_t)mid; lo = mid + 1; }
+        else                { hi = mid - 1; }
+    }
+    struct btree_index_entry ie;
+    memcpy(&ie, data + (size_t)slot * sizeof(ie), sizeof(ie));
+    return ie.child_lba;
+}
+
+/**
+ * Batch tree descent: find the leaf LBA for each of @p count hashes
+ * by descending the B+Tree level by level.  At each level all needed
+ * index nodes are bulk-read with a single pread(), eliminating the
+ * per-hash random I/O that dominates the single-hash traversal.
+ *
+ * @param hashes      Sorted array of unique hashes.
+ * @param count       Number of hashes.
+ * @param leaf_lbas   Output: leaf_lbas[i] receives the leaf LBA for hashes[i].
+ * @param nc          Node cache (populated on the fly).
+ * @return OBMAFS3_OK on success (individual lookup failures are
+ *         reported as leaf_lba == 0 for that hash).
+ */
+int dedup_batch_find_leaves(struct obmafs3_ctx *ctx, const struct btree_header *hdr,
+                            const uint64_t *hashes, uint64_t count,
+                            uint64_t *leaf_lbas, struct dedup_node_cache *nc)
+{
+    size_t bsz = (size_t)ctx->sb.block_size;
+
+    if(hdr->root_node_lba == 0 || count == 0)
+    {
+        memset(leaf_lbas, 0, (size_t)(count * sizeof(uint64_t)));
+        return OBMAFS3_OK;
+    }
+
+    /* cur_lbas[i] = the node LBA that hashes[i] needs at this level. */
+    uint64_t *cur_lbas = malloc((size_t)(count * sizeof(uint64_t)));
+    if(!cur_lbas) return OBMAFS3_ERR_NOMEM;
+
+    for(uint64_t i = 0; i < count; i++)
+        cur_lbas[i] = hdr->root_node_lba;
+
+    /* Descend level by level.  Each iteration:
+     *  1. Collect unique node LBAs at this level.
+     *  2. Bulk-read the range [min_lba .. max_lba] with one pread().
+     *  3. Insert each needed node into the node cache.
+     *  4. For each hash, binary-search its node and record child_lba.
+     *  5. If level == 1, child_lba IS the leaf → done.
+     *     If level == 0, we landed on the root-is-leaf case → done.
+     */
+    for(int depth = 0; depth < 64; depth++) /* 64 = safety bound */
+    {
+        struct timespec lvl_start, lvl_read, lvl_end;
+        clock_gettime(CLOCK_MONOTONIC, &lvl_start);
+
+        /* 1. Collect and sort unique LBAs. */
+        uint64_t *sorted = malloc((size_t)(count * sizeof(uint64_t)));
+        if(!sorted) { free(cur_lbas); return OBMAFS3_ERR_NOMEM; }
+
+        memcpy(sorted, cur_lbas, (size_t)(count * sizeof(uint64_t)));
+        qsort(sorted, (size_t)count, sizeof(uint64_t), lba_cmp);
+
+        uint64_t n_unique = 0;
+        for(uint64_t i = 0; i < count; i++)
+            if(i == 0 || sorted[i] != sorted[i - 1])
+                sorted[n_unique++] = sorted[i];
+
+        /* 2. Bulk-read the LBA range. */
+        uint64_t lba_lo      = sorted[0];
+        uint64_t lba_hi      = sorted[n_unique - 1];
+        size_t   range_bytes = (size_t)((lba_hi - lba_lo + 1) * bsz);
+        uint8_t *bulk        = NULL;
+        int      used_bulk   = 0;
+
+        if(range_bytes <= 64u * 1024 * 1024)
+            bulk = malloc(range_bytes);
+
+        if(bulk)
+        {
+            ssize_t got = pread(ctx->fd, bulk, range_bytes,
+                                (off_t)(lba_lo * bsz));
+            used_bulk = 1;
+
+            /* 3. Insert each unique node into the cache. */
+            if(got > 0 && nc)
+            {
+                for(uint64_t i = 0; i < n_unique; i++)
+                {
+                    size_t off = (size_t)((sorted[i] - lba_lo) * bsz);
+                    if(off + bsz <= (size_t)got)
+                        dedup_cache_insert(nc, sorted[i], bulk + off);
+                }
+            }
+        }
+        else
+        {
+            /* Fallback: per-node cache read. */
+            uint8_t *tbuf = obmafs3_get_thread_bufs(ctx)->node_buf;
+            for(uint64_t i = 0; i < n_unique; i++)
+            {
+                if(nc)
+                    dedup_cache_read(nc, ctx, sorted[i], tbuf, bsz);
+                else
+                    obmafs3_block_read(ctx, sorted[i], tbuf, bsz);
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &lvl_read);
+
+        /* Determine tree level from the first node. */
+        int node_level;
+        {
+            struct btree_node_header nhdr;
+            if(bulk)
+            {
+                memcpy(&nhdr, bulk + (size_t)((sorted[0] - lba_lo) * bsz),
+                       sizeof(nhdr));
+            }
+            else
+            {
+                uint8_t *tbuf = obmafs3_get_thread_bufs(ctx)->node_buf;
+                if(nc) dedup_cache_read(nc, ctx, sorted[0], tbuf, bsz);
+                else   obmafs3_block_read(ctx, sorted[0], tbuf, bsz);
+                memcpy(&nhdr, tbuf, sizeof(nhdr));
+            }
+            node_level = nhdr.level;
+        }
+
+        if(node_level == 0)
+        {
+            /* Root is a leaf (single-level tree) — leaf LBA = root. */
+            clock_gettime(CLOCK_MONOTONIC, &lvl_end);
+            double rd_ms = (lvl_read.tv_sec - lvl_start.tv_sec) * 1000.0
+                         + (lvl_read.tv_nsec - lvl_start.tv_nsec) / 1e6;
+            double tot_ms = (lvl_end.tv_sec - lvl_start.tv_sec) * 1000.0
+                          + (lvl_end.tv_nsec - lvl_start.tv_nsec) / 1e6;
+            fprintf(stderr, "[batch-descent] depth=%d level=%d uniq_nodes=%llu range=%.1fKiB %s read=%.1fms total=%.1fms\n",
+                    depth, node_level, (unsigned long long)n_unique,
+                    range_bytes / 1024.0, used_bulk ? "BULK" : "FALLBACK",
+                    rd_ms, tot_ms);
+            for(uint64_t i = 0; i < count; i++)
+                leaf_lbas[i] = cur_lbas[i];
+            free(sorted);
+            free(bulk);
+            free(cur_lbas);
+            return OBMAFS3_OK;
+        }
+
+        /* 4. For each hash, descend one level. */
+        for(uint64_t i = 0; i < count; i++)
+        {
+            const uint8_t *node_data;
+            uint8_t        stack_buf[4096]; /* stack fallback for small bs */
+
+            if(bulk)
+            {
+                node_data = bulk + (size_t)((cur_lbas[i] - lba_lo) * bsz);
+            }
+            else
+            {
+                /* Read from node cache. */
+                uint8_t *dest = (bsz <= sizeof(stack_buf)) ? stack_buf
+                                                           : obmafs3_get_thread_bufs(ctx)->node_buf;
+                if(nc) dedup_cache_read(nc, ctx, cur_lbas[i], dest, bsz);
+                else   obmafs3_block_read(ctx, cur_lbas[i], dest, bsz);
+                node_data = dest;
+            }
+
+            uint64_t child = index_child_for_hash(node_data, hashes[i]);
+
+            if(node_level == 1)
+                leaf_lbas[i] = child; /* child is a leaf */
+            else
+                cur_lbas[i] = child; /* descend further */
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &lvl_end);
+        {
+            double rd_ms = (lvl_read.tv_sec - lvl_start.tv_sec) * 1000.0
+                         + (lvl_read.tv_nsec - lvl_start.tv_nsec) / 1e6;
+            double tot_ms = (lvl_end.tv_sec - lvl_start.tv_sec) * 1000.0
+                          + (lvl_end.tv_nsec - lvl_start.tv_nsec) / 1e6;
+            fprintf(stderr, "[batch-descent] depth=%d level=%d uniq_nodes=%llu range=%.1fKiB %s read=%.1fms total=%.1fms\n",
+                    depth, node_level, (unsigned long long)n_unique,
+                    range_bytes / 1024.0, used_bulk ? "BULK" : "FALLBACK",
+                    rd_ms, tot_ms);
+        }
+        free(sorted);
+        free(bulk);
+
+        if(node_level == 1)
+        {
+            free(cur_lbas);
+            return OBMAFS3_OK;
+        }
+    }
+
+    /* Should never reach here — tree depth exceeded. */
+    free(cur_lbas);
+    return OBMAFS3_ERR_INVAL;
 }
 
 /**

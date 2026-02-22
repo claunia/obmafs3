@@ -527,6 +527,13 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     /* Initialise the persistent compression thread pool. */
     obmafs3_compress_pool_init(c);
 
+    /* Initialise the dedup B+Tree node cache so that the read path
+     * can cache index nodes in memory and avoid repeated pread()
+     * syscalls for every tree traversal.  Without this the read path
+     * issues 2-3 raw pread() calls per sector lookup (one per tree
+     * level) and is orders of magnitude slower. */
+    obmafs3_dedup_node_cache_init(c);
+
     *ctx = c;
     return OBMAFS3_OK;
 }

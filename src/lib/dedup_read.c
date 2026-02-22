@@ -47,6 +47,64 @@ struct media_dedup_block_cache
 };
 
 /* ------------------------------------------------------------------ */
+/*  Batch sorted lookup helpers                                        */
+/* ------------------------------------------------------------------ */
+
+/** Pair used to sort sector hashes for B+Tree locality. */
+struct hash_lookup_pair
+{
+    uint64_t hash;
+    uint64_t sme_idx;
+};
+
+/** qsort comparator: sort by hash ascending. */
+static int hash_pair_cmp(const void *a, const void *b)
+{
+    const struct hash_lookup_pair *pa = (const struct hash_lookup_pair *)a;
+    const struct hash_lookup_pair *pb = (const struct hash_lookup_pair *)b;
+    if(pa->hash < pb->hash) return -1;
+    if(pa->hash > pb->hash) return 1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Parallel leaf-read worker for the prefetch phase                   */
+/* ------------------------------------------------------------------ */
+
+/** Work descriptor for one parallel leaf-read thread. */
+struct leaf_read_work
+{
+    int                      fd;      ///< file descriptor (pread is thread-safe)
+    const uint64_t          *lbas;    ///< sorted, deduplicated leaf LBAs
+    uint8_t                 *bufs;    ///< output buffer: bsz * (end - start) bytes
+    uint64_t                 start;   ///< first index (inclusive)
+    uint64_t                 end;     ///< last index (exclusive)
+    size_t                   bsz;
+};
+
+/**
+ * Thread entry: read a slice of leaves with raw pread() — no mutex,
+ * no cache interaction.  Each thread writes into its own pre-allocated
+ * region of bufs[], so there is zero synchronization during I/O.
+ */
+static void *leaf_read_worker(void *arg)
+{
+    struct leaf_read_work *w = (struct leaf_read_work *)arg;
+
+    for(uint64_t i = w->start; i < w->end; i++)
+    {
+        pread(w->fd,
+              w->bufs + (i - w->start) * w->bsz,
+              w->bsz,
+              (off_t)(w->lbas[i] * w->bsz));
+    }
+    return NULL;
+}
+
+/** Max threads for parallel leaf reads. */
+#define LEAF_READ_THREADS 32
+
+/* ------------------------------------------------------------------ */
 /*  Media image read path                                              */
 /* ------------------------------------------------------------------ */
 
@@ -75,6 +133,9 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
     if(size == 0) return OBMAFS3_OK;
 
+    struct timespec t_start, t_get_tree, t_sme_read, t_sort, t_dedup_lookup, t_data_read;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     /* Get the dedup tree for this sector size */
     struct btree_header dedup_hdr;
     uint64_t            dedup_hdr_lba;
@@ -84,6 +145,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         fprintf(stderr, "[read_media_image] dedup_get_tree FAILED rc=%d ss=%u\n", rc, sector_size);
         return rc;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_get_tree);
 
     /* ---- Batch-read all needed sector_map_entries in one call ----
      *
@@ -116,6 +179,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         free(sme_batch);
         return rc;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_sme_read);
 
     /* ---- Dedup data-block cache ----
      * When an external cache is provided (persistent across FUSE read
@@ -172,6 +237,271 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     uint8_t *out        = (uint8_t *)buf;
     size_t   bytes_read = 0;
 
+    /* ---- Phase 1: Batch sorted dedup lookups ----
+     *
+     * Collect all sector hashes, sort by hash value, then look up each
+     * unique hash once in sorted order.  Benefits:
+     *  (a) Consecutive sorted hashes tend to reside in the same B+Tree
+     *      leaf, so the leaf cache hit rate jumps dramatically.
+     *  (b) Leaf reads proceed in roughly sequential LBA order (the
+     *      B+Tree is hash-sorted → leaf LBAs track hash order), which
+     *      lets the kernel readahead/prefetch work effectively on HDD.
+     *  (c) Duplicate hashes (e.g. zero sectors) are looked up only
+     *      once instead of once per sector.
+     */
+    struct hash_lookup_pair *pairs = malloc((size_t)(sme_count * sizeof(struct hash_lookup_pair)));
+    struct dedup_entry      *de_results = malloc((size_t)(sme_count * sizeof(struct dedup_entry)));
+    if(!pairs || !de_results)
+    {
+        free(pairs);
+        free(de_results);
+        if(owns_leaf_cache) free(lc->leaf_buf);
+        free(sme_batch);
+        if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    for(uint64_t i = 0; i < sme_count; i++)
+    {
+        pairs[i].hash    = sme_batch[i].hash;
+        pairs[i].sme_idx = i;
+    }
+
+    qsort(pairs, (size_t)sme_count, sizeof(struct hash_lookup_pair), hash_pair_cmp);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_sort);
+
+    /* ---- Phase 1a: Prefetch B+Tree index nodes AND leaves ----
+     *
+     * The dedup tree is keyed by hash, so our sorted hashes map to
+     * random index/leaf nodes scattered across disk.  Single-hash
+     * traversals cause hundreds of random 4 KiB pread() calls (~15 ms
+     * each on HDD → seconds).
+     *
+     * Instead we do a *batch* level-by-level descent:
+     *  1. Collect all unique hashes that aren't in the global lookup cache.
+     *  2. Call dedup_batch_find_leaves() which descends the B+Tree one
+     *     level at a time, bulk-reading every level with a single pread()
+     *     and inserting nodes into the node cache.
+     *  3. Sort the resulting leaf LBAs, bulk-read them with one more
+     *     pread(), and insert into the cache.
+     *
+     * Total I/O: one pread() per tree level + one pread() for all
+     * leaves.  For a typical 3-level tree this is ~4 sequential reads
+     * instead of ~512 random seeks. */
+    uint64_t prefetch_leaves = 0;
+    {
+        struct dedup_node_cache   *nc  = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+
+        /* Collect unique hashes that need tree lookup. */
+        uint64_t *need_hashes = malloc((size_t)(sme_count * sizeof(uint64_t)));
+        uint64_t  need_count  = 0;
+
+        if(need_hashes)
+        {
+            for(uint64_t i = 0; i < sme_count; i++)
+            {
+                if(i > 0 && pairs[i].hash == pairs[i - 1].hash)
+                    continue;
+                struct dedup_entry dummy;
+                if(dlc && dedup_lc_get(dlc, pairs[i].hash, dedup_hdr_lba, &dummy))
+                    continue;
+                need_hashes[need_count++] = pairs[i].hash;
+            }
+        }
+
+        if(need_hashes && need_count > 0 && dedup_hdr.root_node_lba != 0)
+        {
+            /* Step 1: batch-descend index levels → get leaf LBAs. */
+            uint64_t *leaf_lbas = malloc((size_t)(need_count * sizeof(uint64_t)));
+            if(leaf_lbas)
+            {
+                struct timespec t_bd_start, t_bd_end, t_lr_end;
+                clock_gettime(CLOCK_MONOTONIC, &t_bd_start);
+
+                dedup_batch_find_leaves(ctx, &dedup_hdr, need_hashes,
+                                        need_count, leaf_lbas, nc);
+
+                clock_gettime(CLOCK_MONOTONIC, &t_bd_end);
+
+                /* Step 2: sort leaf LBAs, deduplicate, bulk-read. */
+                qsort(leaf_lbas, (size_t)need_count, sizeof(uint64_t), lba_cmp);
+
+                uint64_t unique_leaves = 0;
+                for(uint64_t i = 0; i < need_count; i++)
+                    if(leaf_lbas[i] != 0 &&
+                       (i == 0 || leaf_lbas[i] != leaf_lbas[i - 1]))
+                        leaf_lbas[unique_leaves++] = leaf_lbas[i];
+
+                if(nc && unique_leaves > 0)
+                {
+                    size_t   bsz        = (size_t)ctx->sb.block_size;
+                    uint64_t lba_lo     = leaf_lbas[0];
+                    uint64_t lba_hi     = leaf_lbas[unique_leaves - 1];
+                    size_t   range_bytes = (size_t)((lba_hi - lba_lo + 1) * bsz);
+
+                    if(range_bytes <= 64u * 1024 * 1024)
+                    {
+                        uint8_t *bulk = malloc(range_bytes);
+                        if(bulk)
+                        {
+                            ssize_t got = pread(ctx->fd, bulk, range_bytes,
+                                                (off_t)(lba_lo * bsz));
+                            if(got > 0)
+                            {
+                                for(uint64_t i = 0; i < unique_leaves; i++)
+                                {
+                                    size_t off = (size_t)((leaf_lbas[i] - lba_lo) * bsz);
+                                    if(off + bsz <= (size_t)got)
+                                        dedup_cache_insert(nc, leaf_lbas[i],
+                                                           bulk + off);
+                                }
+                            }
+                            free(bulk);
+                        }
+                        else
+                        {
+                            /* malloc failed — fall back to threaded reads. */
+                            goto threaded_leaf_read;
+                        }
+                    }
+                    else
+                    {
+                    threaded_leaf_read:;
+                        /* Leaves span too much disk (or malloc failed).
+                         *
+                         * Launch LEAF_READ_THREADS threads, each doing
+                         * raw pread() into a pre-allocated buffer with
+                         * ZERO mutex or cache interaction.  This gives
+                         * the kernel N truly concurrent I/O requests,
+                         * allowing the I/O scheduler to elevator-sort
+                         * them into near-sequential sweeps.
+                         *
+                         * After all threads finish, we insert every
+                         * block into the node cache single-threaded
+                         * (no contention). */
+
+                        /* Pre-allocate one buffer for all leaves. */
+                        uint8_t *all_bufs = malloc((size_t)(unique_leaves * bsz));
+                        if(!all_bufs)
+                        {
+                            /* Last resort: single-threaded sequential. */
+                            uint8_t *tbuf = obmafs3_get_thread_bufs(ctx)->node_buf;
+                            for(uint64_t i = 0; i < unique_leaves; i++)
+                                dedup_cache_read(nc, ctx, leaf_lbas[i], tbuf, bsz);
+                        }
+                        else
+                        {
+                            /* Issue WILLNEED for all leaves so the
+                             * kernel can start prefetching while we
+                             * spawn threads. */
+                            for(uint64_t i = 0; i < unique_leaves; i++)
+                                posix_fadvise(ctx->fd,
+                                              (off_t)(leaf_lbas[i] * bsz),
+                                              (off_t)bsz, POSIX_FADV_WILLNEED);
+
+                            int n_threads = LEAF_READ_THREADS;
+                            if((uint64_t)n_threads > unique_leaves)
+                                n_threads = (int)unique_leaves;
+
+                            pthread_t             tids[LEAF_READ_THREADS];
+                            struct leaf_read_work  work[LEAF_READ_THREADS];
+                            uint64_t per = unique_leaves / (uint64_t)n_threads;
+                            uint64_t rem = unique_leaves % (uint64_t)n_threads;
+                            uint64_t pos = 0;
+
+                            for(int t = 0; t < n_threads; t++)
+                            {
+                                work[t].fd    = ctx->fd;
+                                work[t].lbas  = leaf_lbas;
+                                work[t].bsz   = bsz;
+                                work[t].start = pos;
+                                pos += per + ((uint64_t)t < rem ? 1 : 0);
+                                work[t].end   = pos;
+                                work[t].bufs  = all_bufs + work[t].start * bsz;
+                                pthread_create(&tids[t], NULL,
+                                               leaf_read_worker, &work[t]);
+                            }
+                            for(int t = 0; t < n_threads; t++)
+                                pthread_join(tids[t], NULL);
+
+                            /* Single-threaded batch insert — no mutex
+                             * contention, no disk I/O. */
+                            for(uint64_t i = 0; i < unique_leaves; i++)
+                                dedup_cache_insert(nc, leaf_lbas[i],
+                                                   all_bufs + i * bsz);
+
+                            free(all_bufs);
+                        }
+                    }
+                }
+                prefetch_leaves = unique_leaves;
+
+                clock_gettime(CLOCK_MONOTONIC, &t_lr_end);
+                {
+                    double bd_ms = (t_bd_end.tv_sec - t_bd_start.tv_sec) * 1000.0
+                                 + (t_bd_end.tv_nsec - t_bd_start.tv_nsec) / 1e6;
+                    double lr_ms = (t_lr_end.tv_sec - t_bd_end.tv_sec) * 1000.0
+                                 + (t_lr_end.tv_nsec - t_bd_end.tv_nsec) / 1e6;
+                    fprintf(stderr, "[prefetch-split] batch_descent=%.1fms  leaf_read=%.1fms  "
+                            "need=%llu  unique_leaves=%llu  range=%.1fKiB\n",
+                            bd_ms, lr_ms,
+                            (unsigned long long)need_count,
+                            (unsigned long long)unique_leaves,
+                            (nc && unique_leaves > 0)
+                              ? ((double)((leaf_lbas[unique_leaves-1] - leaf_lbas[0] + 1) * (uint64_t)ctx->sb.block_size) / 1024.0)
+                              : 0.0);
+                }
+                free(leaf_lbas);
+            }
+        }
+        free(need_hashes);
+    }
+
+    struct timespec t_prefetch;
+    clock_gettime(CLOCK_MONOTONIC, &t_prefetch);
+
+    uint64_t dedup_unique = 0, dedup_dup = 0, dedup_lc_hits = 0;
+
+    /* Look up each unique hash once in sorted order. */
+    for(uint64_t i = 0; i < sme_count; i++)
+    {
+        /* Deduplicate: reuse the previous result for identical hashes. */
+        if(i > 0 && pairs[i].hash == pairs[i - 1].hash)
+        {
+            de_results[pairs[i].sme_idx] = de_results[pairs[i - 1].sme_idx];
+            dedup_dup++;
+            continue;
+        }
+
+        dedup_unique++;
+
+        struct dedup_entry de;
+        rc = dedup_lookup_cached(ctx, &dedup_hdr, dedup_hdr_lba, pairs[i].hash, &de, lc);
+        if(rc != OBMAFS3_OK)
+        {
+            fprintf(stderr,
+                    "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sme_idx=%" PRIu64 " inode=%" PRIu64
+                    "\n",
+                    rc, pairs[i].hash, pairs[i].sme_idx, inode->inode_id);
+            free(pairs);
+            free(de_results);
+            if(owns_leaf_cache) free(lc->leaf_buf);
+            free(sme_batch);
+            if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+            return rc;
+        }
+        de_results[pairs[i].sme_idx] = de;
+    }
+
+    free(pairs);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_dedup_lookup);
+
+    uint64_t data_block_reads = 0, data_decomps = 0;
+
+    /* ---- Phase 2: Read sector data in original order ---- */
     while(bytes_read < size)
     {
         uint64_t read_pos         = offset + bytes_read;
@@ -184,23 +514,10 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         size_t chunk               = remaining_in_read < remaining_in_sector ? remaining_in_read : remaining_in_sector;
 
         /* Index into the pre-fetched batch */
-        uint64_t                 sme_idx = (uint64_t)(sector_num - first_sector);
-        struct sector_map_entry *sme     = &sme_batch[sme_idx];
+        uint64_t sme_idx = (uint64_t)(sector_num - first_sector);
 
-        /* Look up the hash in the dedup tree (using leaf cache) */
-        struct dedup_entry de;
-        rc = dedup_lookup_cached(ctx, &dedup_hdr, sme->hash, &de, lc);
-        if(rc != OBMAFS3_OK)
-        {
-            fprintf(stderr,
-                    "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sector=%" PRId64 " inode=%" PRIu64
-                    "\n",
-                    rc, sme->hash, sector_num, inode->inode_id);
-            if(owns_leaf_cache) free(lc->leaf_buf);
-            free(sme_batch);
-            if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
-            return rc;
-        }
+        /* Use the pre-computed dedup entry */
+        struct dedup_entry de = de_results[sme_idx];
 
         /* Read the dedup data block if not already cached */
         if(de.block_lba != cached_dedup_lba)
@@ -210,9 +527,9 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             if(rc != OBMAFS3_OK)
             {
                 fprintf(stderr,
-                        "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64 " hash=%" PRIu64
-                        " sector=%" PRId64 "\n",
-                        rc, de.block_lba, sme->hash, sector_num);
+                        "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64 " sector=%" PRId64 "\n",
+                        rc, de.block_lba, sector_num);
+                free(de_results);
                 if(owns_leaf_cache) free(lc->leaf_buf);
                 free(sme_batch);
                 if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
@@ -222,6 +539,21 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             /* Check if the block is compressed */
             struct block_header bhdr;
             memcpy(&bhdr, dedup_buf, sizeof(bhdr));
+
+            if(bhdr.magic != OBMAFS3_BLOCK_MAGIC)
+            {
+                fprintf(stderr,
+                        "[read_media_image] BAD BLOCK MAGIC at lba=%" PRIu64 " hash=%" PRIu64
+                        " block_offset=%" PRIu64 " sector=%" PRId64
+                        " magic=0x%" PRIX64 " (expected 0x%" PRIX64 ")\n",
+                        de.block_lba, de.hash, de.block_offset, (int64_t)(offset + bytes_read) / (int64_t)sector_size,
+                        bhdr.magic, (uint64_t)OBMAFS3_BLOCK_MAGIC);
+                free(de_results);
+                if(owns_leaf_cache) free(lc->leaf_buf);
+                free(sme_batch);
+                if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+                DBG_RETURN(OBMAFS3_ERR_IO, "bad block magic in dedup data block");
+            }
 
             /* Determine actual on-disk payload size and read remaining */
             uint64_t payload_size;
@@ -240,6 +572,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs, (size_t)((needed_std - 1) * bs));
                 if(rc != OBMAFS3_OK)
                 {
+                    free(de_results);
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
                     if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
@@ -248,6 +581,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             }
 
             cached_dedup_lba = de.block_lba;
+            data_block_reads++;
 
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
@@ -256,6 +590,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     decomp_buf = malloc((size_t)ctx->sb.dedup_block_size);
                     if(!decomp_buf)
                     {
+                        free(de_results);
                         if(owns_leaf_cache) free(lc->leaf_buf);
                         free(sme_batch);
                         if(owns_dedup_bufs) free(dedup_buf);
@@ -268,22 +603,40 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                                         (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
+                    fprintf(stderr,
+                            "[read_media_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64
+                            " block_offset=%" PRIu64 " sector=%" PRId64
+                            " compressed_size=%" PRIu64 " original_size=%" PRIu64
+                            " needed_std=%" PRIu64 " flags=0x%02x\n",
+                            de.block_lba, de.hash, de.block_offset,
+                            (int64_t)(offset + bytes_read) / (int64_t)sector_size,
+                            bhdr.compressed_size, bhdr.original_size, needed_std, bhdr.flags);
+                    free(de_results);
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
                     if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
                     return rc;
                 }
                 cached_compressed = 1;
+                data_decomps++;
             }
             else
             {
                 cached_compressed = 0;
             }
 
-            /* Speculatively prefetch the next sector's dedup block.
-             * Uses the leaf cache so the lookup is typically free. */
-            if(sme_idx + 1 < sme_count)
-                dedup_readahead_next(ctx, &dedup_hdr, sme_batch[sme_idx + 1].hash, cached_dedup_lba, lc);
+            /* Speculatively prefetch the next different dedup block.
+             * Use the pre-computed dedup entries — no tree traversal needed. */
+            for(uint64_t next = sme_idx + 1; next < sme_count; next++)
+            {
+                if(de_results[next].block_lba != de.block_lba)
+                {
+                    off_t off = (off_t)(de_results[next].block_lba * ctx->sb.block_size);
+                    off_t len = (off_t)ctx->sb.dedup_block_size;
+                    posix_fadvise(ctx->fd, off, len, POSIX_FADV_WILLNEED);
+                    break;
+                }
+            }
         }
 
         /* Copy sector data from the dedup block at the stored offset.
@@ -301,8 +654,36 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         bytes_read += chunk;
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &t_data_read);
+
+    free(de_results);
     if(owns_leaf_cache) free(lc->leaf_buf);
     free(sme_batch);
+
+    {
+        struct dedup_node_cache  *nc  = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+        uint32_t nc_count = nc ? nc->count : 0;
+        uint32_t nc_cap   = nc ? nc->capacity : 0;
+        uint64_t dlc_count = dlc ? dlc->count : 0;
+        uint64_t dlc_cap   = dlc ? dlc->capacity : 0;
+        fprintf(stderr,
+                "[read-timing] read %zu bytes @ %" PRIu64 " ss=%u: "
+                "get_tree=%.1fms  sme_read=%.1fms(%" PRIu64 " sectors)  "
+                "sort=%.1fms  prefetch=%.1fms(%" PRIu64 " leaves)  "
+                "dedup_lookup=%.1fms(uniq=%" PRIu64 " dup=%" PRIu64 ")  "
+                "data_read=%.1fms(blks=%" PRIu64 " decomps=%" PRIu64 ")  "
+                "TOTAL=%.1fms  nc=%u/%u dlc=%" PRIu64 "/%" PRIu64 "\n",
+                size, offset, sector_size,
+                timespec_diff_ms(&t_start, &t_get_tree),
+                timespec_diff_ms(&t_get_tree, &t_sme_read), sme_count,
+                timespec_diff_ms(&t_sme_read, &t_sort),
+                timespec_diff_ms(&t_sort, &t_prefetch), prefetch_leaves,
+                timespec_diff_ms(&t_prefetch, &t_dedup_lookup), dedup_unique, dedup_dup,
+                timespec_diff_ms(&t_dedup_lookup, &t_data_read), data_block_reads, data_decomps,
+                timespec_diff_ms(&t_start, &t_data_read),
+                nc_count, nc_cap, dlc_count, dlc_cap);
+    }
 
     /* Write back cached state so the next call can reuse the block */
     if(dbc)
@@ -473,6 +854,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
     /* Cached dedup tree header (changes when the sector's data_size changes) */
     struct btree_header cached_dedup_hdr;
+    uint64_t            cached_dedup_hdr_lba = 0;
     uint16_t            cached_data_size = 0;
 
     int      rc         = OBMAFS3_OK;
@@ -556,7 +938,8 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                 fprintf(stderr, "[read_cd_image] dedup_get_tree FAILED rc=%d ss=%u\n", rc, data_size);
                 goto fail;
             }
-            cached_data_size = data_size;
+            cached_data_size     = data_size;
+            cached_dedup_hdr_lba = hdr_lba;
             /* Invalidate leaf cache — it belongs to the previous tree */
             free(leaf_cache.leaf_buf);
             leaf_cache = (struct dedup_leaf_cache)DEDUP_LEAF_CACHE_INIT;
@@ -564,7 +947,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
         /* ---- Look up the sector's hash in the dedup tree ---- */
         struct dedup_entry de;
-        rc = dedup_lookup_cached(ctx, &cached_dedup_hdr, sme->hash, &de, &leaf_cache);
+        rc = dedup_lookup_cached(ctx, &cached_dedup_hdr, cached_dedup_hdr_lba, sme->hash, &de, &leaf_cache);
         if(rc != OBMAFS3_OK)
         {
             fprintf(stderr,
@@ -581,6 +964,18 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
             struct block_header bhdr;
             memcpy(&bhdr, dedup_buf, sizeof(bhdr));
+
+            if(bhdr.magic != OBMAFS3_BLOCK_MAGIC)
+            {
+                fprintf(stderr,
+                        "[read_cd_image] BAD BLOCK MAGIC at lba=%" PRIu64 " hash=%" PRIu64
+                        " block_offset=%" PRIu64 " sector=%" PRId64
+                        " magic=0x%" PRIX64 " (expected 0x%" PRIX64 ")\n",
+                        de.block_lba, de.hash, de.block_offset, sector_num,
+                        bhdr.magic, (uint64_t)OBMAFS3_BLOCK_MAGIC);
+                rc = OBMAFS3_ERR_IO;
+                goto fail;
+            }
 
             uint64_t payload_size =
                 (bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) ? bhdr.compressed_size : bhdr.original_size;
@@ -609,7 +1004,17 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                 }
                 rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr),
                                         (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
-                if(rc != OBMAFS3_OK) goto fail;
+                if(rc != OBMAFS3_OK)
+                {
+                    fprintf(stderr,
+                            "[read_cd_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64
+                            " block_offset=%" PRIu64 " sector=%" PRId64
+                            " compressed_size=%" PRIu64 " original_size=%" PRIu64
+                            " needed_std=%" PRIu64 " flags=0x%02x\n",
+                            de.block_lba, de.hash, de.block_offset, sector_num,
+                            bhdr.compressed_size, bhdr.original_size, needed_std, bhdr.flags);
+                    goto fail;
+                }
                 cached_compressed = 1;
             }
             else

@@ -214,6 +214,57 @@ int dedup_cache_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint6
 }
 
 /**
+ * Insert a block into the node cache directly from a caller-owned buffer.
+ *
+ * Unlike dedup_cache_read() this does NOT perform any disk I/O —
+ * the data is assumed to already be in @p data.  If the LBA is already
+ * cached the call is a no-op.  Used by the leaf-prefetch path which
+ * reads a large contiguous range with a single pread() and then
+ * distributes individual blocks into the cache.
+ */
+void dedup_cache_insert(struct dedup_node_cache *nc, uint64_t lba, const void *data)
+{
+    pthread_mutex_lock(&nc->lock);
+
+    /* Already cached? */
+    if(cache_find_slot(nc, lba))
+    {
+        pthread_mutex_unlock(&nc->lock);
+        return;
+    }
+
+    /* Grow when >= 75 % full */
+    if(nc->count * 4 >= nc->capacity * 3)
+    {
+        if(cache_grow(nc) != OBMAFS3_OK)
+        {
+            pthread_mutex_unlock(&nc->lock);
+            return; /* tolerate */
+        }
+    }
+
+    uint32_t mask = nc->capacity - 1;
+    uint32_t idx  = cache_hash(lba, mask);
+    for(uint32_t i = 0; i < nc->capacity; i++)
+    {
+        uint32_t slot = (idx + i) & mask;
+        if(nc->slots[slot].buf == NULL)
+        {
+            nc->slots[slot].lba = lba;
+            nc->slots[slot].buf = malloc(nc->block_size);
+            if(nc->slots[slot].buf)
+            {
+                memcpy(nc->slots[slot].buf, data, nc->block_size);
+                nc->slots[slot].dirty = 0;
+                nc->count++;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&nc->lock);
+}
+
+/**
  * Write a tree node through the cache (write-back).
  * The data is stored in the cache and marked dirty; no disk I/O
  * happens until dedup_cache_flush().
@@ -939,22 +990,60 @@ void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_
 }
 
 /**
+ * Initialise the global dedup B+Tree node cache in the filesystem context.
+ * Called during obmafs3_open so that the read path can cache index nodes
+ * and avoid repeated pread() syscalls for the same tree nodes.
+ *
+ * Also initialises the global dedup lookup cache (hash→dedup_entry)
+ * which provides O(1) lookups for previously-seen hashes.
+ *
+ * Safe to call when a cache already exists (e.g. created by the write
+ * or housekeeping paths) — in that case this is a no-op.
+ */
+void obmafs3_dedup_node_cache_init(struct obmafs3_ctx *ctx)
+{
+    if(!ctx) return;
+    if(!ctx->dedup_node_cache)
+    {
+        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
+        if(nc) ctx->dedup_node_cache = nc;
+    }
+    if(!ctx->dedup_lookup_cache)
+    {
+        struct dedup_lookup_cache *lc = dedup_lc_create();
+        if(lc) ctx->dedup_lookup_cache = lc;
+    }
+
+    /* Populate the DLC from all dedup tree leaves so that subsequent
+     * reads hit the in-memory cache instead of doing random leaf I/O. */
+    dlc_warmup(ctx);
+}
+
+/**
  * Free the global dedup B+Tree node cache stored in the filesystem context.
  * Called during unmount (obmafs3_close) to release memory.
  */
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx)
 {
-    if(!ctx || !ctx->dedup_node_cache) return;
-    struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
-    /* Flush any dirty entries before releasing the cache. */
-    int                      flush_rc = dedup_cache_flush(nc, ctx);
-    if(flush_rc != OBMAFS3_OK)
-        fprintf(stderr,
-                "WARNING: dedup node cache flush failed at unmount "
-                "(rc=%d) — %u dirty entries lost\n",
-                flush_rc, nc->dirty_count);
-    dedup_cache_free(nc);
-    ctx->dedup_node_cache = NULL;
+    if(!ctx) return;
+    if(ctx->dedup_node_cache)
+    {
+        struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        /* Flush any dirty entries before releasing the cache. */
+        int                      flush_rc = dedup_cache_flush(nc, ctx);
+        if(flush_rc != OBMAFS3_OK)
+            fprintf(stderr,
+                    "WARNING: dedup node cache flush failed at unmount "
+                    "(rc=%d) — %u dirty entries lost\n",
+                    flush_rc, nc->dirty_count);
+        dedup_cache_free(nc);
+        ctx->dedup_node_cache = NULL;
+    }
+    if(ctx->dedup_lookup_cache)
+    {
+        dedup_lc_free((struct dedup_lookup_cache *)ctx->dedup_lookup_cache);
+        ctx->dedup_lookup_cache = NULL;
+    }
 }
 
 /**
@@ -1005,4 +1094,142 @@ void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx)
         pending_free((struct dedup_pending_buf *)ctx->dedup_pending_draining);
         ctx->dedup_pending_draining = NULL;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Global dedup lookup cache (hash → dedup_entry)                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Allocate and initialise a global dedup lookup cache.
+ *
+ * The cache is a fixed-size open-addressing hash table that grows
+ * dynamically up to DEDUP_LC_MAX_CAP.  Since dedup entries are
+ * immutable (a hash always maps to the same block_lba/offset), the
+ * cache never needs invalidation.
+ */
+struct dedup_lookup_cache *dedup_lc_create(void)
+{
+    struct dedup_lookup_cache *lc = calloc(1, sizeof(*lc));
+    if(!lc) return NULL;
+    lc->capacity = DEDUP_LC_INIT_CAP;
+    lc->max_cap  = DEDUP_LC_MAX_CAP;
+    lc->slots    = calloc(lc->capacity, sizeof(struct dedup_lc_slot));
+    if(!lc->slots)
+    {
+        free(lc);
+        return NULL;
+    }
+    pthread_mutex_init(&lc->lock, NULL);
+    return lc;
+}
+
+/** Free the global dedup lookup cache. */
+void dedup_lc_free(struct dedup_lookup_cache *lc)
+{
+    if(!lc) return;
+    pthread_mutex_destroy(&lc->lock);
+    free(lc->slots);
+    free(lc);
+}
+
+/** Fibonacci-hashing of a key to a table index. */
+static uint32_t lc_hash(uint64_t key, uint32_t mask) { return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask; }
+
+/**
+ * Look up a hash in the global lookup cache.
+ * Returns 1 if found (and fills @out), 0 if not found.
+ */
+int dedup_lc_get(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lba, struct dedup_entry *out)
+{
+    pthread_mutex_lock(&lc->lock);
+    uint32_t mask = lc->capacity - 1;
+    uint32_t idx  = lc_hash(hash, mask);
+    for(uint32_t i = 0; i < lc->capacity; i++)
+    {
+        uint32_t s = (idx + i) & mask;
+        if(!lc->slots[s].valid)
+        {
+            pthread_mutex_unlock(&lc->lock);
+            return 0; /* end of probe chain */
+        }
+        if(lc->slots[s].hash == hash && lc->slots[s].tree_lba == tree_lba)
+        {
+            out->hash         = lc->slots[s].hash;
+            out->block_lba    = lc->slots[s].block_lba;
+            out->block_offset = lc->slots[s].block_offset;
+            pthread_mutex_unlock(&lc->lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&lc->lock);
+    return 0;
+}
+
+/** Double the lookup cache table and re-hash all entries. */
+static int lc_grow(struct dedup_lookup_cache *lc)
+{
+    if(lc->capacity >= lc->max_cap) return -1; /* at ceiling */
+    uint32_t              new_cap = lc->capacity * 2;
+    struct dedup_lc_slot *ns      = calloc(new_cap, sizeof(struct dedup_lc_slot));
+    if(!ns) return -1;
+
+    uint32_t new_mask = new_cap - 1;
+    for(uint32_t i = 0; i < lc->capacity; i++)
+    {
+        if(!lc->slots[i].valid) continue;
+        uint32_t idx = lc_hash(lc->slots[i].hash, new_mask);
+        for(uint32_t j = 0; j < new_cap; j++)
+        {
+            uint32_t s = (idx + j) & new_mask;
+            if(!ns[s].valid)
+            {
+                ns[s] = lc->slots[i];
+                break;
+            }
+        }
+    }
+    free(lc->slots);
+    lc->slots    = ns;
+    lc->capacity = new_cap;
+    return 0;
+}
+
+/**
+ * Insert a hash→dedup_entry into the global lookup cache.
+ * Duplicate inserts are silently ignored (entries are immutable).
+ */
+void dedup_lc_put(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lba, const struct dedup_entry *entry)
+{
+    pthread_mutex_lock(&lc->lock);
+
+    /* Grow when >= 75% full */
+    if(lc->count * 4 >= lc->capacity * 3)
+    {
+        if(lc_grow(lc) != 0)
+        {
+            /* At ceiling or OOM — just skip insertion. */
+            pthread_mutex_unlock(&lc->lock);
+            return;
+        }
+    }
+
+    uint32_t mask = lc->capacity - 1;
+    uint32_t idx  = lc_hash(hash, mask);
+    for(uint32_t i = 0; i < lc->capacity; i++)
+    {
+        uint32_t s = (idx + i) & mask;
+        if(!lc->slots[s].valid)
+        {
+            lc->slots[s].hash         = hash;
+            lc->slots[s].tree_lba     = tree_lba;
+            lc->slots[s].block_lba    = entry->block_lba;
+            lc->slots[s].block_offset = entry->block_offset;
+            lc->slots[s].valid        = 1;
+            lc->count++;
+            break;
+        }
+        if(lc->slots[s].hash == hash && lc->slots[s].tree_lba == tree_lba) break; /* already cached */
+    }
+    pthread_mutex_unlock(&lc->lock);
 }

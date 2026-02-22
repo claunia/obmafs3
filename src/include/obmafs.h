@@ -118,6 +118,7 @@ struct obmafs3_ctx
     struct compress_pool *compress_pool;           ///< Persistent compression thread pool
     pid_t                 pre_fuse_pid;            ///< PID before fuse_main (detect fork in init)
     void                 *dedup_node_cache;        ///< Global dedup B+Tree node cache (shared across files)
+    void                 *dedup_lookup_cache;      ///< Global hash→dedup_entry cache (shared across files)
     void                 *dedup_key_set;           ///< Global dedup hash key set (fast existence check)
     void                 *dedup_pending;           ///< Pending insert buffer (deferred B+Tree inserts)
     void                 *dedup_pending_draining;  ///< Pending buffer being drained by housekeeping thread
@@ -287,6 +288,7 @@ int  obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record
                                     struct dedup_block_cache *db_cache);
 int  obmafs3_flush_dedup_block_cache(struct obmafs3_ctx *ctx, uint16_t sector_size, struct dedup_block_cache *db_cache);
 void obmafs3_free_dedup_block_cache(struct obmafs3_ctx *ctx, struct dedup_block_cache *db_cache);
+void obmafs3_dedup_node_cache_init(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx);
