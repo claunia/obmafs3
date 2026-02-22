@@ -164,9 +164,16 @@ static const char *skip_ws(const char *p)
 static const char *parse_token(const char *p, char *out, size_t outsz)
 {
     size_t i = 0;
-    while(*p && *p != ' ' && *p != '\t' && *p != '"' && *p != '=' && *p != '!' && *p != '<' && *p != '>')
+    while(*p && *p != ' ' && *p != '\t' && *p != '"' && *p != '=' && *p != '!' && *p != '<' && *p != '>' && *p != '*')
     {
         if(i < outsz - 1) out[i++] = *p;
+        p++;
+    }
+
+    /* Handle '*' (wildcard key for any-key queries) */
+    if(*p == '*' && i == 0)
+    {
+        out[i++] = '*';
         p++;
     }
     out[i] = '\0';
@@ -631,6 +638,11 @@ static void print_help(void)
            "  <key> CONTAINS \"<value>\"           Substring match\n"
            "  <key> STARTSWITH \"<value>\"         Prefix match\n"
            "  <key> EXISTS                       Key exists (any value)\n"
+           "\n"
+           "  Use * as the key to match across all keys:\n"
+           "    * CONTAINS \"maiden\"               Any key's value contains\n"
+           "    * = \"Rock\"                        Any key's value equals\n"
+           "    * STARTSWITH \"Iron\"               Any key's value starts with\n"
            "\n"
            "  Multiple conditions joined with AND or OR (cannot mix):\n"
            "    artist = \"Iron Maiden\" AND year > \"1985\"\n"

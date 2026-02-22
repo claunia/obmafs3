@@ -310,10 +310,12 @@ void obmafs3_metadata_list_free(char **keys, uint32_t count);
 int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char *value, char ***paths, uint32_t *count);
 void obmafs3_metadata_query_free(char **paths, uint32_t count);
 
-/** A single metadata query filter condition. */
+/** A single metadata query filter condition.
+ *  When key is "*" (single asterisk) the filter matches any key
+ *  whose value satisfies the operator (wildcard key query). */
 struct obmafs3_query_filter
 {
-    char    key[METADATA_KEY_MAX];     /**< Metadata key to match */
+    char    key[METADATA_KEY_MAX];     /**< Metadata key to match ("*" = any key) */
     char    value[METADATA_VALUE_MAX]; /**< Value operand (ignored for kQueryOpExists) */
     uint8_t op;                        /**< enum obmafs3_query_op */
 };

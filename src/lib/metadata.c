@@ -2038,8 +2038,13 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
  * Collect all inode IDs from the reverse-index tree whose key matches
  * @p filter_key and whose value satisfies @p op against @p filter_value.
  *
+ * When the filter key is "*" (wildcard), the entire leaf chain is
+ * scanned and every record whose value satisfies the operator is
+ * collected regardless of key.
+ *
  * Navigates the B+Tree to the first leaf containing @p filter_key and
- * scans the leaf chain until the key changes.
+ * scans the leaf chain until the key changes (or the end of the tree
+ * for wildcard queries).
  */
 static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *flt,
                                  struct inode_id_set *out)
@@ -2049,29 +2054,53 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
     uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_OK;
 
+    /* Wildcard key: "*" matches any key */
+    int wildcard = (flt->key[0] == '*' && flt->key[1] == '\0');
+
     size_t   nsz = meta_node_size(ctx);
     uint8_t *buf = calloc(1, nsz);
     if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
-    /* Navigate to the leaf containing (key, "", 0) — start of key range */
-    static const char empty_val[METADATA_VALUE_MAX] = {0};
-    while(1)
+    if(wildcard)
     {
-        int rc = meta_node_read(ctx, lba, buf);
-        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+        /* Navigate to the leftmost leaf (slot 0 at every level) */
+        while(1)
+        {
+            int rc = meta_node_read(ctx, lba, buf);
+            if(rc != OBMAFS3_OK) { free(buf); return rc; }
 
-        struct btree_node_header hdr;
-        memcpy(&hdr, buf, sizeof(hdr));
-        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
-        if(hdr.level == 0) break;
+            struct btree_node_header hdr;
+            memcpy(&hdr, buf, sizeof(hdr));
+            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+            if(hdr.level == 0) break;
 
-        uint16_t                        slot = midx_index_find(buf, hdr.node_keys, flt->key, empty_val, 0);
-        struct metadata_idx_index_entry ie;
-        memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
-        lba = ie.child_lba;
+            struct metadata_idx_index_entry ie;
+            memcpy(&ie, buf + sizeof(struct btree_node_header), sizeof(ie));
+            lba = ie.child_lba;
+        }
+    }
+    else
+    {
+        /* Navigate to the leaf containing (key, "", 0) — start of key range */
+        static const char empty_val[METADATA_VALUE_MAX] = {0};
+        while(1)
+        {
+            int rc = meta_node_read(ctx, lba, buf);
+            if(rc != OBMAFS3_OK) { free(buf); return rc; }
+
+            struct btree_node_header hdr;
+            memcpy(&hdr, buf, sizeof(hdr));
+            if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+            if(hdr.level == 0) break;
+
+            uint16_t                        slot = midx_index_find(buf, hdr.node_keys, flt->key, empty_val, 0);
+            struct metadata_idx_index_entry ie;
+            memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
+            lba = ie.child_lba;
+        }
     }
 
-    /* Scan leaf chain for all entries with matching key */
+    /* Scan leaf chain */
     while(1)
     {
         struct btree_node_header hdr;
@@ -2083,11 +2112,14 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
             struct metadata_idx_record rec;
             memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
 
-            int kcmp = strncmp(rec.key, flt->key, METADATA_KEY_MAX);
-            if(kcmp < 0) continue;           /* haven't reached the key yet */
-            if(kcmp > 0) goto collect_done;   /* past the key — done */
+            if(!wildcard)
+            {
+                int kcmp = strncmp(rec.key, flt->key, METADATA_KEY_MAX);
+                if(kcmp < 0) continue;           /* haven't reached the key yet */
+                if(kcmp > 0) goto collect_done;   /* past the key — done */
+            }
 
-            /* Key matches — apply the operator against the value */
+            /* Key matches (or wildcard) — apply the operator against the value */
             if(filter_value_matches(rec.value, flt->value, flt->op))
             {
                 if(idset_add(out, rec.inode_id))
