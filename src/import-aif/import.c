@@ -101,8 +101,18 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
     /* Parse track entries */
     TrackEntry *tracks = (TrackEntry *)track_buf;
 
-    uint64_t total_sectors = info->Sectors;
-    uint64_t imported      = 0;
+    /* Count total importable sectors from track ranges (start-pregap..end) */
+    uint64_t total_sectors = 0;
+    for(int t = 0; t < track_count; t++)
+    {
+        int64_t first = tracks[t].start - tracks[t].pregap;
+        if(tracks[t].end >= first)
+            total_sectors += (uint64_t)(tracks[t].end - first + 1);
+    }
+    uint64_t imported = 0;
+
+    fprintf(stderr, "  Image reports %" PRIu64 " sectors, %" PRIu64 " belong to tracks\n",
+            info->Sectors, total_sectors);
 
     /* Initialize ECC context for prefix/suffix reconstruction */
     void *ecc_ctx = aaruf_ecc_cd_init();
@@ -127,12 +137,16 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
     fprintf(stderr, "Importing CD image: %" PRIu64 " sectors, %d tracks\n", total_sectors, track_count);
 
+    /* Iterate track by track; only sectors within each track's range
+     * (start-pregap .. end) are readable from the AIF.  The sector
+     * field in the ioctl conveys the LBA, so gaps between tracks are
+     * simply not written. */
     for(int t = 0; t < track_count; t++)
     {
         TrackEntry *trk   = &tracks[t];
         int         mode  = aaruf_track_type_to_cd_mode(trk->type);
         uint16_t    ss    = cd_mode_sector_size(mode);
-        int64_t     start = trk->start;
+        int64_t     start = trk->start - trk->pregap;
         int64_t     end   = trk->end;
 
         if(mode < 0 || ss == 0)
@@ -142,25 +156,28 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
             continue;
         }
 
-        fprintf(stderr, "  Track %d: sectors %" PRId64 "-%" PRId64 " (%s, %u bytes/sector)\n",
-                trk->sequence, start, end,
+        fprintf(stderr, "  Track %d: sectors %" PRId64 "-%" PRId64 " (pregap %" PRId64 ", %s, %u bytes/sector)\n",
+                trk->sequence, start, end, trk->pregap,
                 mode == kCdSectorModeAudio ? "Audio" :
                 mode == kCdSectorMode1 ? "Mode1" :
                 mode == kCdSectorMode2 ? "Mode2" :
-                mode == kCdSectorMode2Form1 ? "Mode2Form1" : "Mode2Form2",
+                mode == kCdSectorMode2Form1 ? "Mode2Form1" :
+                mode == kCdSectorMode2Form2 ? "Mode2Form2" : "Unknown",
                 ss);
 
         for(int64_t s = start; s <= end; s++)
         {
             struct obmafs3_ioctl_cd_write_arg cd_arg;
             memset(&cd_arg, 0, sizeof(cd_arg));
+            cd_arg.sector      = s;
             cd_arg.sector_mode = (uint8_t)mode;
 
             /* Try to read a raw (long) sector first */
             uint32_t length = CD_RAW_SECTOR_SIZE;
             uint8_t  status = 0;
 
-            int rrc = aaruf_read_sector_long(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer, &length, &status);
+            int rrc = aaruf_read_sector_long(aaruf_ctx, (uint64_t)s, false,
+                                             cd_arg.buffer, &length, &status);
 
             if(rrc == 0 && length == CD_RAW_SECTOR_SIZE)
             {
@@ -199,8 +216,8 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
                                            cd_arg.buffer + data_offset, &length, &status);
                 if(rrc != 0)
                 {
-                    fprintf(stderr, "Warning: failed to read sector %" PRId64 " (rc=%d), filling with zeroes\n",
-                            s, rrc);
+                    fprintf(stderr, "Warning: failed to read sector %" PRId64
+                            " (rc=%d), filling with zeroes\n", s, rrc);
                     memset(cd_arg.buffer, 0, CD_RAW_SECTOR_SIZE);
                 }
 
@@ -209,7 +226,8 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
                     aaruf_ecc_cd_reconstruct_prefix(cd_arg.buffer, trk->type, s);
 
                 /* Reconstruct EDC/ECC suffix (Mode1, Mode2Form1, Mode2Form2) */
-                if(mode == kCdSectorMode1 || mode == kCdSectorMode2Form1 || mode == kCdSectorMode2Form2)
+                if(mode == kCdSectorMode1 || mode == kCdSectorMode2Form1 ||
+                   mode == kCdSectorMode2Form2)
                     aaruf_ecc_cd_reconstruct(ecc_ctx, cd_arg.buffer, trk->type);
 
                 cd_arg.buffer_size = CD_RAW_SECTOR_SIZE;
@@ -229,6 +247,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
             if(ioctl(fd, OBMAFS3_IOC_CD_WRITE_LONG, &cd_arg) != 0)
             {
                 fprintf(stderr, "Error: CD_WRITE_LONG failed at sector %" PRId64 " (errno=%d)\n", s, errno);
+                aaruf_ecc_cd_free(ecc_ctx);
                 return -1;
             }
 
@@ -239,7 +258,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
         }
     }
 
-    fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (100.0%%)\n", imported, imported);
+    fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (100.0%%)\n", imported, total_sectors);
 
     aaruf_ecc_cd_free(ecc_ctx);
     return 0;
