@@ -17,6 +17,14 @@
 
 #define OBMAFS3_ROOT_INODE_ID 2
 
+/* ---- CD sector geometry constants ---- */
+#define CD_RAW_SECTOR_SIZE 2352
+#define CD_RAW_PLUS_SUB    2448
+#define CD_SUBCHANNEL_SIZE 96
+#define CD_PREFIX_SIZE     16
+#define CD_SUFFIX_SIZE     288
+#define CD_DATA_SIZE       2048 /* 2352 - 16 - 288 */
+
 /// Single deduplication hash-to-block mapping entry.
 struct __attribute__((packed)) dedup_entry
 {

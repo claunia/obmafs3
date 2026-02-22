@@ -221,6 +221,10 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
         if(ss == 0) FUSE_RETURN(-EINVAL, "");
         rc = obmafs3_read_media_image_data(g_ctx, ip, (uint64_t)offset, buf, size, ss);
     }
+    else if(ip->file_type == kFileTypeCompactDiscImage)
+    {
+        rc = obmafs3_read_cd_image_data(g_ctx, ip, (uint64_t)offset, buf, size);
+    }
     else
     {
         rc = obmafs3_read_file_data(g_ctx, ip, (uint64_t)offset, buf, size);

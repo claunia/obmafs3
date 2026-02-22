@@ -4731,6 +4731,187 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 }
 
 /* ------------------------------------------------------------------ */
+/*  CD compact disc image read path                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Read data from a compact disc image, reconstructing full 2352-byte
+ * raw sectors from dedup, prefix/suffix B+Trees, and the CD sector map.
+ *
+ * This is the CD equivalent of @c obmafs3_read_media_image_data.
+ * All needed @c cd_sector_map_entry records are batch-read in a single
+ * call to @c obmafs3_read_file_data, eliminating per-sector I/O for
+ * the map.  Each sector is then reconstructed from:
+ *
+ *  - Audio mode: full 2352 bytes from the 2352-byte dedup tree.
+ *  - Data modes: prefix (generated or from prefix tree) + subheader
+ *    (if applicable) + user data (from appropriately-sized dedup tree)
+ *    + suffix (generated or from suffix tree).
+ *
+ * @param ctx    Filesystem context.
+ * @param inode  Inode record describing the CD image file.
+ * @param offset Byte offset into the virtual 2352-byte-per-sector image.
+ * @param buf    Output buffer.
+ * @param size   Number of bytes to read.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode,
+                               uint64_t offset, void *buf, size_t size)
+{
+    if(offset >= inode->file_size) return OBMAFS3_OK;
+    if(offset + size > inode->file_size) size = (size_t)(inode->file_size - offset);
+    if(size == 0) return OBMAFS3_OK;
+
+    /* ---- Batch-read all needed cd_sector_map_entries ---- */
+    int64_t  first_sector = (int64_t)(offset / CD_RAW_SECTOR_SIZE);
+    int64_t  last_sector  = (int64_t)((offset + size - 1) / CD_RAW_SECTOR_SIZE);
+    uint64_t sme_count    = (uint64_t)(last_sector - first_sector + 1);
+
+    struct cd_sector_map_entry *sme_batch = malloc((size_t)(sme_count * sizeof(struct cd_sector_map_entry)));
+    if(!sme_batch) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    struct inode_record map_inode;
+    memcpy(&map_inode, inode, sizeof(map_inode));
+    map_inode.file_size = inode->sector_map_size * sizeof(struct cd_sector_map_entry);
+
+    uint64_t sme_offset = (uint64_t)first_sector * sizeof(struct cd_sector_map_entry);
+    int rc = obmafs3_read_file_data(ctx, &map_inode, sme_offset, sme_batch,
+                                    (size_t)(sme_count * sizeof(struct cd_sector_map_entry)));
+    if(rc != OBMAFS3_OK)
+    {
+        fprintf(stderr, "[read_cd_image] batch read_file_data(cd_sme) FAILED rc=%d "
+                "first_sector=%" PRId64 " count=%" PRIu64 " sme_offset=%" PRIu64
+                " map_file_size=%" PRIu64 " sector_map_size=%" PRIu64
+                " inode=%" PRIu64 "\n",
+                rc, first_sector, sme_count, sme_offset, map_inode.file_size,
+                inode->sector_map_size, inode->inode_id);
+        free(sme_batch);
+        return rc;
+    }
+
+    /* ECC context for suffix reconstruction — lazy-allocated on first use */
+    void *ecc_ctx = NULL;
+
+    uint8_t *out        = (uint8_t *)buf;
+    size_t   bytes_read = 0;
+
+    while(bytes_read < size)
+    {
+        uint64_t read_pos         = offset + bytes_read;
+        int64_t  sector_num       = (int64_t)(read_pos / CD_RAW_SECTOR_SIZE);
+        size_t   offset_in_sector = (size_t)(read_pos % CD_RAW_SECTOR_SIZE);
+
+        size_t remaining_in_sector = CD_RAW_SECTOR_SIZE - offset_in_sector;
+        size_t remaining_in_read   = size - bytes_read;
+        size_t chunk               = remaining_in_read < remaining_in_sector
+                                         ? remaining_in_read
+                                         : remaining_in_sector;
+
+        uint64_t                    sme_idx = (uint64_t)(sector_num - first_sector);
+        struct cd_sector_map_entry *sme     = &sme_batch[sme_idx];
+
+        /* Reconstruct full 2352-byte raw sector into a temporary buffer */
+        uint8_t sector_buf[CD_RAW_SECTOR_SIZE];
+        memset(sector_buf, 0, CD_RAW_SECTOR_SIZE);
+
+        if(sme->sector_mode == kCdSectorModeAudio)
+        {
+            /* Audio: full 2352 bytes from dedup */
+            rc = obmafs3_read_media_image_data(ctx, inode,
+                                               (uint64_t)sector_num * CD_RAW_SECTOR_SIZE,
+                                               sector_buf, CD_RAW_SECTOR_SIZE,
+                                               CD_RAW_SECTOR_SIZE);
+            if(rc != OBMAFS3_OK) goto fail;
+        }
+        else
+        {
+            /* ---- Data modes ---- */
+            uint16_t data_size;
+            int      has_subheader = 0;
+            switch((enum obmafs3_cd_sector_mode)sme->sector_mode)
+            {
+                case kCdSectorMode1:      data_size = CD_DATA_SIZE; break;
+                case kCdSectorMode2:      data_size = 2336;         break;
+                case kCdSectorMode2Form1: data_size = CD_DATA_SIZE; has_subheader = 1; break;
+                case kCdSectorMode2Form2: data_size = 2328;         has_subheader = 1; break;
+                default:
+                    rc = OBMAFS3_ERR_INVAL;
+                    goto fail;
+            }
+
+            /* 1. Prefix (bytes 0-15) */
+            if(sme->generated_prefix)
+            {
+                ecc_cd_reconstruct_prefix(sector_buf, sme->sector_mode, sector_num);
+            }
+            else
+            {
+                uint8_t pfx[CD_PREFIX_DATA_SIZE];
+                rc = obmafs3_cd_prefix_get(ctx, sme->prefix_hash, pfx);
+                if(rc != OBMAFS3_OK) goto fail;
+                memcpy(sector_buf, pfx, CD_PREFIX_SIZE);
+            }
+
+            /* 2. Subheader (bytes 16-23) for Mode 2 variants */
+            if(has_subheader)
+            {
+                memcpy(sector_buf + CD_PREFIX_SIZE, sme->subheader, 4);
+                memcpy(sector_buf + CD_PREFIX_SIZE + 4, sme->subheader + 4, 4);
+            }
+
+            /* 3. Data portion from dedup */
+            {
+                int data_offset_in_sector;
+                if(has_subheader)
+                    data_offset_in_sector = CD_PREFIX_SIZE + 8;
+                else
+                    data_offset_in_sector = CD_PREFIX_SIZE;
+
+                rc = obmafs3_read_media_image_data(ctx, inode,
+                                                   (uint64_t)sector_num * data_size,
+                                                   sector_buf + data_offset_in_sector,
+                                                   data_size, data_size);
+                if(rc != OBMAFS3_OK) goto fail;
+            }
+
+            /* 4. Suffix */
+            if(sme->sector_mode == kCdSectorMode2)
+            {
+                /* Raw Mode 2 has no suffix */
+            }
+            else if(sme->generated_suffix)
+            {
+                if(!ecc_ctx)
+                {
+                    ecc_ctx = ecc_cd_init();
+                    if(!ecc_ctx) { rc = OBMAFS3_ERR_NOMEM; goto fail; }
+                }
+                ecc_cd_reconstruct(ecc_ctx, sector_buf, sme->sector_mode);
+            }
+            else
+            {
+                uint8_t sfx[CD_SUFFIX_DATA_SIZE];
+                rc = obmafs3_cd_suffix_get(ctx, sme->suffix_hash, sfx);
+                if(rc != OBMAFS3_OK) goto fail;
+                memcpy(sector_buf + CD_RAW_SECTOR_SIZE - CD_SUFFIX_SIZE, sfx, CD_SUFFIX_SIZE);
+            }
+        }
+
+        memcpy(out + bytes_read, sector_buf + offset_in_sector, chunk);
+        bytes_read += chunk;
+    }
+
+    ecc_cd_free(ecc_ctx);
+    free(sme_batch);
+    return OBMAFS3_OK;
+
+fail:
+    ecc_cd_free(ecc_ctx);
+    free(sme_batch);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
 /*  CD sector map cache flush / free                                   */
 /* ------------------------------------------------------------------ */
 

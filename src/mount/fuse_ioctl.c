@@ -25,12 +25,9 @@ struct obmafs3_ioctl_tag_arg
 
 #define OBMAFS3_IOC_SET_CD_IMAGE _IO('O', 3)
 
-#define CD_RAW_SECTOR_SIZE 2352
-#define CD_RAW_PLUS_SUB    2448
-#define CD_SUBCHANNEL_SIZE 96
-#define CD_PREFIX_SIZE     16
-#define CD_SUFFIX_SIZE     288
-#define CD_DATA_SIZE       2048 /* 2352 - 16 - 288 */
+/* CD sector geometry constants are defined in defs.h:
+ * CD_RAW_SECTOR_SIZE, CD_RAW_PLUS_SUB, CD_SUBCHANNEL_SIZE,
+ * CD_PREFIX_SIZE, CD_SUFFIX_SIZE, CD_DATA_SIZE */
 
 struct obmafs3_ioctl_cd_write_arg
 {
