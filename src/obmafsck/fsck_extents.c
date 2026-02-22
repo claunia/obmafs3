@@ -260,7 +260,7 @@ static void validate_overflow_extents(struct obmafs3_ctx *ctx, uint64_t total_bl
         {
             for(uint16_t i = 0; i < nhdr.node_keys; i++)
             {
-                struct btree_index_entry ie;
+                struct overflow_index_entry ie;
                 memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
                 if(stk_size >= stk_cap)
                 {
@@ -504,7 +504,7 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
             {
                 for(uint16_t i = 0; i < nhdr.node_keys; i++)
                 {
-                    struct btree_index_entry ie;
+                    struct overflow_index_entry ie;
                     memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
                     if(stk_size >= stk_cap)
                     {
@@ -759,7 +759,7 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
             {
                 for(uint16_t i = 0; i < nhdr.node_keys; i++)
                 {
-                    struct btree_index_entry ie;
+                    struct overflow_index_entry ie;
                     memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
                     if(stk_size >= stk_cap)
                     {
@@ -877,9 +877,12 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                 /* Skip directories — they have no data extents */
                 if(rec.file_type == kFileTypeDirectory) continue;
 
-                /* Skip media/CD images — file_size reflects logical disk size,
-                 * not extent capacity, because data is stored via dedup trees */
-                if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeCompactDiscImage) continue;
+                /* Skip media/CD images and subchannel sidecars — file_size
+                 * reflects logical disk size, not extent capacity, because
+                 * data is stored via dedup / CD B+Trees */
+                if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeCompactDiscImage ||
+                   rec.file_type == kFileTypeSubchannelFile)
+                    continue;
 
                 /* Sum inline extents */
                 uint64_t logical_sum = 0;
@@ -925,9 +928,15 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
 
                 if(rec.file_size > expected_size)
                 {
+                    /* Show inline + overflow breakdown for debugging */
+                    uint64_t inline_sum = 0;
+                    for(int e = 0; e < 8; e++) inline_sum += rec.extents[e].logical_blocks;
+                    uint64_t overflow_sum = logical_sum - inline_sum;
+
                     printf("    inode %" PRIu64 ": file_size=%" PRIu64 " exceeds extent capacity %" PRIu64 " (%" PRIu64
-                           " logical blocks)\n",
-                           rec.inode_id, rec.file_size, expected_size, logical_sum);
+                           " logical blocks: %" PRIu64 " inline + %" PRIu64 " overflow), file_type=%u\n",
+                           rec.inode_id, rec.file_size, expected_size, logical_sum, inline_sum, overflow_sum,
+                           (unsigned)rec.file_type);
                     (*bad_count)++;
                     if(ask_fix(auto_yes, auto_no, "    Clamp file_size to extent capacity?"))
                     {
