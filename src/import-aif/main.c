@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <iconv.h>
 #include <inttypes.h>
 #include <libgen.h>
 #include <stdio.h>
@@ -210,6 +211,62 @@ static int import_media_tags(void *aaruf_ctx, int fd)
  * @param info  ImageInfo struct from libaaruformat.
  * @param fd    Open file descriptor on the mounted OBMAFS3 file.
  */
+/**
+ * Helper: read a UTF-16LE string metadata field from libaaruformat,
+ * convert it to UTF-8 via iconv, and store it via the SET_METADATA ioctl.
+ *
+ * @param aaruf_ctx  libaaruformat context.
+ * @param fd         Open file descriptor on the mounted OBMAFS3 file.
+ * @param getter     Function pointer to the aaruf_get_* accessor.
+ * @param key        Metadata key name to store.
+ */
+static void import_utf16_metadata(void *aaruf_ctx, int fd,
+                                  int32_t (*getter)(const void *, uint8_t *, int32_t *),
+                                  const char *key)
+{
+    int32_t length = 0;
+    if(getter(aaruf_ctx, NULL, &length) != AARUF_ERROR_BUFFER_TOO_SMALL || length <= 0)
+        return;
+
+    uint8_t *utf16 = malloc((size_t)length);
+    if(!utf16) return;
+
+    if(getter(aaruf_ctx, utf16, &length) != AARUF_STATUS_OK)
+    {
+        free(utf16);
+        return;
+    }
+
+    iconv_t cd = iconv_open("UTF-8", "UTF-16LE");
+    if(cd == (iconv_t)-1)
+    {
+        free(utf16);
+        return;
+    }
+
+    struct obmafs3_ioctl_metadata_set_arg meta;
+    memset(&meta, 0, sizeof(meta));
+    strncpy(meta.key, key, METADATA_KEY_MAX - 1);
+
+    char   *inbuf  = (char *)utf16;
+    size_t  inleft = (size_t)length;
+    char   *outbuf = meta.value;
+    size_t  outleft = METADATA_VALUE_MAX - 1;
+
+    if(iconv(cd, &inbuf, &inleft, &outbuf, &outleft) != (size_t)-1 || errno == E2BIG)
+    {
+        /* outbuf advanced past the converted bytes; meta.value is already NUL-filled */
+        if(meta.value[0])
+        {
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                fprintf(stderr, "Warning: failed to set metadata '%s'\n", key);
+        }
+    }
+
+    iconv_close(cd);
+    free(utf16);
+}
+
 static void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
 {
     struct obmafs3_ioctl_metadata_set_arg meta;
@@ -267,6 +324,10 @@ static void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
                 fprintf(stderr, "Warning: failed to set metadata 'media_sequence'\n");
         }
     }
+
+    /* Store UTF-16LE string metadata fields (converted to UTF-8) */
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_creator, "dumper");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_comments, "comments");
 }
 
 /**
