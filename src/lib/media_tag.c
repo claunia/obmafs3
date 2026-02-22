@@ -1,6 +1,36 @@
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : media_tag.c
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : obmafs3
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     OBMAFS3 Media Tag B+Tree operations.
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
+
 /*
- * media_tag.c - OBMAFS3 Media Tag B+Tree operations
- *
  * Composite key: (inode_id, tag_type).  Leaf nodes store
  * media_tag_record entries; index nodes store
  * media_tag_index_entry entries.  Tags <= 512 bytes are stored

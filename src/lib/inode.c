@@ -1,6 +1,36 @@
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : inode.c
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : obmafs3
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     OBMAFS3 Inode B+Tree operations.
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
+
 /*
- * inode.c - OBMAFS3 Inode B+Tree operations
- *
  * Inode tree: proper B+Tree (btrfs-style).
  *   level 0  → leaf nodes storing sorted inode_record entries.
  *   level >0 → index nodes storing sorted btree_index_entry entries.

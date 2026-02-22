@@ -1,7 +1,35 @@
-/*
- * fsck_crosscheck.c — Cross-reference: orphan inodes & dangling catalog
- *                     entries for obmafsck.
- */
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : fsck_crosscheck.c
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : OBMAFS3 filesystem check utility (obmafsck)
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     Cross-reference: orphan inodes & dangling catalog entries for obmafsck.
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
+
 #include "fsck.h"
 
 /* ------------------------------------------------------------------ */

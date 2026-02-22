@@ -1,6 +1,36 @@
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : fuse_ioctl.c
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : FUSE interface for OBMAFS3
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     FUSE ioctl operations for OBMAFS3.
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
+
 /*
- * fuse_ioctl.c - OBMAFS3 FUSE ioctl operations
- *
  * Implements: media tag, CD image, media image, and metadata ioctls
  */
 

@@ -1,6 +1,36 @@
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : fsck.h
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : OBMAFS3 filesystem check utility (obmafsck)
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     Shared declarations for the obmafsck filesystem checker.
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
+
 /*
- * fsck.h — Shared declarations for the obmafsck filesystem checker.
- *
  * Every .c file in the obmafsck directory includes this header to
  * access common helpers, macros, and global state.
  */

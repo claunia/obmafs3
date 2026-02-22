@@ -1,9 +1,34 @@
-/*
- * import-aif - Import an Aaru Image Format (.aif) file into a mounted
- *              OBMAFS3 filesystem via standard POSIX I/O and ioctls.
- *
- * Shared header for all translation units.
- */
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : import_aif.h
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : import-aif
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     Shared header for all translation units.
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
 
 #ifndef IMPORT_AIF_H
 #define IMPORT_AIF_H

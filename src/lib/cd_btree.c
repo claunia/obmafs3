@@ -1,6 +1,36 @@
+// /***************************************************************************
+// Object Based Media Archival File System v3 (OBMAFS3)
+// ----------------------------------------------------------------------------
+//
+// Filename       : cd_btree.c
+// Author(s)      : Natalia Portillo <claunia@claunia.com>
+//
+// Component      : obmafs3
+//
+// --[ Description ] ----------------------------------------------------------
+//
+//     OBMAFS3 CD hash B+Tree operations (prefix/suffix/subchannel).
+//
+// --[ License ] --------------------------------------------------------------
+//
+//     This program is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as
+//     published by the Free Software Foundation, either version 3 of the
+//     License, or (at your option) any later version.
+//
+//     This program is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ----------------------------------------------------------------------------
+// Copyright © 2015-2026 Natalia Portillo
+// ****************************************************************************/
+
 /*
- * cd_btree.c - OBMAFS3 CD hash B+Tree operations (prefix/suffix/subchannel)
- *
  * All three trees share identical logic: uint64 hash key, fixed-
  * size inline data, no external blocks.  The generic helpers are
  * parameterised by record_size (sizeof the leaf record).  The first
