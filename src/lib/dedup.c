@@ -4558,9 +4558,42 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         return rc;
     }
 
+    /* ---- Batch-read all needed sector_map_entries in one call ----
+     *
+     * A single 4 KiB block holds 4096/18 = 227 entries.  The old code
+     * re-read the same block for every sector — thousands of pread
+     * syscalls for a typical 1 MiB FUSE read.  Pre-reading the whole
+     * range collapses that to a handful of block reads. */
+    int64_t  first_sector = (int64_t)(offset / sector_size);
+    int64_t  last_sector  = (int64_t)((offset + size - 1) / sector_size);
+    uint64_t sme_count    = (uint64_t)(last_sector - first_sector + 1);
+
+    struct sector_map_entry *sme_batch = malloc((size_t)(sme_count * sizeof(struct sector_map_entry)));
+    if(!sme_batch) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    /* Temporary inode copy for reading sector map (need to adjust file_size) */
+    struct inode_record map_inode;
+    memcpy(&map_inode, inode, sizeof(map_inode));
+    map_inode.file_size = inode->sector_map_size * sizeof(struct sector_map_entry);
+
+    uint64_t sme_offset = (uint64_t)first_sector * sizeof(struct sector_map_entry);
+    rc = obmafs3_read_file_data(ctx, &map_inode, sme_offset, sme_batch,
+                                (size_t)(sme_count * sizeof(struct sector_map_entry)));
+    if(rc != OBMAFS3_OK)
+    {
+        fprintf(stderr, "[read_media_image] batch read_file_data(sme) FAILED rc=%d "
+                "first_sector=%" PRId64 " count=%" PRIu64 " sme_offset=%" PRIu64
+                " map_file_size=%" PRIu64 " sector_map_size=%" PRIu64
+                " inode=%" PRIu64 "\n",
+                rc, first_sector, sme_count, sme_offset, map_inode.file_size,
+                inode->sector_map_size, inode->inode_id);
+        free(sme_batch);
+        return rc;
+    }
+
     /* Buffer for reading the dedup data block (dedup_block_size bytes) */
     uint8_t *dedup_buf = malloc((size_t)ctx->sb.dedup_block_size);
-    if(!dedup_buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    if(!dedup_buf) { free(sme_batch); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
 
     /* Decompressed payload buffer (allocated on first compressed block) */
     uint8_t *decomp_buf = NULL;
@@ -4568,11 +4601,6 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     /* Cache the last read dedup block LBA to avoid re-reading */
     uint64_t cached_dedup_lba  = 0;
     int      cached_compressed = 0;
-
-    /* Temporary inode copy for reading sector map (need to adjust file_size) */
-    struct inode_record map_inode;
-    memcpy(&map_inode, inode, sizeof(map_inode));
-    map_inode.file_size = inode->sector_map_size * sizeof(struct sector_map_entry);
 
     uint8_t *out        = (uint8_t *)buf;
     size_t   bytes_read = 0;
@@ -4588,31 +4616,19 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         size_t remaining_in_read   = size - bytes_read;
         size_t chunk               = remaining_in_read < remaining_in_sector ? remaining_in_read : remaining_in_sector;
 
-        /* Read the sector_map_entry for this sector from inode data */
-        struct sector_map_entry sme;
-        uint64_t                sme_offset = (uint64_t)sector_num * sizeof(struct sector_map_entry);
-        rc                                 = obmafs3_read_file_data(ctx, &map_inode, sme_offset, &sme, sizeof(sme));
-        if(rc != OBMAFS3_OK)
-        {
-            fprintf(stderr, "[read_media_image] read_file_data(sme) FAILED rc=%d sector=%" PRId64
-                    " sme_offset=%" PRIu64 " map_file_size=%" PRIu64
-                    " sector_map_size=%" PRIu64 " inode=%" PRIu64 "\n",
-                    rc, sector_num, sme_offset, map_inode.file_size,
-                    inode->sector_map_size, inode->inode_id);
-            free(decomp_buf);
-            free(dedup_buf);
-            return rc;
-        }
+        /* Index into the pre-fetched batch */
+        uint64_t sme_idx = (uint64_t)(sector_num - first_sector);
+        struct sector_map_entry *sme = &sme_batch[sme_idx];
 
         /* Look up the hash in the dedup tree */
         struct dedup_entry de;
-        rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, sme.hash, &de);
+        rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, sme->hash, &de);
         if(rc != OBMAFS3_OK)
         {
             fprintf(stderr, "[read_media_image] dedup_lookup FAILED rc=%d hash=%" PRIu64
-                    " sector=%" PRId64 " sme_offset=%" PRIu64
-                    " inode=%" PRIu64 "\n",
-                    rc, sme.hash, sector_num, sme_offset, inode->inode_id);
+                    " sector=%" PRId64 " inode=%" PRIu64 "\n",
+                    rc, sme->hash, sector_num, inode->inode_id);
+            free(sme_batch);
             free(decomp_buf);
             free(dedup_buf);
             return rc;
@@ -4627,7 +4643,8 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             {
                 fprintf(stderr, "[read_media_image] block_read(dedup hdr) FAILED rc=%d lba=%" PRIu64
                         " hash=%" PRIu64 " sector=%" PRId64 "\n",
-                        rc, de.block_lba, sme.hash, sector_num);
+                        rc, de.block_lba, sme->hash, sector_num);
+                free(sme_batch);
                 free(decomp_buf);
                 free(dedup_buf);
                 return rc;
@@ -4654,6 +4671,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 rc = obmafs3_block_read(ctx, de.block_lba + 1, dedup_buf + bs, (size_t)((needed_std - 1) * bs));
                 if(rc != OBMAFS3_OK)
                 {
+                    free(sme_batch);
                     free(decomp_buf);
                     free(dedup_buf);
                     return rc;
@@ -4669,6 +4687,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     decomp_buf = malloc((size_t)ctx->sb.dedup_block_size);
                     if(!decomp_buf)
                     {
+                        free(sme_batch);
                         free(dedup_buf);
                         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                     }
@@ -4677,6 +4696,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                                         decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
+                    free(sme_batch);
                     free(decomp_buf);
                     free(dedup_buf);
                     return rc;
@@ -4704,6 +4724,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         bytes_read += chunk;
     }
 
+    free(sme_batch);
     free(decomp_buf);
     free(dedup_buf);
     return OBMAFS3_OK;
