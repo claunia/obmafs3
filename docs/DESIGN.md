@@ -1075,7 +1075,6 @@ Options:
 - `db_cache` — Persistent dedup data block accumulator (also holds: pending async pool job slot, dedup B+Tree node cache, cached dedup tree header)
 - `cd_sme_cache` — In-memory CD sector map entry cache (flushed on release)
 - `ecc_ctx` — Lazy-initialised CD ECC/EDC context (for prefix/suffix reconstruction)
-- `cd_next_sector` — Next expected CD sector LBA (for sequential write optimisation)
 
 **Extended attributes (xattr):** Media tags and image metadata are exposed as extended attributes:
 - `user.mediatag.<name>` — Binary media tags (e.g., `user.mediatag.cd_toc`, `user.mediatag.dvd_pfi`). Read returns binary data; write sets the tag.
@@ -1089,7 +1088,7 @@ Options:
 | `OBMAFS3_IOC_SET_MEDIA_TAG` | Write binary media tag data for an image |
 | `OBMAFS3_IOC_GET_MEDIA_TAG` | Read binary media tag data for an image |
 | `OBMAFS3_IOC_SET_CD_IMAGE` | Mark a file as a CD image (enables CD sector map mode) |
-| `OBMAFS3_IOC_CD_WRITE_LONG` | Write a raw 2352/2448-byte CD sector (prefix/data/suffix/subchannel split) |
+| `OBMAFS3_IOC_CD_WRITE_LONG` | Write a raw 2352/2448-byte CD sector at a given LBA (prefix/data/suffix/subchannel split) |
 | `OBMAFS3_IOC_CD_READ_LONG` | Read a reconstructed 2352-byte raw CD sector |
 | `OBMAFS3_IOC_CD_READ_LONG_SUB` | Read a reconstructed 2448-byte raw CD sector with subchannel |
 | `OBMAFS3_IOC_SET_METADATA` | Set a key-value metadata pair for an image |

@@ -33,7 +33,6 @@ struct fuse_file_ctx
     struct dedup_block_cache   db_cache;        ///< persistent dedup block accumulator
     struct cd_sector_map_cache cd_sme_cache;    ///< CD sector map cache
     void                      *ecc_ctx;         ///< CD ECC context (lazy-init)
-    int64_t                    cd_next_sector;  ///< next expected CD sector LBA
 };
 
 /* ---- helpers defined in fuse_ops.c ---- */

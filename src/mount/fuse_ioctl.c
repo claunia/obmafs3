@@ -74,9 +74,10 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const struct obmaf
 
     uint8_t mode = arg->sector_mode;
     if(mode > kCdSectorMode2Form2) FUSE_RETURN(-EINVAL, "");
+    if(arg->sector < 0) FUSE_RETURN(-EINVAL, "");
 
     const uint8_t *raw        = arg->buffer;
-    int64_t        sector_lba = ffctx->cd_next_sector;
+    int64_t        sector_lba = arg->sector;
 
     /* Build the cd_sector_map_entry */
     struct cd_sector_map_entry sme;
@@ -282,10 +283,9 @@ cache_and_done:
         cache->entries[cache->count++] = sme;
     }
 
-    /* Update inode sector count and advance the sector LBA */
-    ffctx->cd_next_sector++;
-    if((uint64_t)ffctx->cd_next_sector > ffctx->inode.sector_count)
-        ffctx->inode.sector_count = (uint64_t)ffctx->cd_next_sector;
+    /* Update inode sector count */
+    if((uint64_t)(sector_lba + 1) > ffctx->inode.sector_count)
+        ffctx->inode.sector_count = (uint64_t)(sector_lba + 1);
     ffctx->inode_dirty = 1;
 
     return 0;
@@ -549,7 +549,6 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             ffctx->inode.file_type       = kFileTypeCompactDiscImage;
             ffctx->inode.sector_count    = 0;
             ffctx->inode.sector_map_size = 0;
-            ffctx->cd_next_sector        = 0;
 
             int rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
             return rc == OBMAFS3_OK ? 0 : -EIO;

@@ -59,6 +59,7 @@ struct obmafs3_ioctl_tag_arg
 
 struct obmafs3_ioctl_cd_write_arg
 {
+    int64_t  sector;      /**< Sector LBA to write */
     uint32_t buffer_size; /**< 2352 or 2448 */
     uint8_t  sector_mode; /**< enum obmafs3_cd_sector_mode */
     uint8_t  buffer[CD_RAW_PLUS_SUB];
