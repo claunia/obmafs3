@@ -334,6 +334,10 @@ static void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
     import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_serial_number, "serial_number");
     import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_barcode, "barcode");
     import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_part_number, "part_number");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_manufacturer, "drive_manufacturer");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_model, "drive_model");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_serial_number, "drive_serial_number");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_firmware_revision, "drive_firmware_revision");
 }
 
 /**
