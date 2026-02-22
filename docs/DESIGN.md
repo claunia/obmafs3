@@ -200,7 +200,8 @@ enum obmafs3_file_type {
     kFileTypeDirectory        = 1,
     kFileTypeMediaImage       = 2,
     kFileTypeSymlink          = 3,
-    kFileTypeCompactDiscImage = 4
+    kFileTypeCompactDiscImage = 4,
+    kFileTypeSubchannelFile   = 5
 };
 
 enum obmafs3_compression {
@@ -263,7 +264,7 @@ struct inode_record {                        /* packed, 265 bytes */
     uint64_t access_time;
     uint64_t file_size;          /* File size in bytes */
     struct extent_run extents[8];/* Up to 8 inline extent runs */
-    uint8_t  file_type;          /* 0=regular, 1=dir, 2=media image, 3=symlink, 4=CD image */
+    uint8_t  file_type;          /* 0=regular, 1=dir, 2=media image, 3=symlink, 4=CD image, 5=subchannel */
     uint64_t sector_count;       /* Media images: total number of sectors */
     uint64_t sector_map_size;    /* Media images: number of sector_map_entries written */
     uint32_t ref_count;          /* Number of hardlinks (catalog entries) pointing to this inode */
@@ -271,6 +272,19 @@ struct inode_record {                        /* packed, 265 bytes */
 ```
 
 The `extents` array holds up to 8 inline extent runs. For regular files, these point to data blocks. For media image files, they point to blocks containing a flat array of `sector_map_entry` structures that map each sector to its deduplicated copy. The `sector_count` and `sector_map_size` fields are only used for media image files.
+
+For Compact Disc images written via the `OBMAFS3_IOC_CD_WRITE_LONG` ioctl, `file_size` is set to `sector_count * CD_RAW_SECTOR_SIZE` (2352 bytes per sector). This virtual size reflects the full raw image extent regardless of the actual data sizes stored internally. For CD images written via POSIX `write()`, `file_size` reflects the actual bytes written (typically 2048 bytes per sector).
+
+#### Subchannel Sidecar Files
+
+When a CD sector is written via `OBMAFS3_IOC_CD_WRITE_LONG` with subchannel data (2448-byte buffer), a `.sub` sidecar file is automatically created alongside the CD image. The sidecar uses `file_type = kFileTypeSubchannelFile` and stores **no data of its own** — it shares the parent CD image's `cd_sector_map_entry` array. The inode fields are repurposed:
+
+- `sector_count` — stores the **parent CD image's inode_id** (not a sector count)
+- `file_size` — `parent_sector_count × CD_SUBCHANNEL_SIZE` (96 bytes per sector), kept in sync by the ioctl
+- `sector_map_size` — unused (0)
+- `extents` — unused (no data blocks)
+
+The sidecar is **only created when at least one sector with subchannel data is written**. If no subchannel data is ever written, no sidecar file appears. On read, each 96-byte sector is fetched from the CD Subchannel B+Tree using the `subchannel_hash` from the parent's sector map. Sectors not present in the sector map (gaps between tracks) or sectors without subchannel data (`subchannel_hash == 0`) return a zero-filled 96-byte buffer. Reads never extend beyond the parent's `sector_count`.
 
 #### Hardlinks
 
@@ -488,6 +502,8 @@ struct cd_sector_map_entry {                 /* packed */
     uint8_t  sector_mode;        /* Audio, Mode 1, Mode 2 Form 1/2, etc. */
 };
 ```
+
+The CD sector map is **sparse**: only sectors that belong to a track are stored. Gaps between tracks (e.g., lead-in/lead-out regions) have no entries. The `sector_count` field in the inode records the highest sector LBA + 1, while `sector_map_size` records the actual number of `cd_sector_map_entry` structures written. When reading, entries are located by **binary search** on the `sector` field rather than positional indexing, since the entry index does not necessarily equal the sector number.
 
 When `generated_prefix` or `generated_suffix` is 1, the respective data is not stored in the CD prefix/suffix B+Trees but is instead regenerated from the sector's LBA and mode using the ECC/EDC engine (`ecc_cd_reconstruct`). This is a common case since most CD sectors have predictable sync/header bytes and valid ECC, avoiding storage overhead.
 
@@ -1029,7 +1045,7 @@ Usage: `mount.obmafs --device=<path> <mountpoint> [options]`
 Options:
 - `--compression=<0|1>` — Enable (1) or disable (0) ZSTD compression for writes (default: 1)
 - `--zstd-level=<1-15>` — ZSTD compression level (default: 15)
-- `--disk-images=<spec>` — Semicolon-separated `ext=sector_size` pairs for disk image detection (default: `dsk=512;iso=2048`)
+- `--disk-images=<spec>` — Semicolon-separated `ext=sector_size` pairs for disk image detection (default: `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`)
 - `-f` — Run in foreground (skip daemonisation/fork)
 
 **Supported FUSE operations:**
@@ -1039,7 +1055,7 @@ Options:
 | `getattr` | Return file/directory attributes from inode |
 | `readdir` | List directory entries from catalog tree |
 | `open`    | Allocate per-file context, detect sector size for media images |
-| `read`    | Read regular file data or media image data (with dedup lookup) |
+| `read`    | Read regular file data or media image data (with dedup lookup). For CD images, POSIX reads always return 2352-byte raw sectors without subchannel data. Sectors not present in the sector map (gaps between tracks) are zero-filled. Reads are clamped to `sector_count × 2352` and never extend beyond the last sector. |
 | `create`  | Create new file: catalog entry + inode, detect media image by extension |
 | `write`   | Write regular file data or deduplicated media image data |
 | `flush`   | Persist dirty inode to disk without closing the file |
@@ -1075,6 +1091,9 @@ Options:
 - `db_cache` — Persistent dedup data block accumulator (also holds: pending async pool job slot, dedup B+Tree node cache, cached dedup tree header)
 - `cd_sme_cache` — In-memory CD sector map entry cache (flushed on release)
 - `ecc_ctx` — Lazy-initialised CD ECC/EDC context (for prefix/suffix reconstruction)
+- `sub_inode_id` — Inode ID of the `.sub` subchannel sidecar (0 if none created yet)
+- `sub_inode` — Cached sidecar inode (written back on flush/release)
+- `sub_inode_dirty` — Flag indicating the sidecar inode needs write-back
 
 **Extended attributes (xattr):** Media tags and image metadata are exposed as extended attributes:
 - `user.mediatag.<name>` — Binary media tags (e.g., `user.mediatag.cd_toc`, `user.mediatag.dvd_pfi`). Read returns binary data; write sets the tag.
@@ -1088,7 +1107,7 @@ Options:
 | `OBMAFS3_IOC_SET_MEDIA_TAG` | Write binary media tag data for an image |
 | `OBMAFS3_IOC_GET_MEDIA_TAG` | Read binary media tag data for an image |
 | `OBMAFS3_IOC_SET_CD_IMAGE` | Mark a file as a CD image (enables CD sector map mode) |
-| `OBMAFS3_IOC_CD_WRITE_LONG` | Write a raw 2352/2448-byte CD sector at a given LBA (prefix/data/suffix/subchannel split) |
+| `OBMAFS3_IOC_CD_WRITE_LONG` | Write a raw 2352/2448-byte CD sector at a given LBA (prefix/data/suffix/subchannel split). Updates `sector_count` to `max(sector_count, LBA + 1)` and sets `file_size = sector_count × CD_RAW_SECTOR_SIZE` (2352). When the buffer is 2448 bytes (includes subchannel), a `.sub` sidecar file (`kFileTypeSubchannelFile`) is created on the first such write, and its `file_size` is kept in sync. |
 | `OBMAFS3_IOC_CD_READ_LONG` | Read a reconstructed 2352-byte raw CD sector |
 | `OBMAFS3_IOC_CD_READ_LONG_SUB` | Read a reconstructed 2448-byte raw CD sector with subchannel |
 | `OBMAFS3_IOC_SET_METADATA` | Set a key-value metadata pair for an image |
@@ -1098,7 +1117,7 @@ Options:
 | `OBMAFS3_IOC_QUERY_METADATA` | Query which images have a given key=value pair (paginated paths) |
 | `OBMAFS3_IOC_SET_MEDIA_IMAGE` | Convert an empty regular file to a MediaImage with a given sector size |
 
-**Media image detection**: The extension-to-sector-size mapping is configurable via `--disk-images`. Up to 32 mappings are supported (`OBMAFS3_MAX_DISK_IMAGE_MAPS`). Each mapping associates a file extension with a sector size. The default mapping (`dsk=512;iso=2048`) creates files with `.dsk` as `kFileTypeMediaImage` with 512-byte sectors, and `.iso` as `kFileTypeMediaImage` with 2048-byte sectors. CD images (`kFileTypeCompactDiscImage`) use the CD sector map format with prefix/suffix/subchannel splitting and ECC/EDC reconstruction.
+**Media image detection**: The extension-to-sector-size mapping is configurable via `--disk-images`. Up to 32 mappings are supported (`OBMAFS3_MAX_DISK_IMAGE_MAPS`). Each mapping associates a file extension with a sector size. The default mapping is `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`. Extension matching is **case-insensitive** (`strcasecmp`), so `.DSK`, `.Dsk`, and `.dsk` all match the same mapping. CD images (`kFileTypeCompactDiscImage`) use the CD sector map format with prefix/suffix/subchannel splitting and ECC/EDC reconstruction.
 
 ### `import-aif` — Aaru Image Format importer
 
@@ -1124,7 +1143,7 @@ Options:
    - **Other media**: `OBMAFS3_IOC_SET_MEDIA_IMAGE` ioctl with the image's sector size.
 6. Imports sector data:
    - **Flat images** (`import_flat_image`): Reads each sector via `aaruf_read_sector`, handles variable sector sizes via `AARUF_ERROR_BUFFER_TOO_SMALL` + realloc, writes sequentially.
-   - **CD images** (`import_cd_image`): Reads tracks via `aaruf_get_tracks`, detects subchannel availability, reads raw sectors via `aaruf_read_sector_long` (with optional subchannel via `aaruf_read_sector_tag`), falls back to cooked reads with ECC reconstruction when raw reads fail, writes via `OBMAFS3_IOC_CD_WRITE_LONG` ioctl.
+   - **CD images** (`import_cd_image`): Reads tracks via `aaruf_get_tracks`, then iterates track by track — for each track, sectors from `start - pregap` to `end` are read. Only sectors belonging to a track are imported; gaps between tracks are skipped (the `CD_WRITE_LONG` ioctl carries the sector LBA, so non-contiguous sectors are placed correctly). For each sector, the tool first attempts a raw read via `aaruf_read_sector_long` (2352 bytes); if that fails, it falls back to a cooked read via `aaruf_read_sector` and reconstructs the full raw sector using `aaruf_ecc_cd_reconstruct_prefix` and `aaruf_ecc_cd_reconstruct`. Subchannel data (96 bytes) is appended when available (`aaruf_read_sector_tag`). Each sector is written via the `OBMAFS3_IOC_CD_WRITE_LONG` ioctl with its LBA.
 7. Imports all media tags (`import_media_tags`): Enumerates available tags via `aaruf_get_readable_media_tags`, reads each tag, stores via `OBMAFS3_IOC_SET_MEDIA_TAG` ioctl.
 8. Imports image metadata (`import_metadata`): Stores application name/version, media type string, disk geometry, media sequence, and 12 UTF-16LE metadata fields (converted to UTF-8 via `iconv`) including: creator, comments, media title, manufacturer, model, serial number, barcode, part number, drive manufacturer/model/serial/firmware.
 9. Generates a CDRWin-format cue sheet (`.cue`) for Compact Disc images (`write_cue_file`): Includes `REM ORIGINAL MEDIA-TYPE`, `REM METADATA AARU MEDIA-TYPE`, ripping tool info, `CATALOG` (MCN), per-session markers, and per-track `TRACK`/`FLAGS`/`ISRC`/`INDEX` entries.
