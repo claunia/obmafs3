@@ -710,6 +710,47 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Importing metadata...\n");
     import_metadata(aaruf_ctx, &info, fd);
 
+    /* ---- Export CICM metadata XML if available ---- */
+    {
+        size_t cicm_len = 0;
+        if(aaruf_get_cicm_metadata(aaruf_ctx, NULL, &cicm_len) == AARUF_ERROR_BUFFER_TOO_SMALL && cicm_len > 0)
+        {
+            uint8_t *cicm_buf = malloc(cicm_len);
+            if(cicm_buf)
+            {
+                if(aaruf_get_cicm_metadata(aaruf_ctx, cicm_buf, &cicm_len) == AARUF_STATUS_OK)
+                {
+                    /* Build .metadata.xml path from output_path */
+                    size_t path_len  = strlen(output_path);
+                    char  *xml_path  = malloc(path_len + sizeof(".metadata.xml"));
+                    if(xml_path)
+                    {
+                        memcpy(xml_path, output_path, path_len);
+                        memcpy(xml_path + path_len, ".metadata.xml", sizeof(".metadata.xml"));
+
+                        int xml_fd = open(xml_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+                        if(xml_fd >= 0)
+                        {
+                            ssize_t written = write(xml_fd, cicm_buf, cicm_len);
+                            if(written < 0 || (size_t)written != cicm_len)
+                                fprintf(stderr, "Warning: incomplete write of CICM metadata XML\n");
+                            else
+                                fprintf(stderr, "CICM metadata saved to %s\n", xml_path);
+                            close(xml_fd);
+                        }
+                        else
+                        {
+                            fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n",
+                                    xml_path, errno, strerror(errno));
+                        }
+                        free(xml_path);
+                    }
+                }
+                free(cicm_buf);
+            }
+        }
+    }
+
     /* ---- Cleanup ---- */
     close(fd);
     aaruf_close(aaruf_ctx);
