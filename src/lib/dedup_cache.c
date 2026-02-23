@@ -1097,30 +1097,98 @@ void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Global dedup lookup cache (hash → dedup_entry)                     */
+/*  Global dedup lookup cache — LRU hash table                         */
 /* ------------------------------------------------------------------ */
 
+/** Fibonacci-hashing of a key to a bucket index. */
+static uint32_t lc_bucket(uint64_t hash, uint32_t mask)
+{
+    return (uint32_t)((hash * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+/* ---- LRU list helpers (caller holds lc->lock) ---- */
+
+/** Unlink node @p idx from the LRU doubly-linked list. */
+static void lru_unlink(struct dedup_lookup_cache *lc, uint32_t idx)
+{
+    struct dedup_lc_node *n = &lc->nodes[idx];
+    if(n->lru_prev != DEDUP_LC_NIL)
+        lc->nodes[n->lru_prev].lru_next = n->lru_next;
+    else
+        lc->lru_head = n->lru_next;
+
+    if(n->lru_next != DEDUP_LC_NIL)
+        lc->nodes[n->lru_next].lru_prev = n->lru_prev;
+    else
+        lc->lru_tail = n->lru_prev;
+}
+
+/** Push node @p idx to the front (MRU position) of the LRU list. */
+static void lru_push_front(struct dedup_lookup_cache *lc, uint32_t idx)
+{
+    struct dedup_lc_node *n = &lc->nodes[idx];
+    n->lru_prev = DEDUP_LC_NIL;
+    n->lru_next = lc->lru_head;
+    if(lc->lru_head != DEDUP_LC_NIL)
+        lc->nodes[lc->lru_head].lru_prev = idx;
+    lc->lru_head = idx;
+    if(lc->lru_tail == DEDUP_LC_NIL)
+        lc->lru_tail = idx;
+}
+
+/* ---- Hash chain helpers (caller holds lc->lock) ---- */
+
+/** Remove node @p idx from its hash bucket chain. */
+static void chain_remove(struct dedup_lookup_cache *lc, uint32_t idx)
+{
+    struct dedup_lc_node *n  = &lc->nodes[idx];
+    uint32_t              b  = lc_bucket(n->hash, DEDUP_LC_BUCKETS - 1);
+    uint32_t             *pp = &lc->buckets[b];
+    while(*pp != DEDUP_LC_NIL)
+    {
+        if(*pp == idx) { *pp = n->chain_next; return; }
+        pp = &lc->nodes[*pp].chain_next;
+    }
+}
+
 /**
- * Allocate and initialise a global dedup lookup cache.
+ * Allocate and initialise the global dedup lookup cache (LRU).
  *
- * The cache is a fixed-size open-addressing hash table that grows
- * dynamically up to DEDUP_LC_MAX_CAP.  Since dedup entries are
- * immutable (a hash always maps to the same block_lba/offset), the
- * cache never needs invalidation.
+ * Allocates one contiguous node pool and one bucket array, then
+ * threads all nodes into a free list.
  */
 struct dedup_lookup_cache *dedup_lc_create(void)
 {
     struct dedup_lookup_cache *lc = calloc(1, sizeof(*lc));
     if(!lc) return NULL;
-    lc->capacity = DEDUP_LC_INIT_CAP;
-    lc->max_cap  = DEDUP_LC_MAX_CAP;
-    lc->slots    = calloc(lc->capacity, sizeof(struct dedup_lc_slot));
-    if(!lc->slots)
-    {
-        free(lc);
-        return NULL;
-    }
+
+    lc->capacity  = DEDUP_LC_CAPACITY;
+    lc->count     = 0;
+    lc->lru_head  = DEDUP_LC_NIL;
+    lc->lru_tail  = DEDUP_LC_NIL;
+
+    lc->nodes = malloc((size_t)lc->capacity * sizeof(struct dedup_lc_node));
+    if(!lc->nodes) { free(lc); return NULL; }
+
+    lc->buckets = malloc((size_t)DEDUP_LC_BUCKETS * sizeof(uint32_t));
+    if(!lc->buckets) { free(lc->nodes); free(lc); return NULL; }
+
+    /* Initialise buckets to empty. */
+    for(uint32_t i = 0; i < DEDUP_LC_BUCKETS; i++)
+        lc->buckets[i] = DEDUP_LC_NIL;
+
+    /* Thread all nodes into the free list via chain_next. */
+    for(uint32_t i = 0; i < lc->capacity - 1; i++)
+        lc->nodes[i].chain_next = i + 1;
+    lc->nodes[lc->capacity - 1].chain_next = DEDUP_LC_NIL;
+    lc->free_head = 0;
+
     pthread_mutex_init(&lc->lock, NULL);
+
+    fprintf(stderr, "[dlc] LRU cache created: %u slots (%.0f MiB)\n",
+            lc->capacity,
+            ((double)lc->capacity * sizeof(struct dedup_lc_node)
+             + (double)DEDUP_LC_BUCKETS * sizeof(uint32_t)) / (1024.0 * 1024.0));
     return lc;
 }
 
@@ -1129,107 +1197,101 @@ void dedup_lc_free(struct dedup_lookup_cache *lc)
 {
     if(!lc) return;
     pthread_mutex_destroy(&lc->lock);
-    free(lc->slots);
+    free(lc->nodes);
+    free(lc->buckets);
     free(lc);
 }
 
-/** Fibonacci-hashing of a key to a table index. */
-static uint32_t lc_hash(uint64_t key, uint32_t mask) { return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask; }
-
 /**
- * Look up a hash in the global lookup cache.
+ * Look up a (hash, tree_lba) pair in the LRU cache.
+ * On hit, moves the entry to the MRU position.
  * Returns 1 if found (and fills @out), 0 if not found.
  */
 int dedup_lc_get(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lba, struct dedup_entry *out)
 {
     pthread_mutex_lock(&lc->lock);
-    uint32_t mask = lc->capacity - 1;
-    uint32_t idx  = lc_hash(hash, mask);
-    for(uint32_t i = 0; i < lc->capacity; i++)
+    uint32_t b   = lc_bucket(hash, DEDUP_LC_BUCKETS - 1);
+    uint32_t idx = lc->buckets[b];
+    while(idx != DEDUP_LC_NIL)
     {
-        uint32_t s = (idx + i) & mask;
-        if(!lc->slots[s].valid)
+        struct dedup_lc_node *n = &lc->nodes[idx];
+        if(n->hash == hash && n->tree_lba == tree_lba)
         {
-            pthread_mutex_unlock(&lc->lock);
-            return 0; /* end of probe chain */
-        }
-        if(lc->slots[s].hash == hash && lc->slots[s].tree_lba == tree_lba)
-        {
-            out->hash         = lc->slots[s].hash;
-            out->block_lba    = lc->slots[s].block_lba;
-            out->block_offset = lc->slots[s].block_offset;
+            out->hash         = n->hash;
+            out->block_lba    = n->block_lba;
+            out->block_offset = n->block_offset;
+            /* Move to MRU position. */
+            lru_unlink(lc, idx);
+            lru_push_front(lc, idx);
             pthread_mutex_unlock(&lc->lock);
             return 1;
         }
+        idx = n->chain_next;
     }
     pthread_mutex_unlock(&lc->lock);
     return 0;
 }
 
-/** Double the lookup cache table and re-hash all entries. */
-static int lc_grow(struct dedup_lookup_cache *lc)
-{
-    if(lc->capacity >= lc->max_cap) return -1; /* at ceiling */
-    uint32_t              new_cap = lc->capacity * 2;
-    struct dedup_lc_slot *ns      = calloc(new_cap, sizeof(struct dedup_lc_slot));
-    if(!ns) return -1;
-
-    uint32_t new_mask = new_cap - 1;
-    for(uint32_t i = 0; i < lc->capacity; i++)
-    {
-        if(!lc->slots[i].valid) continue;
-        uint32_t idx = lc_hash(lc->slots[i].hash, new_mask);
-        for(uint32_t j = 0; j < new_cap; j++)
-        {
-            uint32_t s = (idx + j) & new_mask;
-            if(!ns[s].valid)
-            {
-                ns[s] = lc->slots[i];
-                break;
-            }
-        }
-    }
-    free(lc->slots);
-    lc->slots    = ns;
-    lc->capacity = new_cap;
-    return 0;
-}
-
 /**
- * Insert a hash→dedup_entry into the global lookup cache.
- * Duplicate inserts are silently ignored (entries are immutable).
+ * Insert a (hash, tree_lba) → dedup_entry into the LRU cache.
+ *
+ * If the entry already exists, it is moved to MRU position.
+ * If the cache is full, the LRU entry is evicted first.
  */
 void dedup_lc_put(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lba, const struct dedup_entry *entry)
 {
     pthread_mutex_lock(&lc->lock);
 
-    /* Grow when >= 75% full */
-    if(lc->count * 4 >= lc->capacity * 3)
+    uint32_t b   = lc_bucket(hash, DEDUP_LC_BUCKETS - 1);
+
+    /* Check if already present. */
+    uint32_t idx = lc->buckets[b];
+    while(idx != DEDUP_LC_NIL)
     {
-        if(lc_grow(lc) != 0)
+        struct dedup_lc_node *n = &lc->nodes[idx];
+        if(n->hash == hash && n->tree_lba == tree_lba)
         {
-            /* At ceiling or OOM — just skip insertion. */
+            /* Already cached — just promote to MRU. */
+            lru_unlink(lc, idx);
+            lru_push_front(lc, idx);
             pthread_mutex_unlock(&lc->lock);
             return;
         }
+        idx = n->chain_next;
     }
 
-    uint32_t mask = lc->capacity - 1;
-    uint32_t idx  = lc_hash(hash, mask);
-    for(uint32_t i = 0; i < lc->capacity; i++)
+    /* Need a free node.  If the free list is empty, evict LRU tail. */
+    if(lc->free_head == DEDUP_LC_NIL)
     {
-        uint32_t s = (idx + i) & mask;
-        if(!lc->slots[s].valid)
-        {
-            lc->slots[s].hash         = hash;
-            lc->slots[s].tree_lba     = tree_lba;
-            lc->slots[s].block_lba    = entry->block_lba;
-            lc->slots[s].block_offset = entry->block_offset;
-            lc->slots[s].valid        = 1;
-            lc->count++;
-            break;
-        }
-        if(lc->slots[s].hash == hash && lc->slots[s].tree_lba == tree_lba) break; /* already cached */
+        uint32_t victim = lc->lru_tail;
+        /* Remove victim from LRU list. */
+        lru_unlink(lc, victim);
+        /* Remove victim from its hash bucket chain. */
+        chain_remove(lc, victim);
+        /* Return victim to the free list. */
+        lc->nodes[victim].chain_next = lc->free_head;
+        lc->free_head = victim;
+        lc->count--;
     }
+
+    /* Pop a node from the free list. */
+    uint32_t new_idx = lc->free_head;
+    lc->free_head = lc->nodes[new_idx].chain_next;
+
+    /* Populate the node. */
+    struct dedup_lc_node *n = &lc->nodes[new_idx];
+    n->hash         = hash;
+    n->tree_lba     = tree_lba;
+    n->block_lba    = entry->block_lba;
+    n->block_offset = entry->block_offset;
+
+    /* Insert into hash bucket chain. */
+    n->chain_next    = lc->buckets[b];
+    lc->buckets[b]   = new_idx;
+
+    /* Push to MRU position. */
+    lru_push_front(lc, new_idx);
+
+    lc->count++;
     pthread_mutex_unlock(&lc->lock);
 }

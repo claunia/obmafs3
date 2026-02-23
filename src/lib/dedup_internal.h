@@ -147,28 +147,44 @@ int  pending_entry_cmp(const void *a, const void *b);
 /*  Global dedup lookup cache (hash → dedup_entry, immutable entries)   */
 /* ------------------------------------------------------------------ */
 
-/** Slot in the global dedup lookup cache (open-addressing hash table). */
-struct dedup_lc_slot
+/**
+ * Global dedup lookup cache — LRU hash table.
+ *
+ * Fixed-capacity hash table with separate chaining and a doubly-linked
+ * LRU list threaded through the same node pool.  On a cache miss we
+ * evict the least-recently-used entry to make room.
+ *
+ * Memory budget: ~416 MiB for 8M entries (buckets 32 MiB + nodes 384 MiB).
+ */
+
+#define DEDUP_LC_CAPACITY  8388608u   ///< 2^23 = 8M entries (~416 MiB)
+#define DEDUP_LC_BUCKETS   8388608u   ///< must equal capacity (power of 2)
+#define DEDUP_LC_NIL       UINT32_MAX ///< sentinel for "no node"
+
+/** A single node in the LRU lookup cache. */
+struct dedup_lc_node
 {
-    uint64_t hash;          ///< Hash key (0 + !valid = empty sentinel)
-    uint64_t tree_lba;      ///< Dedup tree header LBA (distinguishes trees)
+    uint64_t hash;          ///< Hash key
+    uint64_t tree_lba;      ///< Distinguishes different dedup trees
     uint64_t block_lba;     ///< Dedup block LBA
     uint64_t block_offset;  ///< Offset within the dedup block
-    uint32_t valid;         ///< Non-zero when slot is occupied
+    uint32_t lru_prev;      ///< Previous node in LRU list (DEDUP_LC_NIL = head)
+    uint32_t lru_next;      ///< Next node in LRU list (DEDUP_LC_NIL = tail)
+    uint32_t chain_next;    ///< Next node in hash bucket chain (DEDUP_LC_NIL = end)
 };
 
-/** Global dedup lookup cache — caches hash→dedup_entry across all FUSE calls. */
+/** Global dedup lookup cache — LRU hash→dedup_entry map. */
 struct dedup_lookup_cache
 {
-    struct dedup_lc_slot *slots;
-    uint32_t              capacity;  ///< Must be power of 2
-    uint32_t              count;
-    uint32_t              max_cap;   ///< Hard ceiling (stop growing beyond this)
+    struct dedup_lc_node *nodes;    ///< Node pool [0 .. capacity-1]
+    uint32_t             *buckets;  ///< Hash bucket heads [0 .. DEDUP_LC_BUCKETS-1]
+    uint32_t              capacity; ///< Total node pool size
+    uint32_t              count;    ///< Currently occupied nodes
+    uint32_t              lru_head; ///< Most recently used (DEDUP_LC_NIL if empty)
+    uint32_t              lru_tail; ///< Least recently used (DEDUP_LC_NIL if empty)
+    uint32_t              free_head;///< Head of free-list (singly-linked via chain_next)
     pthread_mutex_t       lock;
 };
-
-#define DEDUP_LC_INIT_CAP   131072  ///< 128K slots ≈ 4 MB initial
-#define DEDUP_LC_MAX_CAP   4194304  ///< 4M slots ≈ 128 MB hard ceiling
 
 struct dedup_lookup_cache *dedup_lc_create(void);
 void  dedup_lc_free(struct dedup_lookup_cache *lc);
