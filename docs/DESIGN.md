@@ -64,6 +64,10 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t pending_blocks;     /* Number of blocks used by the persisted pending buffer */
     uint32_t btree_clump_size;   /* Nodes to pre-allocate per growth for non-dedup trees (0 = default 64) */
     uint32_t dedup_clump_size;   /* Nodes to pre-allocate per growth for dedup trees (0 = default 1024) */
+    uint32_t revision;           /* On-disk format revision (e.g. 20260224); newer → refuse mount */
+    uint64_t compatible_flags;   /* Feature flags safe to ignore (unknown bits are harmless) */
+    uint64_t rocompat_flags;     /* Feature flags requiring read-only mount if unknown */
+    uint64_t incompatible_flags; /* Feature flags that must be understood to mount at all */
     uint8_t  volume_label[256];  /* Volume label, UTF-8, NUL-terminated */
     uint8_t  checksum[32];       /* Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed) */
 };
@@ -91,6 +95,10 @@ A byte-identical **backup copy** of the superblock is stored at the last block o
 - `pending_lba`, `pending_blocks` — Location and size of the persisted pending insert buffer extent. When zero, no pending buffer has been persisted (see [Pending Insert Buffer](#pending-insert-buffer)).
 - `btree_clump_size` — Number of nodes to pre-allocate per growth for non-dedup B+Trees. 0 uses the default of 64 (see [Clump Allocation](#clump-allocation)).
 - `dedup_clump_size` — Number of nodes to pre-allocate per growth for dedup B+Trees. 0 uses the default of 1024 (see [Clump Allocation](#clump-allocation)).
+- `revision` — On-disk format revision (e.g. `20260224`). Set to `OBMAFS3_REVISION` at creation time. If a tool reads a revision higher than the one it was compiled with, mounting is refused (`OBMAFS3_ERR_REVISION`) to prevent corruption by older code that does not understand the newer layout.
+- `compatible_flags` — Bitmask of optional feature flags that are safe to ignore. An implementation that does not recognise a set bit may mount the filesystem normally with full read-write access. No flags are currently defined.
+- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. No flags are currently defined.
+- `incompatible_flags` — Bitmask of feature flags that prevent mounting entirely when unknown. If any bits outside `OBMAFS3_INCOMPAT_FLAGS_KNOWN` are set, the implementation must refuse to mount (`OBMAFS3_ERR_INCOMPAT`). No flags are currently defined.
 
 ---
 
@@ -504,39 +512,76 @@ Maximum leaf records per 4096-byte block: **167** (prefix), **13** (suffix), **3
 
 ## Sector Map
 
-Media image files store a flat array of `sector_map_entry` structures in their inode's data extents. There is one entry per sector in the disk image:
+Media image files store a `sector_map_header` followed by a flat array of `sector_map_entry` structures in their inode's data extents. The header is written once at offset 0 when the first entries are appended, and its checksum is finalized when the sector map cache is flushed.
+
+### Sector Map Header
 
 ```c
-struct sector_map_entry {                    /* packed, 18 bytes */
-    int64_t  sector;         /* Logical sector number within the disk image */
-    uint16_t sector_size;    /* Size of the sector in bytes (e.g. 512, 2048, 4096) */
-    uint64_t hash;           /* XXH64 hash of the sector data */
+#define OBMAFS3_SECTOR_MAP_MAGIC   0x504D524F54434553ULL  /* "SECTORMP" little-endian */
+#define OBMAFS3_SECTOR_MAP_VERSION 1
+
+enum sector_map_type {
+    kSectorMapTypeNormal = 0,    /* Normal (non-CD) sector map */
+    kSectorMapTypeCd     = 1     /* CD sector map */
+};
+
+struct sector_map_header {                   /* packed, 43 bytes */
+    uint64_t magic;              /* OBMAFS3_SECTOR_MAP_MAGIC ("SECTORMP") */
+    uint8_t  type;               /* Discriminator: kSectorMapTypeNormal or kSectorMapTypeCd */
+    uint16_t version;            /* On-disk format version (OBMAFS3_SECTOR_MAP_VERSION) */
+    uint8_t  checksum[32];       /* XXH64 of header (with this field zeroed) + all entries */
 };
 ```
 
+The checksum is computed over the entire header (with the checksum field zeroed) concatenated with all entry data, using the standard XXH64 algorithm. It is recomputed every time the sector map cache is flushed to disk. A zeroed checksum indicates the sector map has not yet been finalized.
+
+### Sector Map Entry
+
+There is one entry per sector in the disk image:
+
+```c
+struct sector_map_entry {                    /* packed, 34 bytes */
+    int64_t  sector;              /* Logical sector number within the disk image */
+    uint16_t sector_size;         /* Size of the sector in bytes (e.g. 512, 2048, 4096) */
+    uint64_t hash;                /* XXH64 hash of the sector data */
+    uint64_t dedup_sector_lba;    /* LBA of the dedup data block containing this sector */
+    uint64_t dedup_sector_offset; /* Byte offset within the dedup data block */
+};
+```
+
+The `dedup_sector_lba` and `dedup_sector_offset` fields cache the immutable location of the sector's data inside the dedup block. Since dedup blocks are append-only and never moved, these fields remain valid for the lifetime of the entry. When non-zero, the read path can skip the B+Tree traversal entirely and read the dedup data block directly. When zero (e.g., if the write path could not determine the location), the read path falls back to the standard dedup tree lookup, and `obmafsck --scrub` can populate the missing values.
+
 To read a sector from the image, the system:
-1. Reads the `sector_map_entry` from the inode's data extents at `sector_num * sizeof(sector_map_entry)`.
-2. Looks up the `hash` in the appropriate dedup tree to get the `dedup_entry`.
-3. Reads the dedup data block at `dedup_entry.block_lba` and extracts the sector data at `dedup_entry.block_offset`.
+1. Reads the `sector_map_entry` from the inode's data extents at `sizeof(sector_map_header) + sector_num * sizeof(sector_map_entry)`.
+2. If `dedup_sector_lba` is non-zero, uses the cached location directly. Otherwise, looks up the `hash` in the appropriate dedup tree to get the `dedup_entry`.
+3. Reads the dedup data block at the determined LBA and extracts the sector data at the stored byte offset.
 
 ### CD Sector Map
 
-CD (Compact Disc) images use an extended sector map entry that also tracks the sector's raw components — prefix, suffix, subchannel, and subheader — for lossless reconstruction of raw 2352/2448-byte sectors:
+CD (Compact Disc) images use the same `sector_map_header` (with `type = kSectorMapTypeCd`) followed by an array of extended `cd_sector_map_entry` structures that also track the sector's raw components — prefix, suffix, subchannel, and subheader — for lossless reconstruction of raw 2352/2448-byte sectors:
 
 ```c
 struct cd_sector_map_entry {                 /* packed */
-    int64_t  sector;             /* Logical sector number within the CD image */
-    uint16_t sector_size;        /* Size (e.g. 2048, 2336, 2352) */
-    uint64_t hash;               /* XXH64 hash of the CD data portion */
-    uint8_t  generated_prefix;   /* 1 if prefix can be regenerated from LBA */
-    uint64_t prefix_hash;        /* XXH64 hash of the 16-byte prefix */
-    uint8_t  generated_suffix;   /* 1 if suffix (ECC/EDC) can be regenerated */
-    uint64_t suffix_hash;        /* XXH64 hash of the 288-byte suffix */
-    uint64_t subchannel_hash;    /* XXH64 hash of 96-byte subchannel (0 = not stored) */
-    uint8_t  subheader[8];       /* Subheader for CD-ROM XA sectors (0 if N/A) */
-    uint8_t  sector_mode;        /* Audio, Mode 1, Mode 2 Form 1/2, etc. */
+    int64_t  sector;                  /* Logical sector number within the CD image */
+    uint16_t sector_size;             /* Size (e.g. 2048, 2336, 2352) */
+    uint64_t hash;                    /* XXH64 hash of the CD data portion */
+    uint8_t  generated_prefix;        /* 1 if prefix can be regenerated from LBA */
+    uint64_t prefix_hash;             /* XXH64 hash of the 16-byte prefix */
+    uint8_t  generated_suffix;        /* 1 if suffix (ECC/EDC) can be regenerated */
+    uint64_t suffix_hash;             /* XXH64 hash of the 288-byte suffix */
+    uint64_t subchannel_hash;         /* XXH64 hash of 96-byte subchannel (0 = not stored) */
+    uint8_t  subheader[8];            /* Subheader for CD-ROM XA sectors (0 if N/A) */
+    uint8_t  sector_mode;             /* Audio, Mode 1, Mode 2 Form 1/2, etc. */
+    uint64_t dedup_sector_lba;        /* LBA of the dedup data block for this sector */
+    uint64_t dedup_sector_offset;     /* Byte offset within the dedup data block */
+    uint64_t dedup_subchannel_lba;    /* LBA of the subchannel B+Tree leaf containing this entry */
+    uint64_t dedup_subchannel_offset; /* Byte offset within the leaf block */
 };
 ```
+
+The `dedup_sector_lba`/`dedup_sector_offset` fields cache the location of the sector's deduplicated data in the same way as in `sector_map_entry`. The `dedup_subchannel_lba`/`dedup_subchannel_offset` fields cache the position of the subchannel record inside the CD subchannel B+Tree leaf node. Because subchannel data is stored inline in B+Tree leaves (rather than in dedup blocks), these positions can change if the leaf is split; however, positions are stable once the image import is complete. The read path validates the cached subchannel location by comparing the hash stored in the leaf record with the expected `subchannel_hash`, falling back to a full tree traversal on mismatch.
+
+The `obmafsck --scrub` phase verifies all cached dedup location fields by looking up each entry's hash in the appropriate dedup or subchannel tree and comparing the result with the cached LBA and offset. Mismatches are reported and can be repaired interactively (or automatically with `-y`).
 
 The CD sector map is **sparse**: only sectors that belong to a track are stored. Gaps between tracks (e.g., lead-in/lead-out regions) have no entries. The `sector_count` field in the inode records the highest sector LBA + 1, while `sector_map_size` records the actual number of `cd_sector_map_entry` structures written. When reading, entries are located by **binary search** on the `sector` field rather than positional indexing, since the entry index does not necessarily equal the sector number.
 
@@ -1036,6 +1081,7 @@ Checksums are applied to:
 - Data blocks (`block_header.checksum`)
 - Bitmap data (`bitmap_header.checksum`)
 - Tree list header (`tree_list_header.checksum`)
+- Sector map header (`sector_map_header.checksum`) — covers the header plus all sector map entries
 
 ---
 
@@ -1082,6 +1128,15 @@ Options:
 - `--zstd-level=<1-15>` — ZSTD compression level (default: 15)
 - `--disk-images=<spec>` — Semicolon-separated `ext=sector_size` pairs for disk image detection (default: `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`)
 - `-f` — Run in foreground (skip daemonisation/fork)
+
+**Mount-time enforcement:**
+
+The following checks are performed by `obmafs3_open_flags()` before the filesystem is fully opened. Both checks are skipped in lenient mode (`OBMAFS3_OPEN_LENIENT`), which is used by `obmafsck`.
+
+- **Revision check**: If the on-disk `revision` exceeds the compiled `OBMAFS3_REVISION`, mounting is refused with `OBMAFS3_ERR_REVISION`. This prevents older code from silently corrupting newer on-disk layouts.
+- **Incompatible flags**: If any bits in `incompatible_flags` are not in `OBMAFS3_INCOMPAT_FLAGS_KNOWN`, mounting is refused with `OBMAFS3_ERR_INCOMPAT`.
+- **Read-only compatible flags**: If any bits in `rocompat_flags` are not in `OBMAFS3_ROCOMPAT_FLAGS_KNOWN`, the `read_only` flag is set in the context and the mount tool injects `-o ro` into the FUSE arguments, forcing a read-only mount.
+- **Compatible flags**: Unknown bits in `compatible_flags` are silently ignored; the filesystem is mounted with full read-write access.
 
 **Supported FUSE operations:**
 | Operation | Description |
@@ -1268,6 +1323,8 @@ Options:
 | Check | Description |
 |-------|-------------|
 | Superblock validation | Magic, checksum, block sizes, LBA consistency |
+| Revision display | Display on-disk revision; mark OK (✔) if ≤ compiled `OBMAFS3_REVISION`, or bad (✗) if newer |
+| Feature flags display | Display all three feature flag fields; count unknown incompatible flags as errors; note if unknown ro-compat flags would force read-only mount |
 | Superblock field range checks | Validate block_size, dedup_block_size, total_bytes, checksum_type, next_inode_id, bitmap_lba/blocks, tree LBAs (bounds + uniqueness), volume_label NUL-termination, creation_time; offer to fix each invalid field |
 | Backup superblock | Read backup at last block, verify magic/checksum/consistency against primary; restore primary from backup when primary is unreadable; overwrite backup from primary on mismatch |
 | Allocation bitmap | Load and verify bitmap checksum |
@@ -1297,6 +1354,7 @@ Options:
 | Dedup data block scrub | Read every unique dedup data block, verify magic and checksum (handles compressed blocks) |
 | Dedup hash verification | Walk all dedup trees, read sector data from data blocks, recompute XXH64 hash, compare against stored hash (optional, `-v`) |
 | CD hash verification | Walk CD prefix/suffix/subchannel trees, recompute XXH64 from inline data, compare against stored hash (optional, `-v`) |
+| Sector map dedup field scrub | Walk all sector maps, verify cached `dedup_sector_lba`/`dedup_sector_offset` match the dedup tree lookup; for CD sector maps also verify `dedup_subchannel_lba`/`dedup_subchannel_offset` against the subchannel B+Tree; offer to fix mismatches (scrub phase, `-s`) |
 | Tree defragmentation | Relocate fragmented B+Tree nodes to contiguous extents (optional, `-f`); see [Tree Defragmentation](#tree-defragmentation) |
 
 The scrub functions correctly handle both compressed and uncompressed blocks by checking the `OBMAFS3_BLOCK_FLAG_COMPRESSED` flag to determine whether to checksum `compressed_size` or `original_size` bytes.
@@ -1318,8 +1376,9 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - File data: `obmafs3_read_file_data`, `obmafs3_write_file_data`
 - Clone/reflink: `obmafs3_clone_file_range`, `obmafs3_free_file_blocks`, `obmafs3_truncate_file_blocks`
 - Refcount: `obmafs3_refcount_get`, `obmafs3_refcount_set`, `obmafs3_refcount_inc`, `obmafs3_refcount_dec`
-- Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`, `obmafs3_read_cd_image_data`
-- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_dedup_node_cache_free`, `obmafs3_dedup_key_set_free`
+- Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`, `obmafs3_read_cd_image_data`, `obmafs3_read_subchannel_data`
+- Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_dedup_node_cache_init`, `obmafs3_dedup_node_cache_free`, `obmafs3_dedup_key_set_free`
+- Media read caches: `obmafs3_alloc_media_leaf_cache`, `obmafs3_free_media_leaf_cache`, `obmafs3_alloc_media_dedup_cache`, `obmafs3_free_media_dedup_cache`
 - Dedup key set: `obmafs3_dedup_keyset_save`, `obmafs3_dedup_keyset_load`
 - Dedup pending buffer: `obmafs3_dedup_pending_save`, `obmafs3_dedup_pending_load`, `obmafs3_dedup_pending_flush_and_free`
 - Dedup warmup: `obmafs3_dedup_warmup_start`, `obmafs3_dedup_warmup_wait`
@@ -1331,7 +1390,7 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - CD sector map cache: `obmafs3_flush_cd_sector_map_cache`, `obmafs3_free_cd_sector_map_cache`
 - Media tags: `obmafs3_media_tag_get`, `obmafs3_media_tag_data_free`, `obmafs3_media_tag_put`, `obmafs3_media_tag_delete`, `obmafs3_media_tag_delete_all`, `obmafs3_media_tag_list`, `obmafs3_media_tag_list_free`
 - Image metadata: `obmafs3_metadata_get`, `obmafs3_metadata_put`, `obmafs3_metadata_delete`, `obmafs3_metadata_delete_all`, `obmafs3_metadata_list`, `obmafs3_metadata_list_free`, `obmafs3_metadata_query`, `obmafs3_metadata_query_filtered`, `obmafs3_metadata_query_free`
-- CD B+Trees: `obmafs3_cd_prefix_get/put/delete`, `obmafs3_cd_suffix_get/put/delete`, `obmafs3_cd_subchannel_get/put/delete`
+- CD B+Trees: `obmafs3_cd_prefix_get/put/delete`, `obmafs3_cd_suffix_get/put/delete`, `obmafs3_cd_subchannel_get/get_location/put/delete`
 - ECC/EDC: `ecc_cd_init`, `ecc_cd_free`, `ecc_cd_is_suffix_correct`, `ecc_cd_is_suffix_correct_mode2`, `ecc_cd_reconstruct`, `ecc_cd_reconstruct_prefix`, `cd_lba_to_msf`
 - Checksum: `obmafs3_checksum_xxh64`, `obmafs3_checksum_block`
 - Compression: `obmafs3_compress`, `obmafs3_decompress`
@@ -1359,6 +1418,8 @@ All library functions return integer error codes:
 #define OBMAFS3_ERR_INVAL    -6  /* Invalid argument */
 #define OBMAFS3_ERR_EXISTS   -7  /* Entry already exists */
 #define OBMAFS3_ERR_NOSPC    -8  /* No space left on device */
+#define OBMAFS3_ERR_REVISION -9  /* Filesystem revision is newer than supported */
+#define OBMAFS3_ERR_INCOMPAT -10 /* Incompatible feature flags set */
 ```
 
 ---
