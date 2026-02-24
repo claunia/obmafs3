@@ -86,6 +86,10 @@ struct obmafs3_thread_bufs
 #define OBMAFS3_ERR_INVAL    -6
 #define OBMAFS3_ERR_EXISTS   -7
 #define OBMAFS3_ERR_NOSPC    -8
+#define OBMAFS3_ERR_REVISION -9
+
+/// Current on-disk format revision.  Bumped when on-disk structures change.
+#define OBMAFS3_REVISION 20260224
 
 /** Filesystem context */
 struct obmafs3_ctx

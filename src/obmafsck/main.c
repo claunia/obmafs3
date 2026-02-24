@@ -435,6 +435,15 @@ int main(int argc, char *argv[])
     result_info("Total bytes:", "%" PRIu64, ctx->sb.total_bytes);
     result_info("Volume label:", "%s", ctx->sb.volume_label);
 
+    if(ctx->sb.revision <= OBMAFS3_REVISION)
+        result_ok("Revision:", "%u", (unsigned)ctx->sb.revision);
+    else
+    {
+        result_bad("Revision:", "%u (this tool supports up to %u)", (unsigned)ctx->sb.revision,
+                   (unsigned)OBMAFS3_REVISION);
+        errors++;
+    }
+
     if(ctx->sb.magic != OBMAFS3_SB_MAGIC) errors++;
 
     validate_superblock_fields(&ctx->sb, fd, (uint64_t)file_stat.st_size, auto_yes, auto_no, &errors);

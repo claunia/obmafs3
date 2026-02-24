@@ -269,6 +269,17 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         }
     }
 
+    /* Reject filesystems created by a newer revision of the format */
+    if(!(flags & OBMAFS3_OPEN_LENIENT) && c->sb.revision > OBMAFS3_REVISION)
+    {
+        fprintf(stderr,
+                "Error: filesystem revision %u is newer than supported revision %u — refusing to mount\n",
+                (unsigned)c->sb.revision, (unsigned)OBMAFS3_REVISION);
+        close(fd);
+        free(c);
+        return OBMAFS3_ERR_REVISION;
+    }
+
     /* Initialise thread-local storage key for per-thread scratch buffers
      * and the write serialisation mutex.  Scratch buffers (hdr_buf,
      * node_buf, io_buf, io_buf2, comp_buf, ZSTD contexts) are allocated
@@ -731,6 +742,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     sb.creation_time     = (uint64_t)time(NULL);
     sb.btree_clump_size  = OBMAFS3_DEFAULT_CLUMP_SIZE;
     sb.dedup_clump_size  = OBMAFS3_DEDUP_CLUMP_SIZE;
+    sb.revision          = OBMAFS3_REVISION;
 
     /* Calculate allocation bitmap size */
     uint64_t total_blocks         = total_size / block_size;
