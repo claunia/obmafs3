@@ -23,3 +23,7 @@ target_link_libraries(mount.obmafs
 target_compile_options(mount.obmafs PRIVATE
     ${FUSE3_CFLAGS_OTHER}
 )
+
+if(HAVE_FUSE_STATX)
+    target_compile_definitions(mount.obmafs PRIVATE HAVE_FUSE_STATX)
+endif()

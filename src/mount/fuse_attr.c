@@ -380,6 +380,7 @@ static int obmafs3_fuse_statfs_impl(const char *path, struct statvfs *stbuf)
     return 0;
 }
 
+#ifdef HAVE_FUSE_STATX
 /**
  * FUSE callback: get extended file attributes (statx).
  *
@@ -472,3 +473,4 @@ int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxb
     pthread_rwlock_unlock(&g_ctx->tree_lock);
     return rc;
 }
+#endif /* HAVE_FUSE_STATX */

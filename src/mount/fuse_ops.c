@@ -271,7 +271,9 @@ struct fuse_operations obmafs3_fuse_ops = {
     .chmod           = obmafs3_fuse_chmod,
     .chown           = obmafs3_fuse_chown,
     .statfs          = obmafs3_fuse_statfs,
+#ifdef HAVE_FUSE_STATX
     .statx           = obmafs3_fuse_statx,
+#endif
     .getxattr        = obmafs3_fuse_getxattr,
     .setxattr        = obmafs3_fuse_setxattr,
     .listxattr       = obmafs3_fuse_listxattr,

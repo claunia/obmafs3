@@ -65,5 +65,18 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED fuse3>=3.0)
 
+# ---------- Detect fuse_operations.statx (requires libfuse >= 3.16) ----------
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES ${FUSE3_INCLUDE_DIRS})
+set(CMAKE_REQUIRED_DEFINITIONS -DFUSE_USE_VERSION=35)
+check_c_source_compiles("
+#include <fuse3/fuse.h>
+int main(void) {
+    struct fuse_operations ops;
+    ops.statx = 0;
+    return 0;
+}
+" HAVE_FUSE_STATX)
+
 # ---------- Subdirectories ----------
 add_subdirectory(src)

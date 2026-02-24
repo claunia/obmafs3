@@ -33,6 +33,7 @@ jobs:
           cp build/src/obmafsck/obmafsck        artifacts/
           cp build/src/import-aif/import-aif    artifacts/
           cp build/src/obmafs-query/obmafs-query artifacts/
+          cp build/_deps/libaaruformat-build/libaaruformat.so artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -101,7 +101,9 @@ int obmafs3_fuse_flush(const char *path, struct fuse_file_info *fi);
 int obmafs3_fuse_release(const char *path, struct fuse_file_info *fi);
 
 int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf);
+#ifdef HAVE_FUSE_STATX
 int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi);
+#endif
 
 int obmafs3_fuse_getxattr(const char *path, const char *name, char *value, size_t size);
 int obmafs3_fuse_setxattr(const char *path, const char *name, const char *value, size_t size, int flags);
