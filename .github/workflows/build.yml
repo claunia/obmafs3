@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [ devel, main ]
+  pull_request:
+    branches: [ devel, main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libfuse3-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Collect binaries
+        run: |
+          mkdir -p artifacts
+          cp build/src/mkobmafs/mkobmafs       artifacts/
+          cp build/src/mount/mount.obmafs       artifacts/
+          cp build/src/obmafsck/obmafsck        artifacts/
+          cp build/src/import-aif/import-aif    artifacts/
+          cp build/src/obmafs-query/obmafs-query artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: obmafs3-linux-x86_64
+          path: artifacts/
