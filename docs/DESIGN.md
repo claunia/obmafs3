@@ -648,7 +648,7 @@ When a file is written to the filesystem:
 
 7. **Shared compression pool**: A persistent thread pool handles compression for both regular file writes (block group batches) and dedup data blocks (async jobs). See the [Compression Pool](#compression-pool) section for full details.
 
-8. **Dedup B+Tree node cache**: Frequently accessed B+Tree nodes are cached in memory during dedup writes, reducing disk reads during hash lookups and insertions.
+8. **Dedup B+Tree node cache**: Frequently accessed B+Tree nodes are cached in memory during dedup writes, reducing disk reads during hash lookups and insertions. The cache uses open-addressing with Fibonacci hashing and a write-back policy — dirty nodes are accumulated in memory and flushed to disk via coalesced `pwritev()` calls. See [Node Cache Memory Management](#node-cache-memory-management) for details on the configurable memory cap and eviction strategy.
 
 9. **Dedup tree header caching**: The dedup B+Tree header is cached in the `dedup_block_cache` across writes, avoiding a tree-list scan and header read on each FUSE write call.
 
@@ -684,6 +684,59 @@ Freed nodes are pushed onto the head of the tree's free-node list. The node's fi
 ### Free Node Chain Format
 
 The free node chain is a singly-linked list. Each free node's on-disk content starts with a `uint64_t` containing the LBA of the next free node (0 = end of chain). The rest of the block is zero-filled.
+
+---
+
+## Node Cache Memory Management
+
+The dedup B+Tree node cache (`dedup_node_cache`) is an open-addressing hash table that caches B+Tree node blocks in memory. Each cached entry holds a full `block_size` buffer (typically 4096 bytes) plus slot metadata.
+
+### Structure
+
+```c
+struct dedup_node_cache {
+    struct dedup_cache_slot *slots;
+    uint32_t  capacity;          /* Current hash table size (always power of 2) */
+    uint32_t  count;             /* Number of occupied slots */
+    uint32_t  max_capacity;      /* Hard cap on slot count (0 = unlimited) */
+    size_t    block_size;        /* Filesystem block size */
+    uint32_t *dirty_list;        /* Indices of dirty slots (for flush) */
+    uint32_t  dirty_count;
+    uint32_t  dirty_cap;
+    uint32_t  writes_since_flush;
+};
+```
+
+### Memory Budget
+
+The cache enforces a configurable RAM ceiling via `max_capacity`. The ceiling is derived from a byte budget (default: **8 GiB**, set via `DEDUP_NC_DEFAULT_BYTES` or the `--cache-limit` mount option). At creation time the byte budget is converted to a maximum slot count:
+
+```
+max_entries = max_bytes / (block_size + sizeof(dedup_cache_slot))
+```
+
+The result is rounded down to the nearest power of two. For a 4096-byte block size, the 8 GiB default yields approximately 1.9 million cached nodes.
+
+### Growth and Eviction
+
+The hash table doubles its capacity when occupancy reaches 75%. Before doubling, the cache checks `max_capacity`:
+
+- **Below cap**: The table is doubled and all entries are rehashed into the new slot array (standard `cache_grow`).
+- **At cap**: Instead of growing, the cache performs **clean-entry eviction** (`cache_evict_clean`):
+  1. Scan the slot array and free all non-dirty (clean) entry buffers until occupancy drops below 75%.
+  2. Collect surviving entries, clear the slot array, and rehash them in place to repair open-addressing probe chains.
+  3. Rebuild the dirty list from scratch.
+
+Dirty entries (nodes with pending writes) are **never evicted**. If all remaining entries are dirty, the eviction returns `OBMAFS3_ERR_NOMEM`, prompting callers to flush dirty entries to disk first.
+
+This design ensures that:
+- **Writes are always safe** — dirty nodes remain in cache until flushed.
+- **Reads degrade gracefully** — evicted clean nodes are simply re-read from disk on the next access.
+- **Memory usage is bounded** — the cache cannot grow beyond the configured limit.
+
+### Mount Option
+
+The memory budget is configured via the `--cache-limit` mount option (see [mount.obmafs](#mountobmafs--fuse-mount)). The value is stored in `obmafs3_ctx.cache_limit` and passed to `dedup_cache_create()` at cache initialization time. A value of 0 uses the 8 GiB default.
 
 ---
 
@@ -1126,6 +1179,7 @@ Usage: `mount.obmafs --device=<path> <mountpoint> [options]`
 Options:
 - `--compression=<0|1>` — Enable (1) or disable (0) ZSTD compression for writes (default: 1)
 - `--zstd-level=<1-15>` — ZSTD compression level (default: 15)
+- `--cache-limit=<size>` — Maximum RAM budget for the dedup B+Tree node cache (default: `8G`). Accepts K, M, or G suffixes (e.g. `2G`, `512M`). See [Node Cache Memory Management](#node-cache-memory-management).
 - `--disk-images=<spec>` — Semicolon-separated `ext=sector_size` pairs for disk image detection (default: `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`)
 - `-f` — Run in foreground (skip daemonisation/fork)
 
@@ -1476,6 +1530,7 @@ xxHash, ZSTD, and libaaruformat are fetched automatically via CMake `FetchConten
 | Block group compression (regular files) | Complete |
 | Async dedup compression (pool-based) | Complete |
 | Dedup B+Tree node cache | Complete |
+| Node cache memory cap and eviction | Complete |
 | Sector map caching (batched writes) | Complete |
 | Inode caching (per file handle) | Complete |
 | Media Tag B+Tree | Complete |
