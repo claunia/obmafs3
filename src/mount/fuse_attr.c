@@ -380,6 +380,14 @@ static int obmafs3_fuse_statfs_impl(const char *path, struct statvfs *stbuf)
     return 0;
 }
 
+int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
+{
+    pthread_rwlock_rdlock(&g_ctx->tree_lock);
+    int rc = obmafs3_fuse_statfs_impl(path, stbuf);
+    pthread_rwlock_unlock(&g_ctx->tree_lock);
+    return rc;
+}
+
 #ifdef HAVE_FUSE_STATX
 /**
  * FUSE callback: get extended file attributes (statx).
@@ -456,14 +464,6 @@ static int obmafs3_fuse_statx_impl(const char *path, int flags, int mask, struct
     if(ip->file_type == kFileTypeMediaImage && g_ctx->compression) stxbuf->stx_attributes |= STATX_ATTR_COMPRESSED;
 
     return 0;
-}
-
-int obmafs3_fuse_statfs(const char *path, struct statvfs *stbuf)
-{
-    pthread_rwlock_rdlock(&g_ctx->tree_lock);
-    int rc = obmafs3_fuse_statfs_impl(path, stbuf);
-    pthread_rwlock_unlock(&g_ctx->tree_lock);
-    return rc;
 }
 
 int obmafs3_fuse_statx(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi)
