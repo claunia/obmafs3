@@ -444,6 +444,32 @@ int main(int argc, char *argv[])
         errors++;
     }
 
+    /* Feature compatibility flags */
+    {
+        uint64_t unknown_compat   = ctx->sb.compatible_flags & ~OBMAFS3_COMPAT_FLAGS_KNOWN;
+        uint64_t unknown_rocompat = ctx->sb.rocompat_flags & ~OBMAFS3_ROCOMPAT_FLAGS_KNOWN;
+        uint64_t unknown_incompat = ctx->sb.incompatible_flags & ~OBMAFS3_INCOMPAT_FLAGS_KNOWN;
+
+        if(ctx->sb.compatible_flags == 0 && ctx->sb.rocompat_flags == 0 && ctx->sb.incompatible_flags == 0)
+            result_ok("Feature flags:", "none");
+        else
+        {
+            result_info("Compat flags:", "0x%016" PRIx64, ctx->sb.compatible_flags);
+            result_info("RO-compat flags:", "0x%016" PRIx64, ctx->sb.rocompat_flags);
+            if(unknown_incompat)
+            {
+                result_bad("Incompat flags:", "0x%016" PRIx64 " (unknown: 0x%016" PRIx64 ")",
+                           ctx->sb.incompatible_flags, unknown_incompat);
+                errors++;
+            }
+            else
+                result_ok("Incompat flags:", "0x%016" PRIx64, ctx->sb.incompatible_flags);
+
+            if(unknown_rocompat)
+                result_info("  (unknown ro-compat flags present — mount will be read-only)", "");
+        }
+    }
+
     if(ctx->sb.magic != OBMAFS3_SB_MAGIC) errors++;
 
     validate_superblock_fields(&ctx->sb, fd, (uint64_t)file_stat.st_size, auto_yes, auto_no, &errors);

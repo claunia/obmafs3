@@ -75,6 +75,9 @@ struct __attribute__((packed)) obmafs3_sb
     uint32_t btree_clump_size;   ///< Nodes to pre-allocate per growth for non-dedup trees (0 = default)
     uint32_t dedup_clump_size;   ///< Nodes to pre-allocate per growth for dedup trees (0 = default)
     uint32_t revision;           ///< On-disk format revision (OBMAFS3_REVISION); newer revision → refuse mount
+    uint64_t compatible_flags;   ///< Feature flags that are safe to ignore (mount normally)
+    uint64_t rocompat_flags;     ///< Feature flags requiring read-only mount if unknown
+    uint64_t incompatible_flags; ///< Feature flags that must be understood to mount at all
     uint8_t  volume_label[256];  ///< Volume label of the filesystem
     uint8_t  checksum[32];       ///< Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed)
 };

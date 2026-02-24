@@ -272,12 +272,37 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     /* Reject filesystems created by a newer revision of the format */
     if(!(flags & OBMAFS3_OPEN_LENIENT) && c->sb.revision > OBMAFS3_REVISION)
     {
-        fprintf(stderr,
-                "Error: filesystem revision %u is newer than supported revision %u — refusing to mount\n",
+        fprintf(stderr, "Error: filesystem revision %u is newer than supported revision %u — refusing to mount\n",
                 (unsigned)c->sb.revision, (unsigned)OBMAFS3_REVISION);
         close(fd);
         free(c);
         return OBMAFS3_ERR_REVISION;
+    }
+
+    /* Check feature compatibility flags */
+    if(!(flags & OBMAFS3_OPEN_LENIENT))
+    {
+        uint64_t unknown_incompat = c->sb.incompatible_flags & ~OBMAFS3_INCOMPAT_FLAGS_KNOWN;
+        if(unknown_incompat)
+        {
+            fprintf(stderr,
+                    "Error: filesystem has incompatible feature flags 0x%016" PRIx64
+                    " that this implementation does not support — refusing to mount\n",
+                    unknown_incompat);
+            close(fd);
+            free(c);
+            return OBMAFS3_ERR_INCOMPAT;
+        }
+
+        uint64_t unknown_rocompat = c->sb.rocompat_flags & ~OBMAFS3_ROCOMPAT_FLAGS_KNOWN;
+        if(unknown_rocompat)
+        {
+            fprintf(stderr,
+                    "Warning: filesystem has read-only compatible feature flags 0x%016" PRIx64
+                    " that this implementation does not support — mounting read-only\n",
+                    unknown_rocompat);
+            c->read_only = 1;
+        }
     }
 
     /* Initialise thread-local storage key for per-thread scratch buffers

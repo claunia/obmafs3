@@ -122,6 +122,15 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        /* Force read-only mount when the library flagged it (unknown rocompat flags) */
+        if(g_ctx->read_only)
+        {
+            fprintf(stderr, "Mounting %s read-only due to unknown read-only compatible feature flags\n",
+                    opts.device);
+            fuse_opt_add_arg(&args, "-o");
+            fuse_opt_add_arg(&args, "ro");
+        }
+
         /* Apply mount options */
         if(opts.compression != -1) g_ctx->compression = (opts.compression != 0);
         if(opts.zstd_level != -1)

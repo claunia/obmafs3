@@ -87,9 +87,15 @@ struct obmafs3_thread_bufs
 #define OBMAFS3_ERR_EXISTS   -7
 #define OBMAFS3_ERR_NOSPC    -8
 #define OBMAFS3_ERR_REVISION -9
+#define OBMAFS3_ERR_INCOMPAT -10
 
 /// Current on-disk format revision.  Bumped when on-disk structures change.
 #define OBMAFS3_REVISION 20260224
+
+/* Feature flags — none defined yet; all bits are reserved for future use. */
+#define OBMAFS3_COMPAT_FLAGS_KNOWN   0ULL  ///< Mask of known compatible feature flags
+#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN 0ULL  ///< Mask of known read-only compatible feature flags
+#define OBMAFS3_INCOMPAT_FLAGS_KNOWN 0ULL  ///< Mask of known incompatible feature flags
 
 /** Filesystem context */
 struct obmafs3_ctx
@@ -137,6 +143,7 @@ struct obmafs3_ctx
     int                   warmup_done;             ///< 1 after warmup has completed
     int                   warmup_started;          ///< 1 if warmup thread was created (needs join)
     volatile int          shutdown_requested;      ///< 1 when close() wants warmup to abort early
+    int                   read_only;               ///< 1 when mounted read-only (e.g. unknown rocompat flags)
 };
 
 /* Open flags */
