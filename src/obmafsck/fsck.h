@@ -201,6 +201,7 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
 void     print_progress(const char *label, uint64_t done, uint64_t total, uint64_t bad);
 uint64_t scrub_data_blocks(struct obmafs3_ctx *ctx);
 uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx);
+uint64_t scrub_sector_map_dedup_fields(struct obmafs3_ctx *ctx, int auto_yes, int auto_no);
 
 /* ------------------------------------------------------------------ */
 /*  fsck_hash.c                                                        */

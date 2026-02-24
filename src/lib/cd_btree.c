@@ -125,16 +125,18 @@ struct cd_hash_btree_path
  *
  * Generic lookup used by CD prefix, suffix, and subchannel trees.
  *
- * @param ctx     Filesystem context.
- * @param hdr     B+Tree header for the target tree.
- * @param hash    Hash key to search for.
- * @param record  Output record buffer.
- * @param rec_sz  Size of each record in bytes.
+ * @param ctx               Filesystem context.
+ * @param hdr               B+Tree header for the target tree.
+ * @param hash              Hash key to search for.
+ * @param record            Output record buffer.
+ * @param rec_sz            Size of each record in bytes.
+ * @param out_leaf_lba      If non-NULL, receives the LBA of the leaf node containing the record.
+ * @param out_record_offset If non-NULL, receives the byte offset of the record within the leaf node.
  * @return @c OBMAFS3_OK if found, @c OBMAFS3_ERR_NOTFOUND if absent,
  *         or another error code on failure.
  */
 static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx, const struct btree_header *hdr, uint64_t hash, void *record,
-                               size_t rec_sz)
+                               size_t rec_sz, uint64_t *out_leaf_lba, uint64_t *out_record_offset)
 {
     uint64_t lba = hdr->root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
@@ -163,7 +165,10 @@ static int cd_hash_tree_lookup(struct obmafs3_ctx *ctx, const struct btree_heade
             int idx = cd_hash_leaf_find(buf, nhdr.node_keys, hash, rec_sz);
             if(idx >= 0)
             {
-                memcpy(record, buf + sizeof(struct btree_node_header) + (size_t)idx * rec_sz, rec_sz);
+                size_t byte_offset = sizeof(struct btree_node_header) + (size_t)idx * rec_sz;
+                memcpy(record, buf + byte_offset, rec_sz);
+                if(out_leaf_lba) *out_leaf_lba = lba;
+                if(out_record_offset) *out_record_offset = byte_offset;
                 return OBMAFS3_OK;
             }
             return OBMAFS3_ERR_NOTFOUND;
@@ -744,7 +749,7 @@ int obmafs3_cd_prefix_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[C
     if(ctx->sb.cd_prefix_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
     struct cd_prefix_record rec;
-    int rc = cd_hash_tree_lookup(ctx, &ctx->cd_prefix_hdr, hash, &rec, sizeof(struct cd_prefix_record));
+    int rc = cd_hash_tree_lookup(ctx, &ctx->cd_prefix_hdr, hash, &rec, sizeof(struct cd_prefix_record), NULL, NULL);
     if(rc != OBMAFS3_OK) return rc;
 
     memcpy(data, rec.data, CD_PREFIX_DATA_SIZE);
@@ -800,7 +805,7 @@ int obmafs3_cd_suffix_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[C
     if(ctx->sb.cd_suffix_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
     struct cd_suffix_record rec;
-    int rc = cd_hash_tree_lookup(ctx, &ctx->cd_suffix_hdr, hash, &rec, sizeof(struct cd_suffix_record));
+    int rc = cd_hash_tree_lookup(ctx, &ctx->cd_suffix_hdr, hash, &rec, sizeof(struct cd_suffix_record), NULL, NULL);
     if(rc != OBMAFS3_OK) return rc;
 
     memcpy(data, rec.data, CD_SUFFIX_DATA_SIZE);
@@ -856,10 +861,35 @@ int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t da
     if(ctx->sb.cd_subchannel_lba == 0) return OBMAFS3_ERR_NOTFOUND;
 
     struct cd_subchannel_record rec;
-    int rc = cd_hash_tree_lookup(ctx, &ctx->cd_subchannel_hdr, hash, &rec, sizeof(struct cd_subchannel_record));
+    int                         rc =
+        cd_hash_tree_lookup(ctx, &ctx->cd_subchannel_hdr, hash, &rec, sizeof(struct cd_subchannel_record), NULL, NULL);
     if(rc != OBMAFS3_OK) return rc;
 
     memcpy(data, rec.data, CD_SUBCHANNEL_DATA_SIZE);
+    return OBMAFS3_OK;
+}
+
+/**
+ * Retrieve subchannel data and its leaf-node location in the B+Tree.
+ *
+ * @param ctx             Filesystem context.
+ * @param hash            XXH64 hash of the subchannel data.
+ * @param data            Output 96-byte subchannel data (may be NULL if only location is needed).
+ * @param leaf_lba        Receives the LBA of the leaf node containing the record.
+ * @param record_offset   Receives the byte offset of the record within the leaf node.
+ * @return @c OBMAFS3_OK on success, or @c OBMAFS3_ERR_NOTFOUND.
+ */
+int obmafs3_cd_subchannel_get_location(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[CD_SUBCHANNEL_DATA_SIZE],
+                                       uint64_t *leaf_lba, uint64_t *record_offset)
+{
+    if(ctx->sb.cd_subchannel_lba == 0) return OBMAFS3_ERR_NOTFOUND;
+
+    struct cd_subchannel_record rec;
+    int rc = cd_hash_tree_lookup(ctx, &ctx->cd_subchannel_hdr, hash, &rec, sizeof(struct cd_subchannel_record),
+                                 leaf_lba, record_offset);
+    if(rc != OBMAFS3_OK) return rc;
+
+    if(data) memcpy(data, rec.data, CD_SUBCHANNEL_DATA_SIZE);
     return OBMAFS3_OK;
 }
 

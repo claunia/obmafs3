@@ -415,3 +415,325 @@ uint64_t scrub_dedup_data_blocks(struct obmafs3_ctx *ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Scrub: verify cached dedup location fields in sector map entries   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Verify that dedup_sector_lba / dedup_sector_offset cached in each
+ * sector_map_entry and cd_sector_map_entry match the actual dedup tree
+ * entries for the corresponding hash.  Mismatches (including zero
+ * fields) are reported and optionally fixed.
+ *
+ * For CD sector map entries, dedup_subchannel_lba / dedup_subchannel_offset
+ * are also verified against the subchannel B+Tree.
+ *
+ * @param ctx       Filesystem context.
+ * @param auto_yes  Non-zero to automatically answer yes to all fix prompts.
+ * @param auto_no   Non-zero to automatically answer no to all fix prompts.
+ * @return Number of mismatches detected.
+ */
+uint64_t scrub_sector_map_dedup_fields(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
+{
+    if(ctx->inode_hdr.root_node_lba == 0)
+    {
+        printf("\n  %sSector map dedup field scrub%s\n", CLR_BOLD, CLR_RESET);
+        result_info("Status:", "no inodes to check");
+        return 0;
+    }
+
+    printf("\n  %sSector map dedup field scrub%s\n", CLR_BOLD, CLR_RESET);
+
+    uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
+    if(!node_buf)
+    {
+        fprintf(stderr, "  Error: out of memory\n");
+        return 0;
+    }
+
+    /* DFS walk over inode B+Tree to visit every inode */
+    uint64_t *stack  = malloc(64 * sizeof(uint64_t));
+    uint64_t  stk_sz = 0, stk_cap = 64;
+    if(!stack)
+    {
+        free(node_buf);
+        return 0;
+    }
+    stack[stk_sz++] = ctx->inode_hdr.root_node_lba;
+
+    uint64_t total_checked = 0;
+    uint64_t total_fixed   = 0;
+    uint64_t total_bad     = 0;
+    uint64_t inodes_seen   = 0;
+
+    while(stk_sz > 0)
+    {
+        uint64_t lba = stack[--stk_sz];
+        int      rc  = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
+        if(rc != OBMAFS3_OK) break;
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, node_buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+        if(hdr.level > 0)
+        {
+            for(uint16_t i = 0; i < hdr.node_keys; i++)
+            {
+                struct btree_index_entry ie;
+                memcpy(&ie, node_buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
+                if(stk_sz >= stk_cap)
+                {
+                    stk_cap *= 2;
+                    uint64_t *tmp = realloc(stack, stk_cap * sizeof(*tmp));
+                    if(!tmp) break;
+                    stack = tmp;
+                }
+                stack[stk_sz++] = ie.child_lba;
+            }
+            continue;
+        }
+
+        /* Leaf node — examine each inode record */
+        for(uint16_t k = 0; k < hdr.node_keys; k++)
+        {
+            struct inode_record irec;
+            memcpy(&irec, node_buf + sizeof(struct btree_node_header) + (size_t)k * sizeof(irec), sizeof(irec));
+
+            if(irec.sector_map_size == 0) continue;
+
+            inodes_seen++;
+
+            int is_cd = (irec.file_type == kFileTypeCompactDiscImage);
+
+            /* Prepare a map inode for reading the sector map data blocks */
+            struct inode_record map_inode;
+            memcpy(&map_inode, &irec, sizeof(map_inode));
+
+            if(is_cd)
+            {
+                /* ---- CD sector map entries ---- */
+                map_inode.file_size =
+                    sizeof(struct sector_map_header) + irec.sector_map_size * sizeof(struct cd_sector_map_entry);
+
+                struct cd_sector_map_entry *entries =
+                    malloc((size_t)(irec.sector_map_size * sizeof(struct cd_sector_map_entry)));
+                if(!entries) continue;
+
+                rc = obmafs3_read_file_data(ctx, &map_inode, sizeof(struct sector_map_header), entries,
+                                            (size_t)(irec.sector_map_size * sizeof(struct cd_sector_map_entry)));
+                if(rc != OBMAFS3_OK)
+                {
+                    free(entries);
+                    continue;
+                }
+
+                int entries_dirty = 0;
+
+                for(uint64_t s = 0; s < irec.sector_map_size; s++)
+                {
+                    struct cd_sector_map_entry *e = &entries[s];
+                    total_checked++;
+
+                    if(s % 256 == 0 || s == irec.sector_map_size - 1)
+                        print_progress("Dedup fields (CD)", total_checked, 0, total_bad);
+
+                    /* Determine data_size for this sector mode */
+                    uint16_t data_size;
+                    switch((enum obmafs3_cd_sector_mode)e->sector_mode)
+                    {
+                        case kCdSectorModeAudio:
+                            data_size = CD_RAW_SECTOR_SIZE;
+                            break;
+                        case kCdSectorMode1:
+                            data_size = CD_DATA_SIZE;
+                            break;
+                        case kCdSectorMode2:
+                            data_size = 2336;
+                            break;
+                        case kCdSectorMode2Form1:
+                            data_size = CD_DATA_SIZE;
+                            break;
+                        case kCdSectorMode2Form2:
+                            data_size = 2328;
+                            break;
+                        default:
+                            continue;
+                    }
+
+                    /* Check dedup_sector fields */
+                    struct btree_header dedup_hdr;
+                    uint64_t            dedup_hdr_lba;
+                    rc = obmafs3_dedup_get_tree(ctx, data_size, &dedup_hdr, &dedup_hdr_lba);
+                    if(rc != OBMAFS3_OK) continue;
+
+                    struct dedup_entry de;
+                    rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, e->hash, &de);
+                    if(rc != OBMAFS3_OK) continue;
+
+                    if(e->dedup_sector_lba != de.block_lba || e->dedup_sector_offset != de.block_offset)
+                    {
+                        total_bad++;
+                        fprintf(stderr,
+                                "\n    inode %" PRIu64 " sector %" PRId64 ": dedup_sector mismatch "
+                                "(cached %" PRIu64 ":%" PRIu64 " vs tree %" PRIu64 ":%" PRIu64 ")\n",
+                                irec.inode_id, e->sector, e->dedup_sector_lba, e->dedup_sector_offset, de.block_lba,
+                                de.block_offset);
+
+                        if(ask_fix(auto_yes, auto_no, "    Fix dedup_sector fields?"))
+                        {
+                            e->dedup_sector_lba    = de.block_lba;
+                            e->dedup_sector_offset = de.block_offset;
+                            entries_dirty          = 1;
+                            total_fixed++;
+                        }
+                    }
+
+                    /* Check dedup_subchannel fields (if subchannel is recorded) */
+                    if(e->subchannel_hash != 0 && ctx->sb.cd_subchannel_lba != 0)
+                    {
+                        uint64_t sub_leaf_lba = 0, sub_rec_off = 0;
+                        rc = obmafs3_cd_subchannel_get_location(ctx, e->subchannel_hash, NULL, &sub_leaf_lba,
+                                                                &sub_rec_off);
+                        if(rc == OBMAFS3_OK)
+                        {
+                            if(e->dedup_subchannel_lba != sub_leaf_lba || e->dedup_subchannel_offset != sub_rec_off)
+                            {
+                                total_bad++;
+                                fprintf(stderr,
+                                        "\n    inode %" PRIu64 " sector %" PRId64 ": dedup_subchannel mismatch "
+                                        "(cached %" PRIu64 ":%" PRIu64 " vs tree %" PRIu64 ":%" PRIu64 ")\n",
+                                        irec.inode_id, e->sector, e->dedup_subchannel_lba, e->dedup_subchannel_offset,
+                                        sub_leaf_lba, sub_rec_off);
+
+                                if(ask_fix(auto_yes, auto_no, "    Fix dedup_subchannel fields?"))
+                                {
+                                    e->dedup_subchannel_lba    = sub_leaf_lba;
+                                    e->dedup_subchannel_offset = sub_rec_off;
+                                    entries_dirty              = 1;
+                                    total_fixed++;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* Write back fixed entries */
+                if(entries_dirty)
+                {
+                    map_inode.file_size =
+                        sizeof(struct sector_map_header) + irec.sector_map_size * sizeof(struct cd_sector_map_entry);
+                    rc = obmafs3_write_file_data(ctx, &map_inode, sizeof(struct sector_map_header), entries,
+                                                 (size_t)(irec.sector_map_size * sizeof(struct cd_sector_map_entry)));
+                    if(rc != OBMAFS3_OK)
+                        fprintf(stderr, "    Error: could not write back fixed CD sector map for inode %" PRIu64 "\n",
+                                irec.inode_id);
+                }
+
+                free(entries);
+            }
+            else if(irec.file_type == kFileTypeMediaImage)
+            {
+                /* ---- Normal sector map entries ---- */
+                map_inode.file_size =
+                    sizeof(struct sector_map_header) + irec.sector_map_size * sizeof(struct sector_map_entry);
+
+                struct sector_map_entry *entries =
+                    malloc((size_t)(irec.sector_map_size * sizeof(struct sector_map_entry)));
+                if(!entries) continue;
+
+                rc = obmafs3_read_file_data(ctx, &map_inode, sizeof(struct sector_map_header), entries,
+                                            (size_t)(irec.sector_map_size * sizeof(struct sector_map_entry)));
+                if(rc != OBMAFS3_OK)
+                {
+                    free(entries);
+                    continue;
+                }
+
+                /* All entries share the same sector_size — use the first one */
+                if(irec.sector_map_size == 0)
+                {
+                    free(entries);
+                    continue;
+                }
+
+                uint16_t ss = entries[0].sector_size;
+
+                struct btree_header dedup_hdr;
+                uint64_t            dedup_hdr_lba;
+                rc = obmafs3_dedup_get_tree(ctx, ss, &dedup_hdr, &dedup_hdr_lba);
+                if(rc != OBMAFS3_OK)
+                {
+                    free(entries);
+                    continue;
+                }
+
+                int entries_dirty = 0;
+
+                for(uint64_t s = 0; s < irec.sector_map_size; s++)
+                {
+                    struct sector_map_entry *e = &entries[s];
+                    total_checked++;
+
+                    if(s % 256 == 0 || s == irec.sector_map_size - 1)
+                        print_progress("Dedup fields", total_checked, 0, total_bad);
+
+                    struct dedup_entry de;
+                    rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, e->hash, &de);
+                    if(rc != OBMAFS3_OK) continue;
+
+                    if(e->dedup_sector_lba != de.block_lba || e->dedup_sector_offset != de.block_offset)
+                    {
+                        total_bad++;
+                        fprintf(stderr,
+                                "\n    inode %" PRIu64 " sector %" PRId64 ": dedup_sector mismatch "
+                                "(cached %" PRIu64 ":%" PRIu64 " vs tree %" PRIu64 ":%" PRIu64 ")\n",
+                                irec.inode_id, e->sector, e->dedup_sector_lba, e->dedup_sector_offset, de.block_lba,
+                                de.block_offset);
+
+                        if(ask_fix(auto_yes, auto_no, "    Fix dedup_sector fields?"))
+                        {
+                            e->dedup_sector_lba    = de.block_lba;
+                            e->dedup_sector_offset = de.block_offset;
+                            entries_dirty          = 1;
+                            total_fixed++;
+                        }
+                    }
+                }
+
+                /* Write back fixed entries */
+                if(entries_dirty)
+                {
+                    map_inode.file_size =
+                        sizeof(struct sector_map_header) + irec.sector_map_size * sizeof(struct sector_map_entry);
+                    rc = obmafs3_write_file_data(ctx, &map_inode, sizeof(struct sector_map_header), entries,
+                                                 (size_t)(irec.sector_map_size * sizeof(struct sector_map_entry)));
+                    if(rc != OBMAFS3_OK)
+                        fprintf(stderr, "    Error: could not write back fixed sector map for inode %" PRIu64 "\n",
+                                irec.inode_id);
+                }
+
+                free(entries);
+            }
+        }
+    }
+
+    free(stack);
+    free(node_buf);
+
+    bar_clear();
+
+    result_info("Inodes checked:", "%" PRIu64, inodes_seen);
+    result_info("Entries checked:", "%" PRIu64, total_checked);
+    if(total_bad == 0) { result_ok("Result:", "all dedup location fields are correct"); }
+    else
+    {
+        if(total_fixed > 0)
+            result_fixed("Result:", "%" PRIu64 " mismatch(es), %" PRIu64 " fixed", total_bad, total_fixed);
+        else
+            result_bad("Result:", "%" PRIu64 " mismatch(es)", total_bad);
+    }
+
+    return total_bad;
+}
+
+/* ------------------------------------------------------------------ */

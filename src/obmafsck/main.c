@@ -1905,6 +1905,9 @@ int main(int argc, char *argv[])
 
         uint64_t dedup_bad = scrub_dedup_data_blocks(ctx);
         if(dedup_bad > 0) errors += (int)dedup_bad;
+
+        uint64_t dedup_field_bad = scrub_sector_map_dedup_fields(ctx, auto_yes, auto_no);
+        if(dedup_field_bad > 0) errors += (int)dedup_field_bad;
         phase_end();
     }
 

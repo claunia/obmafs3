@@ -41,6 +41,19 @@
 /* "OBMABMAP" as little-endian uint64 */
 #define OBMAFS3_BITMAP_MAGIC 0x50414D42414D424FULL
 
+/* "SECTORMP" as little-endian uint64 */
+#define OBMAFS3_SECTOR_MAP_MAGIC 0x504D524F54434553ULL
+
+/// Current on-disk version of the sector map header.
+#define OBMAFS3_SECTOR_MAP_VERSION 1
+
+/// Discriminator values for sector_map_header.
+enum sector_map_type
+{
+    kSectorMapTypeNormal = 0,  ///< Normal (non-CD) sector map
+    kSectorMapTypeCd     = 1   ///< CD sector map
+};
+
 #define OBMAFS3_DEFAULT_BLOCK_SIZE       4096
 #define OBMAFS3_DEFAULT_DEDUP_BLOCK_SIZE 4194304
 
@@ -81,27 +94,42 @@ struct __attribute__((packed)) tree_list_entry
     uint64_t tree_lba;     ///< LBA where the btree is stored
 };
 
+/// On-disk header prepended to the flat array of sector map entries.
+struct __attribute__((packed)) sector_map_header
+{
+    uint64_t magic;         ///< OBMAFS3_SECTOR_MAP_MAGIC ("SECTORMP")
+    uint8_t  type;          ///< Discriminator: kSectorMapTypeNormal or kSectorMapTypeCd
+    uint16_t version;       ///< On-disk format version (OBMAFS3_SECTOR_MAP_VERSION)
+    uint8_t  checksum[32];  ///< XXH64 checksum of header (with this field zeroed) + all entries
+};
+
 /// Maps a logical sector to its deduplicated data hash.
 struct __attribute__((packed)) sector_map_entry
 {
-    int64_t  sector;       ///< Logical sector number within the disk image
-    uint16_t sector_size;  ///< Size of the sector in bytes
-    uint64_t hash;         ///< Hash of the sector data for deduplication
+    int64_t  sector;               ///< Logical sector number within the media image
+    uint16_t sector_size;          ///< Size of the sector in bytes
+    uint64_t hash;                 ///< Hash of the sector data for deduplication
+    uint64_t dedup_sector_lba;     ///< LBA of the dedup data block containing this sector's data
+    uint64_t dedup_sector_offset;  ///< Byte offset within the dedup data block
 };
 
 /// Maps a CD logical sector to its deduplicated data, prefix, suffix and subchannel hashes.
 struct __attribute__((packed)) cd_sector_map_entry
 {
-    int64_t  sector;            ///< Logical sector number within the CD image
-    uint16_t sector_size;       ///< Size of the CD sector in bytes (e.g. 2048, 2336, 2352)
-    uint64_t hash;              ///< Hash of the CD sector data for deduplication
-    uint8_t  generated_prefix;  ///< Indicates if prefix can be generated and is therefore not stored
-    uint64_t prefix_hash;       ///< Hash of the CD sector prefix data (e.g. 16 bytes before main data)
-    uint8_t  generated_suffix;  ///< Indicates if suffix can be generated and is therefore not stored
-    uint64_t suffix_hash;       ///< Hash of the CD sector suffix data (e.g. 288 bytes after main data)
-    uint64_t subchannel_hash;   ///< Hash of the CD sector subchannel data (e.g. 96 bytes), 0 if not stored
-    uint8_t  subheader[8];      ///< Subheader data for CD-ROM XA sectors, 0 if not applicable
-    uint8_t  sector_mode;       ///< Audio, Mode 1, Mode 2 Form 1, Mode 2 Form 2, etc. for CD-ROM XA sectors
+    int64_t  sector;                   ///< Logical sector number within the CD image
+    uint16_t sector_size;              ///< Size of the CD sector in bytes (e.g. 2048, 2336, 2352)
+    uint64_t hash;                     ///< Hash of the CD sector data for deduplication
+    uint8_t  generated_prefix;         ///< Indicates if prefix can be generated and is therefore not stored
+    uint64_t prefix_hash;              ///< Hash of the CD sector prefix data (e.g. 16 bytes before main data)
+    uint8_t  generated_suffix;         ///< Indicates if suffix can be generated and is therefore not stored
+    uint64_t suffix_hash;              ///< Hash of the CD sector suffix data (e.g. 288 bytes after main data)
+    uint64_t subchannel_hash;          ///< Hash of the CD sector subchannel data (e.g. 96 bytes), 0 if not stored
+    uint8_t  subheader[8];             ///< Subheader data for CD-ROM XA sectors, 0 if not applicable
+    uint8_t  sector_mode;              ///< Audio, Mode 1, Mode 2 Form 1, Mode 2 Form 2, etc. for CD-ROM XA sectors
+    uint64_t dedup_sector_lba;         ///< LBA of the dedup data block containing this sector's data
+    uint64_t dedup_sector_offset;      ///< Byte offset within the dedup data block
+    uint64_t dedup_subchannel_lba;     ///< LBA of the subchannel B+Tree leaf node (0 if no subchannel)
+    uint64_t dedup_subchannel_offset;  ///< Byte offset of the subchannel record within the leaf node
 };
 
 /// Contiguous range of allocated blocks.

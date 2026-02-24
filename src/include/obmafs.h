@@ -270,17 +270,19 @@ struct sector_map_cache
  */
 struct dedup_block_cache
 {
-    uint8_t            *data;           ///< In-memory dedup data block buffer
-    uint64_t            block_lba;      ///< LBA of this dedup block
-    uint64_t            offset;         ///< Next write offset within the block
-    uint64_t            capacity;       ///< Total capacity (dedup_block_size)
-    uint64_t            std_blocks;     ///< Number of standard blocks per dedup block
-    int                 dirty;          ///< Whether the buffer has been modified
-    int                 initialized;    ///< Non-zero once first init has run
-    void               *pending_job;    ///< Pending pool_async_job (NULL when idle)
-    struct btree_header dedup_hdr;      ///< Cached dedup tree header
-    uint64_t            dedup_hdr_lba;  ///< Cached dedup tree header LBA
-    int                 hdr_cached;     ///< Non-zero when dedup_hdr is valid
+    uint8_t            *data;               ///< In-memory dedup data block buffer
+    uint64_t            block_lba;          ///< LBA of this dedup block
+    uint64_t            offset;             ///< Next write offset within the block
+    uint64_t            capacity;           ///< Total capacity (dedup_block_size)
+    uint64_t            std_blocks;         ///< Number of standard blocks per dedup block
+    int                 dirty;              ///< Whether the buffer has been modified
+    int                 initialized;        ///< Non-zero once first init has run
+    void               *pending_job;        ///< Pending pool_async_job (NULL when idle)
+    struct btree_header dedup_hdr;          ///< Cached dedup tree header
+    uint64_t            dedup_hdr_lba;      ///< Cached dedup tree header LBA
+    int                 hdr_cached;         ///< Non-zero when dedup_hdr is valid
+    uint64_t            last_dedup_lba;     ///< block_lba of the most recently written/found sector
+    uint64_t            last_dedup_offset;  ///< block_offset of the most recently written/found sector
 };
 
 int  obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record *inode, uint64_t offset,
@@ -304,16 +306,15 @@ int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record 
 void obmafs3_free_sector_map_cache(struct sector_map_cache *cache);
 
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
-                                  size_t size, uint16_t sector_size, void *leaf_cache,
-                                  void *dedup_cache);
+                                  size_t size, uint16_t sector_size, void *leaf_cache, void *dedup_cache);
 void *obmafs3_alloc_media_leaf_cache(void);
 void  obmafs3_free_media_leaf_cache(void *leaf_cache);
 void *obmafs3_alloc_media_dedup_cache(struct obmafs3_ctx *ctx);
 void  obmafs3_free_media_dedup_cache(void *dedup_cache);
-int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
-                               size_t size);
-int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode, uint64_t offset,
-                                 void *buf, size_t size);
+int   obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
+                                 size_t size);
+int   obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode, uint64_t offset,
+                                   void *buf, size_t size);
 
 /* --- Media tag operations --- */
 int  obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t tag_type, void **data,
@@ -336,6 +337,8 @@ int obmafs3_cd_suffix_put(struct obmafs3_ctx *ctx, uint64_t hash, const uint8_t 
 int obmafs3_cd_suffix_delete(struct obmafs3_ctx *ctx, uint64_t hash);
 
 int obmafs3_cd_subchannel_get(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
+int obmafs3_cd_subchannel_get_location(struct obmafs3_ctx *ctx, uint64_t hash, uint8_t data[CD_SUBCHANNEL_DATA_SIZE],
+                                       uint64_t *leaf_lba, uint64_t *record_offset);
 int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash, const uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
 int obmafs3_cd_subchannel_delete(struct obmafs3_ctx *ctx, uint64_t hash);
 

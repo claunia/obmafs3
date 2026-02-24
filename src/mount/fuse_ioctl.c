@@ -128,8 +128,9 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         /* Store subchannel data in the tree (dedup by hash).
          * Lock around shared B+Tree operations. */
         pthread_rwlock_wrlock(&g_ctx->tree_lock);
-        uint8_t existing[CD_SUBCHANNEL_DATA_SIZE];
-        int     rc = obmafs3_cd_subchannel_get(g_ctx, sub_hash, existing);
+        uint64_t sub_leaf_lba = 0, sub_rec_offset = 0;
+        uint8_t  existing[CD_SUBCHANNEL_DATA_SIZE];
+        int      rc = obmafs3_cd_subchannel_get_location(g_ctx, sub_hash, existing, &sub_leaf_lba, &sub_rec_offset);
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = obmafs3_cd_subchannel_put(g_ctx, sub_hash, sub);
@@ -138,6 +139,13 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
                 pthread_rwlock_unlock(&g_ctx->tree_lock);
                 FUSE_RETURN(-EIO, "");
             }
+            /* Retrieve the leaf location of the newly stored record */
+            int lrc = obmafs3_cd_subchannel_get_location(g_ctx, sub_hash, NULL, &sub_leaf_lba, &sub_rec_offset);
+            if(lrc != OBMAFS3_OK)
+            {
+                sub_leaf_lba   = 0;
+                sub_rec_offset = 0;
+            }
         }
         else if(rc != OBMAFS3_OK)
         {
@@ -145,6 +153,8 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
             FUSE_RETURN(-EIO, "");
         }
         pthread_rwlock_unlock(&g_ctx->tree_lock);
+        sme.dedup_subchannel_lba    = sub_leaf_lba;
+        sme.dedup_subchannel_offset = sub_rec_offset;
 
         /* --- Create .sub sidecar file (kFileTypeSubchannelFile) on first subchannel --- */
         if(ffctx->sub_inode_id == 0 && path)
@@ -241,6 +251,9 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         int      rc     = obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, raw, CD_RAW_SECTOR_SIZE,
                                                          CD_RAW_SECTOR_SIZE, NULL, dbc);
         if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+        sme.dedup_sector_lba    = dbc->last_dedup_lba;
+        sme.dedup_sector_offset = dbc->last_dedup_offset;
 
         goto cache_and_done;
     }
@@ -390,6 +403,9 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         int      rc =
             obmafs3_write_media_image_data(g_ctx, &ffctx->inode, offset, data_ptr, data_size, data_size, NULL, dbc);
         if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+        sme.dedup_sector_lba    = dbc->last_dedup_lba;
+        sme.dedup_sector_offset = dbc->last_dedup_offset;
     }
 
 cache_and_done:
@@ -448,11 +464,12 @@ static int obmafs3_cd_read_long(struct fuse_file_ctx *ffctx, struct obmafs3_ioct
     /* Read the cd_sector_map_entry for this sector from inode data */
     struct inode_record map_inode;
     memcpy(&map_inode, &ffctx->inode, sizeof(map_inode));
-    map_inode.file_size = ffctx->inode.sector_map_size * sizeof(struct cd_sector_map_entry);
+    map_inode.file_size =
+        sizeof(struct sector_map_header) + ffctx->inode.sector_map_size * sizeof(struct cd_sector_map_entry);
 
     struct cd_sector_map_entry sme;
-    uint64_t                   sme_offset = (uint64_t)sector_lba * sizeof(struct cd_sector_map_entry);
-    int                        rc         = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset, &sme, sizeof(sme));
+    uint64_t sme_offset = sizeof(struct sector_map_header) + (uint64_t)sector_lba * sizeof(struct cd_sector_map_entry);
+    int      rc         = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset, &sme, sizeof(sme));
     if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
     uint8_t *out = arg->buffer;
@@ -583,11 +600,12 @@ static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx, struct obmafs3_
     /* Read the cd_sector_map_entry to get subchannel_hash */
     struct inode_record map_inode;
     memcpy(&map_inode, &ffctx->inode, sizeof(map_inode));
-    map_inode.file_size = ffctx->inode.sector_map_size * sizeof(struct cd_sector_map_entry);
+    map_inode.file_size =
+        sizeof(struct sector_map_header) + ffctx->inode.sector_map_size * sizeof(struct cd_sector_map_entry);
 
     struct cd_sector_map_entry sme;
-    uint64_t                   sme_offset = (uint64_t)arg->sector * sizeof(struct cd_sector_map_entry);
-    rc                                    = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset, &sme, sizeof(sme));
+    uint64_t sme_offset = sizeof(struct sector_map_header) + (uint64_t)arg->sector * sizeof(struct cd_sector_map_entry);
+    rc                  = obmafs3_read_file_data(g_ctx, &map_inode, sme_offset, &sme, sizeof(sme));
     if(rc != OBMAFS3_OK)
     {
         memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
@@ -596,12 +614,56 @@ static int obmafs3_cd_read_long_sub(struct fuse_file_ctx *ffctx, struct obmafs3_
 
     if(sme.subchannel_hash != 0)
     {
-        uint8_t sub[CD_SUBCHANNEL_DATA_SIZE];
-        rc = obmafs3_cd_subchannel_get(g_ctx, sme.subchannel_hash, sub);
-        if(rc == OBMAFS3_OK) { memcpy(arg->buffer + CD_RAW_SECTOR_SIZE, sub, CD_SUBCHANNEL_SIZE); }
+        if(sme.dedup_subchannel_lba != 0)
+        {
+            /* Use cached leaf location — skip B+Tree traversal */
+            uint8_t *leaf_buf = malloc((size_t)g_ctx->sb.block_size);
+            if(leaf_buf)
+            {
+                rc = obmafs3_block_read(g_ctx, sme.dedup_subchannel_lba, leaf_buf, (size_t)g_ctx->sb.block_size);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct cd_subchannel_record rec;
+                    memcpy(&rec, leaf_buf + sme.dedup_subchannel_offset, sizeof(rec));
+                    if(rec.hash == sme.subchannel_hash)
+                        memcpy(arg->buffer + CD_RAW_SECTOR_SIZE, rec.data, CD_SUBCHANNEL_SIZE);
+                    else
+                    {
+                        /* Cached location stale — fall back to tree lookup */
+                        uint8_t sub[CD_SUBCHANNEL_DATA_SIZE];
+                        rc = obmafs3_cd_subchannel_get(g_ctx, sme.subchannel_hash, sub);
+                        if(rc == OBMAFS3_OK)
+                            memcpy(arg->buffer + CD_RAW_SECTOR_SIZE, sub, CD_SUBCHANNEL_SIZE);
+                        else
+                            memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+                    }
+                }
+                else
+                {
+                    memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+                }
+                free(leaf_buf);
+            }
+            else
+            {
+                /* Allocation failed — fall back to tree lookup */
+                uint8_t sub[CD_SUBCHANNEL_DATA_SIZE];
+                rc = obmafs3_cd_subchannel_get(g_ctx, sme.subchannel_hash, sub);
+                if(rc == OBMAFS3_OK)
+                    memcpy(arg->buffer + CD_RAW_SECTOR_SIZE, sub, CD_SUBCHANNEL_SIZE);
+                else
+                    memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+            }
+        }
         else
         {
-            memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+            uint8_t sub[CD_SUBCHANNEL_DATA_SIZE];
+            rc = obmafs3_cd_subchannel_get(g_ctx, sme.subchannel_hash, sub);
+            if(rc == OBMAFS3_OK) { memcpy(arg->buffer + CD_RAW_SECTOR_SIZE, sub, CD_SUBCHANNEL_SIZE); }
+            else
+            {
+                memset(arg->buffer + CD_RAW_SECTOR_SIZE, 0, CD_SUBCHANNEL_SIZE);
+            }
         }
     }
     else

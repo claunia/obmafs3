@@ -505,19 +505,42 @@ int write_sector_map_batch(struct obmafs3_ctx *ctx, struct inode_record *inode, 
 {
     if(count == 0) return OBMAFS3_OK;
 
+    size_t   hdr_size    = sizeof(struct sector_map_header);
     size_t   entry_size  = sizeof(struct sector_map_entry);
-    uint64_t map_offset  = inode->sector_map_size * entry_size;
+    uint64_t map_offset  = hdr_size + inode->sector_map_size * entry_size;
     size_t   total_bytes = (size_t)(count * entry_size);
 
     /*
      * Temporarily set file_size to the current sector map byte size
-     * so block allocation is computed correctly for the extent-based
-     * storage of sector_map data.
+     * (including the header) so block allocation is computed correctly
+     * for the extent-based storage of sector_map data.
      */
     uint64_t saved_file_size = inode->file_size;
     inode->file_size         = map_offset;
 
-    int rc = obmafs3_write_file_data(ctx, inode, map_offset, entries, total_bytes);
+    int rc;
+
+    /* Write the header when the first entries are appended */
+    if(inode->sector_map_size == 0)
+    {
+        struct sector_map_header smhdr;
+        memset(&smhdr, 0, sizeof(smhdr));
+        smhdr.magic   = OBMAFS3_SECTOR_MAP_MAGIC;
+        smhdr.type    = kSectorMapTypeNormal;
+        smhdr.version = OBMAFS3_SECTOR_MAP_VERSION;
+        /* checksum is zeroed — will be finalized on flush */
+
+        inode->file_size = 0;
+        rc               = obmafs3_write_file_data(ctx, inode, 0, &smhdr, hdr_size);
+        inode->file_size = hdr_size;
+        if(rc != OBMAFS3_OK)
+        {
+            inode->file_size = saved_file_size;
+            return rc;
+        }
+    }
+
+    rc = obmafs3_write_file_data(ctx, inode, map_offset, entries, total_bytes);
 
     /* Restore the logical image size */
     inode->file_size = saved_file_size;
@@ -922,11 +945,37 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         size_t         slen  = sw[idx].len;
         int64_t        snum  = sw[idx].sector_num;
 
+        /* Track dedup block location for this sector */
+        uint64_t cur_dedup_lba = 0;
+        uint64_t cur_dedup_off = 0;
+
         /* Fast path: if the key set or pending buffer confirms this
          * hash exists, skip tree traversal — zero disk I/O. */
         struct dedup_key_set           *ks        = (struct dedup_key_set *)ctx->dedup_key_set;
         const struct dedup_pending_buf *drain_pb2 = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
-        if(keyset_contains(ks, hash) || pending_lookup(pb, hash) || pending_lookup(drain_pb2, hash)) { dedup_hits++; }
+        if(keyset_contains(ks, hash) || pending_lookup(pb, hash) || pending_lookup(drain_pb2, hash))
+        {
+            dedup_hits++;
+            /* Try to retrieve dedup block location from pending buffers or lookup cache */
+            const struct dedup_entry *pe = pending_lookup(pb, hash);
+            if(!pe) pe = pending_lookup(drain_pb2, hash);
+            if(pe)
+            {
+                cur_dedup_lba = pe->block_lba;
+                cur_dedup_off = pe->block_offset;
+            }
+            else
+            {
+                struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+                struct dedup_entry         de_cached;
+                if(dlc && dedup_lc_get(dlc, hash, dedup_hdr_lba, &de_cached))
+                {
+                    cur_dedup_lba = de_cached.block_lba;
+                    cur_dedup_off = de_cached.block_offset;
+                }
+                /* else: leave as 0 — fsck will fill in */
+            }
+        }
         else if(pb && ks)
         {
             /* If sector_size changed (different dedup tree), flush first. */
@@ -965,6 +1014,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             pending_insert(pb, &new_entry);
             keyset_insert(ks, hash);
             pending_deferred++;
+
+            cur_dedup_lba = stored_lba;
+            cur_dedup_off = stored_offset;
         }
         else
         {
@@ -975,7 +1027,12 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             struct dedup_node_cache *nc = (struct dedup_node_cache *)ctx->dedup_node_cache;
             rc                          = dedup_upsert_find(ctx, &dedup_hdr, hash, &existing, &uctx, tree_buf, nc);
 
-            if(rc == OBMAFS3_OK) { dedup_hits++; }
+            if(rc == OBMAFS3_OK)
+            {
+                dedup_hits++;
+                cur_dedup_lba = existing.block_lba;
+                cur_dedup_off = existing.block_offset;
+            }
             else if(rc == OBMAFS3_ERR_NOTFOUND)
             {
                 dedup_misses++;
@@ -1003,6 +1060,9 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                     goto out;
                 }
 
+                cur_dedup_lba = stored_lba;
+                cur_dedup_off = stored_offset;
+
                 /* Add the newly inserted key to the set for future lookups */
                 if(ks) keyset_insert(ks, hash);
             }
@@ -1017,9 +1077,20 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         /* Fill sme_buf at the original position (sector order) */
         if(!skip_sme)
         {
-            sme_buf[idx].sector      = snum;
-            sme_buf[idx].sector_size = sector_size;
-            sme_buf[idx].hash        = hash;
+            sme_buf[idx].sector              = snum;
+            sme_buf[idx].sector_size         = sector_size;
+            sme_buf[idx].hash                = hash;
+            sme_buf[idx].dedup_sector_lba    = cur_dedup_lba;
+            sme_buf[idx].dedup_sector_offset = cur_dedup_off;
+        }
+
+        /* Expose the last dedup location via the persistent block cache
+         * so callers (e.g. CD ioctl path) can populate their own
+         * sector map entries without an extra tree traversal. */
+        if(db_cache)
+        {
+            db_cache->last_dedup_lba    = cur_dedup_lba;
+            db_cache->last_dedup_offset = cur_dedup_off;
         }
 
         /* Update sector count */
@@ -1242,6 +1313,97 @@ out:
 /* ------------------------------------------------------------------ */
 
 /**
+ * Finalize the sector map header checksum.
+ *
+ * Computes an XXH64 hash over the header (with zeroed checksum field)
+ * followed by all entry data on disk, stores the result in the
+ * header's checksum field, and writes the updated header back.
+ *
+ * This function is used by both normal and CD sector map flush paths.
+ *
+ * @param ctx         Filesystem context.
+ * @param inode       Inode whose sector map data is stored.
+ * @param entry_count Total number of entries written.
+ * @param entry_size  Size of each entry in bytes.
+ * @return @c OBMAFS3_OK on success, error code otherwise.
+ */
+int sector_map_finalize_checksum(struct obmafs3_ctx *ctx, struct inode_record *inode, uint64_t entry_count,
+                                 size_t entry_size)
+{
+    size_t   hdr_size   = sizeof(struct sector_map_header);
+    uint64_t total_data = hdr_size + entry_count * entry_size;
+
+    uint64_t saved_file_size = inode->file_size;
+    inode->file_size         = total_data;
+
+    /* Read the existing header */
+    struct sector_map_header smhdr;
+    int                      rc = obmafs3_read_file_data(ctx, inode, 0, &smhdr, hdr_size);
+    if(rc != OBMAFS3_OK)
+    {
+        inode->file_size = saved_file_size;
+        return rc;
+    }
+
+    /* Zero the checksum field for computation */
+    memset(smhdr.checksum, 0, sizeof(smhdr.checksum));
+
+    /* Streaming XXH64 over header + all entries */
+    XXH64_state_t *state = XXH64_createState();
+    if(!state)
+    {
+        inode->file_size = saved_file_size;
+        return OBMAFS3_ERR_NOMEM;
+    }
+    XXH64_reset(state, 0);
+    XXH64_update(state, &smhdr, hdr_size);
+
+    /* Read entries in chunks and feed to hash */
+    size_t   chunk_size = 65536;
+    uint8_t *chunk      = malloc(chunk_size);
+    if(!chunk)
+    {
+        XXH64_freeState(state);
+        inode->file_size = saved_file_size;
+        return OBMAFS3_ERR_NOMEM;
+    }
+
+    uint64_t remaining = entry_count * entry_size;
+    uint64_t offset    = hdr_size;
+    while(remaining > 0)
+    {
+        size_t to_read = remaining < chunk_size ? (size_t)remaining : chunk_size;
+        rc             = obmafs3_read_file_data(ctx, inode, offset, chunk, to_read);
+        if(rc != OBMAFS3_OK)
+        {
+            free(chunk);
+            XXH64_freeState(state);
+            inode->file_size = saved_file_size;
+            return rc;
+        }
+        XXH64_update(state, chunk, to_read);
+        offset += to_read;
+        remaining -= to_read;
+    }
+    free(chunk);
+
+    uint64_t hash = XXH64_digest(state);
+    XXH64_freeState(state);
+
+    /* Store hash in checksum field (first 8 bytes, rest zeroed) */
+    memset(smhdr.checksum, 0, sizeof(smhdr.checksum));
+    memcpy(smhdr.checksum, &hash, sizeof(hash));
+
+    /* Write back the header with the final checksum */
+    rc = obmafs3_write_file_data(ctx, inode, 0, &smhdr, hdr_size);
+
+    inode->file_size = saved_file_size;
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+
+/**
  * Flush cached sector map entries to disk.
  *
  * Writes all accumulated @c sector_map_entry records from @p cache to
@@ -1257,7 +1419,13 @@ int obmafs3_flush_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_record 
     if(!cache || cache->count == 0) return OBMAFS3_OK;
 
     int rc = write_sector_map_batch(ctx, inode, cache->entries, cache->count);
-    if(rc == OBMAFS3_OK) { cache->count = 0; /* keep the buffer for potential reuse */ }
+    if(rc == OBMAFS3_OK)
+    {
+        cache->count = 0; /* keep the buffer for potential reuse */
+
+        /* Finalize the header checksum now that all entries are on disk */
+        rc = sector_map_finalize_checksum(ctx, inode, inode->sector_map_size, sizeof(struct sector_map_entry));
+    }
     return rc;
 }
 

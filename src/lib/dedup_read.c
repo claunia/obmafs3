@@ -39,11 +39,11 @@
 /** Cached dedup data block that persists across FUSE read calls. */
 struct media_dedup_block_cache
 {
-    uint8_t *dedup_buf;        ///< Raw on-disk dedup block (dedup_block_size bytes)
-    uint8_t *decomp_buf;      ///< Decompressed payload (lazy, dedup_block_size bytes)
-    uint64_t cached_lba;      ///< LBA of the block currently in dedup_buf (0 = none)
-    int      compressed;      ///< Non-zero when decomp_buf holds decompressed data
-    uint64_t block_size;      ///< Expected dedup_block_size (for validation)
+    uint8_t *dedup_buf;   ///< Raw on-disk dedup block (dedup_block_size bytes)
+    uint8_t *decomp_buf;  ///< Decompressed payload (lazy, dedup_block_size bytes)
+    uint64_t cached_lba;  ///< LBA of the block currently in dedup_buf (0 = none)
+    int      compressed;  ///< Non-zero when decomp_buf holds decompressed data
+    uint64_t block_size;  ///< Expected dedup_block_size (for validation)
 };
 
 /* ------------------------------------------------------------------ */
@@ -74,12 +74,12 @@ static int hash_pair_cmp(const void *a, const void *b)
 /** Work descriptor for one parallel leaf-read thread. */
 struct leaf_read_work
 {
-    int                      fd;      ///< file descriptor (pread is thread-safe)
-    const uint64_t          *lbas;    ///< sorted, deduplicated leaf LBAs
-    uint8_t                 *bufs;    ///< output buffer: bsz * (end - start) bytes
-    uint64_t                 start;   ///< first index (inclusive)
-    uint64_t                 end;     ///< last index (exclusive)
-    size_t                   bsz;
+    int             fd;     ///< file descriptor (pread is thread-safe)
+    const uint64_t *lbas;   ///< sorted, deduplicated leaf LBAs
+    uint8_t        *bufs;   ///< output buffer: bsz * (end - start) bytes
+    uint64_t        start;  ///< first index (inclusive)
+    uint64_t        end;    ///< last index (exclusive)
+    size_t          bsz;
 };
 
 /**
@@ -93,10 +93,7 @@ static void *leaf_read_worker(void *arg)
 
     for(uint64_t i = w->start; i < w->end; i++)
     {
-        pread(w->fd,
-              w->bufs + (i - w->start) * w->bsz,
-              w->bsz,
-              (off_t)(w->lbas[i] * w->bsz));
+        pread(w->fd, w->bufs + (i - w->start) * w->bsz, w->bsz, (off_t)(w->lbas[i] * w->bsz));
     }
     return NULL;
 }
@@ -124,8 +121,7 @@ static void *leaf_read_worker(void *arg)
  * @return OBMAFS3_OK on success, error code otherwise.
  */
 int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
-                                  size_t size, uint16_t sector_size, void *leaf_cache,
-                                  void *dedup_cache)
+                                  size_t size, uint16_t sector_size, void *leaf_cache, void *dedup_cache)
 {
     if(offset >= inode->file_size) return OBMAFS3_OK;
 
@@ -164,9 +160,9 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     /* Temporary inode copy for reading sector map (need to adjust file_size) */
     struct inode_record map_inode;
     memcpy(&map_inode, inode, sizeof(map_inode));
-    map_inode.file_size = inode->sector_map_size * sizeof(struct sector_map_entry);
+    map_inode.file_size = sizeof(struct sector_map_header) + inode->sector_map_size * sizeof(struct sector_map_entry);
 
-    uint64_t sme_offset = (uint64_t)first_sector * sizeof(struct sector_map_entry);
+    uint64_t sme_offset = sizeof(struct sector_map_header) + (uint64_t)first_sector * sizeof(struct sector_map_entry);
     rc                  = obmafs3_read_file_data(ctx, &map_inode, sme_offset, sme_batch,
                                                  (size_t)(sme_count * sizeof(struct sector_map_entry)));
     if(rc != OBMAFS3_OK)
@@ -196,11 +192,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
     if(dbc)
     {
-        dedup_buf        = dbc->dedup_buf;
-        decomp_buf       = dbc->decomp_buf;
-        cached_dedup_lba = dbc->cached_lba;
+        dedup_buf         = dbc->dedup_buf;
+        decomp_buf        = dbc->decomp_buf;
+        cached_dedup_lba  = dbc->cached_lba;
         cached_compressed = dbc->compressed;
-        owns_dedup_bufs  = 0;
+        owns_dedup_bufs   = 0;
     }
     else
     {
@@ -210,10 +206,10 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             free(sme_batch);
             DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
-        decomp_buf       = NULL;
-        cached_dedup_lba = 0;
+        decomp_buf        = NULL;
+        cached_dedup_lba  = 0;
         cached_compressed = 0;
-        owns_dedup_bufs  = 1;
+        owns_dedup_bufs   = 1;
     }
 
     /* Leaf-level lookup cache: avoids full tree traversal when
@@ -249,7 +245,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
      *  (c) Duplicate hashes (e.g. zero sectors) are looked up only
      *      once instead of once per sector.
      */
-    struct hash_lookup_pair *pairs = malloc((size_t)(sme_count * sizeof(struct hash_lookup_pair)));
+    struct hash_lookup_pair *pairs      = malloc((size_t)(sme_count * sizeof(struct hash_lookup_pair)));
     struct dedup_entry      *de_results = malloc((size_t)(sme_count * sizeof(struct dedup_entry)));
     if(!pairs || !de_results)
     {
@@ -257,17 +253,40 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         free(de_results);
         if(owns_leaf_cache) free(lc->leaf_buf);
         free(sme_batch);
-        if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+        if(owns_dedup_bufs)
+        {
+            free(decomp_buf);
+            free(dedup_buf);
+        }
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
+    /* ---- Phase 0: Use cached dedup locations where available ----
+     *
+     * When dedup_sector_lba is non-zero, the sector_map_entry already
+     * caches the immutable dedup block location.  Populate de_results
+     * directly and only add entries that lack cached info to the
+     * pairs array for tree lookup. */
+    uint64_t need_lookup = 0;
+    uint64_t cached_hits = 0;
     for(uint64_t i = 0; i < sme_count; i++)
     {
-        pairs[i].hash    = sme_batch[i].hash;
-        pairs[i].sme_idx = i;
+        if(sme_batch[i].dedup_sector_lba != 0)
+        {
+            de_results[i].hash         = sme_batch[i].hash;
+            de_results[i].block_lba    = sme_batch[i].dedup_sector_lba;
+            de_results[i].block_offset = sme_batch[i].dedup_sector_offset;
+            cached_hits++;
+        }
+        else
+        {
+            pairs[need_lookup].hash    = sme_batch[i].hash;
+            pairs[need_lookup].sme_idx = i;
+            need_lookup++;
+        }
     }
 
-    qsort(pairs, (size_t)sme_count, sizeof(struct hash_lookup_pair), hash_pair_cmp);
+    qsort(pairs, (size_t)need_lookup, sizeof(struct hash_lookup_pair), hash_pair_cmp);
 
     clock_gettime(CLOCK_MONOTONIC, &t_sort);
 
@@ -295,18 +314,16 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
         struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
 
         /* Collect unique hashes that need tree lookup. */
-        uint64_t *need_hashes = malloc((size_t)(sme_count * sizeof(uint64_t)));
+        uint64_t *need_hashes = malloc((size_t)(need_lookup * sizeof(uint64_t)));
         uint64_t  need_count  = 0;
 
         if(need_hashes)
         {
-            for(uint64_t i = 0; i < sme_count; i++)
+            for(uint64_t i = 0; i < need_lookup; i++)
             {
-                if(i > 0 && pairs[i].hash == pairs[i - 1].hash)
-                    continue;
+                if(i > 0 && pairs[i].hash == pairs[i - 1].hash) continue;
                 struct dedup_entry dummy;
-                if(dlc && dedup_lc_get(dlc, pairs[i].hash, dedup_hdr_lba, &dummy))
-                    continue;
+                if(dlc && dedup_lc_get(dlc, pairs[i].hash, dedup_hdr_lba, &dummy)) continue;
                 need_hashes[need_count++] = pairs[i].hash;
             }
         }
@@ -320,8 +337,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 struct timespec t_bd_start, t_bd_end, t_lr_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_bd_start);
 
-                dedup_batch_find_leaves(ctx, &dedup_hdr, need_hashes,
-                                        need_count, leaf_lbas, nc);
+                dedup_batch_find_leaves(ctx, &dedup_hdr, need_hashes, need_count, leaf_lbas, nc);
 
                 clock_gettime(CLOCK_MONOTONIC, &t_bd_end);
 
@@ -330,15 +346,14 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
                 uint64_t unique_leaves = 0;
                 for(uint64_t i = 0; i < need_count; i++)
-                    if(leaf_lbas[i] != 0 &&
-                       (i == 0 || leaf_lbas[i] != leaf_lbas[i - 1]))
+                    if(leaf_lbas[i] != 0 && (i == 0 || leaf_lbas[i] != leaf_lbas[i - 1]))
                         leaf_lbas[unique_leaves++] = leaf_lbas[i];
 
                 if(nc && unique_leaves > 0)
                 {
-                    size_t   bsz        = (size_t)ctx->sb.block_size;
-                    uint64_t lba_lo     = leaf_lbas[0];
-                    uint64_t lba_hi     = leaf_lbas[unique_leaves - 1];
+                    size_t   bsz         = (size_t)ctx->sb.block_size;
+                    uint64_t lba_lo      = leaf_lbas[0];
+                    uint64_t lba_hi      = leaf_lbas[unique_leaves - 1];
                     size_t   range_bytes = (size_t)((lba_hi - lba_lo + 1) * bsz);
 
                     if(range_bytes <= 64u * 1024 * 1024)
@@ -346,16 +361,13 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                         uint8_t *bulk = malloc(range_bytes);
                         if(bulk)
                         {
-                            ssize_t got = pread(ctx->fd, bulk, range_bytes,
-                                                (off_t)(lba_lo * bsz));
+                            ssize_t got = pread(ctx->fd, bulk, range_bytes, (off_t)(lba_lo * bsz));
                             if(got > 0)
                             {
                                 for(uint64_t i = 0; i < unique_leaves; i++)
                                 {
                                     size_t off = (size_t)((leaf_lbas[i] - lba_lo) * bsz);
-                                    if(off + bsz <= (size_t)got)
-                                        dedup_cache_insert(nc, leaf_lbas[i],
-                                                           bulk + off);
+                                    if(off + bsz <= (size_t)got) dedup_cache_insert(nc, leaf_lbas[i], bulk + off);
                                 }
                             }
                             free(bulk);
@@ -397,19 +409,16 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                              * kernel can start prefetching while we
                              * spawn threads. */
                             for(uint64_t i = 0; i < unique_leaves; i++)
-                                posix_fadvise(ctx->fd,
-                                              (off_t)(leaf_lbas[i] * bsz),
-                                              (off_t)bsz, POSIX_FADV_WILLNEED);
+                                posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz), (off_t)bsz, POSIX_FADV_WILLNEED);
 
                             int n_threads = LEAF_READ_THREADS;
-                            if((uint64_t)n_threads > unique_leaves)
-                                n_threads = (int)unique_leaves;
+                            if((uint64_t)n_threads > unique_leaves) n_threads = (int)unique_leaves;
 
                             pthread_t             tids[LEAF_READ_THREADS];
-                            struct leaf_read_work  work[LEAF_READ_THREADS];
-                            uint64_t per = unique_leaves / (uint64_t)n_threads;
-                            uint64_t rem = unique_leaves % (uint64_t)n_threads;
-                            uint64_t pos = 0;
+                            struct leaf_read_work work[LEAF_READ_THREADS];
+                            uint64_t              per = unique_leaves / (uint64_t)n_threads;
+                            uint64_t              rem = unique_leaves % (uint64_t)n_threads;
+                            uint64_t              pos = 0;
 
                             for(int t = 0; t < n_threads; t++)
                             {
@@ -418,19 +427,16 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                                 work[t].bsz   = bsz;
                                 work[t].start = pos;
                                 pos += per + ((uint64_t)t < rem ? 1 : 0);
-                                work[t].end   = pos;
-                                work[t].bufs  = all_bufs + work[t].start * bsz;
-                                pthread_create(&tids[t], NULL,
-                                               leaf_read_worker, &work[t]);
+                                work[t].end  = pos;
+                                work[t].bufs = all_bufs + work[t].start * bsz;
+                                pthread_create(&tids[t], NULL, leaf_read_worker, &work[t]);
                             }
-                            for(int t = 0; t < n_threads; t++)
-                                pthread_join(tids[t], NULL);
+                            for(int t = 0; t < n_threads; t++) pthread_join(tids[t], NULL);
 
                             /* Single-threaded batch insert — no mutex
                              * contention, no disk I/O. */
                             for(uint64_t i = 0; i < unique_leaves; i++)
-                                dedup_cache_insert(nc, leaf_lbas[i],
-                                                   all_bufs + i * bsz);
+                                dedup_cache_insert(nc, leaf_lbas[i], all_bufs + i * bsz);
 
                             free(all_bufs);
                         }
@@ -440,18 +446,18 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
                 clock_gettime(CLOCK_MONOTONIC, &t_lr_end);
                 {
-                    double bd_ms = (t_bd_end.tv_sec - t_bd_start.tv_sec) * 1000.0
-                                 + (t_bd_end.tv_nsec - t_bd_start.tv_nsec) / 1e6;
-                    double lr_ms = (t_lr_end.tv_sec - t_bd_end.tv_sec) * 1000.0
-                                 + (t_lr_end.tv_nsec - t_bd_end.tv_nsec) / 1e6;
-                    fprintf(stderr, "[prefetch-split] batch_descent=%.1fms  leaf_read=%.1fms  "
+                    double bd_ms =
+                        (t_bd_end.tv_sec - t_bd_start.tv_sec) * 1000.0 + (t_bd_end.tv_nsec - t_bd_start.tv_nsec) / 1e6;
+                    double lr_ms =
+                        (t_lr_end.tv_sec - t_bd_end.tv_sec) * 1000.0 + (t_lr_end.tv_nsec - t_bd_end.tv_nsec) / 1e6;
+                    fprintf(stderr,
+                            "[prefetch-split] batch_descent=%.1fms  leaf_read=%.1fms  "
                             "need=%llu  unique_leaves=%llu  range=%.1fKiB\n",
-                            bd_ms, lr_ms,
-                            (unsigned long long)need_count,
-                            (unsigned long long)unique_leaves,
-                            (nc && unique_leaves > 0)
-                              ? ((double)((leaf_lbas[unique_leaves-1] - leaf_lbas[0] + 1) * (uint64_t)ctx->sb.block_size) / 1024.0)
-                              : 0.0);
+                            bd_ms, lr_ms, (unsigned long long)need_count, (unsigned long long)unique_leaves,
+                            (nc && unique_leaves > 0) ? ((double)((leaf_lbas[unique_leaves - 1] - leaf_lbas[0] + 1) *
+                                                                  (uint64_t)ctx->sb.block_size) /
+                                                         1024.0)
+                                                      : 0.0);
                 }
                 free(leaf_lbas);
             }
@@ -465,7 +471,7 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     uint64_t dedup_unique = 0, dedup_dup = 0, dedup_lc_hits = 0;
 
     /* Look up each unique hash once in sorted order. */
-    for(uint64_t i = 0; i < sme_count; i++)
+    for(uint64_t i = 0; i < need_lookup; i++)
     {
         /* Deduplicate: reuse the previous result for identical hashes. */
         if(i > 0 && pairs[i].hash == pairs[i - 1].hash)
@@ -489,7 +495,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             free(de_results);
             if(owns_leaf_cache) free(lc->leaf_buf);
             free(sme_batch);
-            if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+            if(owns_dedup_bufs)
+            {
+                free(decomp_buf);
+                free(dedup_buf);
+            }
             return rc;
         }
         de_results[pairs[i].sme_idx] = de;
@@ -532,7 +542,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 free(de_results);
                 if(owns_leaf_cache) free(lc->leaf_buf);
                 free(sme_batch);
-                if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+                if(owns_dedup_bufs)
+                {
+                    free(decomp_buf);
+                    free(dedup_buf);
+                }
                 return rc;
             }
 
@@ -543,15 +557,18 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
             if(bhdr.magic != OBMAFS3_BLOCK_MAGIC)
             {
                 fprintf(stderr,
-                        "[read_media_image] BAD BLOCK MAGIC at lba=%" PRIu64 " hash=%" PRIu64
-                        " block_offset=%" PRIu64 " sector=%" PRId64
-                        " magic=0x%" PRIX64 " (expected 0x%" PRIX64 ")\n",
+                        "[read_media_image] BAD BLOCK MAGIC at lba=%" PRIu64 " hash=%" PRIu64 " block_offset=%" PRIu64
+                        " sector=%" PRId64 " magic=0x%" PRIX64 " (expected 0x%" PRIX64 ")\n",
                         de.block_lba, de.hash, de.block_offset, (int64_t)(offset + bytes_read) / (int64_t)sector_size,
                         bhdr.magic, (uint64_t)OBMAFS3_BLOCK_MAGIC);
                 free(de_results);
                 if(owns_leaf_cache) free(lc->leaf_buf);
                 free(sme_batch);
-                if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+                if(owns_dedup_bufs)
+                {
+                    free(decomp_buf);
+                    free(dedup_buf);
+                }
                 DBG_RETURN(OBMAFS3_ERR_IO, "bad block magic in dedup data block");
             }
 
@@ -575,7 +592,11 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     free(de_results);
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
-                    if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+                    if(owns_dedup_bufs)
+                    {
+                        free(decomp_buf);
+                        free(dedup_buf);
+                    }
                     return rc;
                 }
             }
@@ -605,16 +626,19 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                 {
                     fprintf(stderr,
                             "[read_media_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64
-                            " block_offset=%" PRIu64 " sector=%" PRId64
-                            " compressed_size=%" PRIu64 " original_size=%" PRIu64
-                            " needed_std=%" PRIu64 " flags=0x%02x\n",
+                            " block_offset=%" PRIu64 " sector=%" PRId64 " compressed_size=%" PRIu64
+                            " original_size=%" PRIu64 " needed_std=%" PRIu64 " flags=0x%02x\n",
                             de.block_lba, de.hash, de.block_offset,
-                            (int64_t)(offset + bytes_read) / (int64_t)sector_size,
-                            bhdr.compressed_size, bhdr.original_size, needed_std, bhdr.flags);
+                            (int64_t)(offset + bytes_read) / (int64_t)sector_size, bhdr.compressed_size,
+                            bhdr.original_size, needed_std, bhdr.flags);
                     free(de_results);
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
-                    if(owns_dedup_bufs) { free(decomp_buf); free(dedup_buf); }
+                    if(owns_dedup_bufs)
+                    {
+                        free(decomp_buf);
+                        free(dedup_buf);
+                    }
                     return rc;
                 }
                 cached_compressed = 1;
@@ -661,35 +685,32 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
     free(sme_batch);
 
     {
-        struct dedup_node_cache  *nc  = (struct dedup_node_cache *)ctx->dedup_node_cache;
-        struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
-        uint32_t nc_count = nc ? nc->count : 0;
-        uint32_t nc_cap   = nc ? nc->capacity : 0;
-        uint64_t dlc_count = dlc ? dlc->count : 0;
-        uint64_t dlc_cap   = dlc ? dlc->capacity : 0;
+        struct dedup_node_cache   *nc        = (struct dedup_node_cache *)ctx->dedup_node_cache;
+        struct dedup_lookup_cache *dlc       = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+        uint32_t                   nc_count  = nc ? nc->count : 0;
+        uint32_t                   nc_cap    = nc ? nc->capacity : 0;
+        uint64_t                   dlc_count = dlc ? dlc->count : 0;
+        uint64_t                   dlc_cap   = dlc ? dlc->capacity : 0;
         fprintf(stderr,
                 "[read-timing] read %zu bytes @ %" PRIu64 " ss=%u: "
-                "get_tree=%.1fms  sme_read=%.1fms(%" PRIu64 " sectors)  "
+                "get_tree=%.1fms  sme_read=%.1fms(%" PRIu64 " sectors, %" PRIu64 " cached)  "
                 "sort=%.1fms  prefetch=%.1fms(%" PRIu64 " leaves)  "
                 "dedup_lookup=%.1fms(uniq=%" PRIu64 " dup=%" PRIu64 ")  "
                 "data_read=%.1fms(blks=%" PRIu64 " decomps=%" PRIu64 ")  "
                 "TOTAL=%.1fms  nc=%u/%u dlc=%" PRIu64 "/%" PRIu64 "\n",
-                size, offset, sector_size,
-                timespec_diff_ms(&t_start, &t_get_tree),
-                timespec_diff_ms(&t_get_tree, &t_sme_read), sme_count,
-                timespec_diff_ms(&t_sme_read, &t_sort),
-                timespec_diff_ms(&t_sort, &t_prefetch), prefetch_leaves,
+                size, offset, sector_size, timespec_diff_ms(&t_start, &t_get_tree),
+                timespec_diff_ms(&t_get_tree, &t_sme_read), sme_count, cached_hits,
+                timespec_diff_ms(&t_sme_read, &t_sort), timespec_diff_ms(&t_sort, &t_prefetch), prefetch_leaves,
                 timespec_diff_ms(&t_prefetch, &t_dedup_lookup), dedup_unique, dedup_dup,
                 timespec_diff_ms(&t_dedup_lookup, &t_data_read), data_block_reads, data_decomps,
-                timespec_diff_ms(&t_start, &t_data_read),
-                nc_count, nc_cap, dlc_count, dlc_cap);
+                timespec_diff_ms(&t_start, &t_data_read), nc_count, nc_cap, dlc_count, dlc_cap);
     }
 
     /* Write back cached state so the next call can reuse the block */
     if(dbc)
     {
-        dbc->cached_lba  = cached_dedup_lba;
-        dbc->compressed  = cached_compressed;
+        dbc->cached_lba = cached_dedup_lba;
+        dbc->compressed = cached_compressed;
     }
     else
     {
@@ -753,9 +774,9 @@ void *obmafs3_alloc_media_dedup_cache(struct obmafs3_ctx *ctx)
     }
 
     /* decomp_buf is allocated lazily on first compressed block */
-    c->cached_lba  = 0;
-    c->compressed  = 0;
-    c->block_size  = ctx->sb.dedup_block_size;
+    c->cached_lba = 0;
+    c->compressed = 0;
+    c->block_size = ctx->sb.dedup_block_size;
     return c;
 }
 
@@ -824,9 +845,9 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
         struct inode_record map_inode;
         memcpy(&map_inode, inode, sizeof(map_inode));
-        map_inode.file_size = total_entries * sizeof(struct cd_sector_map_entry);
+        map_inode.file_size = sizeof(struct sector_map_header) + total_entries * sizeof(struct cd_sector_map_entry);
 
-        int rc = obmafs3_read_file_data(ctx, &map_inode, 0, sme_all,
+        int rc = obmafs3_read_file_data(ctx, &map_inode, sizeof(struct sector_map_header), sme_all,
                                         (size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
         if(rc != OBMAFS3_OK)
         {
@@ -855,7 +876,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
     /* Cached dedup tree header (changes when the sector's data_size changes) */
     struct btree_header cached_dedup_hdr;
     uint64_t            cached_dedup_hdr_lba = 0;
-    uint16_t            cached_data_size = 0;
+    uint16_t            cached_data_size     = 0;
 
     int      rc         = OBMAFS3_OK;
     uint8_t *out        = (uint8_t *)buf;
@@ -947,13 +968,24 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
 
         /* ---- Look up the sector's hash in the dedup tree ---- */
         struct dedup_entry de;
-        rc = dedup_lookup_cached(ctx, &cached_dedup_hdr, cached_dedup_hdr_lba, sme->hash, &de, &leaf_cache);
-        if(rc != OBMAFS3_OK)
+        if(sme->dedup_sector_lba != 0)
         {
-            fprintf(stderr,
-                    "[read_cd_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sector=%" PRId64 " inode=%" PRIu64 "\n",
-                    rc, sme->hash, sector_num, inode->inode_id);
-            goto fail;
+            /* Use cached dedup location — skip tree traversal */
+            de.hash         = sme->hash;
+            de.block_lba    = sme->dedup_sector_lba;
+            de.block_offset = sme->dedup_sector_offset;
+        }
+        else
+        {
+            rc = dedup_lookup_cached(ctx, &cached_dedup_hdr, cached_dedup_hdr_lba, sme->hash, &de, &leaf_cache);
+            if(rc != OBMAFS3_OK)
+            {
+                fprintf(stderr,
+                        "[read_cd_image] dedup_lookup FAILED rc=%d hash=%" PRIu64 " sector=%" PRId64 " inode=%" PRIu64
+                        "\n",
+                        rc, sme->hash, sector_num, inode->inode_id);
+                goto fail;
+            }
         }
 
         /* ---- Read the dedup data block if not already cached ---- */
@@ -968,11 +1000,9 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
             if(bhdr.magic != OBMAFS3_BLOCK_MAGIC)
             {
                 fprintf(stderr,
-                        "[read_cd_image] BAD BLOCK MAGIC at lba=%" PRIu64 " hash=%" PRIu64
-                        " block_offset=%" PRIu64 " sector=%" PRId64
-                        " magic=0x%" PRIX64 " (expected 0x%" PRIX64 ")\n",
-                        de.block_lba, de.hash, de.block_offset, sector_num,
-                        bhdr.magic, (uint64_t)OBMAFS3_BLOCK_MAGIC);
+                        "[read_cd_image] BAD BLOCK MAGIC at lba=%" PRIu64 " hash=%" PRIu64 " block_offset=%" PRIu64
+                        " sector=%" PRId64 " magic=0x%" PRIX64 " (expected 0x%" PRIX64 ")\n",
+                        de.block_lba, de.hash, de.block_offset, sector_num, bhdr.magic, (uint64_t)OBMAFS3_BLOCK_MAGIC);
                 rc = OBMAFS3_ERR_IO;
                 goto fail;
             }
@@ -1007,12 +1037,11 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                 if(rc != OBMAFS3_OK)
                 {
                     fprintf(stderr,
-                            "[read_cd_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64
-                            " block_offset=%" PRIu64 " sector=%" PRId64
-                            " compressed_size=%" PRIu64 " original_size=%" PRIu64
+                            "[read_cd_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64 " block_offset=%" PRIu64
+                            " sector=%" PRId64 " compressed_size=%" PRIu64 " original_size=%" PRIu64
                             " needed_std=%" PRIu64 " flags=0x%02x\n",
-                            de.block_lba, de.hash, de.block_offset, sector_num,
-                            bhdr.compressed_size, bhdr.original_size, needed_std, bhdr.flags);
+                            de.block_lba, de.hash, de.block_offset, sector_num, bhdr.compressed_size,
+                            bhdr.original_size, needed_std, bhdr.flags);
                     goto fail;
                 }
                 cached_compressed = 1;
@@ -1158,9 +1187,9 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
 
         struct inode_record map_inode;
         memcpy(&map_inode, &parent_inode, sizeof(map_inode));
-        map_inode.file_size = total_entries * sizeof(struct cd_sector_map_entry);
+        map_inode.file_size = sizeof(struct sector_map_header) + total_entries * sizeof(struct cd_sector_map_entry);
 
-        rc = obmafs3_read_file_data(ctx, &map_inode, 0, sme_all,
+        rc = obmafs3_read_file_data(ctx, &map_inode, sizeof(struct sector_map_header), sme_all,
                                     (size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
         if(rc != OBMAFS3_OK)
         {
@@ -1183,7 +1212,9 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
         size_t chunk               = remaining_in_read < remaining_in_sector ? remaining_in_read : remaining_in_sector;
 
         /* Binary search for this sector number */
-        uint64_t subchannel_hash = 0;
+        uint64_t subchannel_hash   = 0;
+        uint64_t sub_cached_lba    = 0;
+        uint64_t sub_cached_offset = 0;
         if(sme_all && total_entries > 0)
         {
             int64_t lo = 0, hi = (int64_t)total_entries - 1;
@@ -1192,7 +1223,9 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
                 int64_t mid = lo + (hi - lo) / 2;
                 if(sme_all[mid].sector == sector_num)
                 {
-                    subchannel_hash = sme_all[mid].subchannel_hash;
+                    subchannel_hash   = sme_all[mid].subchannel_hash;
+                    sub_cached_lba    = sme_all[mid].dedup_subchannel_lba;
+                    sub_cached_offset = sme_all[mid].dedup_subchannel_offset;
                     break;
                 }
                 else if(sme_all[mid].sector < sector_num)
@@ -1206,8 +1239,35 @@ int obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_rec
         uint8_t sub_sector[CD_SUBCHANNEL_DATA_SIZE];
         if(subchannel_hash != 0)
         {
-            rc = obmafs3_cd_subchannel_get(ctx, subchannel_hash, sub_sector);
-            if(rc != OBMAFS3_OK) memset(sub_sector, 0, CD_SUBCHANNEL_DATA_SIZE);
+            if(sub_cached_lba != 0)
+            {
+                /* Use cached leaf location — skip B+Tree traversal.
+                 * Read the leaf block directly and extract the record. */
+                uint8_t *leaf_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
+                rc                = obmafs3_block_read(ctx, sub_cached_lba, leaf_buf, (size_t)ctx->sb.block_size);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct cd_subchannel_record rec;
+                    memcpy(&rec, leaf_buf + sub_cached_offset, sizeof(rec));
+                    if(rec.hash == subchannel_hash)
+                        memcpy(sub_sector, rec.data, CD_SUBCHANNEL_DATA_SIZE);
+                    else
+                    {
+                        /* Cached location stale — fall back to tree lookup */
+                        rc = obmafs3_cd_subchannel_get(ctx, subchannel_hash, sub_sector);
+                        if(rc != OBMAFS3_OK) memset(sub_sector, 0, CD_SUBCHANNEL_DATA_SIZE);
+                    }
+                }
+                else
+                {
+                    memset(sub_sector, 0, CD_SUBCHANNEL_DATA_SIZE);
+                }
+            }
+            else
+            {
+                rc = obmafs3_cd_subchannel_get(ctx, subchannel_hash, sub_sector);
+                if(rc != OBMAFS3_OK) memset(sub_sector, 0, CD_SUBCHANNEL_DATA_SIZE);
+            }
         }
         else
         {
@@ -1243,14 +1303,37 @@ static int write_cd_sector_map_batch(struct obmafs3_ctx *ctx, struct inode_recor
 {
     if(count == 0) return OBMAFS3_OK;
 
+    size_t   hdr_size    = sizeof(struct sector_map_header);
     size_t   entry_size  = sizeof(struct cd_sector_map_entry);
-    uint64_t map_offset  = inode->sector_map_size * entry_size;
+    uint64_t map_offset  = hdr_size + inode->sector_map_size * entry_size;
     size_t   total_bytes = (size_t)(count * entry_size);
 
     uint64_t saved_file_size = inode->file_size;
     inode->file_size         = map_offset;
 
-    int rc = obmafs3_write_file_data(ctx, inode, map_offset, entries, total_bytes);
+    int rc;
+
+    /* Write the header when the first entries are appended */
+    if(inode->sector_map_size == 0)
+    {
+        struct sector_map_header smhdr;
+        memset(&smhdr, 0, sizeof(smhdr));
+        smhdr.magic   = OBMAFS3_SECTOR_MAP_MAGIC;
+        smhdr.type    = kSectorMapTypeCd;
+        smhdr.version = OBMAFS3_SECTOR_MAP_VERSION;
+        /* checksum is zeroed — will be finalized on flush */
+
+        inode->file_size = 0;
+        rc               = obmafs3_write_file_data(ctx, inode, 0, &smhdr, hdr_size);
+        inode->file_size = hdr_size;
+        if(rc != OBMAFS3_OK)
+        {
+            inode->file_size = saved_file_size;
+            return rc;
+        }
+    }
+
+    rc = obmafs3_write_file_data(ctx, inode, map_offset, entries, total_bytes);
 
     inode->file_size = saved_file_size;
 
@@ -1276,7 +1359,13 @@ int obmafs3_flush_cd_sector_map_cache(struct obmafs3_ctx *ctx, struct inode_reco
     if(!cache || cache->count == 0) return OBMAFS3_OK;
 
     int rc = write_cd_sector_map_batch(ctx, inode, cache->entries, cache->count);
-    if(rc == OBMAFS3_OK) { cache->count = 0; }
+    if(rc == OBMAFS3_OK)
+    {
+        cache->count = 0;
+
+        /* Finalize the header checksum now that all entries are on disk */
+        rc = sector_map_finalize_checksum(ctx, inode, inode->sector_map_size, sizeof(struct cd_sector_map_entry));
+    }
     return rc;
 }
 
