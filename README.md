@@ -263,9 +263,55 @@ mkdir -p /mnt/archive
 # Import an Aaru image
 ./build/src/import-aif/import-aif /path/to/image.aif /mnt/archive/my_disc.iso
 
+# Copy an image into the archive
+cp /path/to/another_disc.iso /mnt/archive/
+
+# Copy an image out of the archive
+cp /mnt/archive/my_disc.iso /path/to/exported_disc.iso
+
 # Query metadata
 ./build/src/obmafs-query/obmafs-query /mnt/archive
 ```
+
+## Frequently Asked Questions
+
+### Why is it called OBMAFS3?
+
+The name originated in 2015: it stores media images as **objects** (sectors) rather than as opaque files, and it is a **media archival filesystem**. The "3" denotes the third major iteration of the on-disk format and overall design.
+
+### Is it stable enough for production use?
+
+Not yet. OBMAFS3 is still in its pre-1.0 phase, and the on-disk format may still change between releases. That said, it has been under heavy development and testing, and it should be **relatively stable for evaluation and non-critical use** today. If you plan to rely on it for a critical archive, we recommend waiting for the 1.0 release.
+
+### What kind of files can I store in OBMAFS3?
+
+OBMAFS3 is optimized for disk images, but it can store any file. Feel free to keep your `cover.jpg`, `cheats.ini`, `readme.txt`, or any other supplementary files alongside your images — they will be stored and served correctly. However, non-image files will not benefit from sector-level deduplication and may see lower write performance. For best results, use OBMAFS3 primarily for collections of media images.
+
+Regarding media image formats: the simplest path is to use **raw, block-by-block disk images** — files that contain no header and are simply a sequence of consecutive sectors, such as `.iso`, `.dsk`, or `.img`. More complex multi-file formats like `.cue`/`.bin` or `.ccd`/`.img`/`.sub` are not supported directly; they must first be converted to `Aaru Image Format` (`.aif`) and then imported using `import-aif`.
+
+Additionally, OBMAFS3 implements the `copy_file_range(2)` system call, so external file-level deduplication tools (e.g., `rdfind`, `fdupes`) can still work on top of OBMAFS3 to eliminate duplicate files that do not share sectors. Note that tools which hardcode a dependency on `btrfs` will not work. This feature is currently untested.
+
+### How can I grow the filesystem?
+
+OBMAFS3 is designed to be used **directly on a block device** (hard drive, SSD, or partition) rather than as a file-backed image inside another filesystem. We understand that during the testing phase some users prefer working with image files, and we are exploring support for online filesystem growth, but this is not yet implemented. For now, if you need more space, you will need to create a new, larger filesystem and migrate your data to it.
+
+### Why does copying stall briefly when switching between files with different sector sizes?
+
+For performance, OBMAFS3 delegates B+Tree rebalancing to background threads. When you finish writing a file with one sector size (e.g., 512 bytes) and immediately begin writing a file with a different sector size (e.g., 2048 bytes), the foreground thread may need to wait for the background rebalancing to complete before it can proceed. This pause is inherent to the design. To minimize its impact, batch your copies by sector size — copy all files of one sector size first, then move on to the next.
+
+### `obmafsck` appears stuck at "Refcount validation" — is something wrong?
+
+No, it is not stuck. The refcount validation phase is computationally intensive and can take considerably longer than the other phases. We are working on improving progress feedback during this step, but for now the best course of action is to let it run to completion. The time required depends on the volume size and the amount of stored data; for large filesystems, this phase can take several minutes or more.
+
+### Why do Wii disc images show poor deduplication?
+
+Wii disc data is encrypted, which makes it effectively indistinguishable from random data — and random data does not deduplicate. We are investigating the possibility of storing Wii disc content in decrypted form and transparently re-encrypting it on read, which would allow deduplication to work as expected. However, this requires a thorough understanding of the Wii encryption scheme, and contributions from anyone with relevant expertise are very welcome. The same challenge applies to PlayStation 3, 4, and 5 discs, as well as Xbox One discs, though at present only the PlayStation 3 encryption is publicly understood.
+
+### Why does a pre-compressed media image deduplicate poorly?
+
+Compression transforms data into a high-entropy stream that appears effectively random, and it also destroys sector alignment. As a result, OBMAFS3's sector-level deduplication has nothing meaningful to match against. The solution is simple: **decompress the image before storing it**. OBMAFS3 already applies Zstandard compression internally, so your data will still be stored efficiently.
+
+This applies even to very large images. For example, an SBC (Single Board Computer) disk image that is 16 GB uncompressed and roughly 1 GB in its externally compressed form will typically end up **smaller** inside OBMAFS3 than the pre-compressed file, because deduplication eliminates redundant sectors before compression is applied. Decompress first and let OBMAFS3 handle the rest — you get the best of both worlds.
 
 ## Development with VS Code
 
