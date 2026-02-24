@@ -49,21 +49,40 @@ void compute_node_checksum(uint8_t *buf)
 /*  In-memory write-back cache for dedup B+Tree nodes                  */
 /* ------------------------------------------------------------------ */
 
-/** Allocate and initialise a dedup B+Tree node cache. */
-struct dedup_node_cache *dedup_cache_create(size_t block_size)
+/** Allocate and initialise a dedup B+Tree node cache.
+ *  @param block_size  Filesystem block size in bytes.
+ *  @param max_bytes   Maximum memory budget in bytes (0 = default 8 GiB).
+ *                     Converted to a max slot count internally. */
+struct dedup_node_cache *dedup_cache_create(size_t block_size, uint64_t max_bytes)
 {
     struct dedup_node_cache *nc = calloc(1, sizeof(*nc));
     if(!nc) return NULL;
     nc->capacity   = DEDUP_CACHE_INIT_CAP;
     nc->block_size = block_size;
-    nc->slots      = calloc(nc->capacity, sizeof(struct dedup_cache_slot));
+
+    /* Compute max_capacity from byte budget.  Each slot holds one
+     * block_size buffer + sizeof(dedup_cache_slot) of overhead.
+     * The hash table itself (slot array) is capacity * sizeof(slot). */
+    if(max_bytes == 0) max_bytes = DEDUP_NC_DEFAULT_BYTES;
+    {
+        size_t   per_entry   = block_size + sizeof(struct dedup_cache_slot);
+        uint64_t max_entries = max_bytes / per_entry;
+        /* Clamp to at least the initial capacity and to uint32_t range. */
+        if(max_entries < DEDUP_CACHE_INIT_CAP) max_entries = DEDUP_CACHE_INIT_CAP;
+        if(max_entries > UINT32_MAX) max_entries = UINT32_MAX;
+        /* Round down to the nearest power-of-two for the hash table. */
+        uint32_t pot = 1u;
+        while((uint64_t)pot * 2 <= max_entries) pot *= 2;
+        nc->max_capacity = pot;
+    }
+
+    nc->slots = calloc(nc->capacity, sizeof(struct dedup_cache_slot));
     if(!nc->slots)
     {
         free(nc);
         return NULL;
     }
     nc->dirty_cap  = 256;
-    nc->dirty_list = malloc(nc->dirty_cap * sizeof(uint32_t));
     if(!nc->dirty_list)
     {
         free(nc->slots);
@@ -72,6 +91,11 @@ struct dedup_node_cache *dedup_cache_create(size_t block_size)
     }
     nc->dirty_count = 0;
     pthread_mutex_init(&nc->lock, NULL);
+
+    fprintf(stderr, "[nc] node cache created: block_size=%zu  max_capacity=%u (%.0f MiB budget)\n", block_size,
+            nc->max_capacity,
+            (double)nc->max_capacity * (block_size + sizeof(struct dedup_cache_slot)) / (1024.0 * 1024.0));
+
     return nc;
 }
 
@@ -109,11 +133,123 @@ static void dirty_list_add(struct dedup_node_cache *nc, uint32_t slot_idx)
     nc->dirty_list[nc->dirty_count++] = slot_idx;
 }
 
-/** Double the table capacity and re-hash all entries. */
+/**
+ * Evict clean (non-dirty) entries to bring the load factor below 75 %.
+ * We scan the table and free the buffers of non-dirty slots, clearing
+ * them so the open-addressing probe chains are repaired.
+ *
+ * After eviction the surviving entries are re-hashed (capacity stays
+ * the same) because removing entries from an open-addressed table can
+ * break probe chains.
+ *
+ * @return OBMAFS3_OK     if at least some entries were freed and load
+ *                        is now below 75 %.
+ * @return OBMAFS3_ERR_NOMEM if no clean entries could be freed (all
+ *         remaining entries are dirty — caller should flush first).
+ */
+static int cache_evict_clean(struct dedup_node_cache *nc)
+{
+    /* Target: bring count below 75 % of capacity. */
+    uint32_t target = nc->capacity * 3u / 4u;
+    if(target == 0) target = 1;
+
+    /* First pass — free clean entry buffers. */
+    uint32_t freed = 0;
+    for(uint32_t i = 0; i < nc->capacity && nc->count > target; i++)
+    {
+        if(nc->slots[i].buf && !nc->slots[i].dirty)
+        {
+            free(nc->slots[i].buf);
+            nc->slots[i].buf = NULL;
+            nc->slots[i].lba = 0;
+            nc->count--;
+            freed++;
+        }
+    }
+
+    if(freed == 0) return OBMAFS3_ERR_NOMEM; /* everything is dirty */
+
+    /* Rebuild the table in-place: collect surviving entries, clear the
+     * table, and re-insert them so probe chains are intact. */
+    uint32_t                 alive = nc->count;
+    struct dedup_cache_slot *tmp   = malloc(alive * sizeof(struct dedup_cache_slot));
+    if(!tmp)
+    {
+        /* Cannot allocate temp buffer — the table has holes now, which
+         * breaks probe chains.  As a last resort, do a slow in-place
+         * rehash by allocating a new slot array of the same capacity. */
+        struct dedup_cache_slot *ns = calloc(nc->capacity, sizeof(struct dedup_cache_slot));
+        if(!ns) return OBMAFS3_ERR_NOMEM;
+        uint32_t mask = nc->capacity - 1;
+        for(uint32_t i = 0; i < nc->capacity; i++)
+        {
+            if(nc->slots[i].buf == NULL) continue;
+            uint32_t idx = cache_hash(nc->slots[i].lba, mask);
+            for(uint32_t j = 0; j < nc->capacity; j++)
+            {
+                uint32_t s = (idx + j) & mask;
+                if(ns[s].buf == NULL)
+                {
+                    ns[s] = nc->slots[i];
+                    break;
+                }
+            }
+        }
+        free(nc->slots);
+        nc->slots       = ns;
+        /* Rebuild dirty list. */
+        nc->dirty_count = 0;
+        for(uint32_t i = 0; i < nc->capacity; i++)
+            if(ns[i].buf && ns[i].dirty) dirty_list_add(nc, i);
+        return OBMAFS3_OK;
+    }
+
+    uint32_t j = 0;
+    for(uint32_t i = 0; i < nc->capacity && j < alive; i++)
+    {
+        if(nc->slots[i].buf != NULL) tmp[j++] = nc->slots[i];
+    }
+
+    /* Clear and re-insert. */
+    memset(nc->slots, 0, nc->capacity * sizeof(struct dedup_cache_slot));
+    uint32_t mask = nc->capacity - 1;
+    for(uint32_t i = 0; i < alive; i++)
+    {
+        uint32_t idx = cache_hash(tmp[i].lba, mask);
+        for(uint32_t k = 0; k < nc->capacity; k++)
+        {
+            uint32_t s = (idx + k) & mask;
+            if(nc->slots[s].buf == NULL)
+            {
+                nc->slots[s] = tmp[i];
+                break;
+            }
+        }
+    }
+    free(tmp);
+
+    /* Rebuild dirty list from scratch. */
+    nc->dirty_count = 0;
+    for(uint32_t i = 0; i < nc->capacity; i++)
+    {
+        if(nc->slots[i].buf && nc->slots[i].dirty) dirty_list_add(nc, i);
+    }
+
+    return OBMAFS3_OK;
+}
+
+/** Double the table capacity and re-hash all entries.
+ *  Refuses to grow beyond max_capacity — returns OBMAFS3_ERR_NOMEM
+ *  to signal that the caller should evict instead. */
 static int cache_grow(struct dedup_node_cache *nc)
 {
-    uint32_t                 new_cap = nc->capacity * 2;
-    struct dedup_cache_slot *ns      = calloc(new_cap, sizeof(struct dedup_cache_slot));
+    uint32_t new_cap = nc->capacity * 2;
+
+    /* Enforce hard cap: if doubling would exceed the configured
+     * maximum, evict clean entries instead of growing. */
+    if(nc->max_capacity != 0 && new_cap > nc->max_capacity) return cache_evict_clean(nc);
+
+    struct dedup_cache_slot *ns = calloc(new_cap, sizeof(struct dedup_cache_slot));
     if(!ns) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     uint32_t new_mask = new_cap - 1;
@@ -1005,7 +1141,7 @@ void obmafs3_dedup_node_cache_init(struct obmafs3_ctx *ctx)
     if(!ctx) return;
     if(!ctx->dedup_node_cache)
     {
-        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
+        struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size, ctx->cache_limit);
         if(nc) ctx->dedup_node_cache = nc;
     }
     if(!ctx->dedup_lookup_cache)
@@ -1127,13 +1263,11 @@ static void lru_unlink(struct dedup_lookup_cache *lc, uint32_t idx)
 static void lru_push_front(struct dedup_lookup_cache *lc, uint32_t idx)
 {
     struct dedup_lc_node *n = &lc->nodes[idx];
-    n->lru_prev = DEDUP_LC_NIL;
-    n->lru_next = lc->lru_head;
-    if(lc->lru_head != DEDUP_LC_NIL)
-        lc->nodes[lc->lru_head].lru_prev = idx;
+    n->lru_prev             = DEDUP_LC_NIL;
+    n->lru_next             = lc->lru_head;
+    if(lc->lru_head != DEDUP_LC_NIL) lc->nodes[lc->lru_head].lru_prev = idx;
     lc->lru_head = idx;
-    if(lc->lru_tail == DEDUP_LC_NIL)
-        lc->lru_tail = idx;
+    if(lc->lru_tail == DEDUP_LC_NIL) lc->lru_tail = idx;
 }
 
 /* ---- Hash chain helpers (caller holds lc->lock) ---- */
@@ -1146,7 +1280,11 @@ static void chain_remove(struct dedup_lookup_cache *lc, uint32_t idx)
     uint32_t             *pp = &lc->buckets[b];
     while(*pp != DEDUP_LC_NIL)
     {
-        if(*pp == idx) { *pp = n->chain_next; return; }
+        if(*pp == idx)
+        {
+            *pp = n->chain_next;
+            return;
+        }
         pp = &lc->nodes[*pp].chain_next;
     }
 }
@@ -1162,33 +1300,39 @@ struct dedup_lookup_cache *dedup_lc_create(void)
     struct dedup_lookup_cache *lc = calloc(1, sizeof(*lc));
     if(!lc) return NULL;
 
-    lc->capacity  = DEDUP_LC_CAPACITY;
-    lc->count     = 0;
-    lc->lru_head  = DEDUP_LC_NIL;
-    lc->lru_tail  = DEDUP_LC_NIL;
+    lc->capacity = DEDUP_LC_CAPACITY;
+    lc->count    = 0;
+    lc->lru_head = DEDUP_LC_NIL;
+    lc->lru_tail = DEDUP_LC_NIL;
 
     lc->nodes = malloc((size_t)lc->capacity * sizeof(struct dedup_lc_node));
-    if(!lc->nodes) { free(lc); return NULL; }
+    if(!lc->nodes)
+    {
+        free(lc);
+        return NULL;
+    }
 
     lc->buckets = malloc((size_t)DEDUP_LC_BUCKETS * sizeof(uint32_t));
-    if(!lc->buckets) { free(lc->nodes); free(lc); return NULL; }
+    if(!lc->buckets)
+    {
+        free(lc->nodes);
+        free(lc);
+        return NULL;
+    }
 
     /* Initialise buckets to empty. */
-    for(uint32_t i = 0; i < DEDUP_LC_BUCKETS; i++)
-        lc->buckets[i] = DEDUP_LC_NIL;
+    for(uint32_t i = 0; i < DEDUP_LC_BUCKETS; i++) lc->buckets[i] = DEDUP_LC_NIL;
 
     /* Thread all nodes into the free list via chain_next. */
-    for(uint32_t i = 0; i < lc->capacity - 1; i++)
-        lc->nodes[i].chain_next = i + 1;
+    for(uint32_t i = 0; i < lc->capacity - 1; i++) lc->nodes[i].chain_next = i + 1;
     lc->nodes[lc->capacity - 1].chain_next = DEDUP_LC_NIL;
-    lc->free_head = 0;
+    lc->free_head                          = 0;
 
     pthread_mutex_init(&lc->lock, NULL);
 
-    fprintf(stderr, "[dlc] LRU cache created: %u slots (%.0f MiB)\n",
-            lc->capacity,
-            ((double)lc->capacity * sizeof(struct dedup_lc_node)
-             + (double)DEDUP_LC_BUCKETS * sizeof(uint32_t)) / (1024.0 * 1024.0));
+    fprintf(stderr, "[dlc] LRU cache created: %u slots (%.0f MiB)\n", lc->capacity,
+            ((double)lc->capacity * sizeof(struct dedup_lc_node) + (double)DEDUP_LC_BUCKETS * sizeof(uint32_t)) /
+                (1024.0 * 1024.0));
     return lc;
 }
 
@@ -1242,7 +1386,7 @@ void dedup_lc_put(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lb
 {
     pthread_mutex_lock(&lc->lock);
 
-    uint32_t b   = lc_bucket(hash, DEDUP_LC_BUCKETS - 1);
+    uint32_t b = lc_bucket(hash, DEDUP_LC_BUCKETS - 1);
 
     /* Check if already present. */
     uint32_t idx = lc->buckets[b];
@@ -1270,24 +1414,24 @@ void dedup_lc_put(struct dedup_lookup_cache *lc, uint64_t hash, uint64_t tree_lb
         chain_remove(lc, victim);
         /* Return victim to the free list. */
         lc->nodes[victim].chain_next = lc->free_head;
-        lc->free_head = victim;
+        lc->free_head                = victim;
         lc->count--;
     }
 
     /* Pop a node from the free list. */
     uint32_t new_idx = lc->free_head;
-    lc->free_head = lc->nodes[new_idx].chain_next;
+    lc->free_head    = lc->nodes[new_idx].chain_next;
 
     /* Populate the node. */
     struct dedup_lc_node *n = &lc->nodes[new_idx];
-    n->hash         = hash;
-    n->tree_lba     = tree_lba;
-    n->block_lba    = entry->block_lba;
-    n->block_offset = entry->block_offset;
+    n->hash                 = hash;
+    n->tree_lba             = tree_lba;
+    n->block_lba            = entry->block_lba;
+    n->block_offset         = entry->block_offset;
 
     /* Insert into hash bucket chain. */
-    n->chain_next    = lc->buckets[b];
-    lc->buckets[b]   = new_idx;
+    n->chain_next  = lc->buckets[b];
+    lc->buckets[b] = new_idx;
 
     /* Push to MRU position. */
     lru_push_front(lc, new_idx);

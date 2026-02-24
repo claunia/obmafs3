@@ -144,6 +144,7 @@ struct obmafs3_ctx
     int                   warmup_started;          ///< 1 if warmup thread was created (needs join)
     volatile int          shutdown_requested;      ///< 1 when close() wants warmup to abort early
     int                   read_only;               ///< 1 when mounted read-only (e.g. unknown rocompat flags)
+    uint64_t              cache_limit;             ///< Node-cache RAM budget in bytes (0 = default 8 GiB)
 };
 
 /* Open flags */

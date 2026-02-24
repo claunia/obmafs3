@@ -76,6 +76,7 @@ struct dedup_node_cache
     struct dedup_cache_slot *slots;
     uint32_t                 capacity;
     uint32_t                 count;
+    uint32_t                 max_capacity;  ///< Hard cap on slot count (0 = unlimited)
     size_t                   block_size;
     uint32_t                *dirty_list;
     uint32_t                 dirty_count;
@@ -84,14 +85,18 @@ struct dedup_node_cache
     pthread_mutex_t          lock;
 };
 
-#define DEDUP_CACHE_INIT_CAP     2048
+#define DEDUP_CACHE_INIT_CAP 2048
+
+/** Default node-cache memory budget: 8 GiB.  Converted to a slot count
+ *  at creation time based on the filesystem's block_size. */
+#define DEDUP_NC_DEFAULT_BYTES   (8ULL * 1024 * 1024 * 1024)
 #define DEDUP_NC_FLUSH_INTERVAL  32
 #define DEDUP_NC_DIRTY_THRESHOLD 256
 #define DEDUP_NC_IOV_MAX         1024
 
 void compute_node_checksum(uint8_t *buf);
 
-struct dedup_node_cache *dedup_cache_create(size_t block_size);
+struct dedup_node_cache *dedup_cache_create(size_t block_size, uint64_t max_bytes);
 struct dedup_cache_slot *cache_find_slot(struct dedup_node_cache *nc, uint64_t lba);
 int  dedup_cache_read(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx, uint64_t lba, void *buf, size_t bsz);
 void dedup_cache_insert(struct dedup_node_cache *nc, uint64_t lba, const void *data);

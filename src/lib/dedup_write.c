@@ -707,7 +707,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         pthread_rwlock_wrlock(&ctx->tree_lock);
         if(!ctx->dedup_node_cache)
         {
-            struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size);
+            struct dedup_node_cache *nc = dedup_cache_create((size_t)ctx->sb.block_size, ctx->cache_limit);
             if(nc) ctx->dedup_node_cache = nc;
         }
         pthread_rwlock_unlock(&ctx->tree_lock);
