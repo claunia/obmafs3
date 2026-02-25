@@ -337,10 +337,14 @@ void dlc_warmup(struct obmafs3_ctx *ctx)
             posix_fadvise(ctx->fd, (off_t)(leaf_lbas[i] * bsz),
                           (off_t)bsz, POSIX_FADV_WILLNEED);
 
-        /* Read each leaf and insert all its dedup_entry records. */
+        /* Read each leaf and insert all its dedup_entry records.
+         * Stop once the DLC is full — at mount time there is no
+         * access-frequency data, so continuing to insert would just
+         * churn evictions with no benefit. */
         for(uint64_t i = 0; i < leaf_count; i++)
         {
             if(ctx->shutdown_requested) { free(leaf_lbas); goto done; }
+            if(dlc->count >= dlc->capacity) { free(leaf_lbas); goto done; }
 
             /* Try the node cache first. */
             int got = 0;
