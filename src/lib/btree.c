@@ -150,9 +150,15 @@ int obmafs3_alloc_block(struct obmafs3_ctx *ctx, uint64_t *lba) { return obmafs3
  */
 int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *start_lba)
 {
+    pthread_mutex_lock(&ctx->bitmap_lock);
+
     /* Find contiguous free blocks via the bitmap */
     int rc = obmafs3_bitmap_find_free(ctx, count, start_lba);
-    if(rc != OBMAFS3_OK) return rc;
+    if(rc != OBMAFS3_OK)
+    {
+        pthread_mutex_unlock(&ctx->bitmap_lock);
+        return rc;
+    }
 
     /* Mark them as allocated (in-memory only; bitmap is persisted on
      * flush/release, superblock on unmount). */
@@ -161,6 +167,7 @@ int obmafs3_alloc_blocks(struct obmafs3_ctx *ctx, uint64_t count, uint64_t *star
     /* Keep next_free_lba as a hint for future allocations */
     if(*start_lba + count > ctx->next_free_lba) ctx->next_free_lba = *start_lba + count;
 
+    pthread_mutex_unlock(&ctx->bitmap_lock);
     return OBMAFS3_OK;
 }
 

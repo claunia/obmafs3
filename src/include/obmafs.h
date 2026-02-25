@@ -115,6 +115,7 @@ struct obmafs3_ctx
     uint8_t              *bitmap;                  ///< In-memory allocation bitmap
     uint64_t              bitmap_size;             ///< Size of allocation bitmap in bytes
     uint64_t              next_free_lba;           ///< Allocation hint (persisted in bitmap header)
+    pthread_mutex_t       bitmap_lock;             ///< Protects bitmap alloc/free from concurrent access
     int                   compression;             ///< Non-zero to compress data blocks on write
     int                   zstd_level;              ///< ZSTD compression level (1-15)
     pthread_key_t         tls_key;                 ///< Thread-local scratch buffers (obmafs3_thread_bufs)

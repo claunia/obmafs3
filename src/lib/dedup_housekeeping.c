@@ -223,6 +223,7 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
      * Flushing mid-insert (e.g. inside cache_evict_clean) would NOT
      * be safe because a partially-written split could hit disk. */
 #define DRAIN_FLUSH_INTERVAL 16
+    uint32_t skipped_badmagic = 0;
     for(uint32_t i = 0; i < count; i++)
     {
         struct dedup_entry      existing;
@@ -238,6 +239,17 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
              * allowing them to write a non-zero dedup_sector_lba into
              * newly created sector_map_entries. */
             if(dlc) dedup_lc_put(dlc, entries[i].hash, hdr_lba, &entries[i]);
+        }
+        else if(rc == OBMAFS3_ERR_BADMAGIC)
+        {
+            /* A corrupted node sits in this entry's traversal path.
+             * Skip the entry — the data block is still reachable via
+             * SME back-fill entries, and the hash will be re-inserted
+             * when the sector is next written.  Aborting the entire
+             * drain for one bad node would block all other healthy
+             * subtrees from making progress. */
+            skipped_badmagic++;
+            continue;
         }
         else if(rc != OBMAFS3_OK)
         {
@@ -259,6 +271,12 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
         }
     }
 #undef DRAIN_FLUSH_INTERVAL
+
+    if(skipped_badmagic > 0)
+        fprintf(stderr,
+                "[housekeeping] skipped %u entries due to BADMAGIC "
+                "(corrupted tree nodes) — data blocks are still on disk\n",
+                skipped_badmagic);
 
     /* Final flush for any remaining dirty entries. */
     int flush_rc = dedup_cache_flush(nc, ctx);
@@ -288,6 +306,8 @@ static void *housekeeping_thread_func(void *arg)
     obmafs3_dedup_warmup_wait(ctx);
 
     fprintf(stderr, "[housekeeping] started\n");
+
+    int drain_fail_count = 0; /* consecutive drain failures for backoff */
 
     while(!ctx->shutdown_requested)
     {
@@ -329,6 +349,26 @@ static void *housekeeping_thread_func(void *arg)
             if(!ctx->shutdown_requested) pthread_cond_timedwait(&ctx->housekeeping_cond, &ctx->housekeeping_mutex, &ts);
             pthread_mutex_unlock(&ctx->housekeeping_mutex);
             continue;
+        }
+
+        /* If previous drain attempts failed, back off exponentially
+         * (1s, 2s, 4s, 8s … capped at 60s) to avoid busy-looping
+         * on persistent errors like BADMAGIC.  The draining buffer
+         * is preserved, so no data is lost — we just wait before
+         * retrying. */
+        if(drain_fail_count > 0)
+        {
+            int backoff_sec = 1 << (drain_fail_count - 1);
+            if(backoff_sec > 60) backoff_sec = 60;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += backoff_sec;
+            pthread_mutex_lock(&ctx->housekeeping_mutex);
+            if(!ctx->shutdown_requested)
+                pthread_cond_timedwait(&ctx->housekeeping_cond,
+                                       &ctx->housekeeping_mutex, &ts);
+            pthread_mutex_unlock(&ctx->housekeeping_mutex);
+            if(ctx->shutdown_requested) break;
         }
 
         /* --- drain the buffer in batches --- */
@@ -453,6 +493,7 @@ static void *housekeeping_thread_func(void *arg)
                 pending_free(old);
             }
             pthread_rwlock_unlock(&ctx->tree_lock);
+            drain_fail_count = 0;
         }
         else
         {
@@ -499,6 +540,13 @@ static void *housekeeping_thread_func(void *arg)
                         extracted);
             }
             free(sorted);
+
+            /* Increment consecutive failure count for backoff. */
+            drain_fail_count++;
+            if(drain_fail_count == 1)
+                fprintf(stderr,
+                        "[housekeeping] drain failed — will retry "
+                        "with exponential backoff\n");
         }
     }
 

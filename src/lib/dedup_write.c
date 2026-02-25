@@ -1137,22 +1137,20 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         }
 
         /* Guard: if the fast path couldn't resolve the dedup block
-         * location (cur_dedup_lba is still 0), do a proper locked
-         * tree lookup before writing the SME.  This can happen when
-         * the keyset confirms existence but the DLC has evicted
-         * the entry and the pending/draining buffers don't have it
-         * (e.g. the hash was drained to the tree long ago).
+         * location (cur_dedup_lba is still 0), do a tree lookup.
+         * This happens when the keyset confirms existence but the
+         * DLC has evicted the entry and the pending/draining buffers
+         * don't have it (hash was drained to the tree long ago).
          *
-         * The tree lookup requires tree_lock, which the write path
-         * doesn't hold during Phase 1.  Taking rdlock briefly here
-         * is safe because the tree is structurally stable under
-         * rdlock and the lookup is read-only. */
+         * tree_lock wrlock is already held from the start of the
+         * critical section, so no additional locking is needed.
+         * The node cache warms quickly — internal nodes stay cached
+         * after the first few lookups, so subsequent ones only
+         * fetch leaf nodes. */
         if(cur_dedup_lba == 0)
         {
-            pthread_rwlock_rdlock(&ctx->tree_lock);
             struct dedup_entry guard_de;
             int guard_rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, hash, &guard_de);
-            pthread_rwlock_unlock(&ctx->tree_lock);
             if(guard_rc == OBMAFS3_OK)
             {
                 cur_dedup_lba = guard_de.block_lba;

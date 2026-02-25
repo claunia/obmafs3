@@ -410,7 +410,9 @@ int obmafs3_free_block(struct obmafs3_ctx *ctx, uint64_t lba) { return obmafs3_f
  */
 int obmafs3_free_blocks(struct obmafs3_ctx *ctx, uint64_t lba, uint64_t count)
 {
+    pthread_mutex_lock(&ctx->bitmap_lock);
     obmafs3_bitmap_clear(ctx, lba, count);
+    pthread_mutex_unlock(&ctx->bitmap_lock);
     /* Bitmap is persisted on flush/release, not per free. */
     return OBMAFS3_OK;
 }
