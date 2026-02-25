@@ -317,6 +317,7 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "pthread_key_create");
     }
     pthread_rwlock_init(&c->tree_lock, NULL);
+    pthread_mutex_init(&c->sme_backfill_lock, NULL);
 
     /* Refcount leaf cache buffer (separate from per-thread node_buf so
      * lookups don't clobber the traversal buffer; protected by
@@ -328,6 +329,7 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
     {
         free(c->rc_leaf_buf);
         pthread_key_delete(c->tls_key);
+        pthread_mutex_destroy(&c->sme_backfill_lock);
         pthread_rwlock_destroy(&c->tree_lock);
         close(fd);
         free(c);
@@ -659,6 +661,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
         }
     }
     pthread_key_delete(ctx->tls_key);
+    pthread_mutex_destroy(&ctx->sme_backfill_lock);
     pthread_rwlock_destroy(&ctx->tree_lock);
 
     free(ctx->rc_leaf_buf);

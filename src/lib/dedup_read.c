@@ -509,6 +509,51 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
 
     clock_gettime(CLOCK_MONOTONIC, &t_dedup_lookup);
 
+    /* ---- SME dedup-position back-fill ----
+     *
+     * Any sector_map_entry that had dedup_sector_lba == 0 required a
+     * full B+Tree lookup.  Now that we have the resolved dedup_entry,
+     * write the location back into the on-disk sector map so all
+     * future reads skip the tree entirely.
+     *
+     * The write is serialised by sme_backfill_lock because
+     * obmafs3_write_file_data performs a read-modify-write on the
+     * underlying compression group; concurrent back-fills to
+     * overlapping groups would lose each other's updates. */
+    if(need_lookup > 0)
+    {
+        /* Patch the in-memory sme_batch with resolved positions. */
+        uint64_t patched = 0;
+        for(uint64_t i = 0; i < sme_count; i++)
+        {
+            if(sme_batch[i].dedup_sector_lba == 0 && de_results[i].block_lba != 0)
+            {
+                sme_batch[i].dedup_sector_lba    = de_results[i].block_lba;
+                sme_batch[i].dedup_sector_offset = de_results[i].block_offset;
+                patched++;
+            }
+        }
+
+        if(patched > 0)
+        {
+            pthread_mutex_lock(&ctx->sme_backfill_lock);
+            struct inode_record bf_inode;
+            memcpy(&bf_inode, inode, sizeof(bf_inode));
+            bf_inode.file_size =
+                sizeof(struct sector_map_header) + inode->sector_map_size * sizeof(struct sector_map_entry);
+
+            int bf_rc = obmafs3_write_file_data(ctx, &bf_inode, sme_offset, sme_batch,
+                                                (size_t)(sme_count * sizeof(struct sector_map_entry)));
+            pthread_mutex_unlock(&ctx->sme_backfill_lock);
+
+            if(bf_rc != OBMAFS3_OK)
+                fprintf(stderr,
+                        "[read_media_image] SME back-fill failed rc=%d "
+                        "(non-fatal, %" PRIu64 " entries)\n",
+                        bf_rc, patched);
+        }
+    }
+
     uint64_t data_block_reads = 0, data_decomps = 0;
 
     /* ---- Phase 2: Read sector data in original order ---- */

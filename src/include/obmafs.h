@@ -142,6 +142,7 @@ struct obmafs3_ctx
     int                   warmup_running;          ///< 1 while background warmup is active
     int                   warmup_done;             ///< 1 after warmup has completed
     int                   warmup_started;          ///< 1 if warmup thread was created (needs join)
+    pthread_mutex_t       sme_backfill_lock;       ///< Serialises SME dedup-position back-fill writes
     volatile int          shutdown_requested;      ///< 1 when close() wants warmup to abort early
     int                   read_only;               ///< 1 when mounted read-only (e.g. unknown rocompat flags)
     uint64_t              cache_limit;             ///< Node-cache RAM budget in bytes (0 = default 8 GiB)

@@ -196,8 +196,9 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
 {
     if(count == 0) return OBMAFS3_OK;
 
-    uint8_t                 *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
-    struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    uint8_t                   *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
+    struct dedup_node_cache   *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
+    struct dedup_lookup_cache *dlc      = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
 
     /* Flush any pre-existing dirty entries left by the write path or
      * a prior interrupted drain.  Without this, the cache can be full
@@ -231,6 +232,12 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
         {
             rc = dedup_upsert_insert(ctx, hdr, &entries[i], &uctx, tree_buf, nc);
             if(rc != OBMAFS3_OK) return rc;
+
+            /* Populate the DLC so future write-path keyset hits can
+             * resolve the dedup block location without a tree lookup,
+             * allowing them to write a non-zero dedup_sector_lba into
+             * newly created sector_map_entries. */
+            if(dlc) dedup_lc_put(dlc, entries[i].hash, hdr_lba, &entries[i]);
         }
         else if(rc != OBMAFS3_OK)
         {
