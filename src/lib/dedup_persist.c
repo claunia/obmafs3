@@ -453,14 +453,19 @@ int obmafs3_dedup_pending_save(struct obmafs3_ctx *ctx)
  * Load a persisted pending insert buffer from disk.
  *
  * Reads the extent at ctx->sb.pending_lba, validates the header,
- * and creates a pending buffer with all entries.  Also inserts all
- * loaded hashes into the keyset (if available) so the write path's
- * fast existence check sees them.
+ * and creates a pending buffer with all entries.  When
+ * @p keyset_from_disk is false, also inserts loaded hashes into the
+ * keyset so the write path's fast existence check sees them.
+ * When the keyset was loaded from its persisted file, it already
+ * contains the pending hashes (they were present at save time),
+ * so the insertion loop is skipped.
  *
- * @param ctx  Filesystem context.
+ * @param ctx              Filesystem context.
+ * @param keyset_from_disk Non-zero when the keyset was loaded from
+ *                         disk (skip redundant keyset inserts).
  * @return @c OBMAFS3_OK on success, or an error code.
  */
-int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
+int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx, int keyset_from_disk)
 {
     if(!ctx || ctx->sb.pending_lba == 0 || ctx->sb.pending_blocks == 0) return OBMAFS3_ERR_NOTFOUND;
 
@@ -523,8 +528,10 @@ int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
         return OBMAFS3_ERR_CHECKSUM;
     }
 
-    /* Create pending buffer and insert all entries. */
-    struct dedup_pending_buf *pb = pending_create();
+    /* Create pending buffer pre-sized for the persisted entry count
+     * so that pending_insert() never triggers pending_grow() — avoids
+     * O(N log N) rehash churn when restoring large pending buffers. */
+    struct dedup_pending_buf *pb = pending_create_presized(hdr.count);
     if(!pb)
     {
         free(buf);
@@ -539,14 +546,22 @@ int obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx)
         pending_insert(pb, &entries[i]);
     }
 
-    /* Also insert all loaded hashes into the keyset for fast lookups. */
-    struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
-    if(ks)
+    /* Insert loaded hashes into the keyset for fast lookups — but
+     * only when the keyset was rebuilt via tree scan.  When the
+     * keyset was loaded from its persisted file it already contains
+     * all pending hashes (they were present at save time), so
+     * re-inserting them would just probe a dense 243 M-entry table
+     * for every entry with no benefit. */
+    if(!keyset_from_disk)
     {
-        for(uint64_t i = 0; i < hdr.count; i++)
+        struct dedup_key_set *ks = (struct dedup_key_set *)ctx->dedup_key_set;
+        if(ks)
         {
-            if(entries[i].hash == KEYSET_EMPTY) continue;
-            keyset_insert(ks, entries[i].hash);
+            for(uint64_t i = 0; i < hdr.count; i++)
+            {
+                if(entries[i].hash == KEYSET_EMPTY) continue;
+                keyset_insert(ks, entries[i].hash);
+            }
         }
     }
 

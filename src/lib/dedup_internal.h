@@ -142,6 +142,7 @@ struct dedup_pending_buf
 #define PENDING_INIT_CAP 4096
 
 struct dedup_pending_buf *pending_create(void);
+struct dedup_pending_buf *pending_create_presized(uint64_t min_entries);
 void                      pending_insert(struct dedup_pending_buf *pb, const struct dedup_entry *entry);
 const struct dedup_entry *pending_lookup(const struct dedup_pending_buf *pb, uint64_t hash);
 void                      pending_free(struct dedup_pending_buf *pb);

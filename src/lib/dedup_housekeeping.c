@@ -546,7 +546,7 @@ done:
      * Also inserts loaded hashes into the keyset. */
     if(!ctx->dedup_pending && ctx->sb.pending_lba != 0)
     {
-        int prc = obmafs3_dedup_pending_load(ctx);
+        int prc = obmafs3_dedup_pending_load(ctx, loaded);
         if(prc == OBMAFS3_OK)
         {
             struct dedup_pending_buf *lpb = (struct dedup_pending_buf *)ctx->dedup_pending;

@@ -307,7 +307,7 @@ void obmafs3_dedup_node_cache_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_key_set_free(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_pending_flush_and_free(struct obmafs3_ctx *ctx);
 int  obmafs3_dedup_pending_save(struct obmafs3_ctx *ctx);
-int  obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx);
+int  obmafs3_dedup_pending_load(struct obmafs3_ctx *ctx, int keyset_from_disk);
 int  obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx);
 int  obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx);
 void obmafs3_dedup_warmup_start(struct obmafs3_ctx *ctx);

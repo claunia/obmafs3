@@ -771,6 +771,36 @@ struct dedup_pending_buf *pending_create(void)
     return pb;
 }
 
+/**
+ * Allocate a pending insert buffer pre-sized for at least @p min_entries
+ * entries without triggering any grow/rehash operations.
+ *
+ * The capacity is rounded up to the next power of two that keeps the
+ * load factor below 75 %.  Falls back to PENDING_INIT_CAP when the
+ * computed value would be smaller.
+ */
+struct dedup_pending_buf *pending_create_presized(uint64_t min_entries)
+{
+    /* Target capacity = ceil(min_entries / 0.75) rounded to next pow2. */
+    uint64_t target = (min_entries * 4 + 2) / 3; /* ceil(n / 0.75) */
+    if(target < PENDING_INIT_CAP) target = PENDING_INIT_CAP;
+
+    /* Round up to next power of two. */
+    uint32_t cap = PENDING_INIT_CAP;
+    while((uint64_t)cap < target && cap < (UINT32_MAX / 2)) cap *= 2;
+
+    struct dedup_pending_buf *pb = calloc(1, sizeof(*pb));
+    if(!pb) return NULL;
+    pb->capacity = cap;
+    pb->slots    = calloc(cap, sizeof(struct dedup_entry));
+    if(!pb->slots)
+    {
+        free(pb);
+        return NULL;
+    }
+    return pb;
+}
+
 /** Grow the pending buffer (double capacity, re-insert all entries). */
 static int pending_grow(struct dedup_pending_buf *pb)
 {
