@@ -199,6 +199,16 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
     uint8_t                 *tree_buf = obmafs3_get_thread_bufs(ctx)->node_buf;
     struct dedup_node_cache *nc       = (struct dedup_node_cache *)ctx->dedup_node_cache;
 
+    /* Flush any pre-existing dirty entries left by the write path or
+     * a prior interrupted drain.  Without this, the cache can be full
+     * of dirty nodes before we even start inserting, causing the very
+     * first insert to fail with NOMEM when cache_evict_clean() finds
+     * nothing clean to reclaim. */
+    {
+        int prc = dedup_cache_flush(nc, ctx);
+        if(prc != OBMAFS3_OK) return prc;
+    }
+
     /* Insert all entries — tree nodes should be in the kernel page
      * cache thanks to housekeeping_prefetch_batch(), so nc_block_read
      * cache-miss pread() calls will be served from RAM.

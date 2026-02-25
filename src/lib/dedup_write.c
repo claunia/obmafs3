@@ -1090,6 +1090,22 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                     goto out;
                 }
 
+                /* Flush dirty cache entries immediately after the
+                 * insert to prevent unbounded dirty accumulation.
+                 * Safe here because the insert is complete and the
+                 * tree is in a consistent state. */
+                if(nc && nc->dirty_count > 0)
+                {
+                    int frc = dedup_cache_flush(nc, ctx);
+                    if(frc != OBMAFS3_OK)
+                    {
+                        rc = frc;
+                        free(sw);
+                        free(sorted_idx);
+                        goto out;
+                    }
+                }
+
                 cur_dedup_lba = stored_lba;
                 cur_dedup_off = stored_offset;
 

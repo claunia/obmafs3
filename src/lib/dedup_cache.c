@@ -1000,6 +1000,23 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx, struct 
 
     /* ---- Phase 4: batch insert (all cache hits) ---- */
 
+    /* Flush any pre-existing dirty entries from the write path or a
+     * prior operation, so the cache has room for new dirty nodes
+     * created by splits during the insert loop. */
+    if(nc && nc->dirty_count > 0)
+    {
+        rc = dedup_cache_flush(nc, ctx);
+        if(rc != OBMAFS3_OK)
+        {
+            free(sorted);
+            return rc;
+        }
+    }
+
+    /* Flush periodically between inserts to keep the dirty set
+     * small — prevents NOMEM when cache_evict_clean finds nothing
+     * clean to reclaim.  Same interval as housekeeping_drain_batch. */
+#define PENDING_FLUSH_INTERVAL 16
     for(uint32_t i = 0; i < n; i++)
     {
         struct dedup_upsert_ctx uctx;
@@ -1012,13 +1029,20 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx, struct 
         }
         else if(rc != OBMAFS3_OK) { break; /* I/O error */ }
         /* else: duplicate found — skip */
+
+        if((i + 1) % PENDING_FLUSH_INTERVAL == 0 && nc->dirty_count > 0)
+        {
+            int frc = dedup_cache_flush(nc, ctx);
+            if(frc != OBMAFS3_OK) { rc = frc; break; }
+        }
     }
+#undef PENDING_FLUSH_INTERVAL
 
     free(sorted);
 
     clock_gettime(CLOCK_MONOTONIC, &t_insert);
 
-    /* ---- Phase 5: single flush of dirty cache nodes ---- */
+    /* ---- Phase 5: final flush of dirty cache nodes ---- */
 
     /* Only clear the buffer when ALL entries were successfully
      * inserted.  On partial failure, keep the entries so a retry
@@ -1031,7 +1055,7 @@ int pending_flush(struct dedup_pending_buf *pb, struct obmafs3_ctx *ctx, struct 
         pb->count = 0;
     }
 
-    /* Flush cached tree nodes after the batch insert. */
+    /* Flush any remaining dirty cache entries. */
     if(nc && nc->dirty_count > 0)
     {
         int nc_rc = dedup_cache_flush(nc, ctx);
