@@ -39,13 +39,13 @@
 /** Maximum entries per housekeeping batch.
  *  Kept small so the tree_lock is held for only a few milliseconds
  *  per batch — avoiding long stalls on the write path. */
-#define HOUSEKEEPING_BATCH_SIZE 32
+#define HOUSEKEEPING_BATCH_SIZE 128
 
 /** Sleep interval (seconds) when idle. */
 #define HOUSEKEEPING_IDLE_SEC 5
 
 /** Pause between batches (microseconds) to yield I/O to writes. */
-#define HOUSEKEEPING_YIELD_US 50000 /* 50 ms */
+#define HOUSEKEEPING_YIELD_US 25000 /* 50 ms */
 
 /**
  * Lock-free B+Tree traversal to find the leaf LBA for a given hash.
