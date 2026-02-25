@@ -978,16 +978,46 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
         }
         else if(pb && ks)
         {
-            /* If sector_size changed (different dedup tree), flush first. */
+            /* If sector_size changed (different dedup tree), hand the
+             * stale pending buffer to the housekeeping thread instead
+             * of flushing synchronously on this FUSE thread. */
             if(pb->sector_size != 0 && pb->sector_size != sector_size && pb->count > 0)
             {
-                struct btree_header flush_hdr;
-                uint64_t            flush_hdr_lba;
-                int                 frc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &flush_hdr, &flush_hdr_lba);
-                if(frc == OBMAFS3_OK) frc = pending_flush(pb, ctx, &flush_hdr, flush_hdr_lba);
-                /* Only reset sector_size when flush succeeded;
-                 * otherwise keep old entries for retry / persistence. */
-                if(frc == OBMAFS3_OK || pb->count == 0) pb->sector_size = 0;
+                int handed_off = 0;
+
+                if(!ctx->dedup_pending_draining && ctx->housekeeping_started && !ctx->shutdown_requested)
+                {
+                    struct dedup_pending_buf *fresh = pending_create();
+                    if(fresh)
+                    {
+                        fprintf(stderr,
+                                "[dedup-write] sector size change %u → %u: "
+                                "handing %u pending entries to housekeeping\n",
+                                pb->sector_size, sector_size, pb->count);
+                        ctx->dedup_pending_draining = pb;
+                        ctx->dedup_pending          = fresh;
+                        pb                          = fresh;
+                        handed_off                  = 1;
+
+                        /* Wake housekeeping thread to start draining. */
+                        pthread_mutex_lock(&ctx->housekeeping_mutex);
+                        pthread_cond_signal(&ctx->housekeeping_cond);
+                        pthread_mutex_unlock(&ctx->housekeeping_mutex);
+                    }
+                }
+
+                if(!handed_off)
+                {
+                    /* Draining slot busy, housekeeping not running, or
+                     * malloc failed — flush synchronously as fallback. */
+                    struct btree_header flush_hdr;
+                    uint64_t            flush_hdr_lba;
+                    int frc = obmafs3_dedup_get_tree(ctx, pb->sector_size, &flush_hdr, &flush_hdr_lba);
+                    if(frc == OBMAFS3_OK) frc = pending_flush(pb, ctx, &flush_hdr, flush_hdr_lba);
+                    /* Only reset sector_size when flush succeeded;
+                     * otherwise keep old entries for retry / persistence. */
+                    if(frc == OBMAFS3_OK || pb->count == 0) pb->sector_size = 0;
+                }
             }
 
             /* Keyset says "miss" and pending buffer is available.

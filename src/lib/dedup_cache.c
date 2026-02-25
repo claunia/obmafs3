@@ -83,6 +83,7 @@ struct dedup_node_cache *dedup_cache_create(size_t block_size, uint64_t max_byte
         return NULL;
     }
     nc->dirty_cap  = 256;
+    nc->dirty_list = malloc(nc->dirty_cap * sizeof(uint32_t));
     if(!nc->dirty_list)
     {
         free(nc->slots);
