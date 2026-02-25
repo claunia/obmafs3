@@ -813,6 +813,23 @@ struct dedup_pending_buf {
 
 This avoids B+Tree traversals entirely for new sectors during the hot write path.
 
+### Sector Size Change Handoff
+
+Each pending buffer is bound to a single `sector_size` (and therefore a single dedup B+Tree). When consecutive files use different sector sizes (e.g., a 512-byte `.img` followed by a 2048-byte `.iso`), the stale pending entries must be drained before the write path can buffer entries for the new sector size.
+
+Rather than flushing the stale buffer synchronously on the FUSE write thread (which would block all filesystem operations for the duration of a potentially large batch insert), the write path **hands the buffer off to the housekeeping thread**:
+
+1. If the draining slot is free (`dedup_pending_draining == NULL`), housekeeping is running, and shutdown has not been requested:
+   - Move the current pending buffer to `dedup_pending_draining`.
+   - Allocate a fresh empty pending buffer for the write path (with `sector_size = 0`, to be set on the first insert).
+   - Signal `housekeeping_cond` to wake the housekeeping thread immediately.
+   - The write path continues without waiting — zero synchronous tree I/O.
+
+2. If the draining slot is occupied (housekeeping is actively draining a previous buffer), housekeeping is not running, or the fresh-buffer allocation fails:
+   - Fall back to the original synchronous `pending_flush()` path.
+
+After the handoff the housekeeping thread drains the stale buffer exactly as it would for a normal periodic swap — using the batched prefetch/insert algorithm described in the [Housekeeping Thread](#housekeeping-thread) section. The stale buffer's `sector_size` field tells the housekeeping thread which dedup tree to target.
+
 ### Persistence
 
 The pending buffer is persisted to disk at unmount time so un-drained entries survive across mounts.
@@ -831,6 +848,14 @@ struct pending_persist_header {      /* packed */
 
 Entries from both the active pending buffer and any in-progress draining buffer are merged and written contiguously. The superblock's `pending_lba` / `pending_blocks` fields record the location.
 
+### Restore Optimisations
+
+When restoring a persisted pending buffer at mount time, two optimisations avoid O(N log N) CPU work that would otherwise stall the warmup thread:
+
+1. **Pre-sized allocation** — `pending_create_presized(hdr.count)` allocates the hash table at the final capacity (next power-of-two ≥ `count / 0.75`), eliminating all `pending_grow()` doublings and rehashes. Without pre-sizing, restoring *N* entries from the default 4 096-slot table triggers ~log₂(N / 4096) growth steps, each rehashing every entry.
+
+2. **Conditional keyset insertion** — When the keyset was loaded from its persisted file, the pending hashes are already present (they were inserted during the previous mount and saved with the keyset). The per-entry `keyset_insert()` loop is skipped, avoiding millions of probes into an already-dense hash table. When the keyset had to be rebuilt via a full tree scan, the loop runs as before because the scan only covers entries that were drained into the B+Tree.
+
 ---
 
 ## Housekeeping Thread
@@ -845,7 +870,7 @@ A background **housekeeping thread** drains the pending insert buffer into the B
 
 ### Drain Algorithm
 
-1. **Swap**: Under `tree_lock`, the active pending buffer is moved to a "draining" pointer and a fresh empty buffer is created for the write path.
+1. **Swap**: Under `tree_lock`, the active pending buffer is moved to a "draining" pointer and a fresh empty buffer is created for the write path. The swap can also be initiated by the write path itself during a [sector size change](#sector-size-change-handoff), in which case the housekeeping thread is signalled to wake immediately.
 2. **Extract and sort**: All entries are extracted from the draining buffer and sorted by hash for sequential B+Tree leaf access.
 3. **Batch processing**: Entries are processed in batches of 32 (`HOUSEKEEPING_BATCH_SIZE`):
    - **Phase A — Snapshot**: Briefly acquire `tree_lock` to read the current root LBA.
@@ -870,9 +895,9 @@ A background **warmup thread** populates the dedup key set and node cache at mou
 ### Sequence
 
 1. Creates the dedup node cache if not already present.
-2. **Fast path**: Tries to load the persisted key set from disk (`obmafs3_dedup_keyset_load`). If successful, skips the tree scan.
-3. **Slow path**: If no persisted key set exists or validation fails, creates a fresh key set and scans all dedup tree leaves via BFS to populate it.
-4. Loads the persisted pending buffer from disk (if `pending_lba ≠ 0`).
+2. **Fast path**: Tries to load the persisted key set from disk (`obmafs3_dedup_keyset_load`). If successful, skips the tree scan and sets `loaded = 1`.
+3. **Slow path**: If no persisted key set exists or validation fails, creates a fresh key set and scans all dedup tree leaves via BFS to populate it (`loaded = 0`).
+4. Loads the persisted pending buffer from disk (if `pending_lba ≠ 0`) via `obmafs3_dedup_pending_load(ctx, loaded)`. The `loaded` flag controls [restore optimisations](#restore-optimisations): when the keyset came from disk, redundant keyset insertions are skipped; the pending buffer is always pre-sized to its final capacity to avoid rehash churn.
 5. Creates a fresh pending buffer if none was loaded.
 6. Signals completion via `warmup_cond` broadcast.
 
