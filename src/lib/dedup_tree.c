@@ -1359,21 +1359,83 @@ int dedup_upsert_find(struct obmafs3_ctx *ctx, const struct btree_header *hdr, u
                       struct dedup_entry *existing, struct dedup_upsert_ctx *uctx, uint8_t *buf,
                       struct dedup_node_cache *nc)
 {
-    size_t   bsz = (size_t)ctx->sb.block_size;
-    uint64_t lba = hdr->root_node_lba;
-    uctx->depth  = 0;
+    size_t   bsz     = (size_t)ctx->sb.block_size;
+    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
+    uint64_t lba     = hdr->root_node_lba;
+    int      heals   = 0; /* prevent infinite heal loops */
+    uctx->depth      = 0;
 
     while(1)
     {
+        /* ---- Validate LBA before reading ---- */
+        if(lba == 0 || lba >= max_lba)
+        {
+            fprintf(stderr,
+                    "[dedup_tree] out-of-bounds child lba=%" PRIu64
+                    " (max=%" PRIu64 ") — self-healing\n",
+                    lba, max_lba);
+            goto heal_bad_child;
+        }
+
         int rc = nc_block_read(nc, ctx, lba, buf, bsz);
-        if(rc != OBMAFS3_OK) return rc;
+        if(rc != OBMAFS3_OK)
+        {
+            fprintf(stderr,
+                    "[dedup_tree] read failed lba=%" PRIu64
+                    " rc=%d — self-healing\n",
+                    lba, rc);
+            goto heal_bad_child;
+        }
 
         struct btree_node_header nhdr;
         memcpy(&nhdr, buf, sizeof(nhdr));
 
         if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
-            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "lba=%" PRIu64 " got=0x%" PRIx64 " expected=0x%" PRIx64, lba, nhdr.magic,
-                       (uint64_t)OBMAFS3_BTREE_NODE_MAGIC);
+        {
+            /* ---- Self-healing: replace corrupted node with empty leaf ----
+             *
+             * The node at @lba contains garbage (BADMAGIC).  Rather than
+             * aborting the entire traversal, write a fresh empty leaf at
+             * this LBA so the tree regains structural integrity.  Any
+             * entries that lived in the corrupted subtree are lost from
+             * the B+Tree, but their data blocks are still on disk and
+             * reachable via SME dedup_sector_lba cache entries; when
+             * those sectors are next written they'll be re-inserted. */
+            fprintf(stderr,
+                    "[dedup_tree] BADMAGIC at lba=%" PRIu64
+                    " (got=0x%" PRIx64 ") — self-healing: replacing with empty leaf\n",
+                    lba, nhdr.magic);
+
+            if(++heals > DEDUP_BTREE_MAX_DEPTH)
+            {
+                fprintf(stderr, "[dedup_tree] too many heals — aborting\n");
+                DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "too many consecutive heals");
+            }
+
+            /* Write a valid empty leaf at the same LBA.
+             * dedup_cache_write (via nc_block_write) will overwrite the
+             * stale cached entry in-place if it exists, preserving the
+             * open-addressing probe chains. */
+            memset(buf, 0, bsz);
+            struct btree_node_header fresh;
+            memset(&fresh, 0, sizeof(fresh));
+            fresh.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+            fresh.record_type = kBtreeDataTypeDeduplicationEntry;
+            fresh.level       = 0; /* leaf */
+            fresh.node_keys   = 0;
+            fresh.keys_length = 0;
+            memcpy(buf, &fresh, sizeof(fresh));
+            compute_node_checksum(buf);
+
+            rc = nc_block_write(nc, ctx, lba, buf, bsz);
+            if(rc != OBMAFS3_OK) return rc;
+
+            /* Restart traversal from root — the path through the
+             * healed node will now succeed. */
+            lba         = hdr->root_node_lba;
+            uctx->depth = 0;
+            continue;
+        }
 
         if(nhdr.level > 0)
         {
@@ -1433,6 +1495,73 @@ int dedup_upsert_find(struct obmafs3_ctx *ctx, const struct btree_header *hdr, u
         uctx->insert_pos = lo;
         memcpy(&uctx->leaf_hdr, &nhdr, sizeof(nhdr));
         return OBMAFS3_ERR_NOTFOUND;
+
+    heal_bad_child:
+        /* The current @lba is unreachable (out-of-bounds or I/O error).
+         * We can't write at that LBA, so allocate a fresh empty leaf
+         * and patch the parent index node's child pointer.  If this is
+         * the root, we can't fix it from here (hdr is const). */
+        if(++heals > DEDUP_BTREE_MAX_DEPTH)
+        {
+            fprintf(stderr, "[dedup_tree] too many heals — aborting\n");
+            DBG_RETURN(OBMAFS3_ERR_IO, "too many consecutive heals");
+        }
+
+        if(uctx->depth == 0)
+        {
+            /* Root is unreachable — nothing we can do in find(). */
+            DBG_RETURN(OBMAFS3_ERR_IO,
+                       "root node unreachable, lba=%" PRIu64, lba);
+        }
+
+        {
+            /* Allocate a fresh block for the replacement leaf. */
+            uint64_t new_lba;
+            int      alloc_rc = obmafs3_alloc_blocks(ctx, 1, &new_lba);
+            if(alloc_rc != OBMAFS3_OK) return alloc_rc;
+
+            /* Write empty leaf at the new LBA. */
+            memset(buf, 0, bsz);
+            struct btree_node_header fresh;
+            memset(&fresh, 0, sizeof(fresh));
+            fresh.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+            fresh.record_type = kBtreeDataTypeDeduplicationEntry;
+            fresh.level       = 0;
+            fresh.node_keys   = 0;
+            fresh.keys_length = 0;
+            memcpy(buf, &fresh, sizeof(fresh));
+            compute_node_checksum(buf);
+
+            int wrc = nc_block_write(nc, ctx, new_lba, buf, bsz);
+            if(wrc != OBMAFS3_OK) return wrc;
+
+            /* Patch the parent's child pointer. */
+            uint64_t parent_lba  = uctx->path[uctx->depth - 1].lba;
+            uint16_t parent_slot = uctx->path[uctx->depth - 1].slot;
+
+            int prc = nc_block_read(nc, ctx, parent_lba, buf, bsz);
+            if(prc != OBMAFS3_OK) return prc;
+
+            uint8_t                 *pdata = buf + sizeof(struct btree_node_header);
+            struct btree_index_entry ie;
+            memcpy(&ie, pdata + (size_t)parent_slot * sizeof(ie), sizeof(ie));
+            ie.child_lba = new_lba;
+            memcpy(pdata + (size_t)parent_slot * sizeof(ie), &ie, sizeof(ie));
+            compute_node_checksum(buf);
+
+            wrc = nc_block_write(nc, ctx, parent_lba, buf, bsz);
+            if(wrc != OBMAFS3_OK) return wrc;
+
+            fprintf(stderr,
+                    "[dedup_tree] self-healed: replaced garbage child "
+                    "lba=%" PRIu64 " → fresh leaf at lba=%" PRIu64 "\n",
+                    lba, new_lba);
+
+            /* Restart from root. */
+            lba         = hdr->root_node_lba;
+            uctx->depth = 0;
+            continue;
+        }
     }
 }
 
