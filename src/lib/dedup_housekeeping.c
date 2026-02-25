@@ -316,15 +316,18 @@ static void *housekeeping_thread_func(void *arg)
 
         /* --- drain the buffer in batches --- */
         struct dedup_pending_buf *drain = (struct dedup_pending_buf *)ctx->dedup_pending_draining;
+        struct dedup_entry       *sorted         = NULL;
+        uint32_t                  extracted       = 0;
+        uint32_t                  total_inserted  = 0;
+
         if(!drain || drain->count == 0) goto finish_drain;
 
         /* Extract all entries and sort by hash (no lock needed —
          * only this thread touches the draining buffer). */
-        uint32_t            n      = drain->count;
-        struct dedup_entry *sorted = malloc((size_t)n * sizeof(struct dedup_entry));
+        uint32_t n = drain->count;
+        sorted = malloc((size_t)n * sizeof(struct dedup_entry));
         if(!sorted) goto finish_drain;
 
-        uint32_t extracted = 0;
         for(uint32_t i = 0; i < drain->capacity && extracted < n; i++)
         {
             if(drain->slots[i].hash != KEYSET_EMPTY) sorted[extracted++] = drain->slots[i];
@@ -334,7 +337,6 @@ static void *housekeeping_thread_func(void *arg)
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        uint32_t total_inserted    = 0;
         uint32_t next_progress_msg = 100000;
         for(uint32_t off = 0; off < extracted && !ctx->shutdown_requested; off += HOUSEKEEPING_BATCH_SIZE)
         {
@@ -409,18 +411,17 @@ static void *housekeeping_thread_func(void *arg)
         double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         fprintf(stderr, "[housekeeping] drained %u/%u entries in %.1f ms\n", total_inserted, extracted, ms);
 
-        free(sorted);
-
     finish_drain:
-        /* Release the draining buffer only when ALL entries were
-         * successfully drained.  If shutdown interrupted the drain,
-         * leave the buffer in place so that
-         * obmafs3_dedup_pending_flush_and_free() can persist the
-         * remaining entries for the next mount.  Re-draining
-         * already-inserted entries on the next mount is safe because
-         * dedup_upsert_find skips duplicates. */
+        /* Replace the draining buffer based on how far we got.
+         * When all entries were drained, just free the buffer.
+         * When only a prefix was drained (shutdown or error), build
+         * a new smaller pending buffer containing only the remaining
+         * entries so that persistence doesn't waste disk and the next
+         * mount doesn't redundantly re-drain already-inserted entries. */
         if(total_inserted >= extracted)
         {
+            /* Complete drain — discard the draining buffer. */
+            free(sorted);
             pthread_rwlock_wrlock(&ctx->tree_lock);
             {
                 struct dedup_pending_buf *old = (struct dedup_pending_buf *)ctx->dedup_pending_draining;
@@ -431,10 +432,49 @@ static void *housekeeping_thread_func(void *arg)
         }
         else
         {
+            /* Partial drain — build a trimmed buffer from the
+             * remaining (not-yet-inserted) entries in the sorted
+             * array and swap it in as the draining buffer. */
+            uint32_t remaining = extracted - total_inserted;
+
             fprintf(stderr,
                     "[housekeeping] drain incomplete (%u/%u) — "
-                    "preserving draining buffer for persistence\n",
-                    total_inserted, extracted);
+                    "building trimmed buffer with %u remaining entries\n",
+                    total_inserted, extracted, remaining);
+
+            struct dedup_pending_buf *trimmed = pending_create_presized((uint64_t)remaining);
+            if(trimmed)
+            {
+                trimmed->sector_size = drain->sector_size;
+                for(uint32_t i = total_inserted; i < extracted; i++)
+                    pending_insert(trimmed, &sorted[i]);
+
+                pthread_rwlock_wrlock(&ctx->tree_lock);
+                {
+                    struct dedup_pending_buf *old = (struct dedup_pending_buf *)ctx->dedup_pending_draining;
+                    ctx->dedup_pending_draining   = trimmed;
+                    pending_free(old);
+                }
+                pthread_rwlock_unlock(&ctx->tree_lock);
+
+                fprintf(stderr,
+                        "[housekeeping] trimmed draining buffer: "
+                        "%u → %u entries for persistence\n",
+                        extracted, trimmed->count);
+            }
+            else
+            {
+                /* Could not allocate trimmed buffer — fall back to
+                 * preserving the original draining buffer as before.
+                 * Re-draining already-inserted entries on the next
+                 * mount is safe because dedup_upsert_find skips
+                 * duplicates. */
+                fprintf(stderr,
+                        "[housekeeping] could not allocate trimmed buffer — "
+                        "preserving original draining buffer (%u entries)\n",
+                        extracted);
+            }
+            free(sorted);
         }
     }
 
