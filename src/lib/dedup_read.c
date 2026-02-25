@@ -926,6 +926,7 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
     int      rc         = OBMAFS3_OK;
     uint8_t *out        = (uint8_t *)buf;
     size_t   bytes_read = 0;
+    uint64_t cd_backfill_count = 0;  /* Track SMEs that need back-fill */
 
     while(bytes_read < size)
     {
@@ -1031,6 +1032,11 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                         rc, sme->hash, sector_num, inode->inode_id);
                 goto fail;
             }
+            /* Back-fill the cached dedup position so future reads
+             * skip the tree traversal entirely. */
+            sme->dedup_sector_lba    = de.block_lba;
+            sme->dedup_sector_offset = de.block_offset;
+            cd_backfill_count++;
         }
 
         /* ---- Read the dedup data block if not already cached ---- */
@@ -1177,6 +1183,28 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
     free(leaf_cache.leaf_buf);
     free(decomp_buf);
     free(dedup_buf);
+
+    /* Write back any SME entries that were back-filled with resolved
+     * dedup positions so future reads skip the B+Tree entirely. */
+    if(cd_backfill_count > 0 && sme_all && total_entries > 0)
+    {
+        pthread_mutex_lock(&ctx->sme_backfill_lock);
+        struct inode_record bf_inode;
+        memcpy(&bf_inode, inode, sizeof(bf_inode));
+        bf_inode.file_size =
+            sizeof(struct sector_map_header) + total_entries * sizeof(struct cd_sector_map_entry);
+
+        int bf_rc = obmafs3_write_file_data(ctx, &bf_inode, sizeof(struct sector_map_header), sme_all,
+                                            (size_t)(total_entries * sizeof(struct cd_sector_map_entry)));
+        pthread_mutex_unlock(&ctx->sme_backfill_lock);
+
+        if(bf_rc != OBMAFS3_OK)
+            fprintf(stderr,
+                    "[read_cd_image] SME back-fill failed rc=%d "
+                    "(non-fatal, %" PRIu64 " entries)\n",
+                    bf_rc, cd_backfill_count);
+    }
+
     free(sme_all);
     return OBMAFS3_OK;
 
