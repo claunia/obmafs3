@@ -412,6 +412,13 @@ static void *housekeeping_thread_func(void *arg)
         fprintf(stderr, "[housekeeping] drained %u/%u entries in %.1f ms\n", total_inserted, extracted, ms);
 
     finish_drain:
+        /* Ensure all B+Tree writes from the drain are durable before
+         * we potentially trim the draining buffer.  Without this
+         * fsync, a power failure could lose tree writes while the
+         * trimmed (smaller) pending buffer survives — those entries
+         * would be gone from both places. */
+        if(total_inserted > 0) fsync(ctx->fd);
+
         /* Replace the draining buffer based on how far we got.
          * When all entries were drained, just free the buffer.
          * When only a prefix was drained (shutdown or error), build
