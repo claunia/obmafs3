@@ -953,16 +953,18 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
          * hash exists, skip tree traversal — zero disk I/O. */
         struct dedup_key_set           *ks        = (struct dedup_key_set *)ctx->dedup_key_set;
         const struct dedup_pending_buf *drain_pb2 = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
+        int                             resolved  = 0;
         if(keyset_contains(ks, hash) || pending_lookup(pb, hash) || pending_lookup(drain_pb2, hash))
         {
-            dedup_hits++;
             /* Try to retrieve dedup block location from pending buffers or lookup cache */
             const struct dedup_entry *pe = pending_lookup(pb, hash);
             if(!pe) pe = pending_lookup(drain_pb2, hash);
             if(pe)
             {
+                dedup_hits++;
                 cur_dedup_lba = pe->block_lba;
                 cur_dedup_off = pe->block_offset;
+                resolved      = 1;
             }
             else
             {
@@ -970,13 +972,27 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 struct dedup_entry         de_cached;
                 if(dlc && dedup_lc_get(dlc, hash, dedup_hdr_lba, &de_cached))
                 {
+                    dedup_hits++;
                     cur_dedup_lba = de_cached.block_lba;
                     cur_dedup_off = de_cached.block_offset;
+                    resolved      = 1;
                 }
-                /* else: leave as 0 — fsck will fill in */
+                else
+                {
+                    /* DLC miss — the entry exists somewhere (keyset
+                     * confirmed) but we can't resolve its location
+                     * right now without tree_lock.  Mark as resolved
+                     * (it IS a hit — just with unknown location) so
+                     * we don't fall through to the miss path and
+                     * store a duplicate block.  The guard at the SME
+                     * write point will do a proper locked tree lookup
+                     * to fill in cur_dedup_lba. */
+                    dedup_hits++;
+                    resolved = 1;
+                }
             }
         }
-        else if(pb && ks)
+        if(!resolved && pb && ks)
         {
             /* If sector_size changed (different dedup tree), hand the
              * stale pending buffer to the housekeeping thread instead
@@ -1048,7 +1064,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
             cur_dedup_lba = stored_lba;
             cur_dedup_off = stored_offset;
         }
-        else
+        else if(!resolved)
         {
             /* No pending buffer (or no keyset) — fall back to immediate
              * tree insert (original path). */
@@ -1117,6 +1133,33 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 free(sw);
                 free(sorted_idx);
                 goto out;
+            }
+        }
+
+        /* Guard: if the fast path couldn't resolve the dedup block
+         * location (cur_dedup_lba is still 0), do a proper locked
+         * tree lookup before writing the SME.  This can happen when
+         * the keyset confirms existence but the DLC has evicted
+         * the entry and the pending/draining buffers don't have it
+         * (e.g. the hash was drained to the tree long ago).
+         *
+         * The tree lookup requires tree_lock, which the write path
+         * doesn't hold during Phase 1.  Taking rdlock briefly here
+         * is safe because the tree is structurally stable under
+         * rdlock and the lookup is read-only. */
+        if(cur_dedup_lba == 0)
+        {
+            pthread_rwlock_rdlock(&ctx->tree_lock);
+            struct dedup_entry guard_de;
+            int guard_rc = obmafs3_dedup_lookup(ctx, &dedup_hdr, hash, &guard_de);
+            pthread_rwlock_unlock(&ctx->tree_lock);
+            if(guard_rc == OBMAFS3_OK)
+            {
+                cur_dedup_lba = guard_de.block_lba;
+                cur_dedup_off = guard_de.block_offset;
+                /* Populate DLC to avoid this fallback next time. */
+                struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
+                if(dlc) dedup_lc_put(dlc, hash, dedup_hdr_lba, &guard_de);
             }
         }
 
