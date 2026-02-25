@@ -201,7 +201,17 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
 
     /* Insert all entries — tree nodes should be in the kernel page
      * cache thanks to housekeeping_prefetch_batch(), so nc_block_read
-     * cache-miss pread() calls will be served from RAM. */
+     * cache-miss pread() calls will be served from RAM.
+     *
+     * We flush the node cache every DRAIN_FLUSH_INTERVAL inserts to
+     * keep the dirty-entry high-water mark bounded.  Flushing here —
+     * between complete inserts — is safe because each upsert_insert
+     * writes a self-consistent set of nodes (leaf, siblings, parents,
+     * possibly a new root); by the time we reach this point all nodes
+     * from the previous insert form a valid tree state on disk.
+     * Flushing mid-insert (e.g. inside cache_evict_clean) would NOT
+     * be safe because a partially-written split could hit disk. */
+#define DRAIN_FLUSH_INTERVAL 16
     for(uint32_t i = 0; i < count; i++)
     {
         struct dedup_entry      existing;
@@ -219,9 +229,21 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
              * so these entries survive for the next mount. */
             return rc;
         }
-    }
 
-    /* Flush dirty cache entries. */
+        /* Periodic mid-batch flush: write all dirty nodes to disk and
+         * mark them clean so cache_evict_clean() can reclaim them if
+         * the node cache approaches max_capacity.  This prevents the
+         * NOMEM failure that occurs when the entire cache is dirty and
+         * eviction finds nothing to free. */
+        if((i + 1) % DRAIN_FLUSH_INTERVAL == 0)
+        {
+            int frc = dedup_cache_flush(nc, ctx);
+            if(frc != OBMAFS3_OK) return frc;
+        }
+    }
+#undef DRAIN_FLUSH_INTERVAL
+
+    /* Final flush for any remaining dirty entries. */
     int flush_rc = dedup_cache_flush(nc, ctx);
     if(flush_rc != OBMAFS3_OK) return flush_rc;
 
@@ -312,7 +334,8 @@ static void *housekeeping_thread_func(void *arg)
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        uint32_t total_inserted = 0;
+        uint32_t total_inserted    = 0;
+        uint32_t next_progress_msg = 100000;
         for(uint32_t off = 0; off < extracted && !ctx->shutdown_requested; off += HOUSEKEEPING_BATCH_SIZE)
         {
             uint32_t batch = extracted - off;
@@ -343,7 +366,19 @@ static void *housekeeping_thread_func(void *arg)
                 {
                     rc = housekeeping_drain_batch(ctx, sorted + off, batch, &hdr, hdr_lba);
                     if(rc == OBMAFS3_OK)
+                    {
                         total_inserted += batch;
+                        if(total_inserted >= next_progress_msg)
+                        {
+                            struct timespec tnow;
+                            clock_gettime(CLOCK_MONOTONIC, &tnow);
+                            double elapsed = (tnow.tv_sec - t0.tv_sec) * 1000.0 + (tnow.tv_nsec - t0.tv_nsec) / 1e6;
+                            fprintf(stderr,
+                                    "[housekeeping] progress: %u/%u entries drained (%.1f ms)\n",
+                                    total_inserted, extracted, elapsed);
+                            next_progress_msg = (total_inserted / 100000 + 1) * 100000;
+                        }
+                    }
                     else
                     {
                         fprintf(stderr,

@@ -168,7 +168,19 @@ static int cache_evict_clean(struct dedup_node_cache *nc)
         }
     }
 
-    if(freed == 0) return OBMAFS3_ERR_NOMEM; /* everything is dirty */
+    if(freed == 0)
+    {
+        fprintf(stderr,
+                "[nc] cache_evict_clean: all %u entries are dirty "
+                "(capacity=%u) — cannot evict\n",
+                nc->count, nc->capacity);
+        return OBMAFS3_ERR_NOMEM; /* everything is dirty */
+    }
+
+    fprintf(stderr,
+            "[nc] cache_evict_clean: evicted %u clean entries "
+            "(count=%u → %u, capacity=%u, dirty=%u)\n",
+            freed, nc->count + freed, nc->count, nc->capacity, nc->dirty_count);
 
     /* Rebuild the table in-place: collect surviving entries, clear the
      * table, and re-insert them so probe chains are intact. */
