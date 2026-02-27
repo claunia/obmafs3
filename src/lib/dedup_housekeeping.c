@@ -663,7 +663,8 @@ static void *warmup_thread_func(void *arg)
     if(!loaded)
     {
         /* Full tree scan (slow path). */
-        struct dedup_key_set *ks = keyset_create();
+        uint64_t ks_budget = ctx->keyset_limit ? ctx->keyset_limit : DEDUP_KS_DEFAULT_BYTES;
+        struct dedup_key_set *ks = keyset_create(ks_budget);
         if(!ks) goto done;
         ctx->dedup_key_set = ks;
 

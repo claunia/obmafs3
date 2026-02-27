@@ -90,12 +90,14 @@ int obmafs3_dedup_keyset_save(struct obmafs3_ctx *ctx)
     uint8_t *buf = malloc(buf_size);
     if(!buf) return OBMAFS3_ERR_NOMEM;
 
-    /* Pack non-empty keys directly after the header space. */
+    /* Pack non-empty keys directly after the header space.
+     * Walk the LRU list from head (MRU) to tail so that the most
+     * recently used keys are stored first. */
     uint64_t *key_dst = (uint64_t *)(buf + sizeof(struct keyset_persist_header));
     uint32_t  n       = 0;
-    for(uint32_t i = 0; i < ks->capacity; i++)
+    for(uint32_t cur = ks->lru_head; cur != DEDUP_KS_NIL; cur = ks->slots[cur].lru_next)
     {
-        if(ks->keys[i] != KEYSET_EMPTY) key_dst[n++] = ks->keys[i];
+        if(ks->slots[cur].key != KEYSET_EMPTY) key_dst[n++] = ks->slots[cur].key;
     }
 
     /* Zero-pad tail to block boundary. */
@@ -252,45 +254,20 @@ int obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx)
         return OBMAFS3_ERR_CHECKSUM;
     }
 
-    /* Create key set and bulk-insert. */
-    /* Choose initial capacity: next power-of-2 >= count / 0.75 */
-    uint32_t min_cap = (uint32_t)((hdr.count * 4 + 2) / 3); /* ceil(count / 0.75) */
-    uint32_t cap     = KEYSET_INIT_CAP;
-    while(cap < min_cap) cap *= 2;
-
-    struct dedup_key_set *ks = calloc(1, sizeof(*ks));
+    /* Create key set and bulk-insert via the public API. */
+    uint64_t ks_budget = ctx->keyset_limit ? ctx->keyset_limit : DEDUP_KS_DEFAULT_BYTES;
+    struct dedup_key_set *ks = keyset_create(ks_budget);
     if(!ks)
     {
         free(buf);
         return OBMAFS3_ERR_NOMEM;
     }
-    ks->capacity = cap;
-    ks->keys     = calloc(cap, sizeof(uint64_t));
-    if(!ks->keys)
-    {
-        free(ks);
-        free(buf);
-        return OBMAFS3_ERR_NOMEM;
-    }
 
     const uint64_t *keys = (const uint64_t *)key_data;
-    uint32_t        mask = cap - 1;
     for(uint64_t i = 0; i < hdr.count; i++)
     {
-        uint64_t key = keys[i];
-        if(key == KEYSET_EMPTY) continue;
-        uint32_t idx = keyset_hash(key, mask);
-        for(uint32_t j = 0; j < cap; j++)
-        {
-            uint32_t s = (idx + j) & mask;
-            if(ks->keys[s] == KEYSET_EMPTY)
-            {
-                ks->keys[s] = key;
-                ks->count++;
-                break;
-            }
-            if(ks->keys[s] == key) break; /* duplicate */
-        }
+        if(keys[i] == KEYSET_EMPTY) continue;
+        keyset_insert(ks, keys[i]);
     }
     free(buf);
 

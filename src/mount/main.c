@@ -46,7 +46,8 @@ struct obmafs3_options
     int         show_help;
     int         compression; /* -1 = not set (use default) */
     int         zstd_level;  /* -1 = not set (use default) */
-    const char *cache_limit; /* NULL = not set (use default 8G) */
+    const char *cache_limit;  /* NULL = not set (use default 8G) */
+    const char *keyset_limit; /* NULL = not set (use default 4G) */
 };
 
 #define OPTION(t, p) {t, offsetof(struct obmafs3_options, p), 1}
@@ -59,6 +60,7 @@ static const struct fuse_opt option_spec[] = {
     {"--compression=%d", offsetof(struct obmafs3_options, compression), 0},
     { "--zstd-level=%d", offsetof(struct obmafs3_options,  zstd_level), 0},
     OPTION("--cache-limit=%s", cache_limit),
+    OPTION("--keyset-limit=%s", keyset_limit),
     FUSE_OPT_END
 };
 
@@ -75,6 +77,8 @@ static void show_help(const char *progname)
            "    --compression=<0|1>    Enable (1) or disable (0) compression (default: 1)\n"
            "    --zstd-level=<1-15>    ZSTD compression level (default: 15)\n"
            "    --cache-limit=<size>   Node-cache RAM ceiling (default: 8G)\n"
+           "                           Accepts suffixes: K, M, G (e.g. 2G, 512M)\n"
+           "    --keyset-limit=<size>  Key-set RAM ceiling (default: 4G)\n"
            "                           Accepts suffixes: K, M, G (e.g. 2G, 512M)\n"
            "    --disk-images=<spec>   Semicolon-separated ext=sector_size pairs\n"
            "                           (default: dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512)\n"
@@ -171,6 +175,44 @@ int main(int argc, char *argv[])
                 return 1;
             }
             g_ctx->cache_limit = (uint64_t)val;
+        }
+
+        if(opts.keyset_limit)
+        {
+            /* Parse human-readable size: digits followed by optional K/M/G suffix. */
+            char              *end = NULL;
+            unsigned long long val = strtoull(opts.keyset_limit, &end, 10);
+            if(end && *end)
+            {
+                switch(*end)
+                {
+                    case 'k':
+                    case 'K':
+                        val *= 1024ULL;
+                        break;
+                    case 'm':
+                    case 'M':
+                        val *= 1024ULL * 1024;
+                        break;
+                    case 'g':
+                    case 'G':
+                        val *= 1024ULL * 1024 * 1024;
+                        break;
+                    default:
+                        fprintf(stderr, "Error: --keyset-limit: unknown suffix '%c'\n", *end);
+                        obmafs3_close(g_ctx);
+                        g_ctx = NULL;
+                        return 1;
+                }
+            }
+            if(val == 0)
+            {
+                fprintf(stderr, "Error: --keyset-limit must be greater than 0\n");
+                obmafs3_close(g_ctx);
+                g_ctx = NULL;
+                return 1;
+            }
+            g_ctx->keyset_limit = (uint64_t)val;
         }
 
         if(opts.compression != -1) g_ctx->compression = (opts.compression != 0);

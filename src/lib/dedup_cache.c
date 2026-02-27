@@ -657,93 +657,190 @@ void dedup_cache_free(struct dedup_node_cache *nc)
 }
 
 /* ------------------------------------------------------------------ */
-/*  In-memory hash set of known dedup keys (Bloom-filter replacement)  */
+/*  In-memory hash set of known dedup keys (chained hash + LRU)        */
 /* ------------------------------------------------------------------ */
 
-/** Allocate a dedup key set. */
-struct dedup_key_set *keyset_create(void)
+/** Fibonacci-hashing of a key to a bucket index. */
+static uint32_t ks_bucket(uint64_t key, uint32_t bucket_count)
 {
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) % bucket_count;
+}
+
+/** Promote slot @p idx to the MRU (head) position in the LRU list. */
+static void ks_lru_touch(struct dedup_key_set *ks, uint32_t idx)
+{
+    if(ks->lru_head == idx) return; /* already MRU */
+
+    /* Unlink from current position */
+    uint32_t p = ks->slots[idx].lru_prev;
+    uint32_t n = ks->slots[idx].lru_next;
+    if(p != DEDUP_KS_NIL)
+        ks->slots[p].lru_next = n;
+    if(n != DEDUP_KS_NIL)
+        ks->slots[n].lru_prev = p;
+    else
+        ks->lru_tail = p; /* idx was tail */
+
+    /* Insert at head */
+    ks->slots[idx].lru_prev = DEDUP_KS_NIL;
+    ks->slots[idx].lru_next = ks->lru_head;
+    if(ks->lru_head != DEDUP_KS_NIL)
+        ks->slots[ks->lru_head].lru_prev = idx;
+    ks->lru_head = idx;
+    if(ks->lru_tail == DEDUP_KS_NIL) ks->lru_tail = idx;
+}
+
+/** Remove slot @p idx from its hash-bucket chain. */
+static void ks_chain_remove(struct dedup_key_set *ks, uint32_t idx)
+{
+    uint32_t b = ks_bucket(ks->slots[idx].key, ks->bucket_count);
+    uint32_t prev = DEDUP_KS_NIL;
+    uint32_t cur  = ks->buckets[b];
+    while(cur != DEDUP_KS_NIL)
+    {
+        if(cur == idx)
+        {
+            if(prev == DEDUP_KS_NIL)
+                ks->buckets[b] = ks->slots[cur].chain_next;
+            else
+                ks->slots[prev].chain_next = ks->slots[cur].chain_next;
+            return;
+        }
+        prev = cur;
+        cur  = ks->slots[cur].chain_next;
+    }
+}
+
+/**
+ * Allocate a fixed-capacity dedup key set.
+ *
+ * @param max_bytes  RAM budget in bytes (0 = DEDUP_KS_DEFAULT_BYTES).
+ *                   The capacity is computed so that total allocation
+ *                   fits within this budget.
+ */
+struct dedup_key_set *keyset_create(uint64_t max_bytes)
+{
+    if(max_bytes == 0) max_bytes = DEDUP_KS_DEFAULT_BYTES;
+
+    /* Per-slot cost: sizeof(struct ks_slot).
+     * Per-bucket cost: sizeof(uint32_t).
+     * With DEDUP_KS_BUCKET_FACTOR=2, bucket count = 2 × capacity.
+     * Total ≈ capacity × (sizeof(ks_slot) + 2 × sizeof(uint32_t)) + fixed overhead.
+     */
+    size_t per_slot = sizeof(struct ks_slot) + DEDUP_KS_BUCKET_FACTOR * sizeof(uint32_t);
+    uint64_t cap64  = max_bytes / per_slot;
+    if(cap64 == 0) cap64 = 1;
+    if(cap64 > UINT32_MAX) cap64 = UINT32_MAX;
+    uint32_t capacity     = (uint32_t)cap64;
+    uint32_t bucket_count = capacity * DEDUP_KS_BUCKET_FACTOR;
+    if(bucket_count < capacity) bucket_count = UINT32_MAX; /* overflow guard */
+
     struct dedup_key_set *ks = calloc(1, sizeof(*ks));
     if(!ks) return NULL;
-    ks->capacity = KEYSET_INIT_CAP;
-    ks->keys     = calloc(ks->capacity, sizeof(uint64_t)); /* 0 = empty */
-    if(!ks->keys)
+
+    ks->slots = malloc((size_t)capacity * sizeof(struct ks_slot));
+    if(!ks->slots) { free(ks); return NULL; }
+
+    ks->buckets = malloc((size_t)bucket_count * sizeof(uint32_t));
+    if(!ks->buckets) { free(ks->slots); free(ks); return NULL; }
+
+    ks->capacity     = capacity;
+    ks->bucket_count = bucket_count;
+    ks->count        = 0;
+    ks->lru_head     = DEDUP_KS_NIL;
+    ks->lru_tail     = DEDUP_KS_NIL;
+
+    /* Initialise all buckets to NIL. */
+    for(uint32_t i = 0; i < bucket_count; i++) ks->buckets[i] = DEDUP_KS_NIL;
+
+    /* Build the free list through chain_next (singly linked). */
+    for(uint32_t i = 0; i < capacity; i++)
     {
-        free(ks);
-        return NULL;
+        ks->slots[i].key        = KEYSET_EMPTY;
+        ks->slots[i].chain_next = (i + 1 < capacity) ? i + 1 : DEDUP_KS_NIL;
+        ks->slots[i].lru_prev   = DEDUP_KS_NIL;
+        ks->slots[i].lru_next   = DEDUP_KS_NIL;
     }
+    ks->free_head = 0;
+
+    fprintf(stderr, "[dedup-keyset] created: capacity=%u  buckets=%u  budget=%.1f GiB\n",
+            capacity, bucket_count, (double)max_bytes / (1024.0 * 1024 * 1024));
+
     return ks;
 }
 
-/** Fibonacci-hashing of a key to a table index. */
-uint32_t keyset_hash(uint64_t key, uint32_t mask) { return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask; }
-
-/** Grow the key set (double capacity, re-insert all entries). */
-static int keyset_grow(struct dedup_key_set *ks)
-{
-    uint32_t  new_cap  = ks->capacity * 2;
-    uint64_t *new_keys = calloc(new_cap, sizeof(uint64_t));
-    if(!new_keys) return OBMAFS3_ERR_NOMEM;
-
-    uint32_t new_mask = new_cap - 1;
-    for(uint32_t i = 0; i < ks->capacity; i++)
-    {
-        if(ks->keys[i] == KEYSET_EMPTY) continue;
-        uint32_t idx = keyset_hash(ks->keys[i], new_mask);
-        for(uint32_t j = 0; j < new_cap; j++)
-        {
-            uint32_t s = (idx + j) & new_mask;
-            if(new_keys[s] == KEYSET_EMPTY)
-            {
-                new_keys[s] = ks->keys[i];
-                break;
-            }
-        }
-    }
-    free(ks->keys);
-    ks->keys     = new_keys;
-    ks->capacity = new_cap;
-    return OBMAFS3_OK;
-}
-
-/** Insert a key into the set (no-op if already present). */
+/**
+ * Insert a key into the set (no-op if already present).
+ * When the set is full, the LRU (least-recently-used) entry is evicted.
+ */
 void keyset_insert(struct dedup_key_set *ks, uint64_t key)
 {
-    if(key == KEYSET_EMPTY) return; /* cannot store sentinel */
+    if(!ks || key == KEYSET_EMPTY) return; /* cannot store sentinel */
 
-    /* Grow at 75% load */
-    if(ks->count * 4 >= ks->capacity * 3)
-    {
-        if(keyset_grow(ks) != OBMAFS3_OK) return; /* non-fatal */
-    }
+    uint32_t b = ks_bucket(key, ks->bucket_count);
 
-    uint32_t mask = ks->capacity - 1;
-    uint32_t idx  = keyset_hash(key, mask);
-    for(uint32_t i = 0; i < ks->capacity; i++)
+    /* Walk the chain — if key exists, just touch it. */
+    for(uint32_t cur = ks->buckets[b]; cur != DEDUP_KS_NIL; cur = ks->slots[cur].chain_next)
     {
-        uint32_t s = (idx + i) & mask;
-        if(ks->keys[s] == KEYSET_EMPTY)
+        if(ks->slots[cur].key == key)
         {
-            ks->keys[s] = key;
-            ks->count++;
+            ks_lru_touch(ks, cur);
             return;
         }
-        if(ks->keys[s] == key) return; /* already present */
     }
+
+    /* Need a free slot. */
+    uint32_t idx;
+    if(ks->free_head != DEDUP_KS_NIL)
+    {
+        idx = ks->free_head;
+        ks->free_head = ks->slots[idx].chain_next;
+    }
+    else
+    {
+        /* Evict LRU tail. */
+        if(ks->lru_tail == DEDUP_KS_NIL) return; /* should never happen */
+        idx = ks->lru_tail;
+        /* Unlink from LRU. */
+        uint32_t p = ks->slots[idx].lru_prev;
+        if(p != DEDUP_KS_NIL) ks->slots[p].lru_next = DEDUP_KS_NIL;
+        ks->lru_tail = p;
+        if(ks->lru_head == idx) ks->lru_head = DEDUP_KS_NIL;
+        /* Remove from its old hash chain. */
+        ks_chain_remove(ks, idx);
+        ks->count--;
+    }
+
+    /* Populate slot and insert at head of bucket chain. */
+    ks->slots[idx].key        = key;
+    ks->slots[idx].chain_next = ks->buckets[b];
+    ks->buckets[b]            = idx;
+    ks->count++;
+
+    /* Insert at LRU head (MRU position). */
+    ks->slots[idx].lru_prev = DEDUP_KS_NIL;
+    ks->slots[idx].lru_next = ks->lru_head;
+    if(ks->lru_head != DEDUP_KS_NIL)
+        ks->slots[ks->lru_head].lru_prev = idx;
+    ks->lru_head = idx;
+    if(ks->lru_tail == DEDUP_KS_NIL) ks->lru_tail = idx;
 }
 
-/** Check if a key exists in the set. */
+/** Check if a key exists in the set. Touches LRU on hit. */
 int keyset_contains(const struct dedup_key_set *ks, uint64_t key)
 {
     if(!ks || key == KEYSET_EMPTY) return 0;
 
-    uint32_t mask = ks->capacity - 1;
-    uint32_t idx  = keyset_hash(key, mask);
-    for(uint32_t i = 0; i < ks->capacity; i++)
+    uint32_t b = ks_bucket(key, ks->bucket_count);
+    for(uint32_t cur = ks->buckets[b]; cur != DEDUP_KS_NIL; cur = ks->slots[cur].chain_next)
     {
-        uint32_t s = (idx + i) & mask;
-        if(ks->keys[s] == KEYSET_EMPTY) return 0;
-        if(ks->keys[s] == key) return 1;
+        if(ks->slots[cur].key == key)
+        {
+            /* Touch LRU — cast away const since LRU order is not
+             * part of the logical "content" of the set. */
+            ks_lru_touch((struct dedup_key_set *)ks, cur);
+            return 1;
+        }
     }
     return 0;
 }
@@ -752,17 +849,14 @@ int keyset_contains(const struct dedup_key_set *ks, uint64_t key)
 void keyset_free(struct dedup_key_set *ks)
 {
     if(!ks) return;
-    free(ks->keys);
+    free(ks->slots);
+    free(ks->buckets);
     free(ks);
 }
 
 /**
  * Extract all dedup hash keys from a B+Tree leaf node buffer and
  * insert them into the key set.
- *
- * Called automatically whenever a leaf is read through the cache,
- * so that after one full pass the key set contains every hash in
- * the tree.
  */
 void keyset_ingest_leaf(struct dedup_key_set *ks, const void *buf)
 {
@@ -782,12 +876,6 @@ void keyset_ingest_leaf(struct dedup_key_set *ks, const void *buf)
 
 /**
  * Seed the key set from all leaf nodes already present in the node cache.
- *
- * Called once when the key set is first created while the node cache
- * is already warm.  Without this, cached leaves would never be
- * ingested because the prefetch phase skips them (cache_find_slot
- * returns true → nc_block_read is never called → keyset_ingest_leaf
- * is never invoked for those nodes).
  */
 void keyset_seed_from_cache(struct dedup_key_set *ks, const struct dedup_node_cache *nc)
 {
@@ -801,6 +889,12 @@ void keyset_seed_from_cache(struct dedup_key_set *ks, const struct dedup_node_ca
 /* ------------------------------------------------------------------ */
 /*  Pending insert buffer (deferred B+Tree inserts for keyset misses)  */
 /* ------------------------------------------------------------------ */
+
+/** Fibonacci-hashing for the pending buffer (open-addressing). */
+static uint32_t pending_hash(uint64_t key, uint32_t mask)
+{
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
 
 /** Allocate a pending insert buffer. */
 struct dedup_pending_buf *pending_create(void)
@@ -858,7 +952,7 @@ static int pending_grow(struct dedup_pending_buf *pb)
     for(uint32_t i = 0; i < pb->capacity; i++)
     {
         if(pb->slots[i].hash == KEYSET_EMPTY) continue;
-        uint32_t idx = keyset_hash(pb->slots[i].hash, new_mask);
+        uint32_t idx = pending_hash(pb->slots[i].hash, new_mask);
         for(uint32_t j = 0; j < new_cap; j++)
         {
             uint32_t s = (idx + j) & new_mask;
@@ -887,7 +981,7 @@ void pending_insert(struct dedup_pending_buf *pb, const struct dedup_entry *entr
     }
 
     uint32_t mask = pb->capacity - 1;
-    uint32_t idx  = keyset_hash(entry->hash, mask);
+    uint32_t idx  = pending_hash(entry->hash, mask);
     for(uint32_t i = 0; i < pb->capacity; i++)
     {
         uint32_t s = (idx + i) & mask;
@@ -907,7 +1001,7 @@ const struct dedup_entry *pending_lookup(const struct dedup_pending_buf *pb, uin
     if(!pb || hash == KEYSET_EMPTY) return NULL;
 
     uint32_t mask = pb->capacity - 1;
-    uint32_t idx  = keyset_hash(hash, mask);
+    uint32_t idx  = pending_hash(hash, mask);
     for(uint32_t i = 0; i < pb->capacity; i++)
     {
         uint32_t s = (idx + i) & mask;

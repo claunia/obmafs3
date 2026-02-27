@@ -121,22 +121,43 @@ int  dedup_cache_flush(struct dedup_node_cache *nc, struct obmafs3_ctx *ctx);
 void dedup_cache_free(struct dedup_node_cache *nc);
 
 /* ------------------------------------------------------------------ */
-/*  Dedup key set                                                      */
+/*  Dedup key set  (chained hash + intrusive LRU, fixed capacity)      */
 /* ------------------------------------------------------------------ */
 
-struct dedup_key_set
+/** Default keyset RAM budget: 4 GiB. */
+#define DEDUP_KS_DEFAULT_BYTES (4ULL * 1024 * 1024 * 1024)
+
+/** Sentinel index: "no node". */
+#define DEDUP_KS_NIL UINT32_MAX
+
+/** Hash-table bucket count = 2 × slot capacity for ~50 % load. */
+#define DEDUP_KS_BUCKET_FACTOR 2
+
+#define KEYSET_EMPTY 0ULL /* still needed for sentinel key value */
+
+/** One slot in the keyset node pool. */
+struct ks_slot
 {
-    uint64_t *keys;
-    uint32_t  capacity;
-    uint32_t  count;
+    uint64_t key;        /**< The hash key stored here (0 = unused). */
+    uint32_t chain_next; /**< Next slot in same hash bucket (DEDUP_KS_NIL = end). */
+    uint32_t lru_prev;   /**< Previous in LRU list (DEDUP_KS_NIL = head). */
+    uint32_t lru_next;   /**< Next in LRU list (DEDUP_KS_NIL = tail). */
 };
 
-#define KEYSET_EMPTY    0ULL
-#define KEYSET_INIT_CAP 4096
+/** Fixed-capacity hash set with LRU eviction. */
+struct dedup_key_set
+{
+    struct ks_slot *slots;        /**< Pre-allocated node pool [capacity]. */
+    uint32_t       *buckets;      /**< Hash-table bucket heads [bucket_count]. */
+    uint32_t        capacity;     /**< Total number of slots. */
+    uint32_t        bucket_count; /**< Number of hash buckets. */
+    uint32_t        count;        /**< Number of occupied slots. */
+    uint32_t        free_head;    /**< Head of the free-slot singly-linked list. */
+    uint32_t        lru_head;     /**< Most-recently used slot. */
+    uint32_t        lru_tail;     /**< Least-recently used slot (eviction candidate). */
+};
 
-uint32_t keyset_hash(uint64_t key, uint32_t mask);
-
-struct dedup_key_set *keyset_create(void);
+struct dedup_key_set *keyset_create(uint64_t max_bytes);
 void                  keyset_insert(struct dedup_key_set *ks, uint64_t key);
 int                   keyset_contains(const struct dedup_key_set *ks, uint64_t key);
 void                  keyset_free(struct dedup_key_set *ks);

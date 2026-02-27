@@ -147,6 +147,7 @@ struct obmafs3_ctx
     volatile int          shutdown_requested;      ///< 1 when close() wants warmup to abort early
     int                   read_only;               ///< 1 when mounted read-only (e.g. unknown rocompat flags)
     uint64_t              cache_limit;             ///< Node-cache RAM budget in bytes (0 = default 8 GiB)
+    uint64_t              keyset_limit;            ///< Key-set RAM budget in bytes (0 = default 4 GiB)
 };
 
 /* Open flags */
