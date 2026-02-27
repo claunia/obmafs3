@@ -61,27 +61,41 @@ static inline double timespec_diff_ms(const struct timespec *a, const struct tim
 }
 
 /* ------------------------------------------------------------------ */
-/*  Dedup B+Tree node cache                                            */
+/*  Dedup B+Tree node cache (chained hash + LRU)                       */
 /* ------------------------------------------------------------------ */
+
+#define DEDUP_NC_NIL UINT32_MAX
 
 struct dedup_cache_slot
 {
     uint64_t lba;
     uint8_t *buf;
     int      dirty;
+    /* Hash chain (singly-linked list within a bucket) */
+    uint32_t hash_next;
+    /* LRU doubly-linked list (intrusive) */
+    uint32_t lru_prev;
+    uint32_t lru_next;
 };
 
 struct dedup_node_cache
 {
-    struct dedup_cache_slot *slots;
-    uint32_t                 capacity;
-    uint32_t                 count;
-    uint32_t                 max_capacity;  ///< Hard cap on slot count (0 = unlimited)
+    struct dedup_cache_slot *slots;       ///< Flat pool of slots, indexed 0..capacity-1
+    uint32_t                *buckets;     ///< Bucket heads (indices into slots[])
+    uint32_t                 bucket_count;///< Number of buckets (power-of-two)
+    uint32_t                 capacity;    ///< Total pool size (= max slot count)
+    uint32_t                 count;       ///< Number of occupied slots
+    uint32_t                 max_capacity;///< Hard cap = capacity (set once at init)
     size_t                   block_size;
     uint32_t                *dirty_list;
     uint32_t                 dirty_count;
     uint32_t                 dirty_cap;
     uint32_t                 writes_since_flush;
+    /* Free-slot singly-linked list (threaded through hash_next) */
+    uint32_t                 free_head;
+    /* LRU list endpoints */
+    uint32_t                 lru_head;    ///< Most recently used
+    uint32_t                 lru_tail;    ///< Least recently used (evict from here)
     pthread_mutex_t          lock;
 };
 
@@ -93,6 +107,8 @@ struct dedup_node_cache
 #define DEDUP_NC_FLUSH_INTERVAL  32
 #define DEDUP_NC_DIRTY_THRESHOLD 256
 #define DEDUP_NC_IOV_MAX         1024
+/** Number of hash buckets = 2× capacity for ~0.5 average chain length. */
+#define DEDUP_NC_BUCKET_FACTOR   2
 
 void compute_node_checksum(uint8_t *buf);
 

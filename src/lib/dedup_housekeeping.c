@@ -224,15 +224,16 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
      * be safe because a partially-written split could hit disk. */
 #define DRAIN_FLUSH_INTERVAL 16
     uint32_t skipped_badmagic = 0;
+    int      rc               = OBMAFS3_OK;
     for(uint32_t i = 0; i < count; i++)
     {
         struct dedup_entry      existing;
         struct dedup_upsert_ctx uctx;
-        int                     rc = dedup_upsert_find(ctx, hdr, entries[i].hash, &existing, &uctx, tree_buf, nc);
+        rc = dedup_upsert_find(ctx, hdr, entries[i].hash, &existing, &uctx, tree_buf, nc);
         if(rc == OBMAFS3_ERR_NOTFOUND)
         {
             rc = dedup_upsert_insert(ctx, hdr, &entries[i], &uctx, tree_buf, nc);
-            if(rc != OBMAFS3_OK) return rc;
+            if(rc != OBMAFS3_OK) goto flush_on_error;
 
             /* Populate the DLC so future write-path keyset hits can
              * resolve the dedup block location without a tree lookup,
@@ -253,10 +254,9 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
         }
         else if(rc != OBMAFS3_OK)
         {
-            /* Propagate I/O or other errors — do not silently drop
-             * entries.  The caller will preserve the draining buffer
-             * so these entries survive for the next mount. */
-            return rc;
+            /* I/O or other error — flush dirty nodes + header before
+             * propagating so the free list stays consistent. */
+            goto flush_on_error;
         }
 
         /* Periodic mid-batch flush: write all dirty nodes to disk and
@@ -267,7 +267,7 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
         if((i + 1) % DRAIN_FLUSH_INTERVAL == 0)
         {
             int frc = dedup_cache_flush(nc, ctx);
-            if(frc != OBMAFS3_OK) return frc;
+            if(frc != OBMAFS3_OK) { rc = frc; goto flush_on_error; }
         }
     }
 #undef DRAIN_FLUSH_INTERVAL
@@ -284,6 +284,19 @@ static int housekeeping_drain_batch(struct obmafs3_ctx *ctx, struct dedup_entry 
 
     /* Write updated header. */
     return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+
+flush_on_error:
+    /* A tree insert failed mid-batch.  alloc_node may have popped
+     * nodes from the free list whose btree data is now dirty in the
+     * cache.  We MUST flush those nodes and write the header so the
+     * on-disk free_node_lba matches the actual node contents.
+     * Without this, the stale header points into nodes that now
+     * contain BTREENDE magic instead of free-list chain pointers,
+     * corrupting the free list for the next reader. */
+    if(nc && nc->dirty_count > 0)
+        dedup_cache_flush(nc, ctx);
+    obmafs3_btree_header_write(ctx, hdr_lba, hdr);
+    return rc;
 }
 
 /**

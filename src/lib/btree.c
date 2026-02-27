@@ -38,6 +38,10 @@
 #include "btree_internal.h"
 #include "debug.h"
 
+#include <execinfo.h>
+#include <inttypes.h>
+#include <stdatomic.h>
+
 /**
  * Read a B+Tree header block from disk (strict).
  *
@@ -107,6 +111,54 @@ int obmafs3_btree_header_read_lenient(struct obmafs3_ctx *ctx, uint64_t lba, str
  */
 int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btree_header *hdr)
 {
+    /* ---- Diagnostic: catch the first write of a bad free_node_lba ---- */
+    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
+    if(hdr->free_node_lba != 0 && hdr->free_node_lba >= max_lba)
+    {
+        static atomic_int reported = 0;
+        if(atomic_fetch_add(&reported, 1) == 0)
+        {
+            fprintf(stderr,
+                    "\n=== CORRUPTION CAUGHT ===\n"
+                    "[btree_header_write] about to write bad free_node_lba=%" PRIu64
+                    " (0x%" PRIx64 ") to hdr at lba=%" PRIu64 "\n"
+                    "  max_lba=%" PRIu64 "  free_nodes=%" PRIu32
+                    "  root_node_lba=%" PRIu64 "  total_nodes=%" PRIu32 "\n"
+                    "  tree_type=%" PRIu16 "  data_type=%" PRIu16 "\n",
+                    hdr->free_node_lba, hdr->free_node_lba, lba,
+                    max_lba, hdr->free_nodes,
+                    hdr->root_node_lba, hdr->total_nodes,
+                    hdr->tree_type, hdr->data_type);
+            void *bt[32];
+            int   bt_count = backtrace(bt, 32);
+            backtrace_symbols_fd(bt, bt_count, STDERR_FILENO);
+            fprintf(stderr, "=== END CORRUPTION ===\n\n");
+        }
+
+        /* Fix it so the corruption doesn't reach disk. */
+        hdr->free_node_lba = 0;
+        hdr->free_nodes    = 0;
+    }
+
+    if(hdr->root_node_lba != 0 && hdr->root_node_lba >= max_lba)
+    {
+        static atomic_int root_reported = 0;
+        if(atomic_fetch_add(&root_reported, 1) == 0)
+        {
+            fprintf(stderr,
+                    "\n=== ROOT CORRUPTION CAUGHT ===\n"
+                    "[btree_header_write] about to write bad root_node_lba=%" PRIu64
+                    " (0x%" PRIx64 ") to hdr at lba=%" PRIu64 "\n"
+                    "  max_lba=%" PRIu64 "  total_nodes=%" PRIu32 "\n",
+                    hdr->root_node_lba, hdr->root_node_lba, lba,
+                    max_lba, hdr->total_nodes);
+            void *bt2[32];
+            int   bt2_count = backtrace(bt2, 32);
+            backtrace_symbols_fd(bt2, bt2_count, STDERR_FILENO);
+            fprintf(stderr, "=== END ROOT CORRUPTION ===\n\n");
+        }
+    }
+
     uint8_t *buf = obmafs3_get_thread_bufs(ctx)->hdr_buf;
     memset(buf, 0, (size_t)ctx->sb.block_size);
 
@@ -204,23 +256,63 @@ int obmafs3_btree_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, 
     if(blocks_per_node == 0) blocks_per_node = 1;
 
     /* ---- Pop from free list ---- */
+    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
+
     if(hdr->free_node_lba != 0 && hdr->free_nodes > 0)
     {
+        /* Validate the head pointer is a plausible on-disk LBA. */
+        if(hdr->free_node_lba >= max_lba)
+        {
+            fprintf(stderr,
+                    "[btree] free list head lba=%" PRIu64
+                    " out of bounds (max=%" PRIu64 ") — discarding free list\n",
+                    hdr->free_node_lba, max_lba);
+            hdr->free_node_lba = 0;
+            hdr->free_nodes    = 0;
+            goto alloc_clump;
+        }
+
         *node_lba = hdr->free_node_lba;
 
         /* Read the free node to get the next pointer (stored as uint64_t at offset 0) */
         uint8_t *buf = obmafs3_get_thread_bufs(ctx)->hdr_buf;
         int      rc  = obmafs3_block_read(ctx, hdr->free_node_lba, buf, bsz);
-        if(rc != OBMAFS3_OK) return rc;
+        if(rc != OBMAFS3_OK)
+        {
+            /* Unreadable free node — discard the rest of the chain. */
+            fprintf(stderr,
+                    "[btree] cannot read free node lba=%" PRIu64
+                    " — discarding free list\n",
+                    hdr->free_node_lba);
+            hdr->free_node_lba = 0;
+            hdr->free_nodes    = 0;
+            return OBMAFS3_OK; /* *node_lba is still valid */
+        }
 
         uint64_t next_free;
         memcpy(&next_free, buf, sizeof(next_free));
+
+        /* Validate the next pointer.  If the free node was
+         * overwritten with a B+Tree node, the first 8 bytes are
+         * the BTREENDE magic — clearly not a valid LBA. */
+        if(next_free != 0 && next_free >= max_lba)
+        {
+            fprintf(stderr,
+                    "[btree] free list next_free=%" PRIu64
+                    " (0x%" PRIx64 ") out of bounds at lba=%" PRIu64
+                    " — truncating free list\n",
+                    next_free, next_free, hdr->free_node_lba);
+            next_free = 0;
+            hdr->free_nodes = 1; /* about to decrement to 0 */
+        }
 
         hdr->free_node_lba = next_free;
         hdr->free_nodes--;
 
         return OBMAFS3_OK;
     }
+
+alloc_clump:
 
     /* ---- Free list empty: allocate a clump ---- */
     uint32_t clump = (hdr->tree_type == kBtreeTypeDeduplication) ? ctx->sb.dedup_clump_size : ctx->sb.btree_clump_size;
@@ -302,7 +394,19 @@ clump_allocated:;
 int obmafs3_btree_free_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t node_lba)
 {
     (void)hdr_lba;
-    size_t   bsz = (size_t)ctx->sb.block_size;
+    size_t   bsz     = (size_t)ctx->sb.block_size;
+    uint64_t max_lba = ctx->sb.total_bytes / ctx->sb.block_size;
+
+    /* Refuse to push a garbage LBA onto the free list. */
+    if(node_lba == 0 || node_lba >= max_lba)
+    {
+        fprintf(stderr,
+                "[btree] refusing to free out-of-bounds node lba=%" PRIu64
+                " (max=%" PRIu64 ")\n",
+                node_lba, max_lba);
+        return OBMAFS3_OK; /* silently discard */
+    }
+
     uint8_t *buf = calloc(1, bsz);
     if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
