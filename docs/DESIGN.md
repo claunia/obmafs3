@@ -551,9 +551,15 @@ struct sector_map_entry {                    /* packed, 34 bytes */
 
 The `dedup_sector_lba` and `dedup_sector_offset` fields cache the immutable location of the sector's data inside the dedup block. Since dedup blocks are append-only and never moved, these fields remain valid for the lifetime of the entry. When non-zero, the read path can skip the B+Tree traversal entirely and read the dedup data block directly. When zero (e.g., if the write path could not determine the location), the read path falls back to the standard dedup tree lookup, and `obmafsck --scrub` can populate the missing values.
 
+#### SME Back-fill
+
+When the read path encounters a `sector_map_entry` (or `cd_sector_map_entry`) with `dedup_sector_lba == 0`, it must perform a full B+Tree lookup. Once the lookup succeeds and the entry's `block_lba` / `block_offset` are known, the read path **writes the resolved position back into the on-disk sector map entry** so that all future reads skip the tree entirely.
+
+Because `obmafs3_write_file_data()` performs a read-modify-write cycle on the underlying compression group, concurrent back-fills to overlapping groups would corrupt each other's updates. All back-fill writes are therefore serialised via `ctx->sme_backfill_lock` (`pthread_mutex_t`). Back-fill failures are non-fatal: they are logged but the read still succeeds using the just-resolved location. The same mechanism applies to both normal sector maps and CD sector maps.
+
 To read a sector from the image, the system:
 1. Reads the `sector_map_entry` from the inode's data extents at `sizeof(sector_map_header) + sector_num * sizeof(sector_map_entry)`.
-2. If `dedup_sector_lba` is non-zero, uses the cached location directly. Otherwise, looks up the `hash` in the appropriate dedup tree to get the `dedup_entry`.
+2. If `dedup_sector_lba` is non-zero, uses the cached location directly. Otherwise, looks up the `hash` in the appropriate dedup tree to get the `dedup_entry` (and back-fills the sector map entry on success).
 3. Reads the dedup data block at the determined LBA and extracts the sector data at the stored byte offset.
 
 ### CD Sector Map
@@ -742,23 +748,40 @@ The memory budget is configured via the `--cache-limit` mount option (see [mount
 
 ## Dedup Key Set
 
-The **dedup key set** is an in-memory open-addressing hash table that stores every dedup hash key in the B+Tree. This enables O(1) existence checks ("has this sector hash been seen before?") without any disk I/O.
+The **dedup key set** is a fixed-capacity in-memory hash table with LRU eviction that stores dedup hash keys seen in the B+Tree. This enables O(1) existence checks ("has this sector hash been seen before?") without any disk I/O.
 
 ### Structure
 
 ```c
+struct ks_slot {
+    uint64_t key;        /* The hash key stored here (0 = unused) */
+    uint32_t chain_next; /* Next slot in same hash bucket (DEDUP_KS_NIL = end) */
+    uint32_t lru_prev;   /* Previous in LRU list (DEDUP_KS_NIL = head) */
+    uint32_t lru_next;   /* Next in LRU list (DEDUP_KS_NIL = tail) */
+};
+
 struct dedup_key_set {
-    uint64_t *keys;      /* Slot array — 0 means empty */
-    uint32_t  capacity;  /* Always a power of 2 */
-    uint32_t  count;     /* Number of occupied slots */
+    struct ks_slot *slots;        /* Pre-allocated node pool [capacity] */
+    uint32_t       *buckets;      /* Hash-table bucket heads [bucket_count] */
+    uint32_t        capacity;     /* Total number of slots */
+    uint32_t        bucket_count; /* Number of hash buckets (2 × capacity) */
+    uint32_t        count;        /* Number of occupied slots */
+    uint32_t        free_head;    /* Head of the free-slot singly-linked list */
+    uint32_t        lru_head;     /* Most-recently used slot */
+    uint32_t        lru_tail;     /* Least-recently used slot (eviction candidate) */
 };
 ```
 
-- **Hashing**: Fibonacci hashing (`key × 0x9E3779B97F4A7C15 >> 32`) maps keys to table indices.
-- **Collision resolution**: Linear probing.
-- **Load factor**: Grows (doubles capacity) at 75% occupancy.
+- **Hashing**: Fibonacci hashing (`key × 0x9E3779B97F4A7C15 >> 32`) maps keys to bucket indices.
+- **Collision resolution**: Separate chaining via `chain_next` pointers.
+- **Fixed capacity**: The slot count is computed from a configurable RAM budget (default: **4 GiB**, set via `DEDUP_KS_DEFAULT_BYTES` or the `--keyset-limit` mount option). The formula: `capacity = max_bytes / (sizeof(ks_slot) + 2 × sizeof(uint32_t))`. The bucket count is `2 × capacity` for ~50% average chain length.
+- **LRU eviction**: When the table is full, inserting a new key evicts the least-recently-used entry. Lookups and insertions of existing keys promote the entry to the MRU position.
 - **Sentinel**: Hash value 0 is reserved as "empty slot" and cannot be stored.
-- **Memory**: For 183k keys at 8 bytes each, the table uses ~3 MiB of RAM.
+- **Free list**: Unoccupied slots are threaded into a singly-linked free list via `chain_next`.
+
+### Memory Budget
+
+The capacity is configured via the `--keyset-limit` mount option (see [mount.obmafs](#mountobmafs--fuse-mount)). The value is stored in `obmafs3_ctx.keyset_limit` and passed to `keyset_create()` at warmup time. A value of 0 uses the 4 GiB default. For the default budget, the key set holds approximately 143 million keys.
 
 ### Population
 
@@ -766,7 +789,7 @@ The key set is populated during the [warmup phase](#warmup-thread):
 1. **Fast path**: If a persisted key set exists on disk (`keyset_lba ≠ 0`), it is loaded directly.
 2. **Slow path**: All dedup tree leaves are scanned via BFS, and each leaf's hash keys are ingested into the set.
 
-During normal operation, newly inserted keys are added to the set immediately.
+During normal operation, newly inserted keys are added to the set immediately. If the set is at capacity, the LRU entry is evicted to make room.
 
 ### Persistence
 
@@ -783,6 +806,52 @@ struct keyset_persist_header {       /* packed */
 ```
 
 All non-empty keys are packed into a flat `uint64_t` array, prepended with the header, and written to a contiguously allocated extent. The superblock's `keyset_lba` / `keyset_blocks` fields record the location. On load, the header magic and XXH64 checksum are validated; if either check fails, the key set falls back to a full tree scan.
+
+---
+
+## Dedup Lookup Cache
+
+The **dedup lookup cache** (`dedup_lookup_cache`) is a global, thread-safe LRU hash table that caches `hash → dedup_entry` mappings. It provides O(1) read-path dedup lookups for recently and frequently accessed sectors, avoiding B+Tree traversals entirely on cache hits.
+
+### Structure
+
+```c
+struct dedup_lc_node {
+    uint64_t hash;          /* Hash key */
+    uint64_t tree_lba;      /* Distinguishes different dedup trees */
+    uint64_t block_lba;     /* Dedup block LBA */
+    uint64_t block_offset;  /* Offset within the dedup block */
+    uint32_t lru_prev;      /* Previous node in LRU list */
+    uint32_t lru_next;      /* Next node in LRU list */
+    uint32_t chain_next;    /* Next node in hash bucket chain */
+};
+
+struct dedup_lookup_cache {
+    struct dedup_lc_node *nodes;      /* Node pool [0 .. capacity-1] */
+    uint32_t             *buckets;    /* Hash bucket heads [0 .. DEDUP_LC_BUCKETS-1] */
+    uint32_t              capacity;   /* Total node pool size */
+    uint32_t              count;      /* Currently occupied nodes */
+    uint32_t              lru_head;   /* Most recently used */
+    uint32_t              lru_tail;   /* Least recently used (eviction candidate) */
+    uint32_t              free_head;  /* Head of free-list (singly-linked via chain_next) */
+    pthread_mutex_t       lock;       /* Protects all fields */
+};
+```
+
+- **Capacity**: Fixed at 8 388 608 entries (`DEDUP_LC_CAPACITY`, 2²³). Bucket count equals the capacity.
+- **Memory**: ~416 MiB total (32 MiB for bucket array + 384 MiB for node pool).
+- **Key**: Composite `(hash, tree_lba)` — the `tree_lba` distinguishes entries from different per-sector-size dedup trees.
+- **Hashing**: Fibonacci hashing on `hash`, same as the key set.
+- **Collision resolution**: Separate chaining.
+- **Eviction**: When full, the LRU tail entry is evicted to make room.
+- **Thread safety**: All operations are protected by `lock` (`pthread_mutex_t`).
+
+### Usage
+
+- **Read path**: Before traversing the dedup B+Tree, the read path checks the lookup cache via `dedup_lc_get()`. On a hit, the entry is promoted to MRU and the B+Tree lookup is skipped entirely.
+- **Write path**: When a new dedup entry is inserted (via the pending buffer or direct B+Tree insert), it is also placed into the lookup cache via `dedup_lc_put()` so that subsequent reads see it immediately.
+- **Housekeeping thread**: When draining the pending buffer, successfully inserted entries are added to the lookup cache.
+- **Warmup thread**: The lookup cache is populated via `dlc_warmup()` during the warmup phase, pre-loading entries from the dedup tree leaves.
 
 ---
 
@@ -899,7 +968,8 @@ A background **warmup thread** populates the dedup key set and node cache at mou
 3. **Slow path**: If no persisted key set exists or validation fails, creates a fresh key set and scans all dedup tree leaves via BFS to populate it (`loaded = 0`).
 4. Loads the persisted pending buffer from disk (if `pending_lba ≠ 0`) via `obmafs3_dedup_pending_load(ctx, loaded)`. The `loaded` flag controls [restore optimisations](#restore-optimisations): when the keyset came from disk, redundant keyset insertions are skipped; the pending buffer is always pre-sized to its final capacity to avoid rehash churn.
 5. Creates a fresh pending buffer if none was loaded.
-6. Signals completion via `warmup_cond` broadcast.
+6. Populates the [dedup lookup cache](#dedup-lookup-cache) via `dlc_warmup()`, pre-loading hash→dedup_entry mappings from the dedup tree leaves so the read path has a warm cache from the start.
+7. Signals completion via `warmup_cond` broadcast.
 
 The write path calls `obmafs3_dedup_warmup_wait()` which blocks until the warmup thread signals completion. This ensures the key set and pending buffer are ready before any dedup writes occur.
 
@@ -1205,6 +1275,7 @@ Options:
 - `--compression=<0|1>` — Enable (1) or disable (0) ZSTD compression for writes (default: 1)
 - `--zstd-level=<1-15>` — ZSTD compression level (default: 15)
 - `--cache-limit=<size>` — Maximum RAM budget for the dedup B+Tree node cache (default: `8G`). Accepts K, M, or G suffixes (e.g. `2G`, `512M`). See [Node Cache Memory Management](#node-cache-memory-management).
+- `--keyset-limit=<size>` — Maximum RAM budget for the dedup key set (default: `4G`). Accepts K, M, or G suffixes (e.g. `2G`, `512M`). See [Dedup Key Set — Memory Budget](#memory-budget).
 - `--disk-images=<spec>` — Semicolon-separated `ext=sector_size` pairs for disk image detection (default: `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`)
 - `-f` — Run in foreground (skip daemonisation/fork)
 
@@ -1458,6 +1529,25 @@ Provides the C API for all filesystem operations. Used by all three tools above.
 - Dedup: `obmafs3_dedup_get_tree`, `obmafs3_dedup_lookup`, `obmafs3_write_media_image_data`, `obmafs3_read_media_image_data`, `obmafs3_read_cd_image_data`, `obmafs3_read_subchannel_data`
 - Dedup block cache: `obmafs3_flush_dedup_block_cache`, `obmafs3_free_dedup_block_cache`, `obmafs3_dedup_node_cache_init`, `obmafs3_dedup_node_cache_free`, `obmafs3_dedup_key_set_free`
 - Media read caches: `obmafs3_alloc_media_leaf_cache`, `obmafs3_free_media_leaf_cache`, `obmafs3_alloc_media_dedup_cache`, `obmafs3_free_media_dedup_cache`
+
+### Dedup Leaf Cache
+
+The **dedup leaf cache** (`struct dedup_leaf_cache`) is a stack-allocated per-call cache that stores the last accessed B+Tree leaf node. It is used by the media image read path to avoid redundant B+Tree traversals when reading sequential sectors whose hashes fall in the same leaf.
+
+```c
+struct dedup_leaf_cache {
+    uint8_t *leaf_buf;    /* Cached leaf node data (block_size bytes) */
+    uint16_t num_keys;    /* Number of keys in the cached leaf */
+    uint64_t min_key;     /* Minimum hash key in the cached leaf */
+    uint64_t max_key;     /* Maximum hash key in the cached leaf */
+};
+```
+
+When `dedup_lookup_cached()` is called:
+1. If the target hash falls within `[min_key, max_key]`, a binary search is performed directly on the cached leaf buffer, avoiding any I/O.
+2. On a miss, the standard B+Tree traversal runs and the leaf cache is re-populated with the new leaf via `dedup_leaf_cache_populate()`.
+
+The companion `dedup_readahead_next()` function pre-fetches the next leaf when the current lookup lands near the boundary of the cached leaf, so the next sequential lookup is nearly free. Combined with the global [dedup lookup cache](#dedup-lookup-cache), this gives the read path three levels of caching: lookup cache (global, thread-safe) → leaf cache (per-call, zero-copy) → B+Tree traversal (cold path).
 - Dedup key set: `obmafs3_dedup_keyset_save`, `obmafs3_dedup_keyset_load`
 - Dedup pending buffer: `obmafs3_dedup_pending_save`, `obmafs3_dedup_pending_load`, `obmafs3_dedup_pending_flush_and_free`
 - Dedup warmup: `obmafs3_dedup_warmup_start`, `obmafs3_dedup_warmup_wait`
