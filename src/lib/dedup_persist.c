@@ -263,8 +263,12 @@ int obmafs3_dedup_keyset_load(struct obmafs3_ctx *ctx)
         return OBMAFS3_ERR_NOMEM;
     }
 
+    /* Insert in reverse order: the persisted array is MRU-first
+     * (saved by walking lru_head → lru_tail).  Inserting backwards
+     * means the MRU key is inserted last and lands at the LRU head,
+     * preserving the original recency order. */
     const uint64_t *keys = (const uint64_t *)key_data;
-    for(uint64_t i = 0; i < hdr.count; i++)
+    for(int64_t i = (int64_t)hdr.count - 1; i >= 0; i--)
     {
         if(keys[i] == KEYSET_EMPTY) continue;
         keyset_insert(ks, keys[i]);

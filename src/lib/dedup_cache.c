@@ -826,7 +826,7 @@ void keyset_insert(struct dedup_key_set *ks, uint64_t key)
     if(ks->lru_tail == DEDUP_KS_NIL) ks->lru_tail = idx;
 }
 
-/** Check if a key exists in the set. Touches LRU on hit. */
+/** Check if a key exists in the set (read-only, no LRU mutation). */
 int keyset_contains(const struct dedup_key_set *ks, uint64_t key)
 {
     if(!ks || key == KEYSET_EMPTY) return 0;
@@ -834,13 +834,7 @@ int keyset_contains(const struct dedup_key_set *ks, uint64_t key)
     uint32_t b = ks_bucket(key, ks->bucket_count);
     for(uint32_t cur = ks->buckets[b]; cur != DEDUP_KS_NIL; cur = ks->slots[cur].chain_next)
     {
-        if(ks->slots[cur].key == key)
-        {
-            /* Touch LRU — cast away const since LRU order is not
-             * part of the logical "content" of the set. */
-            ks_lru_touch((struct dedup_key_set *)ks, cur);
-            return 1;
-        }
+        if(ks->slots[cur].key == key) return 1;
     }
     return 0;
 }

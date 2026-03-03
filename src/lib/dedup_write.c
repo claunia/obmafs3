@@ -264,12 +264,26 @@ int dedup_block_init(struct obmafs3_ctx *ctx, const struct btree_header *hdr, st
         memcpy(&bhdr, db->data, sizeof(bhdr));
         if((bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED) && bhdr.original_size > 0)
         {
+            /* Sanity-check sizes before allocating — a corrupt block
+             * header could hold garbage values. */
+            if(bhdr.original_size > db->capacity || bhdr.compressed_size > db->capacity)
+            {
+                fprintf(stderr,
+                        "[dedup-block] corrupt block header at LBA %" PRIu64
+                        ": original_size=%" PRIu64 " compressed_size=%" PRIu64
+                        " capacity=%" PRIu64 " — treating as empty\n",
+                        db->block_lba, bhdr.original_size, bhdr.compressed_size, db->capacity);
+                memset(db->data, 0, (size_t)db->capacity);
+                db->offset = 0;
+            }
+            else
+            {
             uint8_t *temp = malloc((size_t)bhdr.original_size);
             if(!temp)
             {
                 free(db->data);
                 db->data = NULL;
-                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory (original_size=%" PRIu64 ")", bhdr.original_size);
             }
             rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, db->data + sizeof(bhdr),
                                     (size_t)bhdr.compressed_size, temp, (size_t)bhdr.original_size);
@@ -284,6 +298,7 @@ int dedup_block_init(struct obmafs3_ctx *ctx, const struct btree_header *hdr, st
             memset(db->data + sizeof(bhdr), 0, (size_t)db->capacity - sizeof(bhdr));
             memcpy(db->data + sizeof(bhdr), temp, (size_t)bhdr.original_size);
             free(temp);
+            }
         }
     }
     else
