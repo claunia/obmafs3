@@ -656,6 +656,8 @@ void defrag_tui_run(struct defrag_tui *tui)
                 destroy_subwindows(tui);
                 create_subwindows(tui);
                 defrag_tui_draw_chrome(tui);
+                /* Re-apply timeout on the new win_map */
+                wtimeout(tui->win_map, 150);
                 break;
 
             case ERR:
