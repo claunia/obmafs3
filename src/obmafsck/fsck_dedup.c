@@ -33,6 +33,100 @@
 #include "fsck.h"
 
 /* ------------------------------------------------------------------ */
+/*  LBA hash set — O(1) uniqueness checks (open addressing)            */
+/* ------------------------------------------------------------------ */
+
+struct lba_set
+{
+    uint64_t *slots;    /* 0 = empty sentinel */
+    uint64_t  capacity; /* always a power of 2 */
+    uint64_t  count;
+    uint64_t  mask;     /* capacity - 1 */
+};
+
+static struct lba_set *lba_set_create(uint64_t initial_cap)
+{
+    struct lba_set *s = calloc(1, sizeof(*s));
+    if(!s) return NULL;
+
+    /* Round up to power of 2 */
+    uint64_t cap = 64;
+    while(cap < initial_cap) cap <<= 1;
+
+    s->slots    = calloc((size_t)cap, sizeof(uint64_t));
+    if(!s->slots) { free(s); return NULL; }
+    s->capacity = cap;
+    s->mask     = cap - 1;
+    s->count    = 0;
+    return s;
+}
+
+static void lba_set_grow(struct lba_set *s)
+{
+    uint64_t  old_cap   = s->capacity;
+    uint64_t *old_slots = s->slots;
+    uint64_t  new_cap   = old_cap * 2;
+
+    s->slots    = calloc((size_t)new_cap, sizeof(uint64_t));
+    s->capacity = new_cap;
+    s->mask     = new_cap - 1;
+    s->count    = 0;
+
+    if(!s->slots) { s->slots = old_slots; s->capacity = old_cap; s->mask = old_cap - 1; return; }
+
+    /* Re-insert all existing entries */
+    for(uint64_t i = 0; i < old_cap; i++)
+    {
+        if(old_slots[i] != 0)
+        {
+            uint64_t idx = (old_slots[i] * 0x9E3779B97F4A7C15ULL) & s->mask;
+            while(s->slots[idx] != 0)
+                idx = (idx + 1) & s->mask;
+            s->slots[idx] = old_slots[i];
+            s->count++;
+        }
+    }
+    free(old_slots);
+}
+
+/**
+ * Insert @p lba into the set.
+ * @return 1 if the LBA was newly inserted, 0 if it already existed.
+ * @note LBA value 0 cannot be stored (used as empty sentinel).
+ */
+static int lba_set_insert(struct lba_set *s, uint64_t lba)
+{
+    if(lba == 0) return 0;
+
+    /* Grow at 70% load */
+    if(s->count * 10 >= s->capacity * 7)
+        lba_set_grow(s);
+
+    uint64_t idx = (lba * 0x9E3779B97F4A7C15ULL) & s->mask;
+    for(;;)
+    {
+        if(s->slots[idx] == 0)   { s->slots[idx] = lba; s->count++; return 1; }
+        if(s->slots[idx] == lba) { return 0; }
+        idx = (idx + 1) & s->mask;
+    }
+}
+
+static void lba_set_destroy(struct lba_set *s)
+{
+    if(!s) return;
+    free(s->slots);
+    free(s);
+}
+
+/** qsort comparator for uint64_t (ascending). */
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dedup statistics                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -207,143 +301,196 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
         uint8_t *node_buf = calloc(1, (size_t)ctx->sb.block_size);
         if(!node_buf) continue;
 
-        /* DFS walk */
-        uint64_t *stk    = malloc(64 * sizeof(uint64_t));
-        uint64_t  stk_sz = 0, stk_cap = 64;
-        if(!stk)
+        /* Level-order BFS with sorted LBAs for sequential I/O */
+        uint64_t *cur_level = malloc(256 * sizeof(uint64_t));
+        uint64_t  cur_count = 0, cur_cap = 256;
+        uint64_t *nxt_level = malloc(256 * sizeof(uint64_t));
+        uint64_t  nxt_count = 0, nxt_cap = 256;
+
+        if(!cur_level || !nxt_level)
         {
+            free(cur_level);
+            free(nxt_level);
             free(node_buf);
             continue;
         }
 
-        stk[stk_sz++] = thdr.root_node_lba;
+        cur_level[cur_count++] = thdr.root_node_lba;
+
+        struct lba_set *seen = lba_set_create(4096);
 
         uint64_t nodes_visited = 0;
 
-        while(stk_sz > 0)
+        while(cur_count > 0)
         {
-            uint64_t lba = stk[--stk_sz];
+            /* Sort this level's LBAs for sequential I/O */
+            if(cur_count > 1)
+                qsort(cur_level, (size_t)cur_count, sizeof(uint64_t), cmp_u64);
 
-            nodes_visited++;
+            nxt_count = 0;
+
+            /* Prefetch window: advise ahead in batches while reading */
+            #define NODE_PREFETCH_BATCH 256
+            uint64_t prefetched_up_to = 0;
+
+            for(uint64_t ci = 0; ci < cur_count; ci++)
             {
-                char pfx[80];
-                snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] nodes", t + 1, tree_count);
-                print_bar(pfx, nodes_visited, (uint64_t)thdr.total_nodes);
-            }
+                /* Issue prefetch for the next batch if needed */
+                if(ci >= prefetched_up_to)
+                {
+                    uint64_t end = ci + NODE_PREFETCH_BATCH;
+                    if(end > cur_count) end = cur_count;
+                    for(uint64_t p = ci; p < end; p++)
+                        posix_fadvise(ctx->fd, (off_t)(cur_level[p] * ctx->sb.block_size),
+                                      (off_t)ctx->sb.block_size, POSIX_FADV_WILLNEED);
+                    prefetched_up_to = end;
+                }
 
-            rc = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
-            if(rc != OBMAFS3_OK) break;
+                uint64_t lba = cur_level[ci];
 
-            struct btree_node_header nhdr;
-            memcpy(&nhdr, node_buf, sizeof(nhdr));
-            if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+                nodes_visited++;
+                {
+                    char pfx[80];
+                    snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] nodes",
+                             t + 1, tree_count);
+                    print_bar(pfx, nodes_visited, (uint64_t)thdr.total_nodes);
+                }
 
-            if(nhdr.level > 0)
-            {
+                rc = obmafs3_block_read(ctx, lba, node_buf, (size_t)ctx->sb.block_size);
+                if(rc != OBMAFS3_OK) continue;
+
+                struct btree_node_header nhdr;
+                memcpy(&nhdr, node_buf, sizeof(nhdr));
+                if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+
+                if(nhdr.level > 0)
+                {
+                    for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                    {
+                        struct btree_index_entry ie;
+                        memcpy(&ie, node_buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie),
+                               sizeof(ie));
+                        if(nxt_count >= nxt_cap)
+                        {
+                            nxt_cap *= 2;
+                            uint64_t *tmp = realloc(nxt_level, nxt_cap * sizeof(*tmp));
+                            if(!tmp) break;
+                            nxt_level = tmp;
+                        }
+                        nxt_level[nxt_count++] = ie.child_lba;
+                    }
+                    continue;
+                }
+
+                /* Leaf node: count entries and collect unique block LBAs */
+                const uint8_t *ep = node_buf + sizeof(struct btree_node_header);
                 for(uint16_t i = 0; i < nhdr.node_keys; i++)
                 {
-                    struct btree_index_entry ie;
-                    memcpy(&ie, node_buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie), sizeof(ie));
-                    if(stk_sz >= stk_cap)
+                    struct dedup_entry de;
+                    memcpy(&de, ep + i * sizeof(struct dedup_entry), sizeof(de));
+
+                    stats[t].dedup_entries++;
+
+                    if(de.block_lba == 0) continue;
+
+                    /* O(1) hash-set uniqueness check */
+                    if(lba_set_insert(seen, de.block_lba))
                     {
-                        stk_cap *= 2;
-                        uint64_t *tmp = realloc(stk, stk_cap * sizeof(*tmp));
-                        if(!tmp) break;
-                        stk = tmp;
+                        if(base_count >= base_cap)
+                        {
+                            base_cap     = (base_cap == 0) ? 256 : base_cap * 2;
+                            uint64_t *bt = realloc(bases, base_cap * sizeof(*bt));
+                            if(!bt) break;
+                            bases = bt;
+                        }
+                        bases[base_count++] = de.block_lba;
                     }
-                    stk[stk_sz++] = ie.child_lba;
                 }
-                continue;
             }
 
-            /* Leaf node: count entries and collect unique block LBAs */
-            const uint8_t *ep = node_buf + sizeof(struct btree_node_header);
-            for(uint16_t i = 0; i < nhdr.node_keys; i++)
-            {
-                struct dedup_entry de;
-                memcpy(&de, ep + i * sizeof(struct dedup_entry), sizeof(de));
+            #undef NODE_PREFETCH_BATCH
 
-                stats[t].dedup_entries++;
+            /* Swap levels */
+            uint64_t *tmp_ptr = cur_level;
+            cur_level = nxt_level;
+            nxt_level = tmp_ptr;
+            cur_count = nxt_count;
 
-                if(de.block_lba == 0) continue;
-
-                /* Check if this base LBA is already recorded */
-                int found = 0;
-                for(uint64_t j = 0; j < base_count; j++)
-                {
-                    if(bases[j] == de.block_lba)
-                    {
-                        found = 1;
-                        break;
-                    }
-                }
-                if(!found)
-                {
-                    if(base_count >= base_cap)
-                    {
-                        base_cap     = (base_cap == 0) ? 256 : base_cap * 2;
-                        uint64_t *bt = realloc(bases, base_cap * sizeof(*bt));
-                        if(!bt) break;
-                        bases = bt;
-                    }
-                    bases[base_count++] = de.block_lba;
-                }
-            }
+            uint64_t tmp_cap = cur_cap;
+            cur_cap   = nxt_cap;
+            nxt_cap   = tmp_cap;
         }
 
-        free(stk);
+        free(cur_level);
+        free(nxt_level);
         free(node_buf);
+        lba_set_destroy(seen);
 
         stats[t].unique_blocks  = base_count;
         stats[t].physical_bytes = 0;
 
+        /* Sort base LBAs for sequential I/O when reading block headers */
+        if(base_count > 1)
+            qsort(bases, (size_t)base_count, sizeof(uint64_t), cmp_u64);
+
         /* Read each unique data block header for compression stats
-         * and compute actual physical allocation per block */
+         * and compute actual physical allocation per block.
+         * Use raw pread for just the header (58 bytes) instead of
+         * full blocks, and prefetch in batches via posix_fadvise. */
         if(base_count > 0)
         {
-            uint8_t *hdr_buf = calloc(1, (size_t)ctx->sb.block_size);
-            if(hdr_buf)
+            #define PREFETCH_BATCH 256
+
+            for(uint64_t b = 0; b < base_count; b++)
             {
-                for(uint64_t b = 0; b < base_count; b++)
+                /* Issue prefetch hints in batches */
+                if((b % PREFETCH_BATCH) == 0)
                 {
-                    {
-                        char pfx[80];
-                        snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] blocks", t + 1,
-                                 tree_count);
-                        print_bar(pfx, b + 1, base_count);
-                    }
-
-                    rc = obmafs3_block_read(ctx, bases[b], hdr_buf, (size_t)ctx->sb.block_size);
-                    if(rc != OBMAFS3_OK) continue;
-
-                    struct block_header bhdr;
-                    memcpy(&bhdr, hdr_buf, sizeof(bhdr));
-                    if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) continue;
-
-                    stats[t].original_bytes += bhdr.original_size;
-
-                    uint64_t payload_size;
-                    if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
-                    {
-                        stats[t].compressed_bytes += bhdr.compressed_size;
-                        stats[t].compressed_count++;
-                        payload_size = bhdr.compressed_size;
-                    }
-                    else
-                    {
-                        stats[t].compressed_bytes += bhdr.original_size;
-                        stats[t].uncompressed_count++;
-                        payload_size = bhdr.original_size;
-                    }
-
-                    /* Actual on-disk allocation: header + payload,
-                     * rounded up to block_size */
-                    uint64_t on_disk = sizeof(bhdr) + payload_size;
-                    uint64_t bs      = ctx->sb.block_size;
-                    stats[t].physical_bytes += ((on_disk + bs - 1) / bs) * bs;
+                    uint64_t end = b + PREFETCH_BATCH;
+                    if(end > base_count) end = base_count;
+                    for(uint64_t p = b; p < end; p++)
+                        posix_fadvise(ctx->fd, (off_t)(bases[p] * ctx->sb.block_size),
+                                      (off_t)sizeof(struct block_header), POSIX_FADV_WILLNEED);
                 }
-                free(hdr_buf);
+
+                {
+                    char pfx[80];
+                    snprintf(pfx, sizeof(pfx), "Dedup stats [tree %" PRIu64 "/%" PRIu64 "] blocks", t + 1,
+                             tree_count);
+                    print_bar(pfx, b + 1, base_count);
+                }
+
+                /* Read only the block header via pread — no need for a full block */
+                struct block_header bhdr;
+                ssize_t rd = pread(ctx->fd, &bhdr, sizeof(bhdr),
+                                   (off_t)(bases[b] * ctx->sb.block_size));
+                if(rd < (ssize_t)sizeof(bhdr)) continue;
+                if(bhdr.magic != OBMAFS3_BLOCK_MAGIC) continue;
+
+                stats[t].original_bytes += bhdr.original_size;
+
+                uint64_t payload_size;
+                if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                {
+                    stats[t].compressed_bytes += bhdr.compressed_size;
+                    stats[t].compressed_count++;
+                    payload_size = bhdr.compressed_size;
+                }
+                else
+                {
+                    stats[t].compressed_bytes += bhdr.original_size;
+                    stats[t].uncompressed_count++;
+                    payload_size = bhdr.original_size;
+                }
+
+                /* Actual on-disk allocation: header + payload,
+                 * rounded up to block_size */
+                uint64_t on_disk = sizeof(bhdr) + payload_size;
+                uint64_t bs      = ctx->sb.block_size;
+                stats[t].physical_bytes += ((on_disk + bs - 1) / bs) * bs;
             }
+
+            #undef PREFETCH_BATCH
         }
 
         free(bases);
