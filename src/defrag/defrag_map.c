@@ -31,91 +31,123 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
+#define _XOPEN_SOURCE_EXTENDED 1
 #include "defrag_tui.h"
 
 #include <stdatomic.h>
+#include <inttypes.h>
 #include <string.h>
+#include <wchar.h>
+#include <locale.h>
 
 /* ------------------------------------------------------------------ */
 /*  Block-map drawing                                                  */
 /* ------------------------------------------------------------------ */
 
-/** Draw the colour legend row at the top of the map window. */
-static void draw_legend(WINDOW *win)
-{
-    int legend_y = 0;
-    int legend_x = 1;
+/** Height reserved at the bottom of the map window for info panels. */
+#define INFO_PANEL_HEIGHT 10
 
-    wattron(win, COLOR_PAIR(CP_DESKTOP) | A_BOLD);
-    mvwprintw(win, legend_y, legend_x, "Legend:");
+/** Draw the colour legend in a framed box in the bottom-right info area. */
+static void draw_legend(WINDOW *win, int map_h, int map_w)
+{
+    /* Legend box dimensions */
+    int box_w = 22;
+    int box_h = 9;
+    int box_y = map_h - box_h;
+    int box_x = map_w - box_w - 1;
+
+    if(box_y < 1) box_y = 1;
+    if(box_x < 1) box_x = 1;
+
+    /* Draw box frame on the desktop background */
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    for(int r = box_y; r < box_y + box_h && r < map_h; r++)
+        for(int c = box_x; c < box_x + box_w && c < map_w; c++)
+            mvwaddch(win, r, c, ' ');
+
+    /* Frame */
+    mvwaddch(win, box_y, box_x, ACS_ULCORNER);
+    mvwaddch(win, box_y, box_x + box_w - 1, ACS_URCORNER);
+    mvwaddch(win, box_y + box_h - 1, box_x, ACS_LLCORNER);
+    mvwaddch(win, box_y + box_h - 1, box_x + box_w - 1, ACS_LRCORNER);
+    for(int c = box_x + 1; c < box_x + box_w - 1; c++)
+    {
+        mvwaddch(win, box_y, c, ACS_HLINE);
+        mvwaddch(win, box_y + box_h - 1, c, ACS_HLINE);
+    }
+    for(int r = box_y + 1; r < box_y + box_h - 1; r++)
+    {
+        mvwaddch(win, r, box_x, ACS_VLINE);
+        mvwaddch(win, r, box_x + box_w - 1, ACS_VLINE);
+    }
+
+    /* Title */
+    wattron(win, A_BOLD | COLOR_PAIR(CP_DESKTOP));
+    mvwprintw(win, box_y, box_x + 2, " Legend ");
     wattroff(win, A_BOLD);
 
-    legend_x += 9;
+    int y = box_y + 1;
+    int lx = box_x + 2;
 
     /* Used block */
     wattron(win, COLOR_PAIR(CP_MAP_USED));
-    mvwaddch(win, legend_y, legend_x, ACS_CKBOARD);
+    mvwaddch(win, y, lx, ' ');
     wattroff(win, COLOR_PAIR(CP_MAP_USED));
     wattron(win, COLOR_PAIR(CP_DESKTOP));
-    waddstr(win, " Used  ");
+    mvwprintw(win, y++, lx + 2, "Used Block");
 
     /* Free block */
     wattron(win, COLOR_PAIR(CP_MAP_FREE));
-    waddch(win, ACS_BULLET);
+    mvwaddch(win, y, lx, ' ');
     wattroff(win, COLOR_PAIR(CP_MAP_FREE));
     wattron(win, COLOR_PAIR(CP_DESKTOP));
-    waddstr(win, " Free  ");
+    mvwprintw(win, y++, lx + 2, "Free Space");
 
-    /* Tree nodes */
+    /* Tree node */
     wattron(win, COLOR_PAIR(CP_MAP_META));
-    waddch(win, ACS_CKBOARD);
+    mvwaddch(win, y, lx, ' ');
     wattroff(win, COLOR_PAIR(CP_MAP_META));
     wattron(win, COLOR_PAIR(CP_DESKTOP));
-    waddstr(win, " Tree  ");
+    mvwprintw(win, y++, lx + 2, "B+Tree Node");
 
-    /* Dedup data blocks */
+    /* Dedup data */
     wattron(win, COLOR_PAIR(CP_MAP_DEDUP));
-    waddch(win, ACS_CKBOARD);
+    mvwaddch(win, y, lx, ' ');
     wattroff(win, COLOR_PAIR(CP_MAP_DEDUP));
     wattron(win, COLOR_PAIR(CP_DESKTOP));
-    waddstr(win, " Dedup ");
+    mvwprintw(win, y++, lx + 2, "Dedup Data");
 
-    /* Metadata / superblock / bitmap */
+    /* Metadata */
     wattron(win, COLOR_PAIR(CP_MAP_SUPER));
-    waddch(win, ACS_CKBOARD);
+    mvwaddch(win, y, lx, ' ');
     wattroff(win, COLOR_PAIR(CP_MAP_SUPER));
     wattron(win, COLOR_PAIR(CP_DESKTOP));
-    waddstr(win, " Meta");
+    mvwprintw(win, y++, lx + 2, "Metadata");
+
+    /* Moving block */
+    wattron(win, COLOR_PAIR(CP_MAP_MOVING));
+    mvwaddch(win, y, lx, ' ');
+    wattroff(win, COLOR_PAIR(CP_MAP_MOVING));
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    mvwprintw(win, y++, lx + 2, "Moving");
 }
 
 /**
- * Get the colour pair and character for a block type.
+ * Get the colour pair and glyph for a block type.
+ * Used/allocated types use a solid space; free uses U+1FB90
+ * (INVERSE MEDIUM SHADE) for the dithered texture like Norton Speed Disk.
  */
-static void block_type_to_attr(uint8_t bt, int *color_pair, chtype *ch)
+static void block_type_to_attr(uint8_t bt, int *cp, int *use_wide)
 {
+    *use_wide = 0;
     switch(bt)
     {
-        case BT_USED:
-            *color_pair = CP_MAP_USED;
-            *ch = ACS_CKBOARD;
-            break;
-        case BT_TREE:
-            *color_pair = CP_MAP_META;
-            *ch = ACS_CKBOARD;
-            break;
-        case BT_DEDUP:
-            *color_pair = CP_MAP_DEDUP;
-            *ch = ACS_CKBOARD;
-            break;
-        case BT_META:
-            *color_pair = CP_MAP_SUPER;
-            *ch = ACS_CKBOARD;
-            break;
+        case BT_USED:  *cp = CP_MAP_USED;  break;
+        case BT_TREE:  *cp = CP_MAP_META;  break;
+        case BT_DEDUP: *cp = CP_MAP_DEDUP; break;
+        case BT_META:  *cp = CP_MAP_SUPER; break;
         case BT_FREE:
-        default:
-            *color_pair = CP_MAP_FREE;
-            *ch = ACS_BULLET;
-            break;
+        default:       *cp = CP_MAP_FREE;  *use_wide = 1; break;
     }
 }
 
@@ -168,8 +200,6 @@ void defrag_map_draw(struct defrag_tui *tui)
     int map_h, map_w;
     getmaxyx(tui->win_map, map_h, map_w);
 
-    draw_legend(tui->win_map);
-
     /* If no analysis data, show placeholder */
     const uint8_t *bt = tui->analysis.block_types;
     uint64_t total = tui->analysis.total_blocks;
@@ -189,10 +219,11 @@ void defrag_map_draw(struct defrag_tui *tui)
         return;
     }
 
-    /* Map area: rows 1..map_h-1, columns 0..map_w-1 */
-    int map_start_y = 1;
-    int usable_rows = map_h - map_start_y;
-    if(usable_rows < 1) usable_rows = 1;
+    /* Map area: rows 0 .. (map_h - INFO_PANEL_HEIGHT - 1)
+     * The bottom INFO_PANEL_HEIGHT rows are reserved for info panels. */
+    int map_rows = map_h - INFO_PANEL_HEIGHT;
+    if(map_rows < 1) map_rows = 1;
+    int usable_rows = map_rows;
     int usable_cols = map_w;
     uint64_t usable_cells = (uint64_t)usable_rows * (uint64_t)usable_cols;
 
@@ -202,23 +233,101 @@ void defrag_map_draw(struct defrag_tui *tui)
 
     uint64_t block_idx = 0;
 
+    /* U+2592 MEDIUM SHADE — classic DOS dithered free-space glyph */
+    static const wchar_t free_glyph[] = { 0x2592, L'\0' };
+    cchar_t free_cch;
+
     for(int row = 0; row < usable_rows && block_idx < total; row++)
     {
-        wmove(tui->win_map, map_start_y + row, 0);
+        wmove(tui->win_map, row, 0);
 
         for(int col = 0; col < usable_cols && block_idx < total; col++)
         {
             uint8_t dt = dominant_type(bt, total, block_idx, blocks_per_cell);
-
             int cp;
-            chtype glyph;
-            block_type_to_attr(dt, &cp, &glyph);
+            int use_wide;
+            block_type_to_attr(dt, &cp, &use_wide);
 
-            wattron(tui->win_map, COLOR_PAIR(cp));
-            waddch(tui->win_map, glyph);
-            wattroff(tui->win_map, COLOR_PAIR(cp));
+            if(use_wide)
+            {
+                setcchar(&free_cch, free_glyph, 0, (short)cp, NULL);
+                wadd_wch(tui->win_map, &free_cch);
+            }
+            else
+            {
+                wattron(tui->win_map, COLOR_PAIR(cp));
+                waddch(tui->win_map, ' ');
+                wattroff(tui->win_map, COLOR_PAIR(cp));
+            }
 
             block_idx += blocks_per_cell;
+        }
+    }
+
+    /* Draw info panels in the reserved bottom area */
+    draw_legend(tui->win_map, map_h, map_w);
+
+    /* Draw block statistics panel on the bottom-left */
+    {
+        int panel_y = map_h - INFO_PANEL_HEIGHT;
+        int panel_x = 1;
+        int panel_w = map_w / 2 - 2;
+        int panel_h = INFO_PANEL_HEIGHT;
+
+        if(panel_w < 20) panel_w = 20;
+
+        /* Frame */
+        wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
+        for(int r = panel_y; r < panel_y + panel_h && r < map_h; r++)
+            for(int c = panel_x; c < panel_x + panel_w && c < map_w; c++)
+                mvwaddch(tui->win_map, r, c, ' ');
+
+        mvwaddch(tui->win_map, panel_y, panel_x, ACS_ULCORNER);
+        mvwaddch(tui->win_map, panel_y, panel_x + panel_w - 1, ACS_URCORNER);
+        mvwaddch(tui->win_map, panel_y + panel_h - 1, panel_x, ACS_LLCORNER);
+        mvwaddch(tui->win_map, panel_y + panel_h - 1, panel_x + panel_w - 1, ACS_LRCORNER);
+        for(int c = panel_x + 1; c < panel_x + panel_w - 1; c++)
+        {
+            mvwaddch(tui->win_map, panel_y, c, ACS_HLINE);
+            mvwaddch(tui->win_map, panel_y + panel_h - 1, c, ACS_HLINE);
+        }
+        for(int r = panel_y + 1; r < panel_y + panel_h - 1; r++)
+        {
+            mvwaddch(tui->win_map, r, panel_x, ACS_VLINE);
+            mvwaddch(tui->win_map, r, panel_x + panel_w - 1, ACS_VLINE);
+        }
+
+        wattron(tui->win_map, A_BOLD | COLOR_PAIR(CP_DESKTOP));
+        mvwprintw(tui->win_map, panel_y, panel_x + 2, " Status ");
+        wattroff(tui->win_map, A_BOLD);
+
+        int y = panel_y + 1;
+        wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
+
+        if(atomic_load(&tui->analysis.finished))
+        {
+            struct analysis_result *r = &tui->analysis.result;
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Total:  %" PRIu64 " blocks", r->total_blocks);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Used:   %" PRIu64, r->used_blocks);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Free:   %" PRIu64, r->free_blocks);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Tree:   %" PRIu64, r->tree_blocks);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Dedup:  %" PRIu64, r->dedup_blocks);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Meta:   %" PRIu64, r->meta_blocks);
+            y++;
+            mvwprintw(tui->win_map, y++, panel_x + 2, "1 block = %" PRIu64 " blocks",
+                      blocks_per_cell);
+        }
+        else if(tui->analysis_thread_started)
+        {
+            int phase = atomic_load(&tui->analysis.phase);
+            const char *label = (phase >= 0 && phase < ANALYSIS_NUM_PHASES)
+                                    ? analysis_phase_labels[phase] : "Working";
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Analysing...");
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Phase: %s", label);
+        }
+        else
+        {
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Press A to analyse");
         }
     }
 }

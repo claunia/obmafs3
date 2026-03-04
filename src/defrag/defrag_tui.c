@@ -59,14 +59,14 @@ static void init_dos_colors(void)
     init_pair(CP_MENU_BAR,   COLOR_WHITE,   COLOR_BLACK);
     /* Menu hot key: yellow on black */
     init_pair(CP_MENU_HOT,   COLOR_YELLOW,  COLOR_BLACK);
-    /* Map: free = white on blue */
-    init_pair(CP_MAP_FREE,   COLOR_WHITE,   COLOR_BLUE);
-    /* Map: used = white on white (solid block) */
+    /* Map: free = cyan dots on blue (dithered gradient like Norton) */
+    init_pair(CP_MAP_FREE,   COLOR_CYAN,    COLOR_BLUE);
+    /* Map: used = white on white (solid white block) */
     init_pair(CP_MAP_USED,   COLOR_WHITE,   COLOR_WHITE);
-    /* Map: fragmented = red on blue */
-    init_pair(CP_MAP_FRAG,   COLOR_RED,     COLOR_BLUE);
-    /* Map: currently moving = yellow on blue */
-    init_pair(CP_MAP_MOVING, COLOR_YELLOW,  COLOR_BLUE);
+    /* Map: fragmented = red on red (solid red block) */
+    init_pair(CP_MAP_FRAG,   COLOR_RED,     COLOR_RED);
+    /* Map: currently moving = yellow on yellow (solid yellow block) */
+    init_pair(CP_MAP_MOVING, COLOR_YELLOW,  COLOR_YELLOW);
     /* Dialog body: black text on white */
     init_pair(CP_DIALOG_BG,  COLOR_BLACK,   COLOR_WHITE);
     /* Dialog button: white on green */
@@ -77,12 +77,12 @@ static void init_dos_colors(void)
     init_pair(CP_MENU_SEL,   COLOR_BLACK,   COLOR_WHITE);
     /* Progress bar fill: white on magenta */
     init_pair(CP_PROGRESS,   COLOR_WHITE,   COLOR_MAGENTA);
-    /* Map: metadata / B+Tree nodes = magenta on blue */
-    init_pair(CP_MAP_META,   COLOR_MAGENTA, COLOR_BLUE);
-    /* Map: dedup data blocks = green on blue */
-    init_pair(CP_MAP_DEDUP,  COLOR_GREEN,   COLOR_BLUE);
-    /* Map: superblock / bitmap / tree headers = cyan on black */
-    init_pair(CP_MAP_SUPER,  COLOR_CYAN,    COLOR_BLACK);
+    /* Map: B+Tree nodes = magenta on magenta (solid magenta block) */
+    init_pair(CP_MAP_META,   COLOR_MAGENTA, COLOR_MAGENTA);
+    /* Map: dedup data blocks = green on green (solid green block) */
+    init_pair(CP_MAP_DEDUP,  COLOR_GREEN,   COLOR_GREEN);
+    /* Map: superblock / bitmap = cyan on cyan (solid cyan block) */
+    init_pair(CP_MAP_SUPER,  COLOR_CYAN,    COLOR_CYAN);
 }
 
 /* ------------------------------------------------------------------ */

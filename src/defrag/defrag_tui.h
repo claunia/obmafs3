@@ -49,18 +49,18 @@ enum defrag_color
     CP_DESKTOP    = 1, /**< Blue background, cyan text (desktop area)              */
     CP_MENU_BAR   = 2, /**< White on black (menu bar / status bar)                 */
     CP_MENU_HOT   = 3, /**< Yellow on black (hot-key letter in menu)               */
-    CP_MAP_FREE   = 4, /**< White on blue  (free/unallocated block)                */
-    CP_MAP_USED   = 5, /**< White on white (used/allocated block)                  */
-    CP_MAP_FRAG   = 6, /**< Red on blue    (fragmented block)                      */
-    CP_MAP_MOVING = 7, /**< Yellow on blue (block currently being relocated)       */
+    CP_MAP_FREE   = 4, /**< Cyan on blue   (free block = dotted texture)          */
+    CP_MAP_USED   = 5, /**< White on white (used block = solid white square)       */
+    CP_MAP_FRAG   = 6, /**< Red on red     (fragmented block = solid red square)   */
+    CP_MAP_MOVING = 7, /**< Yellow on yellow (block being relocated = solid yellow)*/
     CP_DIALOG_BG  = 8, /**< Black on white (dialog body)                           */
     CP_DIALOG_BTN = 9, /**< White on green (dialog button)                         */
     CP_STATUS_BAR = 10, /**< Black on cyan  (bottom status bar)                    */
     CP_MENU_SEL   = 11, /**< Black on white (selected menu item)                   */
     CP_PROGRESS   = 12, /**< White on magenta (progress bar fill)                  */
-    CP_MAP_META   = 13, /**< Magenta on blue (metadata block / B+Tree node)        */
-    CP_MAP_DEDUP  = 14, /**< Green on blue   (deduplicated data block)             */
-    CP_MAP_SUPER  = 15, /**< Cyan on black   (superblock / bitmap / tree headers)  */
+    CP_MAP_META   = 13, /**< Magenta on magenta (B+Tree node = solid magenta)      */
+    CP_MAP_DEDUP  = 14, /**< Green on green (dedup data = solid green square)      */
+    CP_MAP_SUPER  = 15, /**< Cyan on cyan   (superblock/bitmap = solid cyan)       */
 };
 
 /* ------------------------------------------------------------------ */

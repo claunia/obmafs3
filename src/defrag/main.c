@@ -35,6 +35,7 @@
 #include "obmafs.h"
 
 #include <getopt.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,9 @@ int main(int argc, char *argv[])
     }
 
     const char *device_path = argv[optind];
+
+    /* Enable UTF-8 wide-character output */
+    setlocale(LC_ALL, "");
 
     /* Open the filesystem in lenient mode (read-only analysis) */
     struct obmafs3_ctx *ctx = NULL;
