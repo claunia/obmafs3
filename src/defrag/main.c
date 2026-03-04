@@ -103,7 +103,7 @@ int main(int argc, char *argv[])
     /* ---- Open the device/image for offline, exclusive access ----
      * No node cache, keyset, DLC, warmup or housekeeping threads.
      * Just a raw fd + minimal obmafs3_ctx for block I/O helpers. */
-    int fd = open(device_path, O_RDONLY);
+    int fd = open(device_path, O_RDWR);
     if(fd < 0)
     {
         fprintf(stderr, "Error: cannot open '%s': %s\n", device_path, strerror(errno));

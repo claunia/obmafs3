@@ -37,6 +37,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /*  Colour-pair initialisation (classic DOS / Norton-style palette)    */
@@ -331,6 +332,43 @@ int defrag_tui_start_analysis(struct defrag_tui *tui)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Compaction thread                                                  */
+/* ------------------------------------------------------------------ */
+
+static void *compact_thread_fn(void *arg)
+{
+    struct compact_state *state = (struct compact_state *)arg;
+    defrag_compact_run(state);
+    return NULL;
+}
+
+int defrag_tui_start_compaction(struct defrag_tui *tui)
+{
+    /* Analysis must have completed */
+    if(!tui->analysis_thread_started || !atomic_load(&tui->analysis.finished))
+        return -1;
+    if(tui->compact_thread_started && !atomic_load(&tui->compaction.finished))
+        return -1; /* already running */
+
+    /* Reset compaction state */
+    memset(&tui->compaction, 0, sizeof(tui->compaction));
+    tui->compaction.ctx      = tui->ctx;
+    tui->compaction.analysis = &tui->analysis;
+    atomic_store(&tui->compaction.done_steps, 0);
+    atomic_store(&tui->compaction.total_steps, 0);
+    atomic_store(&tui->compaction.phase, 0);
+    atomic_store(&tui->compaction.finished, 0);
+    atomic_store(&tui->compaction.error, 0);
+    atomic_store(&tui->compaction.cancel_requested, 0);
+
+    int rc = pthread_create(&tui->compact_thread, NULL, compact_thread_fn, &tui->compaction);
+    if(rc != 0) return -1;
+    tui->compact_thread_started = 1;
+    tui->compact_done_shown = 0;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Status bar update                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -340,7 +378,51 @@ void defrag_tui_update_status(struct defrag_tui *tui)
     wbkgd(tui->win_status, COLOR_PAIR(CP_STATUS_BAR));
     wattron(tui->win_status, COLOR_PAIR(CP_STATUS_BAR));
 
-    if(tui->analysis_thread_started && !atomic_load(&tui->analysis.finished))
+    /* Compaction in progress takes priority */
+    if(tui->compact_thread_started && !atomic_load(&tui->compaction.finished))
+    {
+        int phase = atomic_load(&tui->compaction.phase);
+        uint64_t done = atomic_load(&tui->compaction.done_steps);
+        uint64_t total = atomic_load(&tui->compaction.total_steps);
+        double pct = total > 0 ? ((double)done / (double)total) * 100.0 : 0.0;
+        if(pct > 100.0) pct = 100.0;
+
+        const char *phase_label = (phase >= 0 && phase < COMPACT_NUM_PHASES)
+                                      ? compact_phase_labels[phase]
+                                      : "Working";
+
+        /* Elapsed time */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed_s = (double)(now.tv_sec - tui->compaction.start_time.tv_sec) +
+                           (double)(now.tv_nsec - tui->compaction.start_time.tv_nsec) / 1e9;
+        int elapsed_h = (int)(elapsed_s / 3600);
+        int elapsed_m = (int)((elapsed_s - elapsed_h * 3600) / 60);
+        int elapsed_sec = (int)(elapsed_s) % 60;
+
+        /* Estimated remaining time */
+        double eta_s = (pct > 0.1) ? (elapsed_s / pct * (100.0 - pct)) : 0.0;
+        int eta_h = (int)(eta_s / 3600);
+        int eta_m = (int)((eta_s - eta_h * 3600) / 60);
+        int eta_sec = (int)(eta_s) % 60;
+
+        uint64_t src = atomic_load(&tui->compaction.current_src_lba);
+        uint64_t dst = atomic_load(&tui->compaction.current_dst_lba);
+
+        mvwprintw(tui->win_status, 0, 1,
+                  "%s %5.1f%% | %" PRIu64 "->%" PRIu64 " | %02d:%02d:%02d / ~%02d:%02d:%02d | ESC=Stop",
+                  phase_label, pct, src, dst,
+                  elapsed_h, elapsed_m, elapsed_sec, eta_h, eta_m, eta_sec);
+    }
+    else if(tui->compact_thread_started && atomic_load(&tui->compaction.finished))
+    {
+        if(atomic_load(&tui->compaction.error))
+            mvwprintw(tui->win_status, 0, 1, "Compaction FAILED (error %d)  |  Q = Quit",
+                      atomic_load(&tui->compaction.error));
+        else
+            mvwprintw(tui->win_status, 0, 1, "Compaction complete  |  A = Re-analyse  |  Q = Quit");
+    }
+    else if(tui->analysis_thread_started && !atomic_load(&tui->analysis.finished))
     {
         int phase = atomic_load(&tui->analysis.phase);
         uint64_t done = atomic_load(&tui->analysis.done_blocks);
@@ -375,7 +457,7 @@ void defrag_tui_update_status(struct defrag_tui *tui)
     }
     else if(tui->analysis_thread_started && atomic_load(&tui->analysis.finished))
     {
-        mvwprintw(tui->win_status, 0, 1, "Analysis complete  |  Press S for summary  |  Q to quit");
+        mvwprintw(tui->win_status, 0, 1, "Analysis complete  |  S = Summary  C = Compact  Q = Quit");
     }
     else
     {
@@ -516,14 +598,24 @@ void defrag_tui_run(struct defrag_tui *tui)
         {
             case 'q':
             case 'Q':
-                /* If analysis is running, wait for it to finish */
+                /* If compaction is running, request safe stop first */
+                if(tui->compact_thread_started && !atomic_load(&tui->compaction.finished))
+                {
+                    atomic_store(&tui->compaction.cancel_requested, 1);
+                    pthread_join(tui->compact_thread, NULL);
+                    tui->compact_thread_started = 0;
+                }
                 if(tui->analysis_thread_started && !atomic_load(&tui->analysis.finished))
                 {
-                    /* Signal abort — for now just wait */
                     pthread_join(tui->analysis_thread, NULL);
                     tui->analysis_thread_started = 0;
                 }
                 tui->running = 0;
+                break;
+
+            case 27: /* ESC — request safe stop of compaction */
+                if(tui->compact_thread_started && !atomic_load(&tui->compaction.finished))
+                    atomic_store(&tui->compaction.cancel_requested, 1);
                 break;
 
             case 'a':
@@ -545,6 +637,20 @@ void defrag_tui_run(struct defrag_tui *tui)
                     defrag_tui_summary_dialog(tui);
                 break;
 
+            case 'c':
+            case 'C':
+                if(tui->analysis_thread_started && atomic_load(&tui->analysis.finished) &&
+                   (!tui->compact_thread_started || atomic_load(&tui->compaction.finished)))
+                {
+                    if(tui->compact_thread_started)
+                    {
+                        pthread_join(tui->compact_thread, NULL);
+                        tui->compact_thread_started = 0;
+                    }
+                    defrag_tui_start_compaction(tui);
+                }
+                break;
+
             case KEY_RESIZE:
                 /* Terminal was resized — recreate sub-windows. */
                 destroy_subwindows(tui);
@@ -560,11 +666,12 @@ void defrag_tui_run(struct defrag_tui *tui)
                 break;
         }
 
-        /* Live refresh during/after analysis */
-        if(tui->analysis_thread_started)
+        /* Live refresh during analysis or compaction */
+        if(tui->analysis_thread_started || tui->compact_thread_started)
         {
             /* Check if analysis just finished */
-            int finished = atomic_load(&tui->analysis.finished);
+            int analysis_finished = tui->analysis_thread_started &&
+                                    atomic_load(&tui->analysis.finished);
 
             /* Redraw map */
             werase(tui->win_map);
@@ -577,16 +684,21 @@ void defrag_tui_run(struct defrag_tui *tui)
 
             doupdate();
 
-            /* Auto-show summary once when analysis completes */
-            if(finished && !atomic_load(&tui->analysis.error) && !tui->summary_shown)
+            /* Auto-show summary once when analysis completes (and no compaction running) */
+            if(analysis_finished && !atomic_load(&tui->analysis.error) &&
+               !tui->summary_shown && !tui->compact_thread_started)
             {
                 tui->summary_shown = 1;
-
-                /* Join the thread first */
                 pthread_join(tui->analysis_thread, NULL);
-                /* Keep analysis_thread_started = 1 so we know results are available */
-
                 defrag_tui_summary_dialog(tui);
+            }
+
+            /* Show completion message once when compaction finishes */
+            if(tui->compact_thread_started && atomic_load(&tui->compaction.finished) &&
+               !tui->compact_done_shown)
+            {
+                tui->compact_done_shown = 1;
+                pthread_join(tui->compact_thread, NULL);
             }
         }
     }

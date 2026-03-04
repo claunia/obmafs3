@@ -37,6 +37,7 @@
 #include <stdatomic.h>
 #include <inttypes.h>
 #include <string.h>
+#include <time.h>
 #include <wchar.h>
 #include <locale.h>
 
@@ -264,6 +265,39 @@ void defrag_map_draw(struct defrag_tui *tui)
         }
     }
 
+    /* Overlay live read/write position markers during compaction */
+    if(tui->compact_thread_started && !atomic_load(&tui->compaction.finished))
+    {
+        uint64_t src = atomic_load(&tui->compaction.current_src_lba);
+        uint64_t dst = atomic_load(&tui->compaction.current_dst_lba);
+
+        /* Convert LBA to map cell (row, col) */
+        if(src < total && blocks_per_cell > 0)
+        {
+            uint64_t cell = src / blocks_per_cell;
+            int r = (int)(cell / (uint64_t)usable_cols);
+            int c = (int)(cell % (uint64_t)usable_cols);
+            if(r < usable_rows)
+            {
+                wattron(tui->win_map, COLOR_PAIR(CP_MAP_FRAG) | A_BOLD);
+                mvwaddch(tui->win_map, r, c, 'r');
+                wattroff(tui->win_map, COLOR_PAIR(CP_MAP_FRAG) | A_BOLD);
+            }
+        }
+        if(dst < total && blocks_per_cell > 0)
+        {
+            uint64_t cell = dst / blocks_per_cell;
+            int r = (int)(cell / (uint64_t)usable_cols);
+            int c = (int)(cell % (uint64_t)usable_cols);
+            if(r < usable_rows)
+            {
+                wattron(tui->win_map, COLOR_PAIR(CP_MAP_MOVING) | A_BOLD);
+                mvwaddch(tui->win_map, r, c, 'W');
+                wattroff(tui->win_map, COLOR_PAIR(CP_MAP_MOVING) | A_BOLD);
+            }
+        }
+    }
+
     /* Draw info panels in the reserved bottom area */
     draw_legend(tui->win_map, map_h, map_w);
 
@@ -302,9 +336,73 @@ void defrag_map_draw(struct defrag_tui *tui)
         wattroff(tui->win_map, A_BOLD);
 
         int y = panel_y + 1;
+        int inner_w = panel_w - 4;
         wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
 
-        if(atomic_load(&tui->analysis.finished))
+        if(tui->compact_thread_started && !atomic_load(&tui->compaction.finished))
+        {
+            /* Compaction in progress — show Norton-style status */
+            int phase = atomic_load(&tui->compaction.phase);
+            uint64_t done = atomic_load(&tui->compaction.done_steps);
+            uint64_t ctotal = atomic_load(&tui->compaction.total_steps);
+            double pct = ctotal > 0 ? ((double)done / (double)ctotal) * 100.0 : 0.0;
+            if(pct > 100.0) pct = 100.0;
+
+            uint64_t src = atomic_load(&tui->compaction.current_src_lba);
+            uint64_t dst = atomic_load(&tui->compaction.current_dst_lba);
+
+            const char *phase_label = (phase >= 0 && phase < COMPACT_NUM_PHASES)
+                                          ? compact_phase_labels[phase] : "Working";
+
+            /* Elapsed time */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed_s = (double)(now.tv_sec - tui->compaction.start_time.tv_sec) +
+                               (double)(now.tv_nsec - tui->compaction.start_time.tv_nsec) / 1e9;
+            int el_h = (int)(elapsed_s / 3600);
+            int el_m = (int)((elapsed_s - el_h * 3600) / 60);
+            int el_sec = (int)(elapsed_s) % 60;
+
+            /* ETA */
+            double eta_s = (pct > 0.1) ? (elapsed_s / pct * (100.0 - pct)) : 0.0;
+            int eta_h = (int)(eta_s / 3600);
+            int eta_m = (int)((eta_s - eta_h * 3600) / 60);
+            int eta_sec = (int)(eta_s) % 60;
+
+            mvwprintw(tui->win_map, y++, panel_x + 2, "%-*s", inner_w, phase_label);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Block %" PRIu64 " -> %" PRIu64, src, dst);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "                    %5.1f%%", pct);
+            y++;
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Elapsed: %02d:%02d:%02d", el_h, el_m, el_sec);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "ETA:     %02d:%02d:%02d", eta_h, eta_m, eta_sec);
+            y++;
+
+            /* Progress bar */
+            int bar_w = inner_w;
+            int fill = (int)(pct / 100.0 * bar_w);
+            wmove(tui->win_map, y, panel_x + 2);
+            wattron(tui->win_map, COLOR_PAIR(CP_PROGRESS));
+            for(int i = 0; i < fill && i < bar_w; i++)
+                waddch(tui->win_map, ' ');
+            wattroff(tui->win_map, COLOR_PAIR(CP_PROGRESS));
+            wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
+            for(int i = fill; i < bar_w; i++)
+                waddch(tui->win_map, ACS_BULLET);
+        }
+        else if(tui->compact_thread_started && atomic_load(&tui->compaction.finished))
+        {
+            if(atomic_load(&tui->compaction.error))
+                mvwprintw(tui->win_map, y++, panel_x + 2, "Compaction FAILED");
+            else
+                mvwprintw(tui->win_map, y++, panel_x + 2, "Compaction complete!");
+            y++;
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Data moved:  %" PRIu64, tui->compaction.data_blocks_moved);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Dedup moved: %" PRIu64, tui->compaction.dedup_blocks_moved);
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Trees moved: %" PRIu64, tui->compaction.tree_nodes_moved);
+            y++;
+            mvwprintw(tui->win_map, y++, panel_x + 2, "Press A to re-analyse");
+        }
+        else if(atomic_load(&tui->analysis.finished))
         {
             struct analysis_result *r = &tui->analysis.result;
             mvwprintw(tui->win_map, y++, panel_x + 2, "Total:  %" PRIu64 " blocks", r->total_blocks);

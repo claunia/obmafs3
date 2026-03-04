@@ -6,6 +6,7 @@ add_executable(defrag
     defrag_tui.c
     defrag_map.c
     defrag_analysis.c
+    defrag_compact.c
 )
 
 target_include_directories(defrag PRIVATE

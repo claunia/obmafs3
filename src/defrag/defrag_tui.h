@@ -38,6 +38,7 @@
 #include <stdatomic.h>
 
 #include "defrag_analysis.h"
+#include "defrag_compact.h"
 
 /* ------------------------------------------------------------------ */
 /*  Classic DOS colour pairs                                           */
@@ -95,6 +96,12 @@ struct defrag_tui
     pthread_t             analysis_thread;
     int                   analysis_thread_started;
     int                   summary_shown; /**< Set after auto-showing the summary dialog */
+
+    /* Compaction state (shared with background thread) */
+    struct compact_state compaction;
+    pthread_t            compact_thread;
+    int                  compact_thread_started;
+    int                  compact_done_shown;
 };
 
 /* ------------------------------------------------------------------ */
@@ -149,5 +156,12 @@ void defrag_tui_update_status(struct defrag_tui *tui);
  * Show a modal dialog with the analysis results summary.
  */
 void defrag_tui_summary_dialog(struct defrag_tui *tui);
+
+/**
+ * Start the background compaction thread.
+ * Analysis must have completed successfully first.
+ * Returns 0 on success, -1 if not ready or on error.
+ */
+int defrag_tui_start_compaction(struct defrag_tui *tui);
 
 #endif /* DEFRAG_TUI_H */
