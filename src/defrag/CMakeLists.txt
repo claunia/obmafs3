@@ -5,6 +5,7 @@ add_executable(defrag
     main.c
     defrag_tui.c
     defrag_map.c
+    defrag_analysis.c
 )
 
 target_include_directories(defrag PRIVATE
@@ -15,4 +16,5 @@ target_include_directories(defrag PRIVATE
 target_link_libraries(defrag
     obmafs
     ${NCURSES_LIBRARIES}
+    pthread
 )

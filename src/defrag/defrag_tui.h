@@ -34,6 +34,10 @@
 #define DEFRAG_TUI_H
 
 #include <ncurses.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+#include "defrag_analysis.h"
 
 /* ------------------------------------------------------------------ */
 /*  Classic DOS colour pairs                                           */
@@ -55,6 +59,8 @@ enum defrag_color
     CP_MENU_SEL   = 11, /**< Black on white (selected menu item)                   */
     CP_PROGRESS   = 12, /**< White on magenta (progress bar fill)                  */
     CP_MAP_META   = 13, /**< Magenta on blue (metadata block / B+Tree node)        */
+    CP_MAP_DEDUP  = 14, /**< Green on blue   (deduplicated data block)             */
+    CP_MAP_SUPER  = 15, /**< Cyan on black   (superblock / bitmap / tree headers)  */
 };
 
 /* ------------------------------------------------------------------ */
@@ -81,10 +87,14 @@ struct defrag_tui
 
     int running;          /**< Non-zero while the event loop is active  */
 
-    /* Progress tracking (placeholder for future use) */
-    uint64_t total_blocks;
-    uint64_t done_blocks;
-    double   progress_pct;
+    /* Filesystem context (set by main before launching the TUI) */
+    struct obmafs3_ctx *ctx;
+
+    /* Analysis state (shared with background thread) */
+    struct analysis_state analysis;
+    pthread_t             analysis_thread;
+    int                   analysis_thread_started;
+    int                   summary_shown; /**< Set after auto-showing the summary dialog */
 };
 
 /* ------------------------------------------------------------------ */
@@ -119,8 +129,25 @@ int defrag_tui_fsck_dialog(struct defrag_tui *tui);
 void defrag_tui_run(struct defrag_tui *tui);
 
 /**
- * Redraw the block map area.  Currently draws an empty placeholder.
+ * Redraw the block map area from the analysis block_types array.
+ * Shows a placeholder when no analysis has been run yet.
  */
 void defrag_map_draw(struct defrag_tui *tui);
+
+/**
+ * Start the background analysis thread.
+ * Returns 0 on success, -1 if already running or on error.
+ */
+int defrag_tui_start_analysis(struct defrag_tui *tui);
+
+/**
+ * Update the status bar with current analysis progress.
+ */
+void defrag_tui_update_status(struct defrag_tui *tui);
+
+/**
+ * Show a modal dialog with the analysis results summary.
+ */
+void defrag_tui_summary_dialog(struct defrag_tui *tui);
 
 #endif /* DEFRAG_TUI_H */

@@ -33,81 +33,192 @@
 
 #include "defrag_tui.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
 /*  Block-map drawing                                                  */
 /* ------------------------------------------------------------------ */
 
+/** Draw the colour legend row at the top of the map window. */
+static void draw_legend(WINDOW *win)
+{
+    int legend_y = 0;
+    int legend_x = 1;
+
+    wattron(win, COLOR_PAIR(CP_DESKTOP) | A_BOLD);
+    mvwprintw(win, legend_y, legend_x, "Legend:");
+    wattroff(win, A_BOLD);
+
+    legend_x += 9;
+
+    /* Used block */
+    wattron(win, COLOR_PAIR(CP_MAP_USED));
+    mvwaddch(win, legend_y, legend_x, ACS_CKBOARD);
+    wattroff(win, COLOR_PAIR(CP_MAP_USED));
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    waddstr(win, " Used  ");
+
+    /* Free block */
+    wattron(win, COLOR_PAIR(CP_MAP_FREE));
+    waddch(win, ACS_BULLET);
+    wattroff(win, COLOR_PAIR(CP_MAP_FREE));
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    waddstr(win, " Free  ");
+
+    /* Tree nodes */
+    wattron(win, COLOR_PAIR(CP_MAP_META));
+    waddch(win, ACS_CKBOARD);
+    wattroff(win, COLOR_PAIR(CP_MAP_META));
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    waddstr(win, " Tree  ");
+
+    /* Dedup data blocks */
+    wattron(win, COLOR_PAIR(CP_MAP_DEDUP));
+    waddch(win, ACS_CKBOARD);
+    wattroff(win, COLOR_PAIR(CP_MAP_DEDUP));
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    waddstr(win, " Dedup ");
+
+    /* Metadata / superblock / bitmap */
+    wattron(win, COLOR_PAIR(CP_MAP_SUPER));
+    waddch(win, ACS_CKBOARD);
+    wattroff(win, COLOR_PAIR(CP_MAP_SUPER));
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    waddstr(win, " Meta");
+}
+
+/**
+ * Get the colour pair and character for a block type.
+ */
+static void block_type_to_attr(uint8_t bt, int *color_pair, chtype *ch)
+{
+    switch(bt)
+    {
+        case BT_USED:
+            *color_pair = CP_MAP_USED;
+            *ch = ACS_CKBOARD;
+            break;
+        case BT_TREE:
+            *color_pair = CP_MAP_META;
+            *ch = ACS_CKBOARD;
+            break;
+        case BT_DEDUP:
+            *color_pair = CP_MAP_DEDUP;
+            *ch = ACS_CKBOARD;
+            break;
+        case BT_META:
+            *color_pair = CP_MAP_SUPER;
+            *ch = ACS_CKBOARD;
+            break;
+        case BT_FREE:
+        default:
+            *color_pair = CP_MAP_FREE;
+            *ch = ACS_BULLET;
+            break;
+    }
+}
+
+/**
+ * Determine the dominant block type in a range of blocks.
+ *
+ * Counts how many blocks of each type exist in [start, start+count)
+ * and returns the type with the most blocks (ties broken by priority:
+ * META > TREE > DEDUP > USED > FREE).
+ */
+static uint8_t dominant_type(const uint8_t *block_types, uint64_t total,
+                             uint64_t start, uint64_t count)
+{
+    uint32_t counts[5] = {0};
+    uint64_t end = start + count;
+    if(end > total) end = total;
+
+    for(uint64_t i = start; i < end; i++)
+    {
+        uint8_t t = block_types[i];
+        if(t < 5) counts[t]++;
+    }
+
+    /* Priority order: META(4) > TREE(2) > DEDUP(3) > USED(1) > FREE(0) */
+    static const uint8_t priority[] = {BT_META, BT_TREE, BT_DEDUP, BT_USED, BT_FREE};
+    uint8_t  best = BT_FREE;
+    uint32_t best_count = 0;
+
+    for(int i = 0; i < 5; i++)
+    {
+        uint8_t t = priority[i];
+        if(counts[t] > best_count)
+        {
+            best_count = counts[t];
+            best = t;
+        }
+    }
+    return best;
+}
+
 /**
  * Draw the block-map area.
  *
- * Currently this is a placeholder that draws the legend and an empty
- * blue desktop.  When the defrag engine is implemented, each character
- * cell will represent a group of blocks coloured according to their
- * state (free, used, fragmented, metadata, moving).
+ * Each character cell represents a group of filesystem blocks.
+ * The cell is coloured according to the dominant block type in
+ * that group.  Shows a placeholder when no analysis data exists.
  */
 void defrag_map_draw(struct defrag_tui *tui)
 {
     int map_h, map_w;
     getmaxyx(tui->win_map, map_h, map_w);
 
-    /* Draw legend at the top of the map area */
-    int legend_y = 1;
-    int legend_x = 2;
+    draw_legend(tui->win_map);
 
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP) | A_BOLD);
-    mvwprintw(tui->win_map, legend_y, legend_x, "Legend:");
-    wattroff(tui->win_map, A_BOLD);
+    /* If no analysis data, show placeholder */
+    const uint8_t *bt = tui->analysis.block_types;
+    uint64_t total = tui->analysis.total_blocks;
 
-    legend_x += 9;
+    if(!bt || total == 0)
+    {
+        const char *placeholder = "[ Press A to analyse ]";
+        int         ph_len      = (int)strlen(placeholder);
+        int         ph_y        = map_h / 2;
+        int         ph_x        = (map_w - ph_len) / 2;
+        if(ph_x < 0) ph_x = 0;
+        if(ph_y < 1) ph_y = 1;
 
-    /* Used block */
-    wattron(tui->win_map, COLOR_PAIR(CP_MAP_USED));
-    mvwaddch(tui->win_map, legend_y, legend_x, ACS_CKBOARD);
-    wattroff(tui->win_map, COLOR_PAIR(CP_MAP_USED));
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
-    waddstr(tui->win_map, " Used  ");
+        wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP) | A_DIM);
+        mvwprintw(tui->win_map, ph_y, ph_x, "%s", placeholder);
+        wattroff(tui->win_map, A_DIM);
+        return;
+    }
 
-    /* Free block */
-    wattron(tui->win_map, COLOR_PAIR(CP_MAP_FREE));
-    waddch(tui->win_map, ACS_BULLET);
-    wattroff(tui->win_map, COLOR_PAIR(CP_MAP_FREE));
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
-    waddstr(tui->win_map, " Free  ");
+    /* Map area: rows 1..map_h-1, columns 0..map_w-1 */
+    int map_start_y = 1;
+    int usable_rows = map_h - map_start_y;
+    if(usable_rows < 1) usable_rows = 1;
+    int usable_cols = map_w;
+    uint64_t usable_cells = (uint64_t)usable_rows * (uint64_t)usable_cols;
 
-    /* Fragmented block */
-    wattron(tui->win_map, COLOR_PAIR(CP_MAP_FRAG));
-    waddch(tui->win_map, ACS_CKBOARD);
-    wattroff(tui->win_map, COLOR_PAIR(CP_MAP_FRAG));
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
-    waddstr(tui->win_map, " Frag  ");
+    /* How many blocks each cell represents */
+    uint64_t blocks_per_cell = (total + usable_cells - 1) / usable_cells;
+    if(blocks_per_cell < 1) blocks_per_cell = 1;
 
-    /* Metadata block */
-    wattron(tui->win_map, COLOR_PAIR(CP_MAP_META));
-    waddch(tui->win_map, ACS_CKBOARD);
-    wattroff(tui->win_map, COLOR_PAIR(CP_MAP_META));
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
-    waddstr(tui->win_map, " Meta  ");
+    uint64_t block_idx = 0;
 
-    /* Moving block */
-    wattron(tui->win_map, COLOR_PAIR(CP_MAP_MOVING));
-    waddch(tui->win_map, ACS_CKBOARD);
-    wattroff(tui->win_map, COLOR_PAIR(CP_MAP_MOVING));
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP));
-    waddstr(tui->win_map, " Moving");
+    for(int row = 0; row < usable_rows && block_idx < total; row++)
+    {
+        wmove(tui->win_map, map_start_y + row, 0);
 
-    /* --- Placeholder text centred in the map area --- */
-    const char *placeholder = "[ Block map will appear here ]";
-    int         ph_len      = (int)strlen(placeholder);
-    int         ph_y        = map_h / 2;
-    int         ph_x        = (map_w - ph_len) / 2;
+        for(int col = 0; col < usable_cols && block_idx < total; col++)
+        {
+            uint8_t dt = dominant_type(bt, total, block_idx, blocks_per_cell);
 
-    if(ph_x < 0) ph_x = 0;
+            int cp;
+            chtype glyph;
+            block_type_to_attr(dt, &cp, &glyph);
 
-    wattron(tui->win_map, COLOR_PAIR(CP_DESKTOP) | A_DIM);
-    mvwprintw(tui->win_map, ph_y, ph_x, "%s", placeholder);
-    wattroff(tui->win_map, A_DIM);
+            wattron(tui->win_map, COLOR_PAIR(cp));
+            waddch(tui->win_map, glyph);
+            wattroff(tui->win_map, COLOR_PAIR(cp));
 
-    (void)map_h; /* suppress unused warning when legend_y is the only use */
+            block_idx += blocks_per_cell;
+        }
+    }
 }

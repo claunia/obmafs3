@@ -32,6 +32,7 @@
 // ****************************************************************************/
 
 #include "defrag_tui.h"
+#include "obmafs.h"
 
 #include <getopt.h>
 #include <stdio.h>
@@ -89,9 +90,14 @@ int main(int argc, char *argv[])
 
     const char *device_path = argv[optind];
 
-    /* TODO: open the filesystem via obmafs3_open() here.
-     * For the skeleton we only store the path for later use. */
-    (void)device_path;
+    /* Open the filesystem in lenient mode (read-only analysis) */
+    struct obmafs3_ctx *ctx = NULL;
+    int rc = obmafs3_open_flags(device_path, OBMAFS3_OPEN_LENIENT, &ctx);
+    if(rc != OBMAFS3_OK)
+    {
+        fprintf(stderr, "Error: failed to open '%s' (error %d).\n", device_path, rc);
+        return 1;
+    }
 
     /* ---- Launch TUI ---- */
     struct defrag_tui tui;
@@ -99,8 +105,11 @@ int main(int argc, char *argv[])
     if(defrag_tui_init(&tui) != 0)
     {
         fprintf(stderr, "Error: failed to initialise terminal UI.\n");
+        obmafs3_close(ctx);
         return 1;
     }
+
+    tui.ctx = ctx;
 
     /* Draw the full screen chrome first, then show the dialog on top. */
     defrag_tui_draw_chrome(&tui);
@@ -110,12 +119,17 @@ int main(int argc, char *argv[])
     {
         /* User chose "Exit" */
         defrag_tui_shutdown(&tui);
+        obmafs3_close(ctx);
         return 0;
     }
 
     /* User chose "OK" — enter normal event loop. */
     defrag_tui_run(&tui);
 
+    if(tui.analysis.block_types)
+        free(tui.analysis.block_types);
+
     defrag_tui_shutdown(&tui);
+    obmafs3_close(ctx);
     return 0;
 }
