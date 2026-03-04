@@ -34,11 +34,17 @@
 #include "defrag_tui.h"
 #include "obmafs.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <locale.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /*  Usage / help                                                       */
@@ -94,12 +100,62 @@ int main(int argc, char *argv[])
     /* Enable UTF-8 wide-character output */
     setlocale(LC_ALL, "");
 
-    /* Open the filesystem in lenient mode (read-only analysis) */
-    struct obmafs3_ctx *ctx = NULL;
-    int rc = obmafs3_open_flags(device_path, OBMAFS3_OPEN_LENIENT, &ctx);
-    if(rc != OBMAFS3_OK)
+    /* ---- Open the device/image for offline, exclusive access ----
+     * No node cache, keyset, DLC, warmup or housekeeping threads.
+     * Just a raw fd + minimal obmafs3_ctx for block I/O helpers. */
+    int fd = open(device_path, O_RDONLY);
+    if(fd < 0)
     {
-        fprintf(stderr, "Error: failed to open '%s' (error %d).\n", device_path, rc);
+        fprintf(stderr, "Error: cannot open '%s': %s\n", device_path, strerror(errno));
+        return 1;
+    }
+
+    /* Read and validate the superblock */
+    struct obmafs3_sb sb;
+    ssize_t rd = pread(fd, &sb, sizeof(sb), 0);
+    if(rd < (ssize_t)sizeof(sb))
+    {
+        fprintf(stderr, "Error: cannot read superblock from '%s'\n", device_path);
+        close(fd);
+        return 1;
+    }
+
+    if(sb.magic != OBMAFS3_SB_MAGIC)
+    {
+        fprintf(stderr, "Error: '%s' does not contain a valid OBMAFS3 filesystem\n", device_path);
+        close(fd);
+        return 1;
+    }
+
+    /* Build a minimal ctx — no caches, no threads, no housekeeping */
+    struct obmafs3_ctx *ctx = calloc(1, sizeof(*ctx));
+    if(!ctx)
+    {
+        fprintf(stderr, "Error: out of memory\n");
+        close(fd);
+        return 1;
+    }
+    ctx->fd          = fd;
+    ctx->sb          = sb;
+    ctx->compression = 1;
+    ctx->zstd_level  = 15;
+
+    if(pthread_key_create(&ctx->tls_key, NULL) != 0)
+    {
+        fprintf(stderr, "Error: pthread_key_create failed\n");
+        close(fd);
+        free(ctx);
+        return 1;
+    }
+    pthread_rwlock_init(&ctx->tree_lock, NULL);
+
+    /* Allocate thread-local scratch buffers needed by library I/O helpers */
+    struct obmafs3_thread_bufs *tb = obmafs3_get_thread_bufs(ctx);
+    if(!tb || !tb->hdr_buf || !tb->node_buf || !tb->io_buf)
+    {
+        fprintf(stderr, "Error: out of memory allocating work buffers\n");
+        close(fd);
+        free(ctx);
         return 1;
     }
 
@@ -109,7 +165,8 @@ int main(int argc, char *argv[])
     if(defrag_tui_init(&tui) != 0)
     {
         fprintf(stderr, "Error: failed to initialise terminal UI.\n");
-        obmafs3_close(ctx);
+        close(fd);
+        free(ctx);
         return 1;
     }
 
@@ -123,7 +180,8 @@ int main(int argc, char *argv[])
     {
         /* User chose "Exit" */
         defrag_tui_shutdown(&tui);
-        obmafs3_close(ctx);
+        close(fd);
+        free(ctx);
         return 0;
     }
 
@@ -134,6 +192,7 @@ int main(int argc, char *argv[])
         free(tui.analysis.block_types);
 
     defrag_tui_shutdown(&tui);
-    obmafs3_close(ctx);
+    close(fd);
+    free(ctx);
     return 0;
 }
