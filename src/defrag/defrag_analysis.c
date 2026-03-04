@@ -34,9 +34,11 @@
 #include "defrag_analysis.h"
 #include "obmafs.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /*  Phase labels                                                       */
@@ -75,8 +77,18 @@ static inline void mark_block(struct analysis_state *state, uint64_t lba, enum b
 /*  BFS tree node walker                                               */
 /* ------------------------------------------------------------------ */
 
+/** qsort comparator for uint64_t (ascending). */
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
 /**
- * Walk all nodes reachable from @p root_lba via iterative DFS.
+ * Walk all nodes reachable from @p root_lba via level-order BFS.
+ * Each level's LBAs are sorted for sequential I/O and prefetched
+ * via posix_fadvise before reading.
  *
  * Each visited node LBA is marked as BT_TREE in block_types[].
  * Returns the number of nodes walked (0 if root_lba == 0).
@@ -92,64 +104,99 @@ static uint64_t walk_tree(struct analysis_state *state, uint64_t root_lba,
     uint8_t *buf = calloc(1, (size_t)block_size);
     if(!buf) return 0;
 
-    /* Explicit DFS stack */
-    uint64_t stk_cap  = 256;
-    uint64_t stk_size = 0;
-    uint64_t *stack   = malloc(stk_cap * sizeof(uint64_t));
-    if(!stack) { free(buf); return 0; }
+    /* Level-order BFS with sorted LBAs */
+    uint64_t *cur_level = malloc(256 * sizeof(uint64_t));
+    uint64_t  cur_count = 0, cur_cap = 256;
+    uint64_t *nxt_level = malloc(256 * sizeof(uint64_t));
+    uint64_t  nxt_count = 0, nxt_cap = 256;
 
-    uint64_t node_count = 0;
-
-    stack[stk_size++] = root_lba;
-
-    while(stk_size > 0)
+    if(!cur_level || !nxt_level)
     {
-        uint64_t lba = stack[--stk_size];
-
-        if(lba == 0 || lba >= state->total_blocks) continue;
-
-        /* Avoid revisiting (may happen with corrupt sibling links) */
-        if(state->block_types[lba] == BT_TREE)
-            continue;
-
-        mark_block(state, lba, BT_TREE);
-        node_count++;
-        atomic_fetch_add(&state->done_blocks, 1);
-
-        int rc = obmafs3_block_read(ctx, lba, buf, (size_t)block_size);
-        if(rc != OBMAFS3_OK) continue;
-
-        struct btree_node_header *nh = (struct btree_node_header *)buf;
-        if(nh->magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
-
-        /* If index node, push all children */
-        if(nh->level > 0 && nh->node_keys > 0 && index_entry_size > 0)
-        {
-            const uint8_t *records = buf + sizeof(struct btree_node_header);
-            uint16_t nk = nh->node_keys;
-
-            for(uint16_t i = 0; i < nk; i++)
-            {
-                const uint8_t *entry = records + (size_t)i * index_entry_size;
-                uint64_t child_lba;
-                memcpy(&child_lba, entry + child_lba_offset, sizeof(uint64_t));
-
-                if(child_lba == 0 || child_lba >= state->total_blocks) continue;
-
-                /* Grow stack if needed */
-                if(stk_size >= stk_cap)
-                {
-                    stk_cap *= 2;
-                    uint64_t *tmp = realloc(stack, stk_cap * sizeof(uint64_t));
-                    if(!tmp) break;
-                    stack = tmp;
-                }
-                stack[stk_size++] = child_lba;
-            }
-        }
+        free(cur_level); free(nxt_level); free(buf);
+        return 0;
     }
 
-    free(stack);
+    cur_level[cur_count++] = root_lba;
+    uint64_t node_count = 0;
+
+    #define PREFETCH_BATCH 256
+
+    while(cur_count > 0)
+    {
+        /* Sort this level's LBAs for sequential I/O */
+        if(cur_count > 1)
+            qsort(cur_level, (size_t)cur_count, sizeof(uint64_t), cmp_u64);
+
+        nxt_count = 0;
+        uint64_t prefetched_up_to = 0;
+
+        for(uint64_t ci = 0; ci < cur_count; ci++)
+        {
+            /* Prefetch in batches */
+            if(ci >= prefetched_up_to)
+            {
+                uint64_t end = ci + PREFETCH_BATCH;
+                if(end > cur_count) end = cur_count;
+                for(uint64_t p = ci; p < end; p++)
+                    posix_fadvise(ctx->fd, (off_t)(cur_level[p] * block_size),
+                                  (off_t)block_size, POSIX_FADV_WILLNEED);
+                prefetched_up_to = end;
+            }
+
+            uint64_t lba = cur_level[ci];
+            if(lba == 0 || lba >= state->total_blocks) continue;
+
+            /* Avoid revisiting */
+            if(state->block_types[lba] == BT_TREE) continue;
+
+            mark_block(state, lba, BT_TREE);
+            node_count++;
+            atomic_fetch_add(&state->done_blocks, 1);
+
+            int rc = obmafs3_block_read(ctx, lba, buf, (size_t)block_size);
+            if(rc != OBMAFS3_OK) continue;
+
+            struct btree_node_header *nh = (struct btree_node_header *)buf;
+            if(nh->magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+
+            /* If index node, collect children for next level */
+            if(nh->level > 0 && nh->node_keys > 0 && index_entry_size > 0)
+            {
+                const uint8_t *records = buf + sizeof(struct btree_node_header);
+                for(uint16_t i = 0; i < nh->node_keys; i++)
+                {
+                    uint64_t child_lba;
+                    memcpy(&child_lba, records + (size_t)i * index_entry_size + child_lba_offset,
+                           sizeof(uint64_t));
+                    if(child_lba == 0 || child_lba >= state->total_blocks) continue;
+
+                    if(nxt_count >= nxt_cap)
+                    {
+                        nxt_cap *= 2;
+                        uint64_t *tmp = realloc(nxt_level, nxt_cap * sizeof(uint64_t));
+                        if(!tmp) break;
+                        nxt_level = tmp;
+                    }
+                    nxt_level[nxt_count++] = child_lba;
+                }
+            }
+        }
+
+        /* Swap levels */
+        uint64_t *tmp_ptr = cur_level;
+        cur_level = nxt_level;
+        nxt_level = tmp_ptr;
+        cur_count = nxt_count;
+
+        uint64_t tmp_cap = cur_cap;
+        cur_cap = nxt_cap;
+        nxt_cap = tmp_cap;
+    }
+
+    #undef PREFETCH_BATCH
+
+    free(cur_level);
+    free(nxt_level);
     free(buf);
     return node_count;
 }
@@ -179,11 +226,21 @@ static uint64_t walk_free_chain(struct analysis_state *state, uint64_t free_lba)
         count++;
         atomic_fetch_add(&state->done_blocks, 1);
 
+        /* Prefetch current node */
+        posix_fadvise(ctx->fd, (off_t)(lba * block_size),
+                      (off_t)block_size, POSIX_FADV_WILLNEED);
+
         int rc = obmafs3_block_read(ctx, lba, buf, (size_t)block_size);
         if(rc != OBMAFS3_OK) break;
 
         uint64_t next;
         memcpy(&next, buf, sizeof(uint64_t));
+
+        /* Prefetch the NEXT node while we're still processing */
+        if(next != 0 && next < state->total_blocks)
+            posix_fadvise(ctx->fd, (off_t)(next * block_size),
+                          (off_t)block_size, POSIX_FADV_WILLNEED);
+
         lba = next;
 
         /* Safety limit */
@@ -254,73 +311,113 @@ static void walk_dedup_data_blocks(struct analysis_state *state,
     uint8_t *buf = calloc(1, (size_t)block_size);
     if(!buf) return;
 
-    /* DFS to find leaf nodes */
-    uint64_t stk_cap  = 256;
-    uint64_t stk_size = 0;
-    uint64_t *stack   = malloc(stk_cap * sizeof(uint64_t));
-    if(!stack) { free(buf); return; }
+    /* Level-order BFS with sorted LBAs */
+    uint64_t *cur_level = malloc(256 * sizeof(uint64_t));
+    uint64_t  cur_count = 0, cur_cap = 256;
+    uint64_t *nxt_level = malloc(256 * sizeof(uint64_t));
+    uint64_t  nxt_count = 0, nxt_cap = 256;
 
-    stack[stk_size++] = root_lba;
-
-    while(stk_size > 0)
+    if(!cur_level || !nxt_level)
     {
-        uint64_t lba = stack[--stk_size];
-        if(lba == 0 || lba >= state->total_blocks) continue;
+        free(cur_level); free(nxt_level); free(buf);
+        return;
+    }
 
-        int rc = obmafs3_block_read(ctx, lba, buf, (size_t)block_size);
-        if(rc != OBMAFS3_OK) continue;
+    cur_level[cur_count++] = root_lba;
 
-        struct btree_node_header *nh = (struct btree_node_header *)buf;
-        if(nh->magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+    #define PREFETCH_BATCH 256
 
-        if(nh->level > 0)
+    while(cur_count > 0)
+    {
+        if(cur_count > 1)
+            qsort(cur_level, (size_t)cur_count, sizeof(uint64_t), cmp_u64);
+
+        nxt_count = 0;
+        uint64_t prefetched_up_to = 0;
+
+        for(uint64_t ci = 0; ci < cur_count; ci++)
         {
-            /* Index node — push children */
-            const uint8_t *records = buf + sizeof(struct btree_node_header);
-            for(uint16_t i = 0; i < nh->node_keys; i++)
+            if(ci >= prefetched_up_to)
             {
-                const uint8_t *entry = records + (size_t)i * index_entry_size;
-                uint64_t child_lba;
-                memcpy(&child_lba, entry + child_lba_offset, sizeof(uint64_t));
-                if(child_lba == 0 || child_lba >= state->total_blocks) continue;
-
-                if(stk_size >= stk_cap)
-                {
-                    stk_cap *= 2;
-                    uint64_t *tmp = realloc(stack, stk_cap * sizeof(uint64_t));
-                    if(!tmp) break;
-                    stack = tmp;
-                }
-                stack[stk_size++] = child_lba;
+                uint64_t end = ci + PREFETCH_BATCH;
+                if(end > cur_count) end = cur_count;
+                for(uint64_t p = ci; p < end; p++)
+                    posix_fadvise(ctx->fd, (off_t)(cur_level[p] * block_size),
+                                  (off_t)block_size, POSIX_FADV_WILLNEED);
+                prefetched_up_to = end;
             }
-        }
-        else
-        {
-            /* Leaf node — extract dedup_entry records */
-            const uint8_t *records = buf + sizeof(struct btree_node_header);
-            for(uint16_t i = 0; i < nh->node_keys; i++)
+
+            uint64_t lba = cur_level[ci];
+            if(lba == 0 || lba >= state->total_blocks) continue;
+
+            int rc = obmafs3_block_read(ctx, lba, buf, (size_t)block_size);
+            if(rc != OBMAFS3_OK) continue;
+
+            struct btree_node_header *nh = (struct btree_node_header *)buf;
+            if(nh->magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+
+            if(nh->level > 0)
             {
-                struct dedup_entry de;
-                memcpy(&de, records + (size_t)i * sizeof(struct dedup_entry),
-                       sizeof(struct dedup_entry));
-
-                if(de.block_lba == 0 || de.block_lba >= state->total_blocks)
-                    continue;
-
-                /* Mark the entire dedup data block range */
-                for(uint64_t b = 0; b < std_per_dedup && (de.block_lba + b) < state->total_blocks; b++)
+                /* Index node — collect children for next level */
+                const uint8_t *records = buf + sizeof(struct btree_node_header);
+                for(uint16_t i = 0; i < nh->node_keys; i++)
                 {
-                    if(state->block_types[de.block_lba + b] != BT_DEDUP)
+                    uint64_t child_lba;
+                    memcpy(&child_lba, records + (size_t)i * index_entry_size + child_lba_offset,
+                           sizeof(uint64_t));
+                    if(child_lba == 0 || child_lba >= state->total_blocks) continue;
+
+                    if(nxt_count >= nxt_cap)
                     {
-                        state->block_types[de.block_lba + b] = BT_DEDUP;
-                        atomic_fetch_add(&state->done_blocks, 1);
+                        nxt_cap *= 2;
+                        uint64_t *tmp = realloc(nxt_level, nxt_cap * sizeof(uint64_t));
+                        if(!tmp) break;
+                        nxt_level = tmp;
+                    }
+                    nxt_level[nxt_count++] = child_lba;
+                }
+            }
+            else
+            {
+                /* Leaf node — extract dedup_entry records */
+                const uint8_t *records = buf + sizeof(struct btree_node_header);
+                for(uint16_t i = 0; i < nh->node_keys; i++)
+                {
+                    struct dedup_entry de;
+                    memcpy(&de, records + (size_t)i * sizeof(struct dedup_entry),
+                           sizeof(struct dedup_entry));
+
+                    if(de.block_lba == 0 || de.block_lba >= state->total_blocks)
+                        continue;
+
+                    /* Mark the entire dedup data block range */
+                    for(uint64_t b = 0; b < std_per_dedup && (de.block_lba + b) < state->total_blocks; b++)
+                    {
+                        if(state->block_types[de.block_lba + b] != BT_DEDUP)
+                        {
+                            state->block_types[de.block_lba + b] = BT_DEDUP;
+                            atomic_fetch_add(&state->done_blocks, 1);
+                        }
                     }
                 }
             }
         }
+
+        /* Swap levels */
+        uint64_t *tmp_ptr = cur_level;
+        cur_level = nxt_level;
+        nxt_level = tmp_ptr;
+        cur_count = nxt_count;
+
+        uint64_t tmp_cap = cur_cap;
+        cur_cap = nxt_cap;
+        nxt_cap = tmp_cap;
     }
 
-    free(stack);
+    #undef PREFETCH_BATCH
+
+    free(cur_level);
+    free(nxt_level);
     free(buf);
 }
 
