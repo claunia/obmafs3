@@ -53,7 +53,7 @@ static void draw_legend(WINDOW *win, int map_h, int map_w)
 {
     /* Legend box dimensions */
     int box_w = 22;
-    int box_h = 9;
+    int box_h = INFO_PANEL_HEIGHT;
     int box_y = map_h - box_h;
     int box_x = map_w - box_w - 1;
 
@@ -97,10 +97,13 @@ static void draw_legend(WINDOW *win, int map_h, int map_w)
     wattron(win, COLOR_PAIR(CP_DESKTOP));
     mvwprintw(win, y++, lx + 2, "Used Block");
 
-    /* Free block */
-    wattron(win, COLOR_PAIR(CP_MAP_FREE));
-    mvwaddch(win, y, lx, ' ');
-    wattroff(win, COLOR_PAIR(CP_MAP_FREE));
+    /* Free block — use the same U+2592 glyph as the map */
+    {
+        static const wchar_t free_g[] = { 0x2592, L'\0' };
+        cchar_t free_cc;
+        setcchar(&free_cc, free_g, 0, (short)CP_MAP_FREE, NULL);
+        mvwadd_wch(win, y, lx, &free_cc);
+    }
     wattron(win, COLOR_PAIR(CP_DESKTOP));
     mvwprintw(win, y++, lx + 2, "Free Space");
 
@@ -125,12 +128,19 @@ static void draw_legend(WINDOW *win, int map_h, int map_w)
     wattron(win, COLOR_PAIR(CP_DESKTOP));
     mvwprintw(win, y++, lx + 2, "Metadata");
 
-    /* Moving block */
-    wattron(win, COLOR_PAIR(CP_MAP_MOVING));
-    mvwaddch(win, y, lx, ' ');
-    wattroff(win, COLOR_PAIR(CP_MAP_MOVING));
+    /* Reading marker */
+    wattron(win, COLOR_PAIR(CP_MAP_FRAG) | A_BOLD);
+    mvwaddch(win, y, lx, 'r');
+    wattroff(win, COLOR_PAIR(CP_MAP_FRAG) | A_BOLD);
     wattron(win, COLOR_PAIR(CP_DESKTOP));
-    mvwprintw(win, y++, lx + 2, "Moving");
+    mvwprintw(win, y++, lx + 2, "Reading");
+
+    /* Writing marker */
+    wattron(win, COLOR_PAIR(CP_MAP_MOVING) | A_BOLD);
+    mvwaddch(win, y, lx, 'W');
+    wattroff(win, COLOR_PAIR(CP_MAP_MOVING) | A_BOLD);
+    wattron(win, COLOR_PAIR(CP_DESKTOP));
+    mvwprintw(win, y++, lx + 2, "Writing");
 }
 
 /**
