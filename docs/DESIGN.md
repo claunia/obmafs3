@@ -1509,6 +1509,118 @@ Options:
 
 The scrub functions correctly handle both compressed and uncompressed blocks by checking the `OBMAFS3_BLOCK_FLAG_COMPRESSED` flag to determine whether to checksum `compressed_size` or `original_size` bytes.
 
+### `defrag` — Interactive defragmenter (TUI)
+
+An ncurses-based text user interface for interactive filesystem defragmentation.
+
+Usage: `defrag [options] <device-or-image>`
+
+Options:
+- `-h, --help` — Show help message and exit
+
+**User interface layout:**
+
+| Region | Position | Content |
+|--------|----------|---------|
+| Menu bar | Top row | **F**ile, **A**ction, **H**elp menus (hot-key letters highlighted in yellow) |
+| Block map | Middle area (fills remaining space) | Visual map of filesystem blocks coloured by state: used (white), free (dot on blue), tree nodes (magenta), dedup data (green), metadata/superblock/bitmap (cyan) |
+| Status bar | Bottom row | Progress percentage, current phase label, and progress bar during analysis; key hints when idle |
+
+**Colour scheme:** Classic DOS / Norton Utilities palette — blue desktop background, white-on-black menu bar, black-on-cyan status bar, black-on-white dialogs with white-on-green buttons.
+
+**Startup dialog:** On launch, a modal dialog warns "You should do an fsck before starting" with two buttons:
+- **OK** — Dismisses the dialog and enters the normal event loop.
+- **Exit** — Terminates the application immediately.
+
+**Key bindings:**
+- `Q` / `q` — Quit the application
+- `A` / `a` — Start fragmentation analysis
+- `S` / `s` — Show analysis summary (after analysis completes)
+- Left / Right arrows, Tab — Navigate dialog buttons
+- Enter — Activate selected button
+- Terminal resize is handled automatically.
+
+**Analysis action:**
+
+Pressing `A` launches a background analysis thread that classifies every filesystem block into one of five categories:
+
+| Block type | Colour | Description |
+|------------|--------|-------------|
+| Free | White dot on blue | Not allocated in the bitmap |
+| Used | White on white (solid) | Standard data block (inode data, file data) |
+| Tree | Magenta on blue | B+Tree node (any tree: catalog, inode, overflow, dedup, etc.) |
+| Dedup | Green on blue | Deduplicated data block |
+| Meta | Cyan on black | Superblock, backup superblock, bitmap, tree headers, keyset, pending buffer |
+
+The analysis proceeds in five phases:
+1. **Bitmap** — Loads the allocation bitmap and marks metadata blocks (superblock, backup, bitmap, keyset, pending buffer).
+2. **Trees** — BFS-walks every B+Tree (catalog, inode, overflow, metadata, metadata index, media tag, CD prefix/suffix/subchannel, refcount, and each per-sector-size dedup tree) plus free-node chains. Marks all nodes as Tree blocks and records per-tree node counts.
+3. **Dedup** — Walks dedup tree leaves to discover dedup data block LBAs. Each dedup block spans `dedup_block_size / block_size` standard blocks, all marked as Dedup.
+4. **Classify** — Scans the rest of the bitmap: any allocated block not already classified is marked as Used.
+5. **Statistics** — Computes per-type block counts, free-space fragmentation, per-tree fragmentation, and dedup data fragmentation.
+
+During analysis, the TUI refreshes every 150 ms:
+- The **block map** updates live — each character cell represents a group of blocks and is coloured according to the dominant block type in that group.
+- The **status bar** shows the current phase label, a percentage, and a visual progress bar.
+
+When analysis completes, a **summary dialog** is presented showing:
+- Total, free, used, tree, dedup, and metadata block counts with percentages.
+- Free-space fragmentation percentage (based on contiguous free runs).
+- Per-tree fragmentation (name, percentage, node count) for every B+Tree.
+- Dedup data fragmentation percentage.
+
+*Fragmentation formula*: `frag% = (runs − 1) / (total_items − 1) × 100`. A single contiguous extent = 0 %; every block isolated = 100 %.
+
+**Compaction action (press `C` after analysis):**
+
+Compaction moves all allocated blocks to eliminate free-space fragmentation and arrange data for optimal sequential access. It runs in five phases:
+
+| Phase | Description | What moves where |
+|-------|-------------|------------------|
+| 1 — Trees | All B+Tree nodes | → end of disk, each tree contiguous, with 64-block clump gaps |
+| 2 — Data blocks | Inode data extents (inline + overflow) | → beginning of disk, moved as complete extent units |
+| 3 — Dedup blocks | Deduplicated data blocks | → immediately after data blocks |
+| 4 — References | Dedup tree entries, SME caches, subchannel LBAs | Updated in place using relocation maps |
+| 5 — Flush | Bitmap + superblock | Final write to disk |
+
+**Phase 1 — Tree relocation:** Trees are relocated FIRST so their nodes are out of the way when data and dedup blocks are compacted. Each tree's nodes are read entirely into memory, all internal `child_lba`, `left_link`/`right_link` sibling pointers, and free-chain `next_free` pointers are rewritten using an O(1) hash map, then all nodes are written to a contiguous range at the disk end. Tree headers are updated via `obmafs3_btree_header_write()` which auto-computes checksums. Node checksums are computed over `sizeof(btree_node_header) + keys_length` (not the full block), matching the read-path verification. A tree node relocation map is recorded for subchannel LBA fixup in CD SMEs.
+
+**Phase 2 — Inode-aware data compaction:** Data blocks are moved as **complete extent units** — entire `extent_run` ranges are copied atomically via bulk `pread`/`pwrite`, preserving the compressed data inside. The `start_block` field is updated directly in the inode tree leaf node (or overflow tree leaf for overflow extents). Overflow extents are collected in a two-pass approach: (1) BFS-collect all overflow extents with their node LBA and record index, (2) sort by `start_block` for monotonic cursor advancement, (3) process in LBA order, (4) batch-write dirty leaf nodes. When dedup blocks obstruct the target range, the ENTIRE dedup data block is evicted as one unit — the block_header at the base is read to determine actual physical size, and all physical blocks are moved together. Evicted dedup blocks are recorded in a relocation map.
+
+**Phase 3 — Dedup block compaction:** Dedup data blocks are packed contiguously after the data region. Each dedup block's physical size is determined by reading its `block_header.compressed_size`, not by contiguous `BT_DEDUP` runs. Per-block relocation entries are recorded for every moved block.
+
+**Phase 4 — Reference updates:** Three types of references are updated using relocation maps:
+1. **Dedup tree entries** (`dedup_entry.block_lba`) — BFS walks all dedup tree leaves, updates `block_lba` using the dedup reloc map, recomputes node checksums.
+2. **Sector map entry caches** (`sector_map_entry.dedup_sector_lba` / `cd_sector_map_entry.dedup_sector_lba`) — The ENTIRE sector map for each media-image inode is loaded into a contiguous memory buffer (reading all extents — inline + overflow — decompressing as needed), all SME entries are updated in a single pass, then the buffer is recompressed and written back. This avoids alignment issues from 34-byte packed SME entries spanning block/extent boundaries.
+3. **CD subchannel LBAs** (`cd_sector_map_entry.dedup_subchannel_lba`) — Updated using the tree relocation map recorded during Phase 1.
+
+Relocation chains (A→B during eviction, B→C during compaction) are resolved to direct A→C mappings before building the final lookup maps.
+
+**Crash safety:** Block moves follow a write-first, update-references, sync, update-bitmap, sync sequence. Bitmap writes and syncs are batched (every 256 inode tree leaves or 512 overflow extents) to minimise `fdatasync` calls. Safe cancellation via ESC flushes all pending work (including reference updates) before stopping.
+
+**Performance optimisations:**
+- Bulk `pread`/`pwrite` with a reusable 16 MB I/O buffer and retry on short reads/writes
+- `posix_fadvise(FADV_WILLNEED)` prefetch in batches of 64
+- Level-order BFS with sorted LBAs for sequential I/O in all tree traversals
+- Eviction destination cached via decreasing cursor (amortised O(1))
+- Bitmap flush + `fdatasync` batched every 256 leaves / 512 extents
+- Extents already in optimal position are skipped without I/O
+- Whole dedup data block eviction (block_header-based sizing, not BT_DEDUP run counting)
+
+**Status bar during compaction:** Shows the current phase label, completion percentage, current block move (`src→dst`), elapsed time, and estimated remaining time. A `Status` panel in the bottom-left shows detailed operation info. The block map shows `r` (reading) and `W` (writing) position markers during compaction.
+
+**Key bindings:**
+- `A` / `a` — Start fragmentation analysis
+- `S` / `s` — Show analysis summary (after analysis completes)
+- `C` / `c` — Start compaction (after analysis completes)
+- `ESC` — Safely stop compaction (flushes all pending work including reference updates)
+- `Q` / `q` — Quit (safely stops compaction first if running)
+- Left / Right arrows, Tab — Navigate dialog buttons
+- Enter — Activate selected button
+- Terminal resize is handled automatically.
+
+**Implementation notes:** Built with ncursesw (wide-character ncurses). Both the analysis and compaction engines run in detached `pthread`s and communicate with the TUI via lock-free `_Atomic` counters. The block map view dynamically adapts to terminal size — each cell aggregates `ceil(total_blocks / usable_cells)` blocks and displays the dominant type using solid colored blocks (Norton Speed Disk style, with U+2592 MEDIUM SHADE for free space). The device is opened with raw `open(O_RDWR)` for exclusive offline access — no node cache, keyset, DLC, or housekeeping threads are started.
+
 ### `libobmafs` — Static library
 
 Provides the C API for all filesystem operations. Used by all three tools above.
@@ -1676,6 +1788,7 @@ xxHash, ZSTD, and libaaruformat are fetched automatically via CMake `FetchConten
 | Rename / move | Complete |
 | `import-aif` CD cue sheet generation | Complete |
 | `import-aif` sidecar file export (CICM XML, Aaru JSON, dump hardware) | Complete |
+| `defrag` (interactive TUI defragmenter) | Analysis complete, compaction engine implemented |
 
 ---
 
