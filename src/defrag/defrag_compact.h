@@ -46,12 +46,13 @@ struct analysis_state;
 /* ------------------------------------------------------------------ */
 
 #define COMPACT_PHASE_PREPARE     0
-#define COMPACT_PHASE_DATA        1 /**< Moving non-dedup data blocks     */
-#define COMPACT_PHASE_DEDUP       2 /**< Moving dedup data blocks         */
-#define COMPACT_PHASE_TREES       3 /**< Relocating B+Tree nodes          */
-#define COMPACT_PHASE_BITMAP      4 /**< Flushing bitmap & superblock     */
-#define COMPACT_PHASE_DONE        5
-#define COMPACT_NUM_PHASES        6
+#define COMPACT_PHASE_TREES       1 /**< Relocating B+Tree nodes          */
+#define COMPACT_PHASE_DATA        2 /**< Moving non-dedup data blocks     */
+#define COMPACT_PHASE_DEDUP       3 /**< Moving dedup data blocks         */
+#define COMPACT_PHASE_REFS        4 /**< Updating references              */
+#define COMPACT_PHASE_BITMAP      5 /**< Flushing bitmap & superblock     */
+#define COMPACT_PHASE_DONE        6
+#define COMPACT_NUM_PHASES        7
 
 extern const char *compact_phase_labels[COMPACT_NUM_PHASES];
 
@@ -106,6 +107,21 @@ struct compact_state
     uint64_t data_blocks_moved;
     uint64_t dedup_blocks_moved;
     uint64_t tree_nodes_moved;
+
+    /* Dedup block relocation map (built during data+dedup phases,
+     * consumed during reference update phase).
+     * Stored as parallel arrays: reloc_old[i] → reloc_new[i]. */
+    uint64_t *reloc_old;
+    uint64_t *reloc_new;
+    uint64_t  reloc_count;
+    uint64_t  reloc_cap;
+
+    /* Data block relocation map (built during data phase,
+     * consumed during inode extent update phase). */
+    uint64_t *data_reloc_old;
+    uint64_t *data_reloc_new;
+    uint64_t  data_reloc_count;
+    uint64_t  data_reloc_cap;
 };
 
 /* ------------------------------------------------------------------ */
