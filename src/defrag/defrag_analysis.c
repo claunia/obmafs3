@@ -390,8 +390,29 @@ static void walk_dedup_data_blocks(struct analysis_state *state,
                     if(de.block_lba == 0 || de.block_lba >= state->total_blocks)
                         continue;
 
-                    /* Mark the entire dedup data block range */
-                    for(uint64_t b = 0; b < std_per_dedup && (de.block_lba + b) < state->total_blocks; b++)
+                    /* Determine actual physical block count by reading
+                     * the block_header to get compressed_size.
+                     * Compressed dedup blocks use fewer physical blocks
+                     * than dedup_block_size / block_size. */
+                    uint64_t phys_blocks = std_per_dedup; /* fallback */
+                    {
+                        struct block_header dbhdr;
+                        ssize_t hrd = pread(ctx->fd, &dbhdr, sizeof(dbhdr),
+                                            (off_t)(de.block_lba * block_size));
+                        if(hrd >= (ssize_t)sizeof(dbhdr) &&
+                           dbhdr.magic == OBMAFS3_BLOCK_MAGIC)
+                        {
+                            uint64_t payload = (dbhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                                   ? dbhdr.compressed_size
+                                                   : dbhdr.original_size;
+                            phys_blocks = (sizeof(dbhdr) + payload + block_size - 1) / block_size;
+                            if(phys_blocks > std_per_dedup)
+                                phys_blocks = std_per_dedup;
+                        }
+                    }
+
+                    /* Mark only the actual physical blocks as BT_DEDUP */
+                    for(uint64_t b = 0; b < phys_blocks && (de.block_lba + b) < state->total_blocks; b++)
                     {
                         if(state->block_types[de.block_lba + b] != BT_DEDUP)
                         {
@@ -698,8 +719,24 @@ int defrag_analysis_run(struct analysis_state *state)
                             /* Also mark the last (partial) dedup data block */
                             if(dhdr.last_block_lba != 0)
                             {
+                                /* Determine actual physical size of last block */
                                 uint64_t std_per_dedup = ctx->sb.dedup_block_size / block_size;
-                                for(uint64_t b = 0; b < std_per_dedup &&
+                                uint64_t phys = std_per_dedup;
+                                {
+                                    struct block_header lbhdr;
+                                    ssize_t hrd = pread(ctx->fd, &lbhdr, sizeof(lbhdr),
+                                                        (off_t)(dhdr.last_block_lba * block_size));
+                                    if(hrd >= (ssize_t)sizeof(lbhdr) &&
+                                       lbhdr.magic == OBMAFS3_BLOCK_MAGIC)
+                                    {
+                                        uint64_t payload = (lbhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                                               ? lbhdr.compressed_size
+                                                               : lbhdr.original_size;
+                                        phys = (sizeof(lbhdr) + payload + block_size - 1) / block_size;
+                                        if(phys > std_per_dedup) phys = std_per_dedup;
+                                    }
+                                }
+                                for(uint64_t b = 0; b < phys &&
                                     (dhdr.last_block_lba + b) < state->total_blocks; b++)
                                 {
                                     if(state->block_types[dhdr.last_block_lba + b] != BT_DEDUP)
