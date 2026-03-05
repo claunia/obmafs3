@@ -1660,6 +1660,32 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
     if(thdr.free_node_lba != 0)
         thdr.free_node_lba = MAP_LOOKUP(thdr.free_node_lba);
 
+    /* Record all node relocations in state->tree_reloc_old/new
+     * so update_sme_refs can fix dedup_subchannel_lba in CD SMEs. */
+    for(uint64_t i = 0; i < n; i++)
+    {
+        if(old_lbas[i] == dst_start + i) continue; /* not moved */
+
+        if(state->tree_reloc_count >= state->tree_reloc_cap)
+        {
+            uint64_t nc = (state->tree_reloc_cap == 0) ? 4096 : state->tree_reloc_cap * 2;
+            uint64_t *ro = realloc(state->tree_reloc_old, nc * sizeof(uint64_t));
+            uint64_t *rn = realloc(state->tree_reloc_new, nc * sizeof(uint64_t));
+            if(ro && rn)
+            {
+                state->tree_reloc_old = ro;
+                state->tree_reloc_new = rn;
+                state->tree_reloc_cap = nc;
+            }
+        }
+        if(state->tree_reloc_count < state->tree_reloc_cap)
+        {
+            state->tree_reloc_old[state->tree_reloc_count] = old_lbas[i];
+            state->tree_reloc_new[state->tree_reloc_count] = dst_start + i;
+            state->tree_reloc_count++;
+        }
+    }
+
     #undef MAP_LOOKUP
     free(map);
 
@@ -2404,7 +2430,8 @@ static int write_inode_data(struct compact_state *state,
  * the whole thing back.  No per-extent or per-block alignment issues.
  */
 static int update_sme_refs(struct compact_state *state,
-                           const struct reloc_map *rmap)
+                           const struct reloc_map *rmap,
+                           const struct reloc_map *tree_rmap)
 {
     struct obmafs3_ctx *ctx = state->ctx;
     size_t bsz = (size_t)ctx->sb.block_size;
@@ -2509,6 +2536,12 @@ static int update_sme_refs(struct compact_state *state,
                         uint64_t n = reloc_map_get(rmap, cdsme->dedup_sector_lba);
                         if(n != 0 && n != cdsme->dedup_sector_lba)
                         { cdsme->dedup_sector_lba = n; modified = 1; }
+                    }
+                    if(tree_rmap && cdsme->dedup_subchannel_lba != 0)
+                    {
+                        uint64_t n = reloc_map_get(tree_rmap, cdsme->dedup_subchannel_lba);
+                        if(n != 0 && n != cdsme->dedup_subchannel_lba)
+                        { cdsme->dedup_subchannel_lba = n; modified = 1; }
                     }
                     p += esz; remaining -= esz;
                 }
@@ -2669,6 +2702,12 @@ int defrag_compact_run(struct compact_state *state)
         return rc;
     }
 
+    /* Initialize tree relocation map for subchannel LBA fixup */
+    state->tree_reloc_old   = NULL;
+    state->tree_reloc_new   = NULL;
+    state->tree_reloc_count = 0;
+    state->tree_reloc_cap   = 0;
+
     /* ---- Phase 1: Relocate trees to end of disk first ----
      * This must happen BEFORE data/dedup compaction so that tree nodes
      * are out of the way.  relocate_tree() correctly updates all
@@ -2766,6 +2805,9 @@ safe_stop:
     state->data_reloc_old = NULL;
     state->data_reloc_new = NULL;
 
+    /* Free tree reloc arrays (used by subchannel LBA update) will be
+     * freed after update_sme_refs. Keep them alive until then. */
+
     /* Always update dedup references if any blocks were relocated,
      * even on early cancellation — otherwise the tree/SMEs will
      * reference old (now-freed) positions. */
@@ -2804,16 +2846,29 @@ safe_stop:
             update_dedup_tree_refs(state, rmap);
             sync_fd(state);
 
-            update_sme_refs(state, rmap);
+            /* Build tree reloc map for subchannel LBA fixup in CD SMEs */
+            struct reloc_map *tree_rmap = NULL;
+            if(state->tree_reloc_count > 0)
+                tree_rmap = reloc_map_create(state->tree_reloc_old,
+                                             state->tree_reloc_new,
+                                             state->tree_reloc_count);
+
+            update_sme_refs(state, rmap, tree_rmap);
             sync_fd(state);
 
             reloc_map_destroy(rmap);
+            if(tree_rmap) reloc_map_destroy(tree_rmap);
         }
     }
     free(state->reloc_old);
     free(state->reloc_new);
     state->reloc_old = NULL;
     state->reloc_new = NULL;
+
+    free(state->tree_reloc_old);
+    free(state->tree_reloc_new);
+    state->tree_reloc_old = NULL;
+    state->tree_reloc_new = NULL;
 
     atomic_store(&state->phase, COMPACT_PHASE_BITMAP);
     obmafs3_bitmap_write(ctx);

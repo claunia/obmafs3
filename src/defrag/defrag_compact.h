@@ -122,6 +122,13 @@ struct compact_state
     uint64_t *data_reloc_new;
     uint64_t  data_reloc_count;
     uint64_t  data_reloc_cap;
+
+    /* Tree node relocation map (built during tree relocation phase,
+     * consumed by SME update to fix dedup_subchannel_lba in CD SMEs). */
+    uint64_t *tree_reloc_old;
+    uint64_t *tree_reloc_new;
+    uint64_t  tree_reloc_count;
+    uint64_t  tree_reloc_cap;
 };
 
 /* ------------------------------------------------------------------ */
