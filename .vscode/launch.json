@@ -1,6 +1,7 @@
 {
     "version": "0.2.0",
     "configurations": [
+
         {
             "name": "Debug mkobmafs",
             "type": "cppdbg",
@@ -64,6 +65,38 @@
                 }
             ],
             "preLaunchTask": "CMake: Build All"
+        },
+        {
+            "name": "Debug import-aif",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/src/import-aif/import-aif",
+            "args": ["${input:aifFile}", "${input:obmafsPath}"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "CMake: Build All"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "aifFile",
+            "type": "promptString",
+            "description": "Path to the AIF file to import"
+        },
+        {
+            "id": "obmafsPath",
+            "type": "promptString",
+            "description": "Path to the file inside an OBMAFS3 mountpoint"
         }
     ]
 }
