@@ -743,8 +743,7 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_SET_CD_IMAGE:
         {
-            /* Only allow conversion of regular empty files */
-            if(ffctx->inode.file_type != kFileTypeRegular) FUSE_RETURN(-ENOTTY, "");
+            /* Only allow conversion of empty files */
             if(ffctx->inode.file_size != 0) FUSE_RETURN(-ENOTEMPTY, "");
 
             ffctx->inode.file_type       = kFileTypeCompactDiscImage;
@@ -858,8 +857,7 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_SET_MEDIA_IMAGE:
         {
-            /* Only allow conversion of empty regular files */
-            if(ffctx->inode.file_type != kFileTypeRegular) FUSE_RETURN(-ENOTTY, "");
+            /* Only allow conversion of empty files */
             if(ffctx->inode.file_size != 0) FUSE_RETURN(-ENOTEMPTY, "");
             const struct obmafs3_ioctl_set_media_image_arg *mia =
                 (const struct obmafs3_ioctl_set_media_image_arg *)data;
