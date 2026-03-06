@@ -468,9 +468,10 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         return rc;
     }
 
-    uint64_t push_key   = all[left_count].lba;
-    uint64_t push_child = new_leaf_lba;
-    uint64_t left_lba_v = cur_lba;
+    uint64_t push_key       = all[left_count].lba;
+    uint64_t push_child     = new_leaf_lba;
+    uint64_t left_first_key = all[0].lba;
+    uint64_t left_lba_v     = cur_lba;
 
     free(all);
     ctx->refcount_hdr.total_nodes++;
@@ -512,6 +513,16 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
             /* Room in parent — insert */
             uint8_t *id = buf + sizeof(struct btree_node_header);
 
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct btree_index_entry upd;
+            memcpy(&upd, id + (size_t)parent_slot * ie_sz, sizeof(upd));
+            upd.key = left_first_key;
+            memcpy(id + (size_t)parent_slot * ie_sz, &upd, sizeof(upd));
+
             if(idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
@@ -537,6 +548,14 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
         if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct btree_index_entry upd;
+        memcpy(&upd, id + (size_t)parent_slot * ie_sz, sizeof(upd));
+        upd.key = left_first_key;
+        memcpy(id + (size_t)parent_slot * ie_sz, &upd, sizeof(upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         aie[idx_insert].key       = push_key;
         aie[idx_insert].child_lba = push_child;
@@ -590,9 +609,10 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
             return rc;
         }
 
-        push_key   = aie[il].key;
-        push_child = new_idx_lba;
-        left_lba_v = parent_lba;
+        push_key       = aie[il].key;
+        push_child     = new_idx_lba;
+        left_first_key = aie[0].key;
+        left_lba_v     = parent_lba;
 
         free(aie);
         ctx->refcount_hdr.total_nodes++;
@@ -636,9 +656,8 @@ int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_cou
     rhdr.keys_length = (uint16_t)(2 * sizeof(struct btree_index_entry));
     memcpy(buf, &rhdr, sizeof(rhdr));
 
-    /* First child entry uses the smallest possible key for the left subtree */
     struct btree_index_entry e0;
-    e0.key       = 0;
+    e0.key       = left_first_key;
     e0.child_lba = left_lba_v;
     memcpy(buf + sizeof(rhdr), &e0, sizeof(e0));
 

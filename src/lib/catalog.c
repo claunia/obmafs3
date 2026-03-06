@@ -685,6 +685,17 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
             /* Room in parent — insert */
             uint8_t *id = buf + sizeof(struct btree_node_header);
 
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct catalog_index_entry cat_upd;
+            memcpy(&cat_upd, id + (size_t)parent_slot * ie_sz, sizeof(cat_upd));
+            cat_upd.parent_id = left_ie.parent_id;
+            strncpy(cat_upd.name, left_ie.name, sizeof(cat_upd.name) - 1);
+            memcpy(id + (size_t)parent_slot * ie_sz, &cat_upd, sizeof(cat_upd));
+
             if(idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
@@ -707,6 +718,15 @@ int obmafs3_catalog_insert(struct obmafs3_ctx *ctx, const struct catalog_record 
         if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct catalog_index_entry cat_upd;
+        memcpy(&cat_upd, id + (size_t)parent_slot * ie_sz, sizeof(cat_upd));
+        cat_upd.parent_id = left_ie.parent_id;
+        strncpy(cat_upd.name, left_ie.name, sizeof(cat_upd.name) - 1);
+        memcpy(id + (size_t)parent_slot * ie_sz, &cat_upd, sizeof(cat_upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         aie[idx_insert] = push_ie;
         memcpy(&aie[idx_insert + 1], id + (size_t)idx_insert * ie_sz, ((size_t)max_idx - (size_t)idx_insert) * ie_sz);

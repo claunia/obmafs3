@@ -415,6 +415,16 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         {
             uint8_t *id = buf + sizeof(struct btree_node_header);
 
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct btree_index_entry upd;
+            memcpy(&upd, id + (size_t)parent_slot * ie_sz, sizeof(upd));
+            upd.key = left_ie.key;
+            memcpy(id + (size_t)parent_slot * ie_sz, &upd, sizeof(upd));
+
             if(idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
@@ -437,6 +447,14 @@ static int cd_hash_tree_put(struct obmafs3_ctx *ctx, struct btree_header *hdr, u
         if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct btree_index_entry upd;
+        memcpy(&upd, id + (size_t)parent_slot * ie_sz, sizeof(upd));
+        upd.key = left_ie.key;
+        memcpy(id + (size_t)parent_slot * ie_sz, &upd, sizeof(upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         memcpy(&aie[idx_insert], &push_ie, ie_sz);
         memcpy(&aie[idx_insert + 1], id + (size_t)idx_insert * ie_sz, ((size_t)max_idx - (size_t)idx_insert) * ie_sz);

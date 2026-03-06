@@ -467,6 +467,18 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         if(phdr.node_keys < max_idx)
         {
             uint8_t *id = buf + sizeof(struct btree_node_header);
+
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct metadata_index_entry m_upd;
+            memcpy(&m_upd, id + (size_t)parent_slot * ie_sz, sizeof(m_upd));
+            m_upd.inode_id = left_ie.inode_id;
+            strncpy(m_upd.key, left_ie.key, METADATA_KEY_MAX);
+            memcpy(id + (size_t)parent_slot * ie_sz, &m_upd, sizeof(m_upd));
+
             if(idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
@@ -491,6 +503,15 @@ static int meta_tree_put(struct obmafs3_ctx *ctx, const struct metadata_record *
         }
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct metadata_index_entry m_upd;
+        memcpy(&m_upd, id + (size_t)parent_slot * ie_sz, sizeof(m_upd));
+        m_upd.inode_id = left_ie.inode_id;
+        strncpy(m_upd.key, left_ie.key, METADATA_KEY_MAX);
+        memcpy(id + (size_t)parent_slot * ie_sz, &m_upd, sizeof(m_upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         memcpy(&aie[idx_insert], &push_ie, ie_sz);
         memcpy(&aie[idx_insert + 1], id + (size_t)idx_insert * ie_sz, ((size_t)max_idx - (size_t)idx_insert) * ie_sz);
@@ -1140,6 +1161,19 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         if(phdr.node_keys < max_idx)
         {
             uint8_t *id = buf + sizeof(struct btree_node_header);
+
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct metadata_idx_index_entry mi_upd;
+            memcpy(&mi_upd, id + (size_t)parent_slot * ie_sz, sizeof(mi_upd));
+            strncpy(mi_upd.key, left_ie.key, METADATA_KEY_MAX);
+            strncpy(mi_upd.value, left_ie.value, METADATA_VALUE_MAX);
+            mi_upd.inode_id = left_ie.inode_id;
+            memcpy(id + (size_t)parent_slot * ie_sz, &mi_upd, sizeof(mi_upd));
+
             if(idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
@@ -1164,6 +1198,16 @@ static int midx_tree_put(struct obmafs3_ctx *ctx, const struct metadata_idx_reco
         }
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct metadata_idx_index_entry mi_upd;
+        memcpy(&mi_upd, id + (size_t)parent_slot * ie_sz, sizeof(mi_upd));
+        strncpy(mi_upd.key, left_ie.key, METADATA_KEY_MAX);
+        strncpy(mi_upd.value, left_ie.value, METADATA_VALUE_MAX);
+        mi_upd.inode_id = left_ie.inode_id;
+        memcpy(id + (size_t)parent_slot * ie_sz, &mi_upd, sizeof(mi_upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         memcpy(&aie[idx_insert], &push_ie, ie_sz);
         memcpy(&aie[idx_insert + 1], id + (size_t)idx_insert * ie_sz, ((size_t)max_idx - (size_t)idx_insert) * ie_sz);

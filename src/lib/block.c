@@ -903,6 +903,17 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
             /* Room in parent — insert */
             uint8_t *id = buf + sizeof(struct btree_node_header);
 
+            /* Update the key at parent_slot to the left child's
+             * actual minimum.  Without this, the parent key can
+             * be stale (higher than the true minimum) after the
+             * leftmost child accumulated entries with keys below
+             * the original index key. */
+            struct overflow_index_entry oe_upd;
+            memcpy(&oe_upd, id + (size_t)parent_slot * ie_sz, sizeof(oe_upd));
+            oe_upd.inode_id       = left_first_key;
+            oe_upd.logical_offset = left_first_off;
+            memcpy(id + (size_t)parent_slot * ie_sz, &oe_upd, sizeof(oe_upd));
+
             if(idx_insert < phdr.node_keys)
                 memmove(id + ((size_t)idx_insert + 1) * ie_sz, id + (size_t)idx_insert * ie_sz,
                         ((size_t)phdr.node_keys - (size_t)idx_insert) * ie_sz);
@@ -929,6 +940,15 @@ static int overflow_insert(struct obmafs3_ctx *ctx, const struct overflow_extent
         if(!aie) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
         uint8_t *id = buf + sizeof(struct btree_node_header);
+
+        /* Update the key at parent_slot to the left child's
+         * actual minimum before building the merged array. */
+        struct overflow_index_entry oe_upd;
+        memcpy(&oe_upd, id + (size_t)parent_slot * ie_sz, sizeof(oe_upd));
+        oe_upd.inode_id       = left_first_key;
+        oe_upd.logical_offset = left_first_off;
+        memcpy(id + (size_t)parent_slot * ie_sz, &oe_upd, sizeof(oe_upd));
+
         memcpy(aie, id, (size_t)idx_insert * ie_sz);
         aie[idx_insert].inode_id       = push_key;
         aie[idx_insert].logical_offset = push_offset;
