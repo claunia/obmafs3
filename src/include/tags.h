@@ -111,6 +111,6 @@ typedef enum
     kDVD_PFI_2ndLayer      = 74,  ///< DVD Physical Format Information for the second layer
     kFloppy_WriteProtect   = 75,  ///< Write protection status of the floppy disk
     kMaxMediaTag           = kFloppy_WriteProtect
-} MediaTagType;
+} Obmafs3MediaTagType;
 
 #endif /* OBMAFS3_TAGS_H */
