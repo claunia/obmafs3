@@ -830,6 +830,10 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
     uint64_t keyset_fast_hits = 0;
     {
         const struct dedup_key_set     *ks       = (const struct dedup_key_set *)ctx->dedup_key_set;
+        /* Read pending pointers under the tree_lock to prevent
+         * use-after-free if housekeeping frees the drain buffer
+         * between the pointer read and the pending_lookup call. */
+        pthread_rwlock_rdlock(&ctx->tree_lock);
         const struct dedup_pending_buf *pb       = (const struct dedup_pending_buf *)ctx->dedup_pending;
         const struct dedup_pending_buf *drain_pb = (const struct dedup_pending_buf *)ctx->dedup_pending_draining;
         for(uint64_t i = 0; i < num_sectors; i++)
@@ -838,6 +842,7 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                pending_lookup(drain_pb, sw[i].hash))
                 keyset_fast_hits++;
         }
+        pthread_rwlock_unlock(&ctx->tree_lock);
     }
 
     /*
