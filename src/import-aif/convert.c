@@ -134,14 +134,14 @@ int aaruf_track_type_to_cd_mode(int tt)
     {
         case 0: /* Audio */
             return kCdSectorModeAudio;
-        case 1: /* CdMode1 */
-        case 5: /* Data */
+        case 1: /* Data */
+        case 2: /* CdMode1 */
             return kCdSectorMode1;
-        case 2: /* CdMode2Formless */
+        case 3: /* CdMode2Formless */
             return kCdSectorMode2;
-        case 3: /* CdMode2Form1 */
+        case 4: /* CdMode2Form1 */
             return kCdSectorMode2Form1;
-        case 4: /* CdMode2Form2 */
+        case 5: /* CdMode2Form2 */
             return kCdSectorMode2Form2;
         default:
             return -1;
