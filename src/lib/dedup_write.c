@@ -1179,6 +1179,50 @@ int obmafs3_write_media_image_data(struct obmafs3_ctx *ctx, struct inode_record 
                 struct dedup_lookup_cache *dlc = (struct dedup_lookup_cache *)ctx->dedup_lookup_cache;
                 if(dlc) dedup_lc_put(dlc, hash, dedup_hdr_lba, &guard_de);
             }
+            else
+            {
+                /* Keyset/pending confirmed the hash exists, but the
+                 * tree lookup failed (stale keyset entry, or the
+                 * tree was restructured).  Fall back to storing the
+                 * sector data and inserting a fresh tree entry so
+                 * the sector is readable later. */
+                fprintf(stderr,
+                        "[dedup-write] guard lookup miss hash=%" PRIu64
+                        " rc=%d — fallback store+insert\n",
+                        hash, guard_rc);
+                dedup_hits--;
+                dedup_misses++;
+                struct compress_pool *gpool = db_cache ? ctx->compress_pool : NULL;
+                void                **gpjob = db_cache ? &db_cache->pending_job : NULL;
+                rc = dedup_block_store(ctx, db, sdata, slen, &cur_dedup_lba, &cur_dedup_off, gpool, gpjob);
+                if(rc == OBMAFS3_OK)
+                {
+                    struct dedup_entry       new_entry;
+                    new_entry.hash         = hash;
+                    new_entry.block_lba    = cur_dedup_lba;
+                    new_entry.block_offset = cur_dedup_off;
+
+                    struct dedup_node_cache *nc_g = (struct dedup_node_cache *)ctx->dedup_node_cache;
+                    struct dedup_upsert_ctx uctx_g;
+                    struct dedup_entry      existing_g;
+                    int urc = dedup_upsert_find(ctx, &dedup_hdr, hash, &existing_g, &uctx_g, tree_buf, nc_g);
+                    if(urc == OBMAFS3_ERR_NOTFOUND)
+                        urc = dedup_upsert_insert(ctx, &dedup_hdr, &new_entry, &uctx_g, tree_buf, nc_g);
+                    else if(urc == OBMAFS3_OK)
+                    {
+                        /* Found after all — use existing location. */
+                        cur_dedup_lba = existing_g.block_lba;
+                        cur_dedup_off = existing_g.block_offset;
+                    }
+                    if(urc != OBMAFS3_OK) rc = urc;
+                }
+                if(rc != OBMAFS3_OK)
+                {
+                    free(sw);
+                    free(sorted_idx);
+                    goto out;
+                }
+            }
         }
 
         /* Fill sme_buf at the original position (sector order) */
