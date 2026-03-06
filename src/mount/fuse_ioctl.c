@@ -238,7 +238,14 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
         uint64_t hash = obmafs3_checksum_xxh64(raw, CD_RAW_SECTOR_SIZE);
         sme.hash      = hash;
 
-        /* Bootstrap dedup block cache for 2352-byte sectors */
+        /* Bootstrap dedup block cache for 2352-byte sectors.
+         * If a previous track used a different sector size, flush
+         * and reinitialise so we switch to the correct dedup tree. */
+        if(ffctx->db_cache.initialized && ffctx->sector_size != CD_RAW_SECTOR_SIZE)
+        {
+            obmafs3_flush_dedup_block_cache(g_ctx, ffctx->sector_size, &ffctx->db_cache);
+            obmafs3_free_dedup_block_cache(g_ctx, &ffctx->db_cache);
+        }
         if(!ffctx->db_cache.initialized) ffctx->sector_size = CD_RAW_SECTOR_SIZE;
 
         struct dedup_block_cache *dbc = &ffctx->db_cache;
@@ -390,7 +397,14 @@ static int obmafs3_cd_write_long(struct fuse_file_ctx *ffctx, const char *path,
     sme.hash      = hash;
 
     {
-        /* Bootstrap dedup block cache */
+        /* Bootstrap dedup block cache.
+         * If a previous track used a different sector size, flush
+         * and reinitialise so we switch to the correct dedup tree. */
+        if(ffctx->db_cache.initialized && ffctx->sector_size != data_size)
+        {
+            obmafs3_flush_dedup_block_cache(g_ctx, ffctx->sector_size, &ffctx->db_cache);
+            obmafs3_free_dedup_block_cache(g_ctx, &ffctx->db_cache);
+        }
         if(!ffctx->db_cache.initialized) ffctx->sector_size = data_size;
 
         struct dedup_block_cache *dbc = &ffctx->db_cache;
