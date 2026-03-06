@@ -179,22 +179,22 @@ static const char *media_type_to_aaru_string(uint32_t media_type)
 /**
  * Map a libaaruformat TrackType + sector size (bps) to a CDRWin TRACK type string.
  */
-static const char *track_type_to_cue_string(uint8_t track_type, uint32_t bps)
+static const char *track_type_to_cue_string(uint8_t track_type)
 {
     switch(track_type)
     {
         case 0: /* Audio */
-            return (bps == 2448) ? "CDG" : "AUDIO";
+            return "AUDIO";
         case 1: /* Data */
             return "MODE1/2048";
         case 2: /* CdMode1 */
-            return (bps == 2352) ? "MODE1/2352" : "MODE1/2048";
+            return "MODE1/2352";
         case 3: /* CdMode2Formless */
-            return (bps == 2352) ? "MODE2/2352" : "MODE2/2336";
+            return "MODE2/2352";
         case 4: /* CdMode2Form1 */
-            return (bps == 2352) ? "MODE2/2352" : "MODE2/2048";
+            return "MODE2/2352";
         case 5: /* CdMode2Form2 */
-            return (bps == 2352) ? "MODE2/2352" : "MODE2/2324";
+            return "MODE2/2352";
         default:
             return "MODE1/2352";
     }
@@ -314,10 +314,9 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
 
         /* Determine the cooked sector size for this track */
         int      mode = aaruf_track_type_to_cd_mode(trk->type);
-        uint16_t ss   = (mode >= 0) ? cd_mode_sector_size(mode) : 2048;
 
         /* TRACK line */
-        const char *cue_type = track_type_to_cue_string(trk->type, ss);
+        const char *cue_type = track_type_to_cue_string(trk->type);
         fprintf(fp, "  TRACK %02d %s\n", trk->sequence, cue_type);
 
         /* FLAGS */
