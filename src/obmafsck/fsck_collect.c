@@ -690,7 +690,7 @@ int collect_free_chain_blocks(struct obmafs3_ctx *ctx, const struct btree_header
     uint64_t  count = 0;
     uint64_t  cap   = 0;
     uint64_t  cur   = hdr->free_node_lba;
-    uint32_t  limit = hdr->free_nodes + 1; /* safety limit to avoid cycles */
+    uint64_t  limit = ((uint64_t)hdr->free_nodes + 1) * blocks_per_node; /* safety limit (in blocks) to avoid cycles */
 
     while(cur != 0 && count < limit)
     {

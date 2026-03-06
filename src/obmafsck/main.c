@@ -1884,6 +1884,274 @@ int main(int argc, char *argv[])
                     printf("    Expected allocated: %" PRIu64 ", on-disk allocated: %" PRIu64 "\n", expected_alloc,
                            allocated);
 
+                    /* ---- Diagnostic: analyse mismatched blocks ---- */
+                    if(extra > 0 || missing > 0)
+                    {
+                        printf("\n    %s--- Bitmap mismatch diagnostics ---%s\n", CLR_BOLD, CLR_RESET);
+
+                        /* Collect extra blocks into contiguous runs */
+                        if(extra > 0 && extra <= 100000)
+                        {
+                            uint64_t *extra_lbas = malloc((size_t)extra * sizeof(uint64_t));
+                            if(extra_lbas)
+                            {
+                                uint64_t ei = 0;
+                                for(uint64_t b = 0; b < total_blocks && ei < extra; b++)
+                                {
+                                    int on_d = (disk_bitmap[b / 8] >> (b % 8)) & 1;
+                                    int in_e = (expected[b / 8] >> (b % 8)) & 1;
+                                    if(!in_e && on_d) extra_lbas[ei++] = b;
+                                }
+
+                                /* Group into contiguous runs and print */
+                                printf("    Extra allocated runs (allocated but not referenced):\n");
+                                uint64_t run_start = extra_lbas[0];
+                                uint64_t run_len   = 1;
+                                uint64_t run_count = 0;
+                                for(uint64_t i = 1; i <= ei; i++)
+                                {
+                                    if(i < ei && extra_lbas[i] == extra_lbas[i - 1] + 1)
+                                    {
+                                        run_len++;
+                                        continue;
+                                    }
+                                    /* End of run — print it (limit output to first 32 runs) */
+                                    if(run_count < 32)
+                                    {
+                                        printf("      LBA %" PRIu64 " .. %" PRIu64 " (%" PRIu64 " block%s)",
+                                               run_start, run_start + run_len - 1, run_len,
+                                               run_len == 1 ? "" : "s");
+
+                                        /* Identify what's at the first block of the run */
+                                        uint8_t probe[64];
+                                        int     prc = obmafs3_block_read(ctx, run_start, probe, sizeof(probe));
+                                        if(prc == OBMAFS3_OK)
+                                        {
+                                            uint64_t magic;
+                                            memcpy(&magic, probe, sizeof(magic));
+                                            if(magic == OBMAFS3_BTREE_NODE_MAGIC)
+                                                printf(" [btree node]");
+                                            else if(magic == OBMAFS3_BTREE_HDR_MAGIC)
+                                                printf(" [btree header]");
+                                            else if(magic == OBMAFS3_BLOCK_MAGIC)
+                                            {
+                                                struct block_header bh;
+                                                memcpy(&bh, probe, sizeof(bh));
+                                                printf(" [data block: orig=%" PRIu64 " comp=%" PRIu64 " flags=0x%x]",
+                                                       bh.original_size, bh.compressed_size, bh.flags);
+                                            }
+                                            else if(magic == 0)
+                                                printf(" [zeroed]");
+                                            else
+                                            {
+                                                /* Check if it looks like a free-chain pointer */
+                                                uint64_t ptr;
+                                                memcpy(&ptr, probe, sizeof(ptr));
+                                                if(ptr == 0 || (ptr > 0 && ptr < total_blocks))
+                                                    printf(" [free-chain ptr -> %" PRIu64 "]", ptr);
+                                                else
+                                                    printf(" [magic=0x%016" PRIx64 "]", magic);
+                                            }
+                                        }
+                                        printf("\n");
+                                    }
+                                    if(i < ei)
+                                    {
+                                        run_start = extra_lbas[i];
+                                        run_len   = 1;
+                                    }
+                                    run_count++;
+                                }
+                                if(run_count > 32) printf("      ... and %" PRIu64 " more runs\n", run_count - 32);
+                                printf("    Total: %" PRIu64 " extra block(s) in %" PRIu64 " contiguous run(s)\n",
+                                       extra, run_count);
+
+                                free(extra_lbas);
+                            }
+                        }
+
+                        /* Collect missing blocks into contiguous runs */
+                        if(missing > 0 && missing <= 100000)
+                        {
+                            uint64_t *miss_lbas = malloc((size_t)missing * sizeof(uint64_t));
+                            if(miss_lbas)
+                            {
+                                uint64_t mi = 0;
+                                for(uint64_t b = 0; b < total_blocks && mi < missing; b++)
+                                {
+                                    int on_d = (disk_bitmap[b / 8] >> (b % 8)) & 1;
+                                    int in_e = (expected[b / 8] >> (b % 8)) & 1;
+                                    if(in_e && !on_d) miss_lbas[mi++] = b;
+                                }
+                                printf("    Missing allocated runs (referenced but not allocated):\n");
+                                uint64_t run_start = miss_lbas[0];
+                                uint64_t run_len   = 1;
+                                uint64_t run_count = 0;
+                                for(uint64_t i = 1; i <= mi; i++)
+                                {
+                                    if(i < mi && miss_lbas[i] == miss_lbas[i - 1] + 1)
+                                    {
+                                        run_len++;
+                                        continue;
+                                    }
+                                    if(run_count < 32)
+                                    {
+                                        printf("      LBA %" PRIu64 " .. %" PRIu64 " (%" PRIu64 " block%s)\n",
+                                               run_start, run_start + run_len - 1, run_len,
+                                               run_len == 1 ? "" : "s");
+                                    }
+                                    if(i < mi)
+                                    {
+                                        run_start = miss_lbas[i];
+                                        run_len   = 1;
+                                    }
+                                    run_count++;
+                                }
+                                if(run_count > 32) printf("      ... and %" PRIu64 " more runs\n", run_count - 32);
+                                printf("    Total: %" PRIu64 " missing block(s) in %" PRIu64 " contiguous run(s)\n",
+                                       missing, run_count);
+                                free(miss_lbas);
+                            }
+                        }
+
+                        /* Print free-chain summary for all trees */
+                        printf("\n    %s--- Free-chain summary ---%s\n", CLR_BOLD, CLR_RESET);
+                        {
+                            struct
+                            {
+                                const char           *name;
+                                const struct btree_header *hdr;
+                            } trees[] = {
+                                {"Catalog",        &ctx->catalog_hdr},
+                                {"Inode",          &ctx->inode_hdr},
+                                {"Overflow",       &ctx->overflow_hdr},
+                                {"Media tag",      &ctx->media_tag_hdr},
+                                {"CD prefix",      &ctx->cd_prefix_hdr},
+                                {"CD suffix",      &ctx->cd_suffix_hdr},
+                                {"CD subchannel",  &ctx->cd_subchannel_hdr},
+                                {"Metadata",       &ctx->metadata_hdr},
+                                {"Metadata index", &ctx->metadata_idx_hdr},
+                                {"Refcount",       &ctx->refcount_hdr},
+                            };
+                            for(int ti = 0; ti < (int)(sizeof(trees) / sizeof(trees[0])); ti++)
+                            {
+                                const struct btree_header *th = trees[ti].hdr;
+                                if(th->magic != OBMAFS3_BTREE_HDR_MAGIC) continue;
+
+                                /* Walk the free chain and count reachable nodes */
+                                uint64_t walked = 0;
+                                uint64_t cur    = th->free_node_lba;
+                                uint64_t limit  = th->free_nodes + 16; /* safety margin */
+                                uint8_t  fbuf[8];
+                                int      chain_ok = 1;
+                                while(cur != 0 && walked < limit)
+                                {
+                                    if(cur >= total_blocks) { chain_ok = 0; break; }
+                                    walked++;
+                                    int rrc = obmafs3_block_read(ctx, cur, fbuf, sizeof(fbuf));
+                                    if(rrc != OBMAFS3_OK) { chain_ok = 0; break; }
+                                    uint64_t nxt;
+                                    memcpy(&nxt, fbuf, sizeof(nxt));
+                                    /* Detect BTREENDE magic (node was overwritten) */
+                                    if(nxt == OBMAFS3_BTREE_NODE_MAGIC)
+                                    {
+                                        printf("      %s%-16s%s free chain broken at LBA %" PRIu64
+                                               " (contains BTREENDE magic)\n",
+                                               CLR_RED, trees[ti].name, CLR_RESET, cur);
+                                        chain_ok = 0;
+                                        break;
+                                    }
+                                    if(nxt != 0 && nxt >= total_blocks)
+                                    {
+                                        printf("      %s%-16s%s free chain broken at LBA %" PRIu64
+                                               " (next=0x%" PRIx64 " out of bounds)\n",
+                                               CLR_RED, trees[ti].name, CLR_RESET, cur, nxt);
+                                        chain_ok = 0;
+                                        break;
+                                    }
+                                    cur = nxt;
+                                }
+
+                                const char *status_color = chain_ok ? CLR_GREEN : CLR_RED;
+                                const char *status_icon  = chain_ok ? "ok" : "BROKEN";
+                                if(walked != th->free_nodes && chain_ok)
+                                {
+                                    status_color = CLR_YELLOW;
+                                    status_icon  = "COUNT MISMATCH";
+                                }
+                                printf("      %-16s  hdr.free_nodes=%-6u walked=%-6" PRIu64 "  head=%-8" PRIu64
+                                       "  total_nodes=%-6u  [%s%s%s]\n",
+                                       trees[ti].name, th->free_nodes, walked, th->free_node_lba,
+                                       th->total_nodes, status_color, status_icon, CLR_RESET);
+                            }
+
+                            /* Dedup trees */
+                            if(ctx->sb.dedup_lba != 0)
+                            {
+                                uint8_t *list_buf = calloc(1, (size_t)ctx->sb.block_size);
+                                if(list_buf)
+                                {
+                                    int rrc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, list_buf,
+                                                                 (size_t)ctx->sb.block_size);
+                                    if(rrc == OBMAFS3_OK)
+                                    {
+                                        struct tree_list_header lh;
+                                        memcpy(&lh, list_buf, sizeof(lh));
+                                        if(lh.magic == OBMAFS3_TREELIST_MAGIC)
+                                        {
+                                            for(uint64_t t = 0; t < lh.tree_count; t++)
+                                            {
+                                                struct tree_list_entry te;
+                                                memcpy(&te,
+                                                       list_buf + sizeof(struct tree_list_header)
+                                                           + t * sizeof(te),
+                                                       sizeof(te));
+                                                struct btree_header thdr;
+                                                if(obmafs3_btree_header_read(ctx, te.tree_lba, &thdr) == OBMAFS3_OK)
+                                                {
+                                                    uint64_t dwalked = 0;
+                                                    uint64_t dcur    = thdr.free_node_lba;
+                                                    int      dok     = 1;
+                                                    while(dcur != 0 && dwalked < thdr.free_nodes + 16)
+                                                    {
+                                                        if(dcur >= total_blocks) { dok = 0; break; }
+                                                        dwalked++;
+                                                        uint8_t db[8];
+                                                        int     drrc = obmafs3_block_read(ctx, dcur, db, sizeof(db));
+                                                        if(drrc != OBMAFS3_OK) { dok = 0; break; }
+                                                        uint64_t dnxt;
+                                                        memcpy(&dnxt, db, sizeof(dnxt));
+                                                        if(dnxt == OBMAFS3_BTREE_NODE_MAGIC) { dok = 0; break; }
+                                                        if(dnxt != 0 && dnxt >= total_blocks) { dok = 0; break; }
+                                                        dcur = dnxt;
+                                                    }
+                                                    char dname[32];
+                                                    snprintf(dname, sizeof(dname), "Dedup[%u]",
+                                                             (unsigned)te.sector_size);
+                                                    const char *ds_color = dok ? CLR_GREEN : CLR_RED;
+                                                    const char *ds_icon  = dok ? "ok" : "BROKEN";
+                                                    if(dwalked != thdr.free_nodes && dok)
+                                                    {
+                                                        ds_color = CLR_YELLOW;
+                                                        ds_icon  = "COUNT MISMATCH";
+                                                    }
+                                                    printf("      %-16s  hdr.free_nodes=%-6u walked=%-6" PRIu64
+                                                           "  head=%-8" PRIu64 "  total_nodes=%-6u"
+                                                           "  last_blk=%-8" PRIu64 "  [%s%s%s]\n",
+                                                           dname, thdr.free_nodes, dwalked, thdr.free_node_lba,
+                                                           thdr.total_nodes, thdr.last_block_lba,
+                                                           ds_color, ds_icon, CLR_RESET);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    free(list_buf);
+                                }
+                            }
+                        }
+                        printf("    %s--- End diagnostics ---%s\n\n", CLR_BOLD, CLR_RESET);
+                    }
+
                     if(ask_fix(auto_yes, auto_no, "Fix allocation bitmap?"))
                     {
                         memcpy(ctx->bitmap, expected, (size_t)bitmap_bytes);
