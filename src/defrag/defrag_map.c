@@ -97,9 +97,9 @@ static void draw_legend(WINDOW *win, int map_h, int map_w)
     wattron(win, COLOR_PAIR(CP_DESKTOP));
     mvwprintw(win, y++, lx + 2, "Used Block");
 
-    /* Free block — use the same U+2592 glyph as the map */
+    /* Free block — use the same U+2591 glyph as the map */
     {
-        static const wchar_t free_g[] = { 0x2592, L'\0' };
+        static const wchar_t free_g[] = { 0x2591, L'\0' };
         cchar_t free_cc;
         setcchar(&free_cc, free_g, 0, (short)CP_MAP_FREE, NULL);
         mvwadd_wch(win, y, lx, &free_cc);
@@ -244,8 +244,8 @@ void defrag_map_draw(struct defrag_tui *tui)
 
     uint64_t block_idx = 0;
 
-    /* U+2592 MEDIUM SHADE — classic DOS dithered free-space glyph */
-    static const wchar_t free_glyph[] = { 0x2592, L'\0' };
+    /* U+2591 LIGHT SHADE — free-space glyph */
+    static const wchar_t free_glyph[] = { 0x2591, L'\0' };
     cchar_t free_cch;
 
     for(int row = 0; row < usable_rows && block_idx < total; row++)
