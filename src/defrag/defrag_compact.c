@@ -1378,6 +1378,8 @@ static int collect_tree_nodes(struct compact_state *state, struct tree_reloc *tr
 {
     struct obmafs3_ctx *ctx = state->ctx;
     size_t bsz = (size_t)ctx->sb.block_size;
+    if(tr->blocks_per_node == 0) tr->blocks_per_node = 1;
+    size_t node_sz = bsz * tr->blocks_per_node;
 
     struct btree_header hdr;
     int rc = obmafs3_btree_header_read(ctx, tr->hdr_lba, &hdr);
@@ -1400,7 +1402,7 @@ static int collect_tree_nodes(struct compact_state *state, struct tree_reloc *tr
 
     queue[qt++] = hdr.root_node_lba;
 
-    uint8_t *buf = calloc(1, bsz);
+    uint8_t *buf = calloc(1, node_sz);
     if(!buf) { free(queue); free(tr->node_lbas); return OBMAFS3_ERR_NOMEM; }
 
     while(qh < qt)
@@ -1418,7 +1420,7 @@ static int collect_tree_nodes(struct compact_state *state, struct tree_reloc *tr
         }
         tr->node_lbas[count++] = lba;
 
-        rc = obmafs3_block_read(ctx, lba, buf, bsz);
+        rc = obmafs3_block_read(ctx, lba, buf, node_sz);
         if(rc != OBMAFS3_OK) continue;
 
         struct btree_node_header nh;
@@ -1490,6 +1492,9 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
 
     uint64_t *old_lbas = tr->node_lbas;
     uint64_t  n        = tr->node_count;
+    uint64_t  bpn      = tr->blocks_per_node;
+    if(bpn == 0) bpn = 1;
+    size_t    nsz      = bsz * (size_t)bpn;
     int       rc;
 
     /* Step 1: Read ALL nodes into memory first to avoid the overlap problem.
@@ -1500,7 +1505,7 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
 
     for(uint64_t i = 0; i < n; i++)
     {
-        node_data[i] = malloc(bsz);
+        node_data[i] = malloc(nsz);
         if(!node_data[i])
         {
             for(uint64_t k = 0; k < i; k++) free(node_data[k]);
@@ -1508,7 +1513,7 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
             return OBMAFS3_ERR_NOMEM;
         }
 
-        rc = obmafs3_block_read(ctx, old_lbas[i], node_data[i], bsz);
+        rc = obmafs3_block_read(ctx, old_lbas[i], node_data[i], nsz);
         if(rc != OBMAFS3_OK)
         {
             for(uint64_t k = 0; k <= i; k++) free(node_data[k]);
@@ -1539,7 +1544,7 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
         while(map[idx].used)
             idx = (idx + 1) & map_mask;
         map[idx].old_lba = old_lbas[i];
-        map[idx].new_lba = dst_start + i;
+        map[idx].new_lba = dst_start + i * bpn;
         map[idx].used = 1;
     }
 
@@ -1628,12 +1633,12 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
     /* Step 3: Write all nodes to their new positions */
     for(uint64_t i = 0; i < n; i++)
     {
-        uint64_t dst = dst_start + i;
+        uint64_t dst = dst_start + i * bpn;
 
         atomic_store(&state->current_src_lba, old_lbas[i]);
         atomic_store(&state->current_dst_lba, dst);
 
-        rc = obmafs3_block_write(ctx, dst, node_data[i], bsz);
+        rc = obmafs3_block_write(ctx, dst, node_data[i], nsz);
         if(rc != OBMAFS3_OK)
         {
             for(uint64_t k = 0; k < n; k++) free(node_data[k]);
@@ -1664,7 +1669,7 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
      * so update_sme_refs can fix dedup_subchannel_lba in CD SMEs. */
     for(uint64_t i = 0; i < n; i++)
     {
-        if(old_lbas[i] == dst_start + i) continue; /* not moved */
+        if(old_lbas[i] == dst_start + i * bpn) continue; /* not moved */
 
         if(state->tree_reloc_count >= state->tree_reloc_cap)
         {
@@ -1681,7 +1686,7 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
         if(state->tree_reloc_count < state->tree_reloc_cap)
         {
             state->tree_reloc_old[state->tree_reloc_count] = old_lbas[i];
-            state->tree_reloc_new[state->tree_reloc_count] = dst_start + i;
+            state->tree_reloc_new[state->tree_reloc_count] = dst_start + i * bpn;
             state->tree_reloc_count++;
         }
     }
@@ -1696,18 +1701,24 @@ static int relocate_tree(struct compact_state *state, struct tree_reloc *tr,
     sync_fd(state);
 
     /* Step 5: Update bitmap: set new range, clear old individual LBAs */
-    obmafs3_bitmap_set(ctx, dst_start, n);
+    obmafs3_bitmap_set(ctx, dst_start, n * bpn);
     for(uint64_t i = 0; i < n; i++)
     {
         uint64_t old = old_lbas[i];
-        if(old < dst_start || old >= dst_start + n)
-            obmafs3_bitmap_clear(ctx, old, 1);
+        uint64_t dst = dst_start + i * bpn;
+        if(old < dst_start || old >= dst_start + n * bpn)
+            obmafs3_bitmap_clear(ctx, old, bpn);
 
         if(state->analysis->block_types)
         {
-            if(old < dst_start || old >= dst_start + n)
-                state->analysis->block_types[old] = BT_FREE;
-            state->analysis->block_types[dst_start + i] = BT_TREE;
+            for(uint64_t b = 0; b < bpn; b++)
+            {
+                if(old + b < state->analysis->total_blocks &&
+                   (old < dst_start || old >= dst_start + n * bpn))
+                    state->analysis->block_types[old + b] = BT_FREE;
+                if(dst + b < state->analysis->total_blocks)
+                    state->analysis->block_types[dst + b] = BT_TREE;
+            }
         }
     }
 
@@ -2567,9 +2578,10 @@ static int compact_trees(struct compact_state *state)
 
     /* Collect all trees to relocate */
     struct tree_reloc trees[20];
+    memset(trees, 0, sizeof(trees));
     int tc = 0;
 
-    #define ADD_TREE(name_str, lba_val, ie_type, clba_field)          \
+    #define ADD_TREE(name_str, lba_val, ie_type, clba_field, bpn)     \
         do {                                                          \
             if((lba_val) != 0 && tc < 20)                             \
             {                                                         \
@@ -2577,22 +2589,23 @@ static int compact_trees(struct compact_state *state)
                 trees[tc].hdr_lba = (lba_val);                        \
                 trees[tc].idx_entry_size = sizeof(ie_type);            \
                 trees[tc].child_lba_off = offsetof(ie_type, child_lba);\
+                trees[tc].blocks_per_node = (bpn);                    \
                 trees[tc].node_lbas = NULL;                           \
                 trees[tc].node_count = 0;                             \
                 tc++;                                                 \
             }                                                         \
         } while(0)
 
-    ADD_TREE("Catalog",      ctx->sb.catalog_lba,       struct catalog_index_entry,      child_lba);
-    ADD_TREE("Inode",        ctx->sb.inode_lba,         struct btree_index_entry,        child_lba);
-    ADD_TREE("Overflow",     ctx->sb.overflow_lba,      struct overflow_index_entry,     child_lba);
-    ADD_TREE("Metadata",     ctx->sb.metadata_lba,      struct metadata_index_entry,     child_lba);
-    ADD_TREE("MetadataIdx",  ctx->sb.metadata_idx_lba,  struct metadata_idx_index_entry, child_lba);
-    ADD_TREE("MediaTag",     ctx->sb.media_tag_lba,     struct media_tag_index_entry,    child_lba);
-    ADD_TREE("CdPrefix",     ctx->sb.cd_prefix_lba,     struct btree_index_entry,        child_lba);
-    ADD_TREE("CdSuffix",     ctx->sb.cd_suffix_lba,     struct btree_index_entry,        child_lba);
-    ADD_TREE("CdSubchannel", ctx->sb.cd_subchannel_lba, struct btree_index_entry,        child_lba);
-    ADD_TREE("Refcount",     ctx->sb.refcount_lba,      struct btree_index_entry,        child_lba);
+    ADD_TREE("Catalog",      ctx->sb.catalog_lba,       struct catalog_index_entry,      child_lba, 1);
+    ADD_TREE("Inode",        ctx->sb.inode_lba,         struct btree_index_entry,        child_lba, 1);
+    ADD_TREE("Overflow",     ctx->sb.overflow_lba,      struct overflow_index_entry,     child_lba, 1);
+    ADD_TREE("Metadata",     ctx->sb.metadata_lba,      struct metadata_index_entry,     child_lba, METADATA_NODE_BLOCKS);
+    ADD_TREE("MetadataIdx",  ctx->sb.metadata_idx_lba,  struct metadata_idx_index_entry, child_lba, METADATA_NODE_BLOCKS);
+    ADD_TREE("MediaTag",     ctx->sb.media_tag_lba,     struct media_tag_index_entry,    child_lba, 1);
+    ADD_TREE("CdPrefix",     ctx->sb.cd_prefix_lba,     struct btree_index_entry,        child_lba, 1);
+    ADD_TREE("CdSuffix",     ctx->sb.cd_suffix_lba,     struct btree_index_entry,        child_lba, 1);
+    ADD_TREE("CdSubchannel", ctx->sb.cd_subchannel_lba, struct btree_index_entry,        child_lba, 1);
+    ADD_TREE("Refcount",     ctx->sb.refcount_lba,      struct btree_index_entry,        child_lba, 1);
 
     /* Add dedup trees from the tree list */
     if(ctx->sb.dedup_lba != 0)
@@ -2618,6 +2631,7 @@ static int compact_trees(struct compact_state *state)
                         trees[tc].hdr_lba = entries[t].tree_lba;
                         trees[tc].idx_entry_size = sizeof(struct btree_index_entry);
                         trees[tc].child_lba_off = offsetof(struct btree_index_entry, child_lba);
+                        trees[tc].blocks_per_node = 1;
                         trees[tc].node_lbas = NULL;
                         trees[tc].node_count = 0;
                         tc++;
@@ -2639,11 +2653,14 @@ static int compact_trees(struct compact_state *state)
         total_nodes += trees[i].node_count;
     }
 
-    /* Calculate total space needed: nodes + clump gaps between trees */
-    uint64_t total_needed = total_nodes + (uint64_t)(tc > 0 ? tc - 1 : 0) * COMPACT_TREE_CLUMP;
+    /* Calculate total space needed: nodes × blocks_per_node + clump gaps between trees */
+    uint64_t total_blocks_needed = 0;
+    for(int i = 0; i < tc; i++)
+        total_blocks_needed += trees[i].node_count * trees[i].blocks_per_node;
+    total_blocks_needed += (uint64_t)(tc > 0 ? tc - 1 : 0) * COMPACT_TREE_CLUMP;
 
     /* Place trees at the end of the disk (before the backup superblock) */
-    uint64_t trees_start = total_blocks - 1 - total_needed;
+    uint64_t trees_start = total_blocks - 1 - total_blocks_needed;
 
     /* Relocate each tree */
     uint64_t cursor = trees_start;
@@ -2654,7 +2671,7 @@ static int compact_trees(struct compact_state *state)
         int rc = relocate_tree(state, &trees[i], cursor);
         if(rc != OBMAFS3_OK) goto cleanup;
 
-        cursor += trees[i].node_count + COMPACT_TREE_CLUMP;
+        cursor += trees[i].node_count * trees[i].blocks_per_node + COMPACT_TREE_CLUMP;
     }
 
     /* Flush bitmap after all trees are relocated */

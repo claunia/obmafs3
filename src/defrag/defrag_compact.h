@@ -67,6 +67,7 @@ struct tree_reloc
     uint64_t    hdr_lba;        /**< LBA of the btree_header block        */
     size_t      idx_entry_size; /**< sizeof the tree's index entry        */
     size_t      child_lba_off;  /**< offsetof(child_lba) in index entry   */
+    uint64_t    blocks_per_node;/**< Blocks per node (1 or METADATA_NODE_BLOCKS) */
     uint64_t   *node_lbas;      /**< Collected node LBAs (malloc'd)       */
     uint64_t    node_count;     /**< Number of nodes                      */
 };
