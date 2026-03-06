@@ -30,6 +30,7 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
+#include "errors.h"
 #include "import_aif.h"
 
 /**
@@ -117,11 +118,20 @@ int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 {
     /* Get track information */
-    uint8_t track_buf[4096];
-    size_t  track_buf_len = sizeof(track_buf);
-    int     track_count   = aaruf_get_tracks(aaruf_ctx, track_buf, &track_buf_len);
+    uint8_t *track_buf = NULL;
+    size_t  track_buf_len = 0;
+    int     err   = aaruf_get_tracks(aaruf_ctx, track_buf, &track_buf_len);
 
-    if(track_count <= 0)
+    if(err != AARUF_ERROR_BUFFER_TOO_SMALL || track_buf_len == 0)
+    {
+        fprintf(stderr, "Warning: no tracks found, cannot import as CD image\n");
+        return -1;
+    }
+
+    track_buf = malloc(track_buf_len);
+    err   = aaruf_get_tracks(aaruf_ctx, track_buf, &track_buf_len);
+
+    if(err != AARUF_STATUS_OK)
     {
         fprintf(stderr, "Warning: no tracks found, cannot import as CD image\n");
         return -1;
@@ -129,6 +139,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
     /* Parse track entries */
     TrackEntry *tracks = (TrackEntry *)track_buf;
+    int         track_count = (int)(track_buf_len / sizeof(TrackEntry));
 
     /* Count total importable sectors from track ranges (start-pregap..end) */
     uint64_t total_sectors = 0;
@@ -207,7 +218,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
             int rrc = aaruf_read_sector_long(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer, &length, &status);
 
-            if(rrc == 0 && length == CD_RAW_SECTOR_SIZE)
+            if(rrc == AARUF_STATUS_OK && length == CD_RAW_SECTOR_SIZE)
             {
                 /* Full 2352-byte raw sector */
                 cd_arg.buffer_size = CD_RAW_SECTOR_SIZE;
@@ -241,7 +252,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
                 length = ss;
                 rrc = aaruf_read_sector(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer + data_offset, &length, &status);
-                if(rrc != 0)
+                if(rrc != AARUF_STATUS_OK)
                 {
                     fprintf(stderr, "Warning: failed to read sector %" PRId64 " (rc=%d), filling with zeroes\n", s,
                             rrc);
@@ -264,7 +275,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
                 uint32_t sub_len = 96;
                 int      src = aaruf_read_sector_tag(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer + CD_RAW_SECTOR_SIZE,
                                                      &sub_len, 8 /* CdSectorSubchannelAaru */);
-                if(src == 0 && sub_len == 96) cd_arg.buffer_size = CD_RAW_PLUS_SUB;
+                if(src == AARUF_STATUS_OK && sub_len == 96) cd_arg.buffer_size = CD_RAW_PLUS_SUB;
             }
 
             if(ioctl(fd, OBMAFS3_IOC_CD_WRITE_LONG, &cd_arg) != 0)
