@@ -32,6 +32,7 @@
 
 #include "errors.h"
 #include "import_aif.h"
+#include "ui.h"
 
 #include <iconv.h>
 
@@ -71,7 +72,7 @@ int import_media_tags(void *aaruf_ctx, int fd)
 
         if(data_len > OBMAFS3_IOC_MAX_TAG_DATA)
         {
-            fprintf(stderr, "Warning: media tag %d too large (%u bytes), skipping\n", obmafs_tag, data_len);
+            ui_warn("Media tag %d too large (%u bytes), skipping", obmafs_tag, data_len);
             continue;
         }
 
@@ -84,7 +85,7 @@ int import_media_tags(void *aaruf_ctx, int fd)
         if(rc != AARUF_STATUS_OK) continue; /* Skip tags we can't read */
 
         if(ioctl(fd, OBMAFS3_IOC_SET_MEDIA_TAG, &tag_arg) != 0)
-            fprintf(stderr, "Warning: failed to store media tag %d (errno=%d)\n", obmafs_tag, errno);
+            ui_warn("Failed to store media tag %d (errno=%d)", obmafs_tag, errno);
     }
 
     return 0;
@@ -136,7 +137,7 @@ static void import_utf16_metadata(void *aaruf_ctx, int fd, int32_t (*getter)(con
         if(meta.value[0])
         {
             if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-                fprintf(stderr, "Warning: failed to set metadata '%s'\n", key);
+                ui_warn("Failed to set metadata '%s'", key);
         }
     }
 
@@ -161,7 +162,7 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
         strncpy(meta.key, "application", METADATA_KEY_MAX - 1);
         strncpy(meta.value, info->Application, METADATA_VALUE_MAX - 1);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-            fprintf(stderr, "Warning: failed to set metadata 'application'\n");
+            ui_warn("Failed to set metadata 'application'");
     }
 
     if(info->ApplicationVersion[0])
@@ -170,7 +171,7 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
         strncpy(meta.key, "application_version", METADATA_KEY_MAX - 1);
         strncpy(meta.value, info->ApplicationVersion, METADATA_VALUE_MAX - 1);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-            fprintf(stderr, "Warning: failed to set metadata 'application_version'\n");
+            ui_warn("Failed to set metadata 'application_version'");
     }
 
     /* Store media type as a numeric string */
@@ -179,7 +180,7 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
         strncpy(meta.key, "media_type", METADATA_KEY_MAX - 1);
         snprintf(meta.value, METADATA_VALUE_MAX, "%d", info->MediaType);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-            fprintf(stderr, "Warning: failed to set metadata 'media_type'\n");
+            ui_warn("Failed to set metadata 'media_type'");
     }
 
     /* Store CHS geometry if available */
@@ -192,7 +193,7 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
             snprintf(meta.value, METADATA_VALUE_MAX, "%" PRIu32 "/%" PRIu32 "/%" PRIu32, cylinders, heads,
                      sectors_per_track);
             if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-                fprintf(stderr, "Warning: failed to set metadata 'geometry'\n");
+                ui_warn("Failed to set metadata 'geometry'");
         }
     }
 
@@ -205,7 +206,7 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
             strncpy(meta.key, "media_sequence", METADATA_KEY_MAX - 1);
             snprintf(meta.value, METADATA_VALUE_MAX, "%" PRId32 "/%" PRId32, sequence, last_sequence);
             if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-                fprintf(stderr, "Warning: failed to set metadata 'media_sequence'\n");
+                ui_warn("Failed to set metadata 'media_sequence'");
         }
     }
 

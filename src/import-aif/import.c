@@ -32,6 +32,7 @@
 
 #include "errors.h"
 #include "import_aif.h"
+#include "ui.h"
 
 /**
  * Import a non-optical (flat) media image: read sectors sequentially
@@ -50,7 +51,8 @@ int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
     uint8_t *buf = malloc(buf_cap);
     if(!buf) return -1;
 
-    fprintf(stderr, "Importing %" PRIu64 " sectors (nominal sector size %u)...\n", sectors, (unsigned)buf_cap);
+    ui_info("Sectors:", "%" PRIu64, sectors);
+    ui_info("Sector size:", "%u bytes", (unsigned)buf_cap);
 
     for(uint64_t s = 0; s < sectors; s++)
     {
@@ -61,11 +63,11 @@ int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
         if(rrc == AARUF_ERROR_BUFFER_TOO_SMALL && length > buf_cap)
         {
-            /* Sector is larger than current buffer — grow and retry */
             uint8_t *tmp = realloc(buf, length);
             if(!tmp)
             {
-                fprintf(stderr, "Error: out of memory re-allocating sector buffer to %u bytes\n", length);
+                ui_progress_clear();
+                ui_error("Out of memory re-allocating sector buffer to %u bytes", length);
                 free(buf);
                 return -1;
             }
@@ -76,27 +78,26 @@ int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
         if(rrc != AARUF_STATUS_OK)
         {
-            fprintf(stderr, "Warning: failed to read sector %" PRIu64 " (rc=%d), filling with zeroes\n", s, rrc);
             memset(buf, 0, buf_cap);
             length = buf_cap;
         }
 
-        /* length may be smaller than buf_cap for this sector — write only what was returned */
         ssize_t written = write(fd, buf, length);
         if(written < 0 || (uint32_t)written != length)
         {
-            fprintf(stderr, "Error: write failed at sector %" PRIu64 " (errno=%d)\n", s, errno);
+            ui_progress_clear();
+            ui_error("Write failed at sector %" PRIu64 " (errno=%d)", s, errno);
             free(buf);
             return -1;
         }
 
-        /* Progress every 10000 sectors */
-        if((s % 10000) == 0 && s > 0)
-            fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (%.1f%%)", s, sectors,
-                    (double)s / (double)sectors * 100.0);
+        if((s % 1000) == 0 || s + 1 == sectors)
+            ui_progress("Importing", s + 1, sectors);
     }
 
-    fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (100.0%%)\n", sectors, sectors);
+    ui_progress("Importing", sectors, sectors);
+    ui_progress_clear();
+    ui_ok("Imported %" PRIu64 " sectors", sectors);
 
     free(buf);
     return 0;
@@ -124,7 +125,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
     if(err != AARUF_ERROR_BUFFER_TOO_SMALL || track_buf_len == 0)
     {
-        fprintf(stderr, "Warning: no tracks found, cannot import as CD image\n");
+        ui_error("No tracks found, cannot import as CD image");
         return -1;
     }
 
@@ -133,7 +134,7 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
     if(err != AARUF_STATUS_OK)
     {
-        fprintf(stderr, "Warning: no tracks found, cannot import as CD image\n");
+        ui_error("Failed to read track information");
         return -1;
     }
 
@@ -150,30 +151,28 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
     }
     uint64_t imported = 0;
 
-    fprintf(stderr, "  Image reports %" PRIu64 " sectors, %" PRIu64 " belong to tracks\n", info->Sectors,
-            total_sectors);
+    ui_info("Image sectors:", "%" PRIu64, info->Sectors);
+    ui_info("Track sectors:", "%" PRIu64, total_sectors);
 
     /* Initialize ECC context for prefix/suffix reconstruction */
     void *ecc_ctx = aaruf_ecc_cd_init();
     if(!ecc_ctx)
     {
-        fprintf(stderr, "Error: failed to initialize ECC context\n");
+        ui_error("Failed to initialize ECC context");
         return -1;
     }
 
     /* Check if subchannel data is available */
     int has_subchannel = 0;
     {
-        /* CdSectorSubchannelAaru = 8 in aaru.h SectorTagType enum;
-         * MaxSectorTag = 21, so the bool array has 22 entries. */
         uint8_t stag_buf[22];
         size_t  stag_len = sizeof(stag_buf);
         int     strc     = aaruf_get_readable_sector_tags(aaruf_ctx, stag_buf, &stag_len);
         if(strc == 0 && stag_len >= 9 && stag_buf[8]) has_subchannel = 1;
     }
-    fprintf(stderr, "  Subchannel: %s\n", has_subchannel ? "available" : "not available");
-
-    fprintf(stderr, "Importing CD image: %" PRIu64 " sectors, %d tracks\n", total_sectors, track_count);
+    ui_info("Subchannel:", "%s%s%s", has_subchannel ? C_GREEN : C_DIM,
+            has_subchannel ? "available" : "not available", C_RESET);
+    ui_info("Tracks:", "%d", track_count);
 
     /* Iterate track by track; only sectors within each track's range
      * (start-pregap .. end) are readable from the AIF.  The sector
@@ -191,19 +190,18 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
         if(mode < 0 || ss == 0)
         {
-            fprintf(stderr, "Warning: unknown track type %d for track %d, skipping\n", trk->type, trk->sequence);
+            ui_warn("Unknown track type %d for track %d, skipping", trk->type, trk->sequence);
             continue;
         }
 
-        fprintf(stderr, "  Track %d: sectors %" PRId64 "-%" PRId64 " (pregap %" PRId64 ", %s, %u bytes/sector)\n",
-                trk->sequence, start, end, trk->pregap,
-                mode == kCdSectorModeAudio    ? "Audio"
-                : mode == kCdSectorMode1      ? "Mode1"
-                : mode == kCdSectorMode2      ? "Mode2"
-                : mode == kCdSectorMode2Form1 ? "Mode2Form1"
-                : mode == kCdSectorMode2Form2 ? "Mode2Form2"
-                                              : "Unknown",
-                ss);
+        const char *mode_name = mode == kCdSectorModeAudio    ? "Audio"
+                                : mode == kCdSectorMode1      ? "Mode1"
+                                : mode == kCdSectorMode2      ? "Mode2"
+                                : mode == kCdSectorMode2Form1 ? "Mode2Form1"
+                                : mode == kCdSectorMode2Form2 ? "Mode2Form2"
+                                                              : "Unknown";
+        ui_progress_clear();
+        ui_track_info(trk->sequence, start, end, trk->pregap, mode_name, ss);
 
         for(int64_t s = start; s <= end; s++)
         {
@@ -254,8 +252,6 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
                 rrc = aaruf_read_sector(aaruf_ctx, (uint64_t)s, false, cd_arg.buffer + data_offset, &length, &status);
                 if(rrc != AARUF_STATUS_OK)
                 {
-                    fprintf(stderr, "Warning: failed to read sector %" PRId64 " (rc=%d), filling with zeroes\n", s,
-                            rrc);
                     memset(cd_arg.buffer, 0, CD_RAW_SECTOR_SIZE);
                 }
 
@@ -280,19 +276,21 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 
             if(ioctl(fd, OBMAFS3_IOC_CD_WRITE_LONG, &cd_arg) != 0)
             {
-                fprintf(stderr, "Error: CD_WRITE_LONG failed at sector %" PRId64 " (errno=%d)\n", s, errno);
+                ui_progress_clear();
+                ui_error("CD_WRITE_LONG failed at sector %" PRId64 " (errno=%d)", s, errno);
                 aaruf_ecc_cd_free(ecc_ctx);
                 return -1;
             }
 
             imported++;
-            if(imported > 0 && (imported % 10000) == 0)
-                fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (%.1f%%)", imported, total_sectors,
-                        (double)imported / (double)total_sectors * 100.0);
+            if((imported % 500) == 0 || imported == total_sectors)
+                ui_progress("CD sectors", imported, total_sectors);
         }
     }
 
-    fprintf(stderr, "\r  %" PRIu64 "/%" PRIu64 " sectors (100.0%%)\n", imported, total_sectors);
+    ui_progress("CD sectors", imported, total_sectors);
+    ui_progress_clear();
+    ui_ok("Imported %" PRIu64 " sectors across %d tracks", imported, track_count);
 
     aaruf_ecc_cd_free(ecc_ctx);
     return 0;

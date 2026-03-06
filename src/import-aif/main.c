@@ -32,9 +32,11 @@
 // ****************************************************************************/
 
 #include "import_aif.h"
+#include "ui.h"
 
 #include <getopt.h>
 #include <libgen.h>
+#include <time.h>
 
 /**
  * Print usage information.
@@ -42,18 +44,22 @@
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [options] <aif-file> <output-path>\n"
+            "%sUsage:%s %s [options] <aif-file> <output-path>\n"
             "\n"
             "Import an Aaru Image Format (.aif) file into a mounted OBMAFS3 filesystem.\n"
             "\n"
-            "Arguments:\n"
-            "  <aif-file>     Path to the source .aif file\n"
-            "  <output-path>  Full path for the image within the mounted filesystem\n"
-            "                 (e.g. /mnt/obmafs/images/myimage)\n"
+            "%sArguments:%s\n"
+            "  %s<aif-file>%s     Path to the source .aif file\n"
+            "  %s<output-path>%s  Full path for the image within the mounted filesystem\n"
             "\n"
-            "Options:\n"
-            "  -h, --help     Show this help\n",
-            prog);
+            "%sOptions:%s\n"
+            "  %s-h, --help%s     Show this help\n",
+            C_BOLD, C_RESET, prog,
+            C_BOLD, C_RESET,
+            C_CYAN, C_RESET,
+            C_CYAN, C_RESET,
+            C_BOLD, C_RESET,
+            C_GREEN, C_RESET);
 }
 
 /**
@@ -99,6 +105,8 @@ static int mkdirs(const char *path)
  */
 int main(int argc, char *argv[])
 {
+    ui_init();
+
     static struct option long_opts[] = {
         {"help", no_argument, NULL, 'h'},
         {  NULL,           0, NULL,   0}
@@ -119,7 +127,7 @@ int main(int argc, char *argv[])
 
     if(optind + 2 > argc)
     {
-        fprintf(stderr, "Error: expected <aif-file> and <output-path>\n");
+        ui_error("Expected <aif-file> and <output-path>");
         usage(argv[0]);
         return 1;
     }
@@ -127,57 +135,64 @@ int main(int argc, char *argv[])
     const char *aif_path    = argv[optind];
     const char *output_path = argv[optind + 1];
 
-    /* ---- Open the AIF file ---- */
-    fprintf(stderr, "Opening AIF: %s\n", aif_path);
+    ui_banner();
+
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    /* ---- Phase 1: Open source image ---- */
+    ui_phase(1, "Open source image");
+    ui_info("Source:", "%s", aif_path);
+
     void *aaruf_ctx = aaruf_open(aif_path, false, NULL);
     if(!aaruf_ctx)
     {
-        fprintf(stderr, "Error: failed to open AIF file: %s\n", aif_path);
+        ui_error("Failed to open AIF file: %s", aif_path);
         return 1;
     }
 
-    /* Get image info */
     ImageInfo info;
     memset(&info, 0, sizeof(info));
     aaruf_get_image_info(aaruf_ctx, &info);
 
-    fprintf(stderr, "  Sectors:    %" PRIu64 "\n", info.Sectors);
-    fprintf(stderr, "  SectorSize: %u\n", info.SectorSize);
-    fprintf(stderr, "  MediaType:  %d\n", info.MediaType);
-
     int is_cd = is_compact_disc_media(info.MediaType);
-    fprintf(stderr, "  Image type: %s\n", is_cd ? "Compact Disc" : "Flat media image");
 
-    /* ---- Create parent directories ---- */
+    ui_info("Sectors:", "%" PRIu64, info.Sectors);
+    ui_info("Sector size:", "%u bytes", info.SectorSize);
+    ui_info("Media type:", "%s%d%s", C_CYAN, info.MediaType, C_RESET);
+    ui_info("Image type:", "%s%s%s", C_BOLD, is_cd ? "Compact Disc" : "Flat media image", C_RESET);
+    ui_ok("Image opened successfully");
+
+    /* ---- Phase 2: Create output file ---- */
+    ui_phase(2, "Create output file");
+    ui_info("Destination:", "%s", output_path);
+
     if(mkdirs(output_path) != 0)
     {
-        fprintf(stderr, "Error: failed to create parent directories for '%s' (errno=%d)\n", output_path, errno);
+        ui_error("Failed to create parent directories (errno=%d)", errno);
         aaruf_close(aaruf_ctx);
         return 1;
     }
 
-    /* ---- Create the output file ---- */
-    fprintf(stderr, "Creating: %s\n", output_path);
     int fd = open(output_path, O_CREAT | O_RDWR | O_EXCL, 0644);
     if(fd < 0)
     {
-        fprintf(stderr, "Error: failed to create '%s' (errno=%d: %s)\n", output_path, errno, strerror(errno));
+        ui_error("Failed to create '%s' (%s)", output_path, strerror(errno));
         aaruf_close(aaruf_ctx);
         return 1;
     }
 
-    /* ---- Convert to appropriate file type ---- */
     if(is_cd)
     {
         if(ioctl(fd, OBMAFS3_IOC_SET_CD_IMAGE) != 0)
         {
-            fprintf(stderr, "Error: SET_CD_IMAGE ioctl failed (errno=%d: %s)\n", errno, strerror(errno));
+            ui_error("SET_CD_IMAGE ioctl failed (%s)", strerror(errno));
             close(fd);
             unlink(output_path);
             aaruf_close(aaruf_ctx);
             return 1;
         }
-        fprintf(stderr, "  File type: CompactDiscImage\n");
+        ui_info("File type:", "%sCompactDiscImage%s", C_MAGENTA, C_RESET);
     }
     else
     {
@@ -187,16 +202,19 @@ int main(int argc, char *argv[])
 
         if(ioctl(fd, OBMAFS3_IOC_SET_MEDIA_IMAGE, &mia) != 0)
         {
-            fprintf(stderr, "Error: SET_MEDIA_IMAGE ioctl failed (errno=%d: %s)\n", errno, strerror(errno));
+            ui_error("SET_MEDIA_IMAGE ioctl failed (%s)", strerror(errno));
             close(fd);
             unlink(output_path);
             aaruf_close(aaruf_ctx);
             return 1;
         }
-        fprintf(stderr, "  File type: MediaImage (sector size %u)\n", info.SectorSize);
+        ui_info("File type:", "%sMediaImage%s (sector size %u)", C_BLUE, C_RESET, info.SectorSize);
     }
+    ui_ok("Output file created");
 
-    /* ---- Import sector data ---- */
+    /* ---- Phase 3: Import sector data ---- */
+    ui_phase(3, "Import sector data");
+
     int rc;
     if(is_cd)
         rc = import_cd_image(aaruf_ctx, fd, &info);
@@ -205,19 +223,21 @@ int main(int argc, char *argv[])
 
     if(rc != 0)
     {
-        fprintf(stderr, "Error: import failed\n");
+        ui_error("Sector data import failed");
         close(fd);
         aaruf_close(aaruf_ctx);
         return 1;
     }
 
-    /* ---- Import media tags ---- */
-    fprintf(stderr, "Importing media tags...\n");
+    /* ---- Phase 4: Import media tags ---- */
+    ui_phase(4, "Import media tags");
     import_media_tags(aaruf_ctx, fd);
+    ui_ok("Media tags imported");
 
-    /* ---- Import metadata ---- */
-    fprintf(stderr, "Importing metadata...\n");
+    /* ---- Phase 5: Import metadata ---- */
+    ui_phase(5, "Import metadata");
     import_metadata(aaruf_ctx, &info, fd);
+    ui_ok("Metadata imported");
 
     /* Compute output base path (without extension) for sidecar files */
     size_t      base_len = strlen(output_path);
@@ -225,20 +245,25 @@ int main(int argc, char *argv[])
     const char *slash    = strrchr(output_path, '/');
     if(dot && (!slash || dot > slash)) base_len = (size_t)(dot - output_path);
 
-    /* ---- Write cue sheet for compact disc images ---- */
+    /* ---- Phase 6: Write sidecar files ---- */
+    ui_phase(6, "Export sidecar files");
+
     if(is_cd)
     {
-        fprintf(stderr, "Writing cue sheet...\n");
         write_cue_file(aaruf_ctx, &info, output_path, base_len);
     }
 
-    /* ---- Export sidecar files ---- */
     export_sidecar_files(aaruf_ctx, output_path, base_len);
+    ui_ok("Sidecar export complete");
 
-    /* ---- Cleanup ---- */
+    /* ---- Cleanup & summary ---- */
     close(fd);
     aaruf_close(aaruf_ctx);
 
-    fprintf(stderr, "Import complete: %s -> %s\n", aif_path, output_path);
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double elapsed = (double)(t_end.tv_sec - t_start.tv_sec) + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+
+    ui_summary(aif_path, output_path, elapsed, info.Sectors, info.SectorSize);
     return 0;
 }

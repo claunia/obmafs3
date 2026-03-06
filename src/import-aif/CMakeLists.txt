@@ -5,6 +5,7 @@ add_executable(import-aif
     metadata.c
     import.c
     sidecar.c
+    ui.c
 )
 
 target_include_directories(import-aif PRIVATE ${CMAKE_SOURCE_DIR}/src/include)

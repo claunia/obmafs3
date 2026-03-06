@@ -31,6 +31,7 @@
 // ****************************************************************************/
 
 #include "import_aif.h"
+#include "ui.h"
 
 /**
  * Write a binary blob as a sidecar file.
@@ -47,14 +48,14 @@ static void write_sidecar(const uint8_t *data, size_t data_len, const char *path
     {
         ssize_t written = write(fd, data, data_len);
         if(written < 0 || (size_t)written != data_len)
-            fprintf(stderr, "Warning: incomplete write of %s\n", label);
+            ui_warn("Incomplete write of %s", label);
         else
-            fprintf(stderr, "%s saved to %s\n", label, path);
+            ui_ok("%s %s%s%s %s", label, C_DIM, SYM_ARROW, C_RESET, path);
         close(fd);
     }
     else
     {
-        fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n", path, errno, strerror(errno));
+        ui_warn("Failed to create '%s' (%s)", path, strerror(errno));
     }
 }
 

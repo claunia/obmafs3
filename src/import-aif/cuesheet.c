@@ -32,6 +32,7 @@
 
 #include "errors.h"
 #include "import_aif.h"
+#include "ui.h"
 
 /**
  * Map a MediaType enum value to a CDRWin "REM ORIGINAL MEDIA-TYPE" string.
@@ -232,7 +233,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
 
     if(rc != AARUF_ERROR_BUFFER_TOO_SMALL || track_buf_len == 0)
     {
-        fprintf(stderr, "Warning: no tracks found, cannot write cue sheet\n");
+        ui_warn("No tracks found, cannot write cue sheet");
         return -1;
     }
 
@@ -250,7 +251,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
 
     if(track_count == 0)
     {
-        fprintf(stderr, "Warning: no tracks found, cannot write cue sheet\n");
+        ui_warn("No tracks found, cannot write cue sheet");
         free(track_buf);
         return -1;
     }
@@ -264,7 +265,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
     FILE *fp = fopen(cue_path, "w");
     if(!fp)
     {
-        fprintf(stderr, "Warning: failed to create '%s' (errno=%d: %s)\n", cue_path, errno, strerror(errno));
+        ui_warn("Failed to create '%s' (%s)", cue_path, strerror(errno));
         free(cue_path);
         return -1;
     }
@@ -414,7 +415,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
     /* Final session LEAD-OUT is NOT written (matches Aaru behavior) */
 
     fclose(fp);
-    fprintf(stderr, "Cue sheet saved to %s\n", cue_path);
+    ui_ok("Cue sheet %s%s%s %s", C_DIM, SYM_ARROW, C_RESET, cue_path);
     free(cue_path);
     free(track_buf);
     return 0;
