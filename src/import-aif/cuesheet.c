@@ -30,6 +30,7 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
+#include "errors.h"
 #include "import_aif.h"
 
 /**
@@ -225,17 +226,34 @@ static void lba_to_msf(int64_t lba, int *m, int *s, int *f)
 int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_path, size_t base_len)
 {
     /* Get track information */
-    uint8_t track_buf[4096];
-    size_t  track_buf_len = sizeof(track_buf);
-    int     track_count   = aaruf_get_tracks(aaruf_ctx, track_buf, &track_buf_len);
+    uint8_t* track_buf = NULL;
+    size_t  track_buf_len = 0;
+    int     rc   = aaruf_get_tracks(aaruf_ctx, track_buf, &track_buf_len);
 
-    if(track_count <= 0)
+    if(rc != AARUF_ERROR_BUFFER_TOO_SMALL || track_buf_len == 0)
     {
         fprintf(stderr, "Warning: no tracks found, cannot write cue sheet\n");
         return -1;
     }
 
+    track_buf = malloc(track_buf_len);
+    if(!track_buf) return -1;
+    rc   = aaruf_get_tracks(aaruf_ctx, track_buf, &track_buf_len);
+    if(rc != AARUF_STATUS_OK)
+    {
+        free(track_buf);
+        return -1;
+    }
+
     TrackEntry *tracks = (TrackEntry *)track_buf;
+    int         track_count = (int)(track_buf_len / sizeof(TrackEntry));
+
+    if(track_count == 0)
+    {
+        fprintf(stderr, "Warning: no tracks found, cannot write cue sheet\n");
+        free(track_buf);
+        return -1;
+    }
 
     /* Build the cue file path */
     char *cue_path = malloc(base_len + sizeof(".cue"));
@@ -263,7 +281,7 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
         uint8_t  mcn_buf[16];
         uint32_t mcn_len = sizeof(mcn_buf);
         /* CD_MCN = 6 in MediaTagType */
-        if(aaruf_read_media_tag(aaruf_ctx, mcn_buf, 6, &mcn_len) == 0 && mcn_len > 0)
+        if(aaruf_read_media_tag(aaruf_ctx, mcn_buf, CD_MCN, &mcn_len) == 0 && mcn_len > 0)
         {
             /* MCN is typically 13 bytes, ensure NUL termination */
             if(mcn_len < sizeof(mcn_buf))
@@ -398,5 +416,6 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
     fclose(fp);
     fprintf(stderr, "Cue sheet saved to %s\n", cue_path);
     free(cue_path);
+    free(track_buf);
     return 0;
 }
