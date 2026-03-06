@@ -176,6 +176,8 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
         int64_t     start = trk->start - trk->pregap;
         int64_t     end   = trk->end;
 
+        if(start < 0) start = 0;
+
         if(mode < 0 || ss == 0)
         {
             fprintf(stderr, "Warning: unknown track type %d for track %d, skipping\n", trk->type, trk->sequence);
