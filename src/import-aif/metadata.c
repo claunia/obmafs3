@@ -30,6 +30,7 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
+#include "errors.h"
 #include "import_aif.h"
 
 #include <iconv.h>
@@ -43,19 +44,21 @@
  */
 int import_media_tags(void *aaruf_ctx, int fd)
 {
-    uint8_t tag_buf[4096];
-    size_t  tag_buf_len = sizeof(tag_buf);
-    int     count       = aaruf_get_readable_media_tags(aaruf_ctx, tag_buf, &tag_buf_len);
+    /* aaruf_get_readable_media_tags fills an array of booleans
+     * indexed by AarufMediaTagType.  Entry [i] is true if tag i
+     * is present in the image. */
+    uint8_t tag_avail[MaxMediaTag + 1];
+    size_t  tag_avail_len = sizeof(tag_avail);
+    int     rc = aaruf_get_readable_media_tags(aaruf_ctx, tag_avail, &tag_avail_len);
 
-    if(count <= 0) return 0;
+    if(rc != AARUF_STATUS_OK) return 0;
 
-    /* The buffer contains 'count' uint32_t DataType values */
-    for(int i = 0; i < count; i++)
+    /* Walk every possible tag type and process the ones that are present */
+    for(int i = 0; i <= MaxMediaTag; i++)
     {
-        uint32_t dt;
-        memcpy(&dt, tag_buf + i * sizeof(uint32_t), sizeof(uint32_t));
+        if(!tag_avail[i]) continue;
 
-        int obmafs_tag = aaruf_tag_to_obmafs((int)dt);
+        int obmafs_tag = aaruf_tag_to_obmafs(i);
         if(obmafs_tag < 0) continue;
 
         /* Read the media tag data */
@@ -63,8 +66,8 @@ int import_media_tags(void *aaruf_ctx, int fd)
         uint8_t  probe    = 0;
 
         /* First call to get size */
-        aaruf_read_media_tag(aaruf_ctx, &probe, dt, &data_len);
-        if(data_len == 0) continue;
+        rc = aaruf_read_media_tag(aaruf_ctx, &probe, (uint32_t)i, &data_len);
+        if(rc != AARUF_ERROR_BUFFER_TOO_SMALL || data_len == 0) continue;
 
         if(data_len > OBMAFS3_IOC_MAX_TAG_DATA)
         {
@@ -77,8 +80,8 @@ int import_media_tags(void *aaruf_ctx, int fd)
         tag_arg.tag_type    = (uint16_t)obmafs_tag;
         tag_arg.data_length = data_len;
 
-        int rrc = aaruf_read_media_tag(aaruf_ctx, tag_arg.data, dt, &data_len);
-        if(rrc != 0) continue; /* Skip tags we can't read */
+        rc = aaruf_read_media_tag(aaruf_ctx, tag_arg.data, (uint32_t)i, &data_len);
+        if(rc != AARUF_STATUS_OK) continue; /* Skip tags we can't read */
 
         if(ioctl(fd, OBMAFS3_IOC_SET_MEDIA_TAG, &tag_arg) != 0)
             fprintf(stderr, "Warning: failed to store media tag %d (errno=%d)\n", obmafs_tag, errno);
