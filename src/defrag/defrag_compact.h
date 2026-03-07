@@ -111,9 +111,12 @@ struct compact_state
 
     /* Dedup block relocation map (built during data+dedup phases,
      * consumed during reference update phase).
-     * Stored as parallel arrays: reloc_old[i] → reloc_new[i]. */
+     * Stored as parallel arrays: reloc_old[i] → reloc_new[i].
+     * reloc_cksum[i] is the block header checksum discriminator
+     * (first 8 bytes) used to verify chain links during resolution. */
     uint64_t *reloc_old;
     uint64_t *reloc_new;
+    uint64_t *reloc_cksum;
     uint64_t  reloc_count;
     uint64_t  reloc_cap;
 
@@ -123,6 +126,14 @@ struct compact_state
     uint64_t *data_reloc_new;
     uint64_t  data_reloc_count;
     uint64_t  data_reloc_cap;
+
+    /* Phase 3 obstacle eviction map (dedup blocks evicted to make room
+     * for compaction moves).  Kept separate from main moves to avoid
+     * false chain resolution across different data blocks. */
+    uint64_t *dedup_evict_old;
+    uint64_t *dedup_evict_new;
+    uint64_t  dedup_evict_count;
+    uint64_t  dedup_evict_cap;
 
     /* Tree node relocation map (built during tree relocation phase,
      * consumed by SME update to fix dedup_subchannel_lba in CD SMEs). */

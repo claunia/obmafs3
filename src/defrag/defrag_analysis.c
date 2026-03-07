@@ -719,24 +719,13 @@ int defrag_analysis_run(struct analysis_state *state)
                             /* Also mark the last (partial) dedup data block */
                             if(dhdr.last_block_lba != 0)
                             {
-                                /* Determine actual physical size of last block */
+                                /* The last (partial) dedup data block keeps ALL
+                                 * std_per_dedup blocks allocated — dedup_block_flush
+                                 * intentionally does not free trailing blocks so the
+                                 * block can be resumed on next mount.  Mark the full
+                                 * extent so defrag moves them all together. */
                                 uint64_t std_per_dedup = ctx->sb.dedup_block_size / block_size;
-                                uint64_t phys = std_per_dedup;
-                                {
-                                    struct block_header lbhdr;
-                                    ssize_t hrd = pread(ctx->fd, &lbhdr, sizeof(lbhdr),
-                                                        (off_t)(dhdr.last_block_lba * block_size));
-                                    if(hrd >= (ssize_t)sizeof(lbhdr) &&
-                                       lbhdr.magic == OBMAFS3_BLOCK_MAGIC)
-                                    {
-                                        uint64_t payload = (lbhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
-                                                               ? lbhdr.compressed_size
-                                                               : lbhdr.original_size;
-                                        phys = (sizeof(lbhdr) + payload + block_size - 1) / block_size;
-                                        if(phys > std_per_dedup) phys = std_per_dedup;
-                                    }
-                                }
-                                for(uint64_t b = 0; b < phys &&
+                                for(uint64_t b = 0; b < std_per_dedup &&
                                     (dhdr.last_block_lba + b) < state->total_blocks; b++)
                                 {
                                     if(state->block_types[dhdr.last_block_lba + b] != BT_DEDUP)

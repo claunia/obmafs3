@@ -52,6 +52,55 @@
 
 #define CANCELLED(s) (atomic_load(&(s)->cancel_requested))
 
+/* Debug output only when OBMAFS3_DEBUG is set in the environment */
+static int g_defrag_debug = -1; /* -1 = not checked yet */
+#define DBG(...)                                                 \
+    do                                                           \
+    {                                                            \
+        if(g_defrag_debug < 0) g_defrag_debug = (getenv("OBMAFS3_DEBUG") != NULL); \
+        if(g_defrag_debug) fprintf(stderr, __VA_ARGS__);         \
+    } while(0)
+
+/** Record a dedup block relocation with checksum discriminator. */
+#define RECORD_RELOC(st, old_lba, new_lba, cksum_val)                            \
+    do {                                                                          \
+        if((st)->reloc_count >= (st)->reloc_cap) {                                \
+            uint64_t _nc = ((st)->reloc_cap == 0) ? 4096 : (st)->reloc_cap * 2;  \
+            uint64_t *_ro = realloc((st)->reloc_old, _nc * sizeof(uint64_t));     \
+            uint64_t *_rn = realloc((st)->reloc_new, _nc * sizeof(uint64_t));     \
+            uint64_t *_rc = realloc((st)->reloc_cksum, _nc * sizeof(uint64_t));   \
+            if(_ro && _rn && _rc) {                                               \
+                (st)->reloc_old = _ro; (st)->reloc_new = _rn;                     \
+                (st)->reloc_cksum = _rc; (st)->reloc_cap = _nc;                   \
+            }                                                                     \
+        }                                                                         \
+        if((st)->reloc_count < (st)->reloc_cap) {                                 \
+            (st)->reloc_old[(st)->reloc_count]   = (old_lba);                     \
+            (st)->reloc_new[(st)->reloc_count]   = (new_lba);                     \
+            (st)->reloc_cksum[(st)->reloc_count] = (cksum_val);                   \
+            (st)->reloc_count++;                                                  \
+        }                                                                         \
+    } while(0)
+
+#define RECORD_EVICT(st, old_lba, new_lba)                                        \
+    do {                                                                          \
+        if((st)->dedup_evict_count >= (st)->dedup_evict_cap) {                    \
+            uint64_t _nc = ((st)->dedup_evict_cap == 0) ? 4096                    \
+                           : (st)->dedup_evict_cap * 2;                           \
+            uint64_t *_ro = realloc((st)->dedup_evict_old, _nc * sizeof(uint64_t));\
+            uint64_t *_rn = realloc((st)->dedup_evict_new, _nc * sizeof(uint64_t));\
+            if(_ro && _rn) {                                                      \
+                (st)->dedup_evict_old = _ro; (st)->dedup_evict_new = _rn;          \
+                (st)->dedup_evict_cap = _nc;                                       \
+            }                                                                     \
+        }                                                                         \
+        if((st)->dedup_evict_count < (st)->dedup_evict_cap) {                     \
+            (st)->dedup_evict_old[(st)->dedup_evict_count] = (old_lba);            \
+            (st)->dedup_evict_new[(st)->dedup_evict_count] = (new_lba);            \
+            (st)->dedup_evict_count++;                                             \
+        }                                                                         \
+    } while(0)
+
 /* ------------------------------------------------------------------ */
 /*  Phase labels                                                       */
 /* ------------------------------------------------------------------ */
@@ -122,6 +171,17 @@ static int copy_block(struct compact_state *state, uint64_t src, uint64_t dst, s
     if(rc != OBMAFS3_OK) return rc;
 
     return obmafs3_block_write(ctx, dst, g_io_buf, size);
+}
+
+/** Read the first 8 bytes of a block header's checksum field as a discriminator. */
+static uint64_t read_block_checksum_id(struct obmafs3_ctx *ctx, uint64_t lba, size_t bsz)
+{
+    struct block_header bh;
+    ssize_t rd = pread(ctx->fd, &bh, sizeof(bh), (off_t)(lba * bsz));
+    if(rd < (ssize_t)sizeof(bh) || bh.magic != OBMAFS3_BLOCK_MAGIC) return 0;
+    uint64_t id;
+    memcpy(&id, bh.checksum, sizeof(id));
+    return id;
 }
 
 /**
@@ -332,7 +392,10 @@ static uint64_t find_free_range(struct compact_state *state, uint64_t from,
             while(base_lba > 0 && block_types[base_lba - 1] == BT_DEDUP)
                 base_lba--;
 
-            /* Read the block_header at the base to get actual size */
+            /* Read the block_header at the base to get actual size.
+             * The base MUST have a valid header — if not, this is a
+             * fragment of a dedup block whose true base was already
+             * freed.  Skip the entire fragment to avoid splitting. */
             struct block_header dbhdr;
             ssize_t hrd = pread(ctx->fd, &dbhdr, sizeof(dbhdr),
                                 (off_t)(base_lba * bsz));
@@ -346,11 +409,22 @@ static uint64_t find_free_range(struct compact_state *state, uint64_t from,
             }
             else
             {
-                /* Can't read header — use contiguous BT_DEDUP run */
-                phys_blocks = 1;
-                while(base_lba + phys_blocks < total &&
-                      block_types[base_lba + phys_blocks] == BT_DEDUP)
-                    phys_blocks++;
+                /* No valid header at base — this is a fragment of a
+                 * dedup block whose header was at an earlier position.
+                 * Clear the fragment's bitmap + BT_DEDUP markers so
+                 * they don't interfere with subsequent operations. */
+                uint64_t frag_end = base_lba;
+                while(frag_end < total && block_types[frag_end] == BT_DEDUP)
+                    frag_end++;
+                for(uint64_t fi = base_lba; fi < frag_end; fi++)
+                {
+                    block_types[fi] = BT_FREE;
+                    if(obmafs3_bitmap_is_set(ctx, fi))
+                        obmafs3_bitmap_clear(ctx, fi, 1);
+                }
+                pos = frag_end;
+                usable = 0;
+                break;
             }
 
             /* Evict the ENTIRE dedup data block [base_lba, base_lba+phys_blocks) */
@@ -378,27 +452,17 @@ static uint64_t find_free_range(struct compact_state *state, uint64_t from,
                 if(base_lba + j < total)
                     block_types[base_lba + j] = BT_FREE;
             }
+
             evicted_any = 1;
 
-            fprintf(stderr, "[evict-dedup] %" PRIu64 "->%" PRIu64 " (%" PRIu64 " blks, base=%" PRIu64 ")\n",
+            DBG("[evict-dedup] %" PRIu64 "->%" PRIu64 " (%" PRIu64 " blks, base=%" PRIu64 ")\n",
                     base_lba, evict_dst, phys_blocks, base_lba);
 
-            /* Record relocations for ALL blocks of this dedup data block */
-            for(uint64_t j = 0; j < phys_blocks; j++)
+            /* Record base-LBA relocation only — dedup tree entries and
+             * SMEs reference the base LBA, not individual blocks. */
             {
-                if(state->reloc_count >= state->reloc_cap)
-                {
-                    uint64_t nc = (state->reloc_cap == 0) ? 4096 : state->reloc_cap * 2;
-                    uint64_t *ro = realloc(state->reloc_old, nc * sizeof(uint64_t));
-                    uint64_t *rn = realloc(state->reloc_new, nc * sizeof(uint64_t));
-                    if(ro && rn) { state->reloc_old = ro; state->reloc_new = rn; state->reloc_cap = nc; }
-                }
-                if(state->reloc_count < state->reloc_cap)
-                {
-                    state->reloc_old[state->reloc_count] = base_lba + j;
-                    state->reloc_new[state->reloc_count] = evict_dst + j;
-                    state->reloc_count++;
-                }
+                uint64_t ck = read_block_checksum_id(ctx, base_lba, bsz);
+                RECORD_RELOC(state, base_lba, evict_dst, ck);
             }
 
             /* Advance past the evicted region */
@@ -416,7 +480,7 @@ static uint64_t find_free_range(struct compact_state *state, uint64_t from,
     }
 
     if(positions_scanned > 10000)
-        fprintf(stderr, "[find_free_range] SLOW: scanned %" PRIu64
+        DBG("[find_free_range] SLOW: scanned %" PRIu64
                 " positions for count=%" PRIu64 " from=%" PRIu64 " — NOT FOUND\n",
                 positions_scanned, count, from);
     return 0;
@@ -522,7 +586,7 @@ static int compact_data_blocks(struct compact_state *state)
     #define SYNC_EVERY_N_LEAVES 256
     #define PREFETCH_BATCH 64
 
-    fprintf(stderr, "[data-phase] START root_lba=%" PRIu64 "\n", ihdr.root_node_lba);
+    DBG("[data-phase] START root_lba=%" PRIu64 "\n", ihdr.root_node_lba);
     struct timespec phase_start;
     clock_gettime(CLOCK_MONOTONIC, &phase_start);
 
@@ -530,7 +594,7 @@ static int compact_data_blocks(struct compact_state *state)
     {
         if(CANCELLED(state)) break;
 
-        fprintf(stderr, "[data-phase] level: %" PRIu64 " nodes\n", cur_count);
+        DBG("[data-phase] level: %" PRIu64 " nodes\n", cur_count);
         struct timespec level_start;
         clock_gettime(CLOCK_MONOTONIC, &level_start);
 
@@ -591,7 +655,7 @@ static int compact_data_blocks(struct compact_state *state)
         leaf_count++;
         if((leaf_count % 100) == 0)
         {
-            fprintf(stderr, "[data-phase] leaf=%"PRIu64" extents: total=%"PRIu64
+            DBG("[data-phase] leaf=%"PRIu64" extents: total=%"PRIu64
                     " moved=%"PRIu64" skipped=%"PRIu64
                     " evictions=%"PRIu64"/%"PRIu64"blks cursor=%"PRIu64"\n",
                     leaf_count, total_extents, moved_extents, skipped_extents,
@@ -676,7 +740,7 @@ static int compact_data_blocks(struct compact_state *state)
         clock_gettime(CLOCK_MONOTONIC, &level_end);
         double level_secs = (double)(level_end.tv_sec - level_start.tv_sec) +
                             (double)(level_end.tv_nsec - level_start.tv_nsec) / 1e9;
-        fprintf(stderr, "[data-phase] level done: %.1fs, next_count=%" PRIu64 "\n",
+        DBG("[data-phase] level done: %.1fs, next_count=%" PRIu64 "\n",
                 level_secs, nxt_count);
 
         /* Swap levels */
@@ -701,7 +765,7 @@ static int compact_data_blocks(struct compact_state *state)
         clock_gettime(CLOCK_MONOTONIC, &phase_end);
         double total_secs = (double)(phase_end.tv_sec - phase_start.tv_sec) +
                             (double)(phase_end.tv_nsec - phase_start.tv_nsec) / 1e9;
-        fprintf(stderr, "[data-phase] DONE: %.1fs total, cursor=%" PRIu64 "\n",
+        DBG("[data-phase] DONE: %.1fs total, cursor=%" PRIu64 "\n",
                 total_secs, state->write_cursor);
     }
 
@@ -719,7 +783,7 @@ static int compact_data_blocks(struct compact_state *state)
      *         write cursor advances monotonically. */
     if(ctx->sb.overflow_lba != 0)
     {
-        fprintf(stderr, "[data-phase] Processing overflow tree at lba=%" PRIu64 "\n",
+        DBG("[data-phase] Processing overflow tree at lba=%" PRIu64 "\n",
                 ctx->sb.overflow_lba);
         struct timespec ovf_start;
         clock_gettime(CLOCK_MONOTONIC, &ovf_start);
@@ -820,7 +884,7 @@ static int compact_data_blocks(struct compact_state *state)
                 free(olev);
                 free(onlev);
 
-                fprintf(stderr, "[overflow] collected %" PRIu64 " extents\n", oc_count);
+                DBG("[overflow] collected %" PRIu64 " extents\n", oc_count);
 
                 /* --- Pass 2: Sort by start_block --- */
                 if(oc_count > 1)
@@ -876,7 +940,7 @@ static int compact_data_blocks(struct compact_state *state)
                         double ext_ms = ((double)(t_ext_end.tv_sec - t_ext_start.tv_sec) * 1000.0) +
                                         ((double)(t_ext_end.tv_nsec - t_ext_start.tv_nsec) / 1e6);
                         if(ext_ms > 10.0)
-                            fprintf(stderr, "[ovf %"PRIu64"/%"PRIu64"] SKIP lba=%"PRIu64" (%"PRIu64" blks) find=%.0fms total=%.0fms\n",
+                            DBG("[ovf %"PRIu64"/%"PRIu64"] SKIP lba=%"PRIu64" (%"PRIu64" blks) find=%.0fms total=%.0fms\n",
                                     ei, oc_count, entry->start_block, entry->block_count, find_ms, ext_ms);
                         continue;
                     }
@@ -899,7 +963,7 @@ static int compact_data_blocks(struct compact_state *state)
                     if(rc != OBMAFS3_OK)
                     {
                         ovf_skipped++;
-                        fprintf(stderr, "[ovf %"PRIu64"/%"PRIu64"] FAIL %"PRIu64"->%"PRIu64" (%"PRIu64" blks) find=%.0fms copy=%.0fms rc=%d\n",
+                        DBG("[ovf %"PRIu64"/%"PRIu64"] FAIL %"PRIu64"->%"PRIu64" (%"PRIu64" blks) find=%.0fms copy=%.0fms rc=%d\n",
                                 ei, oc_count, entry->start_block, dst, entry->block_count, find_ms, copy_ms, rc);
                         continue;
                     }
@@ -915,7 +979,7 @@ static int compact_data_blocks(struct compact_state *state)
                     double ext_ms = ((double)(t_ext_end.tv_sec - t_ext_start.tv_sec) * 1000.0) +
                                     ((double)(t_ext_end.tv_nsec - t_ext_start.tv_nsec) / 1e6);
 
-                    fprintf(stderr, "[ovf %"PRIu64"/%"PRIu64"] MOVE %"PRIu64"->%"PRIu64" (%"PRIu64" blks) find=%.0fms copy=%.0fms total=%.0fms\n",
+                    DBG("[ovf %"PRIu64"/%"PRIu64"] MOVE %"PRIu64"->%"PRIu64" (%"PRIu64" blks) find=%.0fms copy=%.0fms total=%.0fms\n",
                             ei, oc_count, old_start, dst, entry->block_count, find_ms, copy_ms, ext_ms);
 
                     /* Mark this leaf node as dirty */
@@ -942,7 +1006,7 @@ static int compact_data_blocks(struct compact_state *state)
                     {
                         obmafs3_bitmap_write(ctx);
                         sync_fd(state);
-                        fprintf(stderr, "[overflow] batch sync at %"PRIu64"/%"PRIu64" moved=%"PRIu64"\n",
+                        DBG("[overflow] batch sync at %"PRIu64"/%"PRIu64" moved=%"PRIu64"\n",
                                 ei, oc_count, ovf_moved);
                     }
                 }
@@ -951,12 +1015,12 @@ static int compact_data_blocks(struct compact_state *state)
                 obmafs3_bitmap_write(ctx);
                 sync_fd(state);
 
-                fprintf(stderr, "[overflow] moved=%" PRIu64 " skipped=%" PRIu64
+                DBG("[overflow] moved=%" PRIu64 " skipped=%" PRIu64
                         " dirty_nodes=%" PRIu64 "\n",
                         ovf_moved, ovf_skipped, dirty_count);
 
                 /* --- Pass 4: Rewrite dirty leaf nodes --- */
-                fprintf(stderr, "[pass4] dirty_count=%" PRIu64 " oc_count=%" PRIu64 "\n",
+                DBG("[pass4] dirty_count=%" PRIu64 " oc_count=%" PRIu64 "\n",
                         dirty_count, oc_count);
                 for(uint64_t di = 0; di < dirty_count; di++)
                 {
@@ -980,7 +1044,7 @@ static int compact_data_blocks(struct compact_state *state)
 
                         if(oe2->start_block != oc[ei].start_block)
                         {
-                            fprintf(stderr, "[pass4] node=%" PRIu64 " rec=%u: %"PRIu64"->%"PRIu64"\n",
+                            DBG("[pass4] node=%" PRIu64 " rec=%u: %"PRIu64"->%"PRIu64"\n",
                                     dlba, oc[ei].record_idx, oe2->start_block, oc[ei].start_block);
                             oe2->start_block = oc[ei].start_block;
                             any_mod = 1;
@@ -1039,7 +1103,7 @@ static int compact_data_blocks(struct compact_state *state)
             clock_gettime(CLOCK_MONOTONIC, &ovf_end);
             double ovf_secs = (double)(ovf_end.tv_sec - ovf_start.tv_sec) +
                               (double)(ovf_end.tv_nsec - ovf_start.tv_nsec) / 1e9;
-            fprintf(stderr, "[data-phase] Overflow tree done: %.1fs\n", ovf_secs);
+            DBG("[data-phase] Overflow tree done: %.1fs\n", ovf_secs);
         }
     }
 
@@ -1076,6 +1140,16 @@ static int compact_dedup_blocks(struct compact_state *state)
 
     if(std_per_dedup < 1) std_per_dedup = 1;
 
+    /* Count dedup blocks before compaction */
+    {
+        uint64_t dedup_before = 0;
+        for(uint64_t i = 0; i < total_blocks; i++)
+            if(block_types[i] == BT_DEDUP) dedup_before++;
+        DBG("[dedup-phase] START: bt_dedup=%" PRIu64 " cursor=%" PRIu64
+            " reloc_count=%" PRIu64 "\n",
+            dedup_before, state->write_cursor, state->reloc_count);
+    }
+
     uint64_t scan = state->write_cursor;
 
     #define DEDUP_BATCH_SIZE 65536
@@ -1097,12 +1171,6 @@ static int compact_dedup_blocks(struct compact_state *state)
         {
             if(pending_n > 0)
             {
-                sync_fd(state);
-                for(uint64_t p = 0; p < pending_n; p++)
-                {
-                    obmafs3_bitmap_set(ctx, pending_new[p], pending_cnt[p]);
-                    obmafs3_bitmap_clear(ctx, pending_old[p], pending_cnt[p]);
-                }
                 obmafs3_bitmap_write(ctx);
                 sync_fd(state);
             }
@@ -1133,20 +1201,19 @@ static int compact_dedup_blocks(struct compact_state *state)
             /* Flush remaining pending bitmap updates */
             if(pending_n > 0)
             {
-                sync_fd(state);
-                for(uint64_t p = 0; p < pending_n; p++)
-                {
-                    obmafs3_bitmap_set(ctx, pending_new[p], pending_cnt[p]);
-                    obmafs3_bitmap_clear(ctx, pending_old[p], pending_cnt[p]);
-                }
                 obmafs3_bitmap_write(ctx);
                 sync_fd(state);
             }
             break;
         }
 
-        /* Determine actual physical size of the dedup data block at scan
-         * by reading its block_header. */
+        /* Determine actual physical size of the dedup data block at scan.
+         * Start from the block_header payload size, then extend to
+         * include any trailing padding that is still allocated in the
+         * bitmap but not marked BT_DEDUP (the last block of each dedup
+         * tree keeps all std_per_dedup blocks allocated).  Stop
+         * extending if we hit another BT_DEDUP block (that's the start
+         * of the NEXT dedup data block, not padding). */
         uint64_t run_len;
         {
             struct block_header dbhdr;
@@ -1154,6 +1221,11 @@ static int compact_dedup_blocks(struct compact_state *state)
                                 (off_t)(scan * bsz));
             if(hrd >= (ssize_t)sizeof(dbhdr) && dbhdr.magic == OBMAFS3_BLOCK_MAGIC)
             {
+                /* Valid block header — use the block header's payload
+                 * to determine the actual physical size of THIS dedup
+                 * data block.  Don't use the BT_DEDUP span because
+                 * adjacent dedup data blocks may form a long contiguous
+                 * BT_DEDUP run that crosses std_per_dedup boundaries. */
                 uint64_t payload = (dbhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
                                        ? dbhdr.compressed_size
                                        : dbhdr.original_size;
@@ -1163,22 +1235,39 @@ static int compact_dedup_blocks(struct compact_state *state)
             }
             else
             {
-                /* Can't read header — use contiguous BT_DEDUP run */
+                /* No valid block header at scan — this is a fragment of
+                 * a dedup data block whose base was freed by Phase 2
+                 * eviction.  Skip past it; the dedup entry still points
+                 * to the eviction destination where the complete block
+                 * lives.  Clear the bitmap for these orphaned fragments. */
                 run_len = 1;
                 while(scan + run_len < total_blocks &&
                       block_types[scan + run_len] == BT_DEDUP &&
                       run_len < std_per_dedup)
                     run_len++;
+
+                DBG("[dedup-frag] SKIP scan=%" PRIu64 " (%" PRIu64 " blks, no valid header, magic=0x%016" PRIx64 ")\n",
+                    scan, run_len, *(uint64_t *)&dbhdr);
+
+                obmafs3_bitmap_clear(ctx, scan, run_len);
+                for(uint64_t fi = 0; fi < run_len; fi++)
+                    block_types[scan + fi] = BT_FREE;
+                scan += run_len;
+                continue;
             }
         }
 
         uint64_t dst = state->write_cursor;
 
-        /* Evict obstacles — flush pending first for safety */
+        /* Evict obstacles — flush pending first for safety.
+         * Skip positions within the source range [scan, scan+run_len)
+         * because those blocks ARE the data being moved, not obstacles. */
         int need_evict = 0;
         for(uint64_t i = 0; i < run_len; i++)
         {
             uint64_t pos = dst + i;
+            if(pos >= scan && pos < scan + run_len)
+                continue; /* source block, not an obstacle */
             if(pos < total_blocks && obmafs3_bitmap_is_set(ctx, pos) &&
                block_types[pos] != BT_FREE)
             {
@@ -1192,12 +1281,6 @@ static int compact_dedup_blocks(struct compact_state *state)
             /* Flush pending batch before evicting */
             if(pending_n > 0)
             {
-                sync_fd(state);
-                for(uint64_t p = 0; p < pending_n; p++)
-                {
-                    obmafs3_bitmap_set(ctx, pending_new[p], pending_cnt[p]);
-                    obmafs3_bitmap_clear(ctx, pending_old[p], pending_cnt[p]);
-                }
                 obmafs3_bitmap_write(ctx);
                 sync_fd(state);
                 pending_n = 0;
@@ -1209,6 +1292,12 @@ static int compact_dedup_blocks(struct compact_state *state)
             while(ei < run_len)
             {
                 uint64_t epos = dst + ei;
+                /* Skip source blocks — they're being moved, not obstacles */
+                if(epos >= scan && epos < scan + run_len)
+                {
+                    ei++;
+                    continue;
+                }
                 if(epos >= total_blocks || !obmafs3_bitmap_is_set(ctx, epos) ||
                    block_types[epos] == BT_FREE)
                 {
@@ -1235,10 +1324,12 @@ static int compact_dedup_blocks(struct compact_state *state)
                 }
                 else
                 {
-                    obs_len = 1;
-                    while(ebase + obs_len < total_blocks &&
-                          block_types[ebase + obs_len] == BT_DEDUP)
-                        obs_len++;
+                    /* No valid header — this is a fragment.  Skip it. */
+                    uint64_t frag_end = ebase;
+                    while(frag_end < total_blocks && block_types[frag_end] == BT_DEDUP)
+                        frag_end++;
+                    ei = (frag_end > dst) ? (frag_end - dst) : ei + 1;
+                    continue;
                 }
 
                 /* Evict the ENTIRE dedup data block */
@@ -1264,22 +1355,7 @@ static int compact_dedup_blocks(struct compact_state *state)
                         block_types[ebase + j] = BT_FREE;
                 }
 
-                for(uint64_t j = 0; j < obs_len; j++)
-                {
-                    if(state->reloc_count >= state->reloc_cap)
-                    {
-                        uint64_t nc = (state->reloc_cap == 0) ? 4096 : state->reloc_cap * 2;
-                        uint64_t *ro = realloc(state->reloc_old, nc * sizeof(uint64_t));
-                        uint64_t *rn = realloc(state->reloc_new, nc * sizeof(uint64_t));
-                        if(ro && rn) { state->reloc_old = ro; state->reloc_new = rn; state->reloc_cap = nc; }
-                    }
-                    if(state->reloc_count < state->reloc_cap)
-                    {
-                        state->reloc_old[state->reloc_count] = ebase + j;
-                        state->reloc_new[state->reloc_count] = evict_dst + j;
-                        state->reloc_count++;
-                    }
-                }
+                RECORD_EVICT(state, ebase, evict_dst);
 
                 /* Advance past the evicted block */
                 uint64_t eend = ebase + obs_len;
@@ -1295,63 +1371,45 @@ static int compact_dedup_blocks(struct compact_state *state)
         atomic_store(&state->current_src_lba, scan);
         atomic_store(&state->current_dst_lba, dst);
 
+        uint64_t src_cksum = read_block_checksum_id(ctx, scan, bsz);
+
+        DBG("[dedup-move] %" PRIu64 "->%" PRIu64 " (%" PRIu64 " blks)\n", scan, dst, run_len);
+
         int rc = copy_blocks(state, scan, dst, run_len, bsz);
         if(rc != OBMAFS3_OK) { free(pending_old); free(pending_new); free(pending_cnt); return rc; }
 
+        /* Clear source BEFORE setting destination so that when ranges
+         * overlap (dst < scan < dst+run_len), the set wins. */
         for(uint64_t i = 0; i < run_len; i++)
-        {
-            block_types[dst + i]  = BT_DEDUP;
             block_types[scan + i] = BT_FREE;
-        }
+        for(uint64_t i = 0; i < run_len; i++)
+            block_types[dst + i]  = BT_DEDUP;
 
-        /* Record each relocated block individually so that
-         * dedup_entry.block_lba lookups work for any block within
-         * the run, not just the first one. */
         if(scan != dst)
-        {
-            for(uint64_t ri = 0; ri < run_len; ri++)
-            {
-                if(state->reloc_count >= state->reloc_cap)
-                {
-                    uint64_t new_cap = (state->reloc_cap == 0) ? 4096 : state->reloc_cap * 2;
-                    uint64_t *ro = realloc(state->reloc_old, new_cap * sizeof(uint64_t));
-                    uint64_t *rn = realloc(state->reloc_new, new_cap * sizeof(uint64_t));
-                    if(ro && rn)
-                    {
-                        state->reloc_old = ro;
-                        state->reloc_new = rn;
-                        state->reloc_cap = new_cap;
-                    }
-                }
-                if(state->reloc_count < state->reloc_cap)
-                {
-                    state->reloc_old[state->reloc_count] = scan + ri;
-                    state->reloc_new[state->reloc_count] = dst + ri;
-                    state->reloc_count++;
-                }
-            }
-        }
+            RECORD_RELOC(state, scan, dst, src_cksum);
 
-        /* Queue bitmap update */
-        pending_old[pending_n] = scan;
+        /* CLEAR source before SET destination — when src and dst
+         * overlap the set must come last to keep destination bits. */
+        obmafs3_bitmap_clear(ctx, scan, run_len);
+        obmafs3_bitmap_set(ctx, dst, run_len);
+
+        /* Use pending batch only for the sync/flush schedule */
+        pending_old[pending_n] = scan;   /* for tracking only */
         pending_new[pending_n] = dst;
-        pending_cnt[pending_n] = run_len;
+        pending_cnt[pending_n] = 0;      /* already applied above */
         pending_n++;
 
         state->write_cursor = dst + run_len;
+        /* Advance scan past the moved block.  Step 1 block at a time
+         * so the next iteration lands on the next block header, not
+         * in the middle of raw payload. */
         scan += run_len;
         state->dedup_blocks_moved += run_len;
         atomic_fetch_add(&state->done_steps, run_len);
 
-        /* Flush batch when full */
+        /* Flush batch when full — just sync, bitmap already applied */
         if(pending_n >= DEDUP_BATCH_SIZE)
         {
-            sync_fd(state);
-            for(uint64_t p = 0; p < pending_n; p++)
-            {
-                obmafs3_bitmap_set(ctx, pending_new[p], pending_cnt[p]);
-                obmafs3_bitmap_clear(ctx, pending_old[p], pending_cnt[p]);
-            }
             obmafs3_bitmap_write(ctx);
             sync_fd(state);
             pending_n = 0;
@@ -1361,6 +1419,17 @@ static int compact_dedup_blocks(struct compact_state *state)
     free(pending_old);
     free(pending_new);
     free(pending_cnt);
+
+    /* Count total BT_DEDUP blocks remaining after compaction */
+    {
+        uint64_t dedup_remaining = 0;
+        for(uint64_t i = 0; i < total_blocks; i++)
+            if(block_types[i] == BT_DEDUP) dedup_remaining++;
+        DBG("[dedup-phase] DONE: moved=%" PRIu64 " remaining_bt_dedup=%" PRIu64
+            " reloc_count=%" PRIu64 " cursor=%" PRIu64 "\n",
+            state->dedup_blocks_moved, dedup_remaining,
+            state->reloc_count, state->write_cursor);
+    }
 
     #undef DEDUP_BATCH_SIZE
 
@@ -1738,6 +1807,7 @@ struct reloc_map
 {
     uint64_t *old_lbas;
     uint64_t *new_lbas;
+    uint64_t *checksums;
     int      *used;
     uint64_t  capacity;
     uint64_t  mask;
@@ -1745,6 +1815,7 @@ struct reloc_map
 
 static struct reloc_map *reloc_map_create(const uint64_t *old_arr,
                                           const uint64_t *new_arr,
+                                          const uint64_t *cksum_arr,
                                           uint64_t count)
 {
     struct reloc_map *m = calloc(1, sizeof(*m));
@@ -1753,12 +1824,13 @@ static struct reloc_map *reloc_map_create(const uint64_t *old_arr,
     uint64_t cap = 64;
     while(cap < count * 2) cap <<= 1;
 
-    m->old_lbas = calloc((size_t)cap, sizeof(uint64_t));
-    m->new_lbas = calloc((size_t)cap, sizeof(uint64_t));
-    m->used     = calloc((size_t)cap, sizeof(int));
-    if(!m->old_lbas || !m->new_lbas || !m->used)
+    m->old_lbas  = calloc((size_t)cap, sizeof(uint64_t));
+    m->new_lbas  = calloc((size_t)cap, sizeof(uint64_t));
+    m->checksums = calloc((size_t)cap, sizeof(uint64_t));
+    m->used      = calloc((size_t)cap, sizeof(int));
+    if(!m->old_lbas || !m->new_lbas || !m->checksums || !m->used)
     {
-        free(m->old_lbas); free(m->new_lbas); free(m->used); free(m);
+        free(m->old_lbas); free(m->new_lbas); free(m->checksums); free(m->used); free(m);
         return NULL;
     }
     m->capacity = cap;
@@ -1769,9 +1841,10 @@ static struct reloc_map *reloc_map_create(const uint64_t *old_arr,
         uint64_t idx = (old_arr[i] * 0x9E3779B97F4A7C15ULL) & m->mask;
         while(m->used[idx])
             idx = (idx + 1) & m->mask;
-        m->old_lbas[idx] = old_arr[i];
-        m->new_lbas[idx] = new_arr[i];
-        m->used[idx] = 1;
+        m->old_lbas[idx]  = old_arr[i];
+        m->new_lbas[idx]  = new_arr[i];
+        m->checksums[idx] = cksum_arr ? cksum_arr[i] : 0;
+        m->used[idx]      = 1;
     }
     return m;
 }
@@ -1790,11 +1863,52 @@ static uint64_t reloc_map_get(const struct reloc_map *m, uint64_t old_lba)
     return 0; /* not relocated */
 }
 
+/** Lookup old_lba with checksum discrimination.
+ *  When multiple entries share the same old_lba (position reuse),
+ *  returns the one whose checksum matches @p cksum.
+ *  Falls back to first match if no checksum matches or cksum is 0. */
+static uint64_t reloc_map_get_by_cksum(const struct reloc_map *m, uint64_t old_lba, uint64_t cksum)
+{
+    if(!m || old_lba == 0) return 0;
+    uint64_t idx = (old_lba * 0x9E3779B97F4A7C15ULL) & m->mask;
+    uint64_t first_match = 0;
+    int      have_first  = 0;
+    while(m->used[idx])
+    {
+        if(m->old_lbas[idx] == old_lba)
+        {
+            if(!have_first) { first_match = m->new_lbas[idx]; have_first = 1; }
+            if(cksum != 0 && m->checksums[idx] == cksum)
+                return m->new_lbas[idx];
+        }
+        idx = (idx + 1) & m->mask;
+    }
+    return first_match; /* fallback to first match */
+}
+
+/** Lookup old_lba and return new_lba + checksum. Returns 0 if not found. */
+static uint64_t reloc_map_get_with_cksum(const struct reloc_map *m, uint64_t old_lba, uint64_t *out_cksum)
+{
+    if(!m || old_lba == 0) return 0;
+    uint64_t idx = (old_lba * 0x9E3779B97F4A7C15ULL) & m->mask;
+    while(m->used[idx])
+    {
+        if(m->old_lbas[idx] == old_lba)
+        {
+            if(out_cksum) *out_cksum = m->checksums[idx];
+            return m->new_lbas[idx];
+        }
+        idx = (idx + 1) & m->mask;
+    }
+    return 0;
+}
+
 static void reloc_map_destroy(struct reloc_map *m)
 {
     if(!m) return;
     free(m->old_lbas);
     free(m->new_lbas);
+    free(m->checksums);
     free(m->used);
     free(m);
 }
@@ -1832,14 +1946,31 @@ static int update_dedup_tree_refs(struct compact_state *state,
 
         struct btree_header dhdr;
         rc = obmafs3_btree_header_read(ctx, entries[t].tree_lba, &dhdr);
-        if(rc != OBMAFS3_OK) continue;
-        if(dhdr.root_node_lba == 0) continue;
+        if(rc != OBMAFS3_OK)
+        {
+            DBG("[dedup-refs] tree %" PRIu64 " (lba=%" PRIu64 " ss=%u): header read FAILED rc=%d\n",
+                t, entries[t].tree_lba, entries[t].sector_size, rc);
+            continue;
+        }
+        if(dhdr.root_node_lba == 0)
+        {
+            DBG("[dedup-refs] tree %" PRIu64 " (lba=%" PRIu64 " ss=%u): empty (root=0)\n",
+                t, entries[t].tree_lba, entries[t].sector_size);
+            continue;
+        }
+
+        DBG("[dedup-refs] tree %" PRIu64 " (lba=%" PRIu64 " ss=%u): root=%" PRIu64
+            " last_blk=%" PRIu64 " nodes=%" PRIu32 "\n",
+            t, entries[t].tree_lba, entries[t].sector_size,
+            dhdr.root_node_lba, dhdr.last_block_lba, dhdr.total_nodes);
 
         /* Also update last_block_lba in the header */
         if(dhdr.last_block_lba != 0)
         {
             uint64_t new_last = reloc_map_get(rmap, dhdr.last_block_lba);
-            if(new_last != 0)
+            DBG("[dedup-refs] tree %" PRIu64 " last_block_lba=%" PRIu64 " -> %" PRIu64 "\n",
+                t, dhdr.last_block_lba, new_last);
+            if(new_last != 0 && new_last != dhdr.last_block_lba)
             {
                 dhdr.last_block_lba = new_last;
                 obmafs3_btree_header_write(ctx, entries[t].tree_lba, &dhdr);
@@ -1853,17 +1984,31 @@ static int update_dedup_tree_refs(struct compact_state *state,
 
         queue[qt++] = dhdr.root_node_lba;
 
+        uint64_t nodes_walked = 0, entries_updated = 0, leaves_found = 0;
+        uint64_t entries_total = 0, entries_unmoved = 0;
+
         while(qh < qt)
         {
             uint64_t lba = queue[qh++];
             if(lba == 0) continue;
 
             rc = obmafs3_block_read(ctx, lba, node_buf, bsz);
-            if(rc != OBMAFS3_OK) continue;
+            if(rc != OBMAFS3_OK)
+            {
+                DBG("[dedup-refs]   node lba=%" PRIu64 " read FAILED\n", lba);
+                continue;
+            }
+
+            nodes_walked++;
 
             struct btree_node_header nh;
             memcpy(&nh, node_buf, sizeof(nh));
-            if(nh.magic != OBMAFS3_BTREE_NODE_MAGIC) continue;
+            if(nh.magic != OBMAFS3_BTREE_NODE_MAGIC)
+            {
+                DBG("[dedup-refs]   node lba=%" PRIu64 " bad magic 0x%" PRIx64 "\n",
+                    lba, nh.magic);
+                continue;
+            }
 
             if(nh.level > 0)
             {
@@ -1886,6 +2031,7 @@ static int update_dedup_tree_refs(struct compact_state *state,
             }
 
             /* Leaf node — update dedup_entry.block_lba */
+            leaves_found++;
             int modified = 0;
             uint8_t *records = node_buf + sizeof(struct btree_node_header);
             for(uint16_t i = 0; i < nh.node_keys; i++)
@@ -1895,11 +2041,17 @@ static int update_dedup_tree_refs(struct compact_state *state,
 
                 if(de->block_lba == 0) continue;
 
+                entries_total++;
                 uint64_t new_lba = reloc_map_get(rmap, de->block_lba);
                 if(new_lba != 0 && new_lba != de->block_lba)
                 {
                     de->block_lba = new_lba;
                     modified = 1;
+                    entries_updated++;
+                }
+                else
+                {
+                    entries_unmoved++;
                 }
             }
 
@@ -1915,6 +2067,11 @@ static int update_dedup_tree_refs(struct compact_state *state,
         }
 
         free(queue);
+        DBG("[dedup-refs] tree %" PRIu64 " (ss=%u): walked=%" PRIu64
+            " nodes, %" PRIu64 " leaves, %" PRIu64 "/%" PRIu64
+            " entries updated, %" PRIu64 " unmoved\n",
+            t, entries[t].sector_size, nodes_walked, leaves_found,
+            entries_updated, entries_total, entries_unmoved);
     }
 
     free(node_buf);
@@ -2653,8 +2810,16 @@ static int compact_trees(struct compact_state *state)
         total_nodes += trees[i].node_count;
     }
 
-    /* Calculate total space needed: nodes × blocks_per_node + clump gaps between trees */
+    /* Calculate total space needed: header blocks + nodes × blocks_per_node + clump gaps */
     uint64_t total_blocks_needed = 0;
+    /* One block per tree header */
+    for(int i = 0; i < tc; i++)
+    {
+        if(trees[i].node_count > 0) total_blocks_needed++; /* header block */
+    }
+    /* Tree list block (dedup) */
+    if(ctx->sb.dedup_lba != 0) total_blocks_needed++;
+    /* Nodes */
     for(int i = 0; i < tc; i++)
         total_blocks_needed += trees[i].node_count * trees[i].blocks_per_node;
     total_blocks_needed += (uint64_t)(tc > 0 ? tc - 1 : 0) * COMPACT_TREE_CLUMP;
@@ -2662,8 +2827,173 @@ static int compact_trees(struct compact_state *state)
     /* Place trees at the end of the disk (before the backup superblock) */
     uint64_t trees_start = total_blocks - 1 - total_blocks_needed;
 
-    /* Relocate each tree */
+    /* Evict any dedup data blocks that sit in the destination range.
+     * compact_trees runs BEFORE compact_dedup_blocks, so dedup data
+     * blocks may occupy positions in [trees_start, trees_start+total_blocks_needed).
+     * Without evicting them first, relocate_tree would silently overwrite
+     * them, losing the data for one sector size's dedup tree. */
+    {
+        uint8_t *bt_local = state->analysis->block_types;
+        size_t   evict_bsz = (size_t)ctx->sb.block_size;
+        uint64_t evict_std_per_dedup = ctx->sb.dedup_block_size / ctx->sb.block_size;
+        if(evict_std_per_dedup < 1) evict_std_per_dedup = 1;
+        uint64_t dest_end = trees_start + total_blocks_needed;
+        if(dest_end > total_blocks) dest_end = total_blocks;
+
+        for(uint64_t pos = trees_start; pos < dest_end; )
+        {
+            if(bt_local[pos] != BT_DEDUP && bt_local[pos] != BT_USED)
+            {
+                pos++;
+                continue;
+            }
+
+            if(bt_local[pos] == BT_DEDUP)
+            {
+                /* Find the base of this dedup data block */
+                uint64_t base = pos;
+                while(base > 0 && bt_local[base - 1] == BT_DEDUP)
+                    base--;
+
+                /* Verify valid header at base */
+                struct block_header dbh;
+                ssize_t hrd = pread(ctx->fd, &dbh, sizeof(dbh),
+                                    (off_t)(base * evict_bsz));
+                uint64_t obs_len;
+                if(hrd >= (ssize_t)sizeof(dbh) && dbh.magic == OBMAFS3_BLOCK_MAGIC)
+                {
+                    uint64_t payload = (dbh.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
+                                           ? dbh.compressed_size
+                                           : dbh.original_size;
+                    obs_len = (sizeof(dbh) + payload + evict_bsz - 1) / evict_bsz;
+                }
+                else
+                {
+                    /* Fragment — clear bitmap + BT_DEDUP markers so
+                     * relocate_tree won't overwrite referenced data,
+                     * and Phase 3 won't re-encounter them. */
+                    uint64_t frag_end = pos;
+                    while(frag_end < dest_end && bt_local[frag_end] == BT_DEDUP)
+                        frag_end++;
+                    for(uint64_t fi = pos; fi < frag_end; fi++)
+                    {
+                        bt_local[fi] = BT_FREE;
+                        if(obmafs3_bitmap_is_set(ctx, fi))
+                            obmafs3_bitmap_clear(ctx, fi, 1);
+                    }
+                    pos = frag_end;
+                    continue;
+                }
+
+                /* Evict the ENTIRE dedup block from its true base */
+                uint64_t evict_dst = 0;
+                int found = 0;
+                for(uint64_t s = trees_start; s >= obs_len; s--)
+                {
+                    int ok = 1;
+                    for(uint64_t j = 0; j < obs_len; j++)
+                    {
+                        if(s - obs_len + j < total_blocks &&
+                           bt_local[s - obs_len + j] != BT_FREE)
+                        { ok = 0; break; }
+                    }
+                    if(ok) { evict_dst = s - obs_len; found = 1; break; }
+                }
+                if(!found) { pos = base + obs_len; continue; }
+
+                int rc = copy_blocks(state, base, evict_dst, obs_len, evict_bsz);
+                if(rc != OBMAFS3_OK) { pos = base + obs_len; continue; }
+
+                obmafs3_bitmap_set(ctx, evict_dst, obs_len);
+                obmafs3_bitmap_clear(ctx, base, obs_len);
+
+                for(uint64_t j = 0; j < obs_len; j++)
+                {
+                    bt_local[evict_dst + j] = BT_DEDUP;
+                    if(base + j < total_blocks)
+                        bt_local[base + j] = BT_FREE;
+                }
+
+                {
+                    uint64_t ck = read_block_checksum_id(ctx, evict_dst, evict_bsz);
+                    RECORD_RELOC(state, base, evict_dst, ck);
+                }
+
+                pos = base + obs_len;
+            }
+            else
+            {
+                /* BT_USED obstacle — just skip past it.  Data blocks
+                 * in the tree destination range are handled by Phase 2. */
+                pos++;
+            }
+        }
+
+        obmafs3_bitmap_write(ctx);
+        sync_fd(state);
+    }
+
+    /* Save the original header LBAs before relocation changes them */
+    uint64_t orig_hdr_lbas[20];
+    for(int i = 0; i < tc; i++)
+        orig_hdr_lbas[i] = trees[i].hdr_lba;
+
+    /* Phase A: Relocate header blocks and tree list to the start of
+     * the reserved range (1 block each).  This prevents node writes
+     * from overwriting headers that happen to sit in the destination. */
     uint64_t cursor = trees_start;
+    size_t   bsz_local = (size_t)ctx->sb.block_size;
+
+    /* Tree list block first */
+    if(ctx->sb.dedup_lba != 0 && ctx->sb.dedup_lba != cursor)
+    {
+        uint8_t *hbuf = malloc(bsz_local);
+        if(hbuf)
+        {
+            int rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, hbuf, bsz_local);
+            if(rc == OBMAFS3_OK)
+            {
+                rc = obmafs3_block_write(ctx, cursor, hbuf, bsz_local);
+                if(rc == OBMAFS3_OK)
+                {
+                    obmafs3_bitmap_set(ctx, cursor, 1);
+                    if(ctx->sb.dedup_lba < trees_start || ctx->sb.dedup_lba >= trees_start + total_blocks_needed)
+                        obmafs3_bitmap_clear(ctx, ctx->sb.dedup_lba, 1);
+                    ctx->sb.dedup_lba = cursor;
+                }
+            }
+            free(hbuf);
+        }
+        cursor++;
+    }
+
+    /* Tree headers */
+    for(int i = 0; i < tc; i++)
+    {
+        if(trees[i].node_count == 0) continue;
+        if(trees[i].hdr_lba == cursor) { cursor++; continue; } /* already in place */
+
+        uint8_t *hbuf = malloc(bsz_local);
+        if(!hbuf) continue;
+
+        int rc = obmafs3_block_read(ctx, trees[i].hdr_lba, hbuf, bsz_local);
+        if(rc == OBMAFS3_OK)
+        {
+            rc = obmafs3_block_write(ctx, cursor, hbuf, bsz_local);
+            if(rc == OBMAFS3_OK)
+            {
+                obmafs3_bitmap_set(ctx, cursor, 1);
+                if(trees[i].hdr_lba < trees_start || trees[i].hdr_lba >= trees_start + total_blocks_needed)
+                    obmafs3_bitmap_clear(ctx, trees[i].hdr_lba, 1);
+                trees[i].hdr_lba = cursor;
+            }
+        }
+        free(hbuf);
+        cursor++;
+    }
+    sync_fd(state);
+
+    /* Phase B: Relocate tree nodes */
     for(int i = 0; i < tc; i++)
     {
         if(trees[i].node_count == 0) continue;
@@ -2674,9 +3004,84 @@ static int compact_trees(struct compact_state *state)
         cursor += trees[i].node_count * trees[i].blocks_per_node + COMPACT_TREE_CLUMP;
     }
 
+    /* Update superblock LBAs to point to new header locations */
+    for(int i = 0; i < tc; i++)
+    {
+        if(trees[i].node_count == 0) continue;
+        uint64_t old_lba = orig_hdr_lbas[i];
+        uint64_t new_lba = trees[i].hdr_lba;
+        if(old_lba == new_lba) continue;
+
+        if(old_lba == ctx->sb.catalog_lba)           ctx->sb.catalog_lba = new_lba;
+        else if(old_lba == ctx->sb.inode_lba)        ctx->sb.inode_lba = new_lba;
+        else if(old_lba == ctx->sb.overflow_lba)     ctx->sb.overflow_lba = new_lba;
+        else if(old_lba == ctx->sb.metadata_lba)     ctx->sb.metadata_lba = new_lba;
+        else if(old_lba == ctx->sb.metadata_idx_lba) ctx->sb.metadata_idx_lba = new_lba;
+        else if(old_lba == ctx->sb.media_tag_lba)    ctx->sb.media_tag_lba = new_lba;
+        else if(old_lba == ctx->sb.cd_prefix_lba)    ctx->sb.cd_prefix_lba = new_lba;
+        else if(old_lba == ctx->sb.cd_suffix_lba)    ctx->sb.cd_suffix_lba = new_lba;
+        else if(old_lba == ctx->sb.cd_subchannel_lba) ctx->sb.cd_subchannel_lba = new_lba;
+        else if(old_lba == ctx->sb.refcount_lba)     ctx->sb.refcount_lba = new_lba;
+    }
+
+    /* Update tree list entries for dedup trees */
+    if(ctx->sb.dedup_lba != 0)
+    {
+        size_t   tlsz  = (size_t)ctx->sb.block_size;
+        uint8_t *tlbuf = calloc(1, tlsz);
+        if(tlbuf)
+        {
+            int rc = obmafs3_block_read(ctx, ctx->sb.dedup_lba, tlbuf, tlsz);
+            if(rc == OBMAFS3_OK)
+            {
+                struct tree_list_header *tlh = (struct tree_list_header *)tlbuf;
+                if(tlh->magic == OBMAFS3_TREELIST_MAGIC)
+                {
+                    struct tree_list_entry *entries =
+                        (struct tree_list_entry *)(tlbuf + sizeof(struct tree_list_header));
+                    int modified = 0;
+                    for(uint64_t t = 0; t < tlh->tree_count; t++)
+                    {
+                        for(int i = 0; i < tc; i++)
+                        {
+                            if(trees[i].node_count == 0) continue;
+                            if(orig_hdr_lbas[i] == entries[t].tree_lba && trees[i].hdr_lba != orig_hdr_lbas[i])
+                            {
+                                entries[t].tree_lba = trees[i].hdr_lba;
+                                modified = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if(modified)
+                    {
+                        memset(tlh->checksum, 0, sizeof(tlh->checksum));
+                        obmafs3_checksum_block(tlbuf,
+                            sizeof(struct tree_list_header) + tlh->tree_count * sizeof(struct tree_list_entry),
+                            tlh->checksum);
+                        obmafs3_block_write(ctx, ctx->sb.dedup_lba, tlbuf, tlsz);
+                    }
+                }
+            }
+            free(tlbuf);
+        }
+    }
+
+    /* Persist superblock */
+    obmafs3_sb_write(ctx->fd, &ctx->sb);
+
     /* Flush bitmap after all trees are relocated */
     obmafs3_bitmap_write(ctx);
     sync_fd(state);
+
+    /* Diagnostic: count BT_DEDUP blocks after tree relocation */
+    {
+        uint64_t total_local = ctx->sb.total_bytes / ctx->sb.block_size;
+        uint64_t dedup_after_trees = 0;
+        for(uint64_t i = 0; i < total_local; i++)
+            if(state->analysis->block_types[i] == BT_DEDUP) dedup_after_trees++;
+        DBG("[compact] After trees: bt_dedup=%" PRIu64 "\n", dedup_after_trees);
+    }
 
 cleanup:
     for(int i = 0; i < tc; i++)
@@ -2719,6 +3124,18 @@ int defrag_compact_run(struct compact_state *state)
         return rc;
     }
 
+    /* Initialize relocation maps early — compact_trees may evict dedup
+     * blocks from the destination range and record them here. */
+    state->reloc_old   = NULL;
+    state->reloc_new   = NULL;
+    state->reloc_cksum = NULL;
+    state->reloc_count = 0;
+    state->reloc_cap   = 0;
+    state->data_reloc_old   = NULL;
+    state->data_reloc_new   = NULL;
+    state->data_reloc_count = 0;
+    state->data_reloc_cap   = 0;
+
     /* Initialize tree relocation map for subchannel LBA fixup */
     state->tree_reloc_old   = NULL;
     state->tree_reloc_new   = NULL;
@@ -2729,7 +3146,7 @@ int defrag_compact_run(struct compact_state *state)
      * This must happen BEFORE data/dedup compaction so that tree nodes
      * are out of the way.  relocate_tree() correctly updates all
      * internal child_lba, sibling, and free-chain pointers. */
-    fprintf(stderr, "[compact] === PHASE 1: TREES ===\n");
+    DBG("[compact] === PHASE 1: TREES ===\n");
     struct timespec ts_trees_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_trees_start);
     atomic_store(&state->phase, COMPACT_PHASE_TREES);
@@ -2739,7 +3156,7 @@ int defrag_compact_run(struct compact_state *state)
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
         double secs = (double)(ts_now.tv_sec - ts_trees_start.tv_sec) +
                       (double)(ts_now.tv_nsec - ts_trees_start.tv_nsec) / 1e9;
-        fprintf(stderr, "[compact] TREES done: %.1fs rc=%d\n", secs, rc);
+        DBG("[compact] TREES done: %.1fs rc=%d\n", secs, rc);
     }
     if(rc != OBMAFS3_OK)
     {
@@ -2751,18 +3168,8 @@ int defrag_compact_run(struct compact_state *state)
 
     if(CANCELLED(state)) goto safe_stop;
 
-    /* Initialize dedup relocation map */
-    state->reloc_old   = NULL;
-    state->reloc_new   = NULL;
-    state->reloc_count = 0;
-    state->reloc_cap   = 0;
-    state->data_reloc_old   = NULL;
-    state->data_reloc_new   = NULL;
-    state->data_reloc_count = 0;
-    state->data_reloc_cap   = 0;
-
     /* ---- Phase 2: Inode-aware data block compaction ---- */
-    fprintf(stderr, "[compact] === PHASE 2: DATA ===\n");
+    DBG("[compact] === PHASE 2: DATA ===\n");
     struct timespec ts_data_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_data_start);
     atomic_store(&state->phase, COMPACT_PHASE_DATA);
@@ -2772,7 +3179,7 @@ int defrag_compact_run(struct compact_state *state)
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
         double secs = (double)(ts_now.tv_sec - ts_data_start.tv_sec) +
                       (double)(ts_now.tv_nsec - ts_data_start.tv_nsec) / 1e9;
-        fprintf(stderr, "[compact] DATA done: %.1fs rc=%d\n", secs, rc);
+        DBG("[compact] DATA done: %.1fs rc=%d\n", secs, rc);
     }
     if(rc != OBMAFS3_OK)
     {
@@ -2782,10 +3189,41 @@ int defrag_compact_run(struct compact_state *state)
     }
     sync_fd(state);
 
+    /* Diagnostic: count BT_DEDUP after data compaction */
+    {
+        uint64_t total_local = ctx->sb.total_bytes / ctx->sb.block_size;
+        uint64_t dedup_after_data = 0;
+        for(uint64_t i = 0; i < total_local; i++)
+            if(bt[i] == BT_DEDUP) dedup_after_data++;
+        DBG("[compact] After data: bt_dedup=%" PRIu64 " reloc_count=%" PRIu64
+            " cursor=%" PRIu64 "\n",
+            dedup_after_data, state->reloc_count, state->write_cursor);
+    }
+
     if(CANCELLED(state)) goto safe_stop;
 
+    /* Save Phase 2 eviction relocs separately.  They must be applied
+     * to the dedup tree BEFORE Phase 3 relocs, because Phase 3 may
+     * reuse positions freed by Phase 2 evictions. */
+    uint64_t *phase2_reloc_old   = state->reloc_old;
+    uint64_t *phase2_reloc_new   = state->reloc_new;
+    uint64_t  phase2_reloc_count = state->reloc_count;
+
+    /* Phase 3 gets a fresh reloc array */
+    state->reloc_old   = NULL;
+    state->reloc_new   = NULL;
+    state->reloc_cksum = NULL;
+    state->reloc_count = 0;
+    state->reloc_cap   = 0;
+
+    /* Phase 3 obstacle evictions also start fresh */
+    state->dedup_evict_old   = NULL;
+    state->dedup_evict_new   = NULL;
+    state->dedup_evict_count = 0;
+    state->dedup_evict_cap   = 0;
+
     /* ---- Phase 3: Move dedup blocks after data ---- */
-    fprintf(stderr, "[compact] === PHASE 3: DEDUP ===\n");
+    DBG("[compact] === PHASE 3: DEDUP ===\n");
     struct timespec ts_dedup_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_dedup_start);
     atomic_store(&state->phase, COMPACT_PHASE_DEDUP);
@@ -2795,7 +3233,7 @@ int defrag_compact_run(struct compact_state *state)
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
         double secs = (double)(ts_now.tv_sec - ts_dedup_start.tv_sec) +
                       (double)(ts_now.tv_nsec - ts_dedup_start.tv_nsec) / 1e9;
-        fprintf(stderr, "[compact] DEDUP done: %.1fs rc=%d reloc_count=%" PRIu64 "\n",
+        DBG("[compact] DEDUP done: %.1fs rc=%d reloc_count=%" PRIu64 "\n",
                 secs, rc, state->reloc_count);
     }
     if(rc != OBMAFS3_OK)
@@ -2809,7 +3247,7 @@ int defrag_compact_run(struct compact_state *state)
     sync_fd(state);
 
     /* ---- Phase 4: Update references ---- */
-    fprintf(stderr, "[compact] === PHASE 4: REFS ===\n");
+    DBG("[compact] === PHASE 4: REFS ===\n");
     struct timespec ts_refs_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_refs_start);
 safe_stop:
@@ -2827,47 +3265,81 @@ safe_stop:
 
     /* Always update dedup references if any blocks were relocated,
      * even on early cancellation — otherwise the tree/SMEs will
-     * reference old (now-freed) positions. */
+     * reference old (now-freed) positions.
+     *
+     * Apply in three sequential steps to avoid false chain resolution
+     * where obstacle evictions and main moves share intermediate LBAs:
+     *   Step 1: Phase 2 data-phase evictions  (original → evicted)
+     *   Step 2: Phase 3 obstacle evictions    (obstacle → far end)
+     *   Step 3: Phase 3 main moves            (scan pos → write cursor)
+     */
+
+    /* Step 1: Apply Phase 2 eviction relocs */
+    if(phase2_reloc_count > 0)
+    {
+        DBG("[defrag] Step 1: Phase 2 eviction reloc_count=%" PRIu64 "\n", phase2_reloc_count);
+        struct reloc_map *p2map = reloc_map_create(phase2_reloc_old,
+                                                   phase2_reloc_new,
+                                                   NULL,
+                                                   phase2_reloc_count);
+        if(p2map)
+        {
+            update_dedup_tree_refs(state, p2map);
+            update_sme_refs(state, p2map, NULL);
+            sync_fd(state);
+            reloc_map_destroy(p2map);
+        }
+    }
+    free(phase2_reloc_old);
+    free(phase2_reloc_new);
+
+    /* Step 2: Apply Phase 3 obstacle eviction relocs.
+     * These map obstacle positions (in the write-cursor destination
+     * range) to their eviction destinations at the end of disk. */
+    if(state->dedup_evict_count > 0)
+    {
+        DBG("[defrag] Step 2: Phase 3 obstacle evict_count=%" PRIu64 "\n",
+            state->dedup_evict_count);
+        struct reloc_map *evmap = reloc_map_create(state->dedup_evict_old,
+                                                   state->dedup_evict_new,
+                                                   NULL,
+                                                   state->dedup_evict_count);
+        if(evmap)
+        {
+            update_dedup_tree_refs(state, evmap);
+            update_sme_refs(state, evmap, NULL);
+            sync_fd(state);
+            reloc_map_destroy(evmap);
+        }
+    }
+    free(state->dedup_evict_old);
+    free(state->dedup_evict_new);
+    state->dedup_evict_old  = NULL;
+    state->dedup_evict_new  = NULL;
+
+    /* Step 3: Apply Phase 3 main move relocs.
+     * These map original dedup scan positions to their compacted
+     * destinations at the write cursor.  No chain resolution needed
+     * because obstacles were already cleared before each move. */
     if(state->reloc_count > 0)
     {
-        fprintf(stderr, "[defrag] reloc_count=%" PRIu64 ", resolving chains...\n",
-                state->reloc_count);
-        /* Resolve chained relocations: if a block was evicted A→B by
-         * the data phase and then moved B→C by the dedup phase, we
-         * need A→C (not A→B). */
-        struct reloc_map *chain_map = reloc_map_create(state->reloc_old,
-                                                       state->reloc_new,
-                                                       state->reloc_count);
-        if(chain_map)
-        {
-            for(uint64_t i = 0; i < state->reloc_count; i++)
-            {
-                uint64_t dest = state->reloc_new[i];
-                for(int depth = 0; depth < 10; depth++) /* max chain depth */
-                {
-                    uint64_t next = reloc_map_get(chain_map, dest);
-                    if(next == 0 || next == dest) break;
-                    dest = next;
-                }
-                state->reloc_new[i] = dest;
-            }
-            reloc_map_destroy(chain_map);
-        }
+        DBG("[defrag] Step 3: Phase 3 main move reloc_count=%" PRIu64 "\n",
+            state->reloc_count);
 
-        /* Now build the final map with resolved destinations */
         struct reloc_map *rmap = reloc_map_create(state->reloc_old,
                                                   state->reloc_new,
+                                                  state->reloc_cksum,
                                                   state->reloc_count);
         if(rmap)
         {
             update_dedup_tree_refs(state, rmap);
             sync_fd(state);
 
-            /* Build tree reloc map for subchannel LBA fixup in CD SMEs */
             struct reloc_map *tree_rmap = NULL;
             if(state->tree_reloc_count > 0)
                 tree_rmap = reloc_map_create(state->tree_reloc_old,
                                              state->tree_reloc_new,
+                                             NULL,
                                              state->tree_reloc_count);
 
             update_sme_refs(state, rmap, tree_rmap);
@@ -2879,8 +3351,10 @@ safe_stop:
     }
     free(state->reloc_old);
     free(state->reloc_new);
-    state->reloc_old = NULL;
-    state->reloc_new = NULL;
+    free(state->reloc_cksum);
+    state->reloc_old   = NULL;
+    state->reloc_new   = NULL;
+    state->reloc_cksum = NULL;
 
     free(state->tree_reloc_old);
     free(state->tree_reloc_new);
