@@ -70,6 +70,7 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd);
 /* ---- import.c ---- */
 int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info);
 int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info);
+int import_sector_tags(void *aaruf_ctx, int fd, const ImageInfo *info);
 
 /* ---- sidecar.c ---- */
 void export_sidecar_files(void *aaruf_ctx, const char *output_path, size_t base_len);

@@ -363,6 +363,22 @@ int main(int argc, char *argv[])
                     sb.refcount_lba, rc);
     }
 
+    if(sb.sector_tag_data_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.sector_tag_data_lba, &ctx->sector_tag_data_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read sector tag data tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.sector_tag_data_lba, rc);
+    }
+
+    if(sb.sector_tag_ref_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.sector_tag_ref_lba, &ctx->sector_tag_ref_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read sector tag ref tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.sector_tag_ref_lba, rc);
+    }
+
     int errors = 0;
 
     /* ---- Dedup-stats-only fast path: skip all integrity checks ---- */
@@ -394,12 +410,12 @@ int main(int argc, char *argv[])
     else
         result_bad("Magic:", "0x%016" PRIx64, ctx->sb.magic);
 
-    /* Verify superblock checksum */
+    /* Verify superblock checksum (V1 portion: bytes 0..OBMAFS3_SB_V1_SIZE-1) */
     {
         uint8_t stored[32], computed[32];
         memcpy(stored, ctx->sb.checksum, 32);
         memset(ctx->sb.checksum, 0, 32);
-        obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), computed);
+        obmafs3_checksum_block(&ctx->sb, OBMAFS3_SB_V1_SIZE, computed);
         memcpy(ctx->sb.checksum, stored, 32);
         int sb_cs_ok = (memcmp(stored, computed, 32) == 0);
         if(sb_cs_ok)
@@ -411,7 +427,10 @@ int main(int argc, char *argv[])
             if(ask_fix(auto_yes, auto_no, "Recompute superblock checksum?"))
             {
                 memset(ctx->sb.checksum, 0, 32);
-                obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), ctx->sb.checksum);
+                obmafs3_checksum_block(&ctx->sb, OBMAFS3_SB_V1_SIZE, ctx->sb.checksum);
+                memset(ctx->sb.checksum2, 0, 32);
+                obmafs3_checksum_block((const uint8_t *)&ctx->sb + OBMAFS3_SB_V1_SIZE,
+                                       sizeof(ctx->sb) - OBMAFS3_SB_V1_SIZE, ctx->sb.checksum2);
                 ssize_t nn = pwrite(fd, &ctx->sb, sizeof(ctx->sb), 0);
                 if(nn < 0 || (size_t)nn != sizeof(ctx->sb))
                     fprintf(stderr, "  %sError: could not write superblock checksum fix%s\n", CLR_RED, CLR_RESET);
@@ -1629,6 +1648,114 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* ---- Sector Tag Data tree ---- */
+    if(ctx->sb.sector_tag_data_lba != 0)
+    {
+        printf("\n  %sSector Tag Data tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->sector_tag_data_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+            result_ok("Magic:", "0x%016" PRIx64, ctx->sector_tag_data_hdr.magic);
+        else
+            result_bad("Magic:", "0x%016" PRIx64, ctx->sector_tag_data_hdr.magic);
+        {
+            int cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.sector_tag_data_lba, &ctx->sector_tag_data_hdr, &cs_ok);
+            if(cs_ok)
+                result_ok("Header checksum:", "");
+            else
+                result_bad("Header checksum:", "mismatch");
+            if(!cs_ok) errors++;
+        }
+
+        if(ctx->sector_tag_data_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes      = NULL;
+            uint64_t  node_count = 0;
+            int wrc = walk_inode_btree_nodes(ctx, ctx->sector_tag_data_hdr.root_node_lba,
+                                             sizeof(struct btree_index_entry),
+                                             __builtin_offsetof(struct btree_index_entry, child_lba), &nodes,
+                                             &node_count, ctx->sector_tag_data_hdr.total_nodes, "SectorTagData");
+            if(wrc == OBMAFS3_OK)
+            {
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "SectorTagData", auto_yes, auto_no, &bad, &cs_fix);
+                free(nodes);
+                if(bad > 0)
+                {
+                    if(cs_fix > 0)
+                        result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+                    else
+                        result_bad("Node checksums:", "%" PRIu64 " bad", bad);
+                    errors += (int)(bad - cs_fix);
+                }
+                else
+                    result_ok("Node checksums:", "");
+                verify_fix_total_nodes(ctx, &ctx->sector_tag_data_hdr, ctx->sb.sector_tag_data_lba, node_count,
+                                       "SectorTagData", "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->sector_tag_data_hdr, ctx->sb.sector_tag_data_lba,
+                                      "SectorTagData", "  ", auto_yes, auto_no, &errors);
+            }
+            else
+            {
+                result_bad("Node checksums:", "could not walk tree");
+                errors++;
+            }
+        }
+    }
+
+    /* ---- Sector Tag Ref tree ---- */
+    if(ctx->sb.sector_tag_ref_lba != 0)
+    {
+        printf("\n  %sSector Tag Ref tree%s\n", CLR_BOLD, CLR_RESET);
+        if(ctx->sector_tag_ref_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+            result_ok("Magic:", "0x%016" PRIx64, ctx->sector_tag_ref_hdr.magic);
+        else
+            result_bad("Magic:", "0x%016" PRIx64, ctx->sector_tag_ref_hdr.magic);
+        {
+            int cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.sector_tag_ref_lba, &ctx->sector_tag_ref_hdr, &cs_ok);
+            if(cs_ok)
+                result_ok("Header checksum:", "");
+            else
+                result_bad("Header checksum:", "mismatch");
+            if(!cs_ok) errors++;
+        }
+
+        if(ctx->sector_tag_ref_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes      = NULL;
+            uint64_t  node_count = 0;
+            int wrc = walk_inode_btree_nodes(ctx, ctx->sector_tag_ref_hdr.root_node_lba,
+                                             sizeof(struct sector_tag_ref_index_entry),
+                                             __builtin_offsetof(struct sector_tag_ref_index_entry, child_lba), &nodes,
+                                             &node_count, ctx->sector_tag_ref_hdr.total_nodes, "SectorTagRef");
+            if(wrc == OBMAFS3_OK)
+            {
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "SectorTagRef", auto_yes, auto_no, &bad, &cs_fix);
+                free(nodes);
+                if(bad > 0)
+                {
+                    if(cs_fix > 0)
+                        result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+                    else
+                        result_bad("Node checksums:", "%" PRIu64 " bad", bad);
+                    errors += (int)(bad - cs_fix);
+                }
+                else
+                    result_ok("Node checksums:", "");
+                verify_fix_total_nodes(ctx, &ctx->sector_tag_ref_hdr, ctx->sb.sector_tag_ref_lba, node_count,
+                                       "SectorTagRef", "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->sector_tag_ref_hdr, ctx->sb.sector_tag_ref_lba,
+                                      "SectorTagRef", "  ", auto_yes, auto_no, &errors);
+            }
+            else
+            {
+                result_bad("Node checksums:", "could not walk tree");
+                errors++;
+            }
+        }
+    }
+
     phase_end();
 
     /* ---- Phase 3: Cross-references & consistency ---- */
@@ -1681,7 +1808,10 @@ int main(int argc, char *argv[])
 
                     /* Recompute superblock checksum and write */
                     memset(ctx->sb.checksum, 0, sizeof(ctx->sb.checksum));
-                    obmafs3_checksum_block(&ctx->sb, sizeof(ctx->sb), ctx->sb.checksum);
+                    obmafs3_checksum_block(&ctx->sb, OBMAFS3_SB_V1_SIZE, ctx->sb.checksum);
+                    memset(ctx->sb.checksum2, 0, sizeof(ctx->sb.checksum2));
+                    obmafs3_checksum_block((const uint8_t *)&ctx->sb + OBMAFS3_SB_V1_SIZE,
+                                           sizeof(ctx->sb) - OBMAFS3_SB_V1_SIZE, ctx->sb.checksum2);
                     ssize_t nn = pwrite(fd, &ctx->sb, sizeof(ctx->sb), 0);
                     if(nn < 0 || (size_t)nn != sizeof(ctx->sb))
                         fprintf(stderr, "  Error: could not write superblock fix\n");

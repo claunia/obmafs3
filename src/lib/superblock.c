@@ -68,10 +68,15 @@ int obmafs3_sb_read(int fd, struct obmafs3_sb *sb)
  */
 int obmafs3_sb_write(int fd, const struct obmafs3_sb *sb)
 {
-    /* Compute checksum: zero field, hash entire struct, store result */
+    /* Compute V1 checksum: zero field, hash first OBMAFS3_SB_V1_SIZE bytes */
     struct obmafs3_sb tmp = *sb;
     memset(tmp.checksum, 0, sizeof(tmp.checksum));
-    obmafs3_checksum_block(&tmp, sizeof(tmp), tmp.checksum);
+    obmafs3_checksum_block(&tmp, OBMAFS3_SB_V1_SIZE, tmp.checksum);
+
+    /* Compute extension checksum: zero field, hash bytes 526..4095 */
+    memset(tmp.checksum2, 0, sizeof(tmp.checksum2));
+    obmafs3_checksum_block((const uint8_t *)&tmp + OBMAFS3_SB_V1_SIZE,
+                           sizeof(tmp) - OBMAFS3_SB_V1_SIZE, tmp.checksum2);
 
     /* Write the primary superblock at LBA 0 */
     ssize_t n = pwrite(fd, &tmp, sizeof(tmp), 0);
@@ -112,14 +117,31 @@ int obmafs3_sb_read_lenient(int fd, struct obmafs3_sb *sb, int *checksum_ok)
     int rc = obmafs3_sb_read(fd, sb);
     if(rc != OBMAFS3_OK) return rc;
 
-    /* Verify checksum: save stored, zero field, recompute, compare */
+    /* Verify V1 checksum: covers bytes 0..OBMAFS3_SB_V1_SIZE-1 */
     uint8_t stored[32];
     memcpy(stored, sb->checksum, 32);
     memset(sb->checksum, 0, 32);
     uint8_t computed[32];
-    obmafs3_checksum_block(sb, sizeof(*sb), computed);
+    obmafs3_checksum_block(sb, OBMAFS3_SB_V1_SIZE, computed);
     memcpy(sb->checksum, stored, 32);
     *checksum_ok = (memcmp(stored, computed, 32) == 0);
+
+    /* Verify extension checksum (checksum2): covers bytes 526..4095 */
+    if(*checksum_ok)
+    {
+        uint8_t stored2[32];
+        memcpy(stored2, sb->checksum2, 32);
+        memset(sb->checksum2, 0, 32);
+        uint8_t computed2[32];
+        obmafs3_checksum_block((const uint8_t *)sb + OBMAFS3_SB_V1_SIZE,
+                               sizeof(*sb) - OBMAFS3_SB_V1_SIZE, computed2);
+        memcpy(sb->checksum2, stored2, 32);
+        /* Extension checksum is only meaningful when non-zero (old FS have all-zero extension) */
+        uint8_t zero[32];
+        memset(zero, 0, 32);
+        if(memcmp(stored2, zero, 32) != 0)
+            *checksum_ok = (memcmp(stored2, computed2, 32) == 0);
+    }
 
     return OBMAFS3_OK;
 }
@@ -193,14 +215,30 @@ int obmafs3_sb_read_backup_lenient(int fd, uint64_t block_size, uint64_t total_b
     int rc = obmafs3_sb_read_backup(fd, block_size, total_bytes, sb);
     if(rc != OBMAFS3_OK) return rc;
 
-    /* Verify checksum: save stored, zero field, recompute, compare */
+    /* Verify V1 checksum: covers bytes 0..OBMAFS3_SB_V1_SIZE-1 */
     uint8_t stored[32];
     memcpy(stored, sb->checksum, 32);
     memset(sb->checksum, 0, 32);
     uint8_t computed[32];
-    obmafs3_checksum_block(sb, sizeof(*sb), computed);
+    obmafs3_checksum_block(sb, OBMAFS3_SB_V1_SIZE, computed);
     memcpy(sb->checksum, stored, 32);
     *checksum_ok = (memcmp(stored, computed, 32) == 0);
+
+    /* Verify extension checksum (checksum2) */
+    if(*checksum_ok)
+    {
+        uint8_t stored2[32];
+        memcpy(stored2, sb->checksum2, 32);
+        memset(sb->checksum2, 0, 32);
+        uint8_t computed2[32];
+        obmafs3_checksum_block((const uint8_t *)sb + OBMAFS3_SB_V1_SIZE,
+                               sizeof(*sb) - OBMAFS3_SB_V1_SIZE, computed2);
+        memcpy(sb->checksum2, stored2, 32);
+        uint8_t zero[32];
+        memset(zero, 0, 32);
+        if(memcmp(stored2, zero, 32) != 0)
+            *checksum_ok = (memcmp(stored2, computed2, 32) == 0);
+    }
 
     return OBMAFS3_OK;
 }

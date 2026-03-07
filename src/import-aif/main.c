@@ -234,8 +234,16 @@ int main(int argc, char *argv[])
     import_media_tags(aaruf_ctx, fd);
     ui_ok("Media tags imported");
 
-    /* ---- Phase 5: Import metadata ---- */
-    ui_phase(5, "Import metadata");
+    /* ---- Phase 5: Import sector tags (non-CD only) ---- */
+    if(!is_cd)
+    {
+        ui_phase(5, "Import sector tags");
+        import_sector_tags(aaruf_ctx, fd, &info);
+        ui_ok("Sector tags imported");
+    }
+
+    /* ---- Phase 6: Import metadata ---- */
+    ui_phase(6, "Import metadata");
     import_metadata(aaruf_ctx, &info, fd);
     ui_ok("Metadata imported");
 
@@ -245,8 +253,8 @@ int main(int argc, char *argv[])
     const char *slash    = strrchr(output_path, '/');
     if(dot && (!slash || dot > slash)) base_len = (size_t)(dot - output_path);
 
-    /* ---- Phase 6: Write sidecar files ---- */
-    ui_phase(6, "Export sidecar files");
+    /* ---- Phase 7: Write sidecar files ---- */
+    ui_phase(7, "Export sidecar files");
 
     if(is_cd)
     {

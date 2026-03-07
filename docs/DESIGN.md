@@ -24,8 +24,10 @@ All multi-byte values are stored **little-endian**. All on-disk structures use `
 | 11                  | Metadata B+Tree header               | `BTREEHDR` |
 | 12                  | Metadata Index B+Tree header         | `BTREEHDR` |
 | 13                  | Refcount B+Tree header               | `BTREEHDR` |
-| 14 .. 14+N-1        | Allocation bitmap                    | `OBMABMAP` (0x50414D42414D424F) |
-| 14+N ..             | Data blocks, B+Tree nodes, dedup data| `OBMABLCK` / `BTREENDE` |
+| 14                  | Sector Tag Data B+Tree header        | `BTREEHDR` |
+| 15                  | Sector Tag Ref B+Tree header         | `BTREEHDR` |
+| 16 .. 16+N-1        | Allocation bitmap                    | `OBMABMAP` (0x50414D42414D424F) |
+| 16+N ..             | Data blocks, B+Tree nodes, dedup data| `OBMABLCK` / `BTREENDE` |
 | total_blocks − 1    | Backup superblock                    | `OBMAFS_3` (0x335F5346414D424F) |
 
 The block size for regular data (catalog, inode, overflow, file data) defaults to **4096 bytes**.
@@ -69,13 +71,28 @@ struct obmafs3_sb {                          /* packed, all fields little-endian
     uint64_t rocompat_flags;     /* Feature flags requiring read-only mount if unknown */
     uint64_t incompatible_flags; /* Feature flags that must be understood to mount at all */
     uint8_t  volume_label[256];  /* Volume label, UTF-8, NUL-terminated */
-    uint8_t  checksum[32];       /* Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed) */
+    uint8_t  checksum[32];       /* Checksum of V1 portion (bytes 0..525, XXH64) */
+
+    /* ---- Extension fields (bytes 526..4063) ---- */
+    uint64_t sector_tag_data_lba;/* LBA of Sector Tag Data B+Tree header (block 14, 0 = none) */
+    uint64_t sector_tag_ref_lba; /* LBA of Sector Tag Ref B+Tree header (block 15, 0 = none) */
+    uint8_t  reserved[3506];     /* Zero-filled, reserved for future expansion */
+    uint8_t  checksum2[32];      /* Checksum of extension area (bytes 526..4095, XXH64) */
 };
+
+#define OBMAFS3_SB_V1_SIZE 526   /* sizeof(V1 portion covered by checksum) */
 ```
+
+The superblock occupies a full 4096-byte block. It is divided into two independently checksummed regions:
+
+- **V1 portion** (bytes 0–525, `OBMAFS3_SB_V1_SIZE` = 526 bytes): Contains all original fields, terminated by `checksum`. The V1 checksum is computed over bytes 0–525 with the `checksum` field zeroed.
+- **Extension area** (bytes 526–4095, 3570 bytes): Contains new fields (`sector_tag_data_lba`, `sector_tag_ref_lba`, etc.) followed by reserved space and `checksum2`. The extension checksum is computed over bytes 526–4095 with the `checksum2` field zeroed.
+
+This two-checksum design ensures backward compatibility: older implementations read and validate only the V1 portion, see an unknown `rocompat_flags` bit, and mount read-only. Newer implementations validate both checksums. When the extension area is all-zeroes (no `checksum2`), the extension checksum is skipped — this handles filesystems created by older code.
 
 The superblock identifies the filesystem, stores global parameters, and provides the LBAs for all top-level structures. The root inode ID is always 2 (`OBMAFS3_ROOT_INODE_ID`), and `next_inode_id` starts at 3 after creation.
 
-A byte-identical **backup copy** of the superblock is stored at the last block of the filesystem (`LBA = total_blocks − 1`). The backup is written every time the primary superblock is updated. If the primary superblock is unreadable or has invalid magic, `obmafs3_open()` and `obmafsck` automatically fall back to the backup, probing 8 candidate block sizes (4096, 512, 1024, 2048, 8192, 16384, 32768, 65536) since the block size is stored inside the superblock itself. The backup block is marked as allocated in the allocation bitmap.
+A byte-identical **backup copy** of the full 4096-byte superblock is stored at the last block of the filesystem (`LBA = total_blocks − 1`). The backup is written every time the primary superblock is updated; both checksums (`checksum` and `checksum2`) are independently verified during recovery. If the primary superblock is unreadable or has invalid magic, `obmafs3_open()` and `obmafsck` automatically fall back to the backup, probing 8 candidate block sizes (4096, 512, 1024, 2048, 8192, 16384, 32768, 65536) since the block size is stored inside the superblock itself. The backup block is marked as allocated in the allocation bitmap.
 
 **Field descriptions:**
 
@@ -97,8 +114,11 @@ A byte-identical **backup copy** of the superblock is stored at the last block o
 - `dedup_clump_size` — Number of nodes to pre-allocate per growth for dedup B+Trees. 0 uses the default of 1024 (see [Clump Allocation](#clump-allocation)).
 - `revision` — On-disk format revision (e.g. `20260224`). Set to `OBMAFS3_REVISION` at creation time. If a tool reads a revision higher than the one it was compiled with, mounting is refused (`OBMAFS3_ERR_REVISION`) to prevent corruption by older code that does not understand the newer layout.
 - `compatible_flags` — Bitmask of optional feature flags that are safe to ignore. An implementation that does not recognise a set bit may mount the filesystem normally with full read-write access. No flags are currently defined.
-- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. No flags are currently defined.
+- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. Currently defined: `OBMAFS3_ROCOMPAT_SECTOR_TAGS` (bit 0) — per-sector tag storage.
 - `incompatible_flags` — Bitmask of feature flags that prevent mounting entirely when unknown. If any bits outside `OBMAFS3_INCOMPAT_FLAGS_KNOWN` are set, the implementation must refuse to mount (`OBMAFS3_ERR_INCOMPAT`). No flags are currently defined.
+- `sector_tag_data_lba` — LBA of the Sector Tag Data B+Tree header. A hash-keyed dictionary of unique per-sector tag blobs. 0 if sector tags are not enabled.
+- `sector_tag_ref_lba` — LBA of the Sector Tag Ref B+Tree header. A composite-keyed tree mapping `(inode_id, sector, tag_type)` to tag hashes in the data tree. 0 if sector tags are not enabled.
+- `checksum2` — Checksum of the extension area (bytes 526–4095), computed with this field zeroed. All-zero when no extension fields are in use.
 
 ---
 
@@ -186,7 +206,9 @@ enum obmafs3_btree_type {
     kBtreeTypeCdSuffix      = 7,
     kBtreeTypeCdSubchannel  = 8,
     kBtreeTypeMetadataIndex = 9,
-    kBtreeTypeRefcount      = 10
+    kBtreeTypeRefcount      = 10,
+    kBtreeTypeSectorTagData = 11,
+    kBtreeTypeSectorTagRef  = 12
 };
 
 enum obmafs3_btree_data_type {
@@ -200,7 +222,9 @@ enum obmafs3_btree_data_type {
     kBtreeDataTypeCdSuffixEntry      = 7,
     kBtreeDataTypeCdSubchannelEntry  = 8,
     kBtreeDataTypeMetadataIndexEntry = 9,
-    kBtreeDataTypeRefcountEntry      = 10
+    kBtreeDataTypeRefcountEntry      = 10,
+    kBtreeDataTypeSectorTagDataEntry  = 11,
+    kBtreeDataTypeSectorTagRefEntry   = 12
 };
 
 enum obmafs3_file_type {
@@ -507,6 +531,69 @@ struct cd_subchannel_record {                /* packed, 104 bytes */
 ```
 
 Maximum leaf records per 4096-byte block: **167** (prefix), **13** (suffix), **38** (subchannel). All three trees support multi-level indexing with standard `btree_index_entry` nodes.
+
+### Sector Tag B+Trees (per-sector side data)
+
+Two B+Trees store per-sector tag data (Apple Sony tags, DVD sector info, floppy address marks, etc.) for non-CD media images using a **hash-dedup** approach. This feature is protected by the `OBMAFS3_ROCOMPAT_SECTOR_TAGS` flag (bit 0 of `rocompat_flags`).
+
+Most disk images have very few *unique* tag values — the same 12-byte Apple tag or 1-byte DVD sector info byte repeats across millions of sectors. The hash-dedup design separates the unique tag data from the per-sector references, achieving significant space savings.
+
+#### Sector Tag Data Tree (hash-keyed dictionary)
+
+A B+Tree keyed by `XXH64(tag_type ‖ data)` that stores unique tag blobs. Index nodes use standard `btree_index_entry`.
+
+```c
+#define SECTOR_TAG_DATA_MAX 64
+
+struct sector_tag_data_record {              /* packed, 76 bytes */
+    uint64_t hash;                           /* XXH64(tag_type ‖ data) */
+    uint16_t tag_type;                       /* SectorTagType enum value */
+    uint16_t data_length;                    /* Actual bytes of tag data */
+    uint8_t  data[SECTOR_TAG_DATA_MAX];      /* Inline tag data (max 64 bytes) */
+};
+```
+
+The 64-byte inline maximum comfortably covers all known per-sector tag types: Apple Sony (12B), Apple Profile (20B), Priam DataTower (24B), DVD sector info (1–5B), floppy address marks.
+
+Maximum leaf records per 4096-byte block: `(4096 − 70) / 76` = **53 records**. Maximum index entries per node: `(4096 − 70) / 16` = **251 entries**.
+
+#### Sector Tag Ref Tree (composite-keyed per-sector mapping)
+
+A B+Tree keyed by `(inode_id, sector, tag_type)` that maps each sector's tag to a hash in the data tree.
+
+```c
+struct sector_tag_ref_record {               /* packed, 26 bytes */
+    uint64_t inode_id;                       /* Image inode */
+    int64_t  sector;                         /* Logical sector number */
+    uint16_t tag_type;                       /* SectorTagType discriminator */
+    uint64_t tag_hash;                       /* XXH64(tag_type ‖ data) → key into data tree */
+};
+
+struct sector_tag_ref_index_entry {          /* packed, 26 bytes */
+    uint64_t inode_id;                       /* Smallest inode_id reachable through child */
+    int64_t  sector;                         /* Smallest sector reachable through child */
+    uint16_t tag_type;                       /* Smallest tag_type reachable through child */
+    uint64_t child_lba;                      /* LBA of the child node */
+};
+```
+
+Maximum leaf records per 4096-byte block: `(4096 − 70) / 26` = **154 records**. Maximum index entries per node: `(4096 − 70) / 26` = **154 entries**.
+
+#### Read path
+
+1. Look up `(inode_id, sector, tag_type)` in the Sector Tag Ref Tree → get `tag_hash`.
+2. Look up `tag_hash` in the Sector Tag Data Tree → get `(tag_type, data_length, data[])`.
+3. Return the tag data.
+
+#### Write path
+
+1. Compute `hash = XXH64(tag_type ‖ data)`.
+2. Insert `(hash, tag_type, data_length, data)` into the Sector Tag Data Tree (idempotent — same hash = same data, dedup hit).
+3. Insert `(inode_id, sector, tag_type, hash)` into the Sector Tag Ref Tree.
+
+#### Deletion
+
+When a media image file is deleted, all Sector Tag Ref Tree entries for that inode are removed. Data Tree entries are **not** removed since they may be shared by other inodes; orphaned data entries are harmless and can be cleaned up by `obmafsck`.
 
 ---
 
@@ -1357,6 +1444,8 @@ The following checks are performed by `obmafs3_open_flags()` before the filesyst
 | `OBMAFS3_IOC_LIST_METADATA` | List metadata keys for an image (paginated) |
 | `OBMAFS3_IOC_QUERY_METADATA` | Multi-filter metadata query with AND/OR combination (up to 4 filters, paginated paths). Supports operators: equal, not-equal, greater, less, greater-or-equal, less-or-equal, contains, starts-with, and exists. All comparisons are lexicographic. Setting the key to `"*"` performs a wildcard query across all metadata keys. |
 | `OBMAFS3_IOC_SET_MEDIA_IMAGE` | Convert an empty regular file to a MediaImage with a given sector size |
+| `OBMAFS3_IOC_SET_SECTOR_TAG` | Write a per-sector tag to a media image (stores in hash-dedup sector tag trees) |
+| `OBMAFS3_IOC_GET_SECTOR_TAG` | Read a per-sector tag from a media image |
 
 **Media image detection**: The extension-to-sector-size mapping is configurable via `--disk-images`. Up to 32 mappings are supported (`OBMAFS3_MAX_DISK_IMAGE_MAPS`). Each mapping associates a file extension with a sector size. The default mapping is `dsk=512;iso=2048;img=512;IMA=512;adf=512;xdf=512;usb=512`. Extension matching is **case-insensitive** (`strcasecmp`), so `.DSK`, `.Dsk`, and `.dsk` all match the same mapping. CD images (`kFileTypeCompactDiscImage`) use the CD sector map format with prefix/suffix/subchannel splitting and ECC/EDC reconstruction.
 
@@ -1386,9 +1475,10 @@ Options:
    - **Flat images** (`import_flat_image`): Reads each sector via `aaruf_read_sector`, handles variable sector sizes via `AARUF_ERROR_BUFFER_TOO_SMALL` + realloc, writes sequentially.
    - **CD images** (`import_cd_image`): Reads tracks via `aaruf_get_tracks`, then iterates track by track — for each track, sectors from `start - pregap` to `end` are read. Only sectors belonging to a track are imported; gaps between tracks are skipped (the `CD_WRITE_LONG` ioctl carries the sector LBA, so non-contiguous sectors are placed correctly). For each sector, the tool first attempts a raw read via `aaruf_read_sector_long` (2352 bytes); if that fails, it falls back to a cooked read via `aaruf_read_sector` and reconstructs the full raw sector using `aaruf_ecc_cd_reconstruct_prefix` and `aaruf_ecc_cd_reconstruct`. Subchannel data (96 bytes) is appended when available (`aaruf_read_sector_tag`). Each sector is written via the `OBMAFS3_IOC_CD_WRITE_LONG` ioctl with its LBA.
 7. Imports all media tags (`import_media_tags`): Enumerates available tags via `aaruf_get_readable_media_tags`, reads each tag, stores via `OBMAFS3_IOC_SET_MEDIA_TAG` ioctl.
-8. Imports image metadata (`import_metadata`): Stores application name/version, media type string, disk geometry, media sequence, and 12 UTF-16LE metadata fields (converted to UTF-8 via `iconv`) including: creator, comments, media title, manufacturer, model, serial number, barcode, part number, drive manufacturer/model/serial/firmware.
-9. Generates a CDRWin-format cue sheet (`.cue`) for Compact Disc images (`write_cue_file`): Includes `REM ORIGINAL MEDIA-TYPE`, `REM METADATA AARU MEDIA-TYPE`, ripping tool info, `CATALOG` (MCN), per-session markers, and per-track `TRACK`/`FLAGS`/`ISRC`/`INDEX` entries.
-10. Exports sidecar files:
+8. For non-CD images, imports per-sector tags (`import_sector_tags`): Queries `aaruf_get_readable_sector_tags` for available non-CD tag types (Apple Sony 12B, DVD CMI, floppy address marks, DVD sector title key/info/number/IED/EDC, Apple Profile 20B, Priam DataTower 24B), iterates all sectors, and stores each tag via `OBMAFS3_IOC_SET_SECTOR_TAG` ioctl. CD-specific tags (sync, header, subchannel, etc.) are skipped since they are handled by the CD import path.
+9. Imports image metadata (`import_metadata`): Stores application name/version, media type string, disk geometry, media sequence, and 12 UTF-16LE metadata fields (converted to UTF-8 via `iconv`) including: creator, comments, media title, manufacturer, model, serial number, barcode, part number, drive manufacturer/model/serial/firmware.
+10. Generates a CDRWin-format cue sheet (`.cue`) for Compact Disc images (`write_cue_file`): Includes `REM ORIGINAL MEDIA-TYPE`, `REM METADATA AARU MEDIA-TYPE`, ripping tool info, `CATALOG` (MCN), per-session markers, and per-track `TRACK`/`FLAGS`/`ISRC`/`INDEX` entries.
+11. Exports sidecar files:
     - CICM XML metadata (`.metadata.xml`)
     - Aaru JSON metadata (`.metadata.json`)
     - Dump hardware JSON (`.dumphw.json`) — parsed from binary format (18-byte header, 36-byte per-entry records with strings and extent arrays)
@@ -1402,7 +1492,7 @@ Options:
 | `convert.c` | Tag/type mapping helpers (`aaruf_tag_to_obmafs`, `aaruf_track_type_to_cd_mode`, `cd_mode_sector_size`), `is_compact_disc_media()` |
 | `cuesheet.c` | CDRWin cue sheet generation (`write_cue_file`) |
 | `metadata.c` | Media tag import (`import_media_tags`), metadata import with UTF-16LE→UTF-8 conversion (`import_metadata`) |
-| `import.c` | Sector data import for flat images (`import_flat_image`) and CD images (`import_cd_image`) |
+| `import.c` | Sector data import for flat images (`import_flat_image`), CD images (`import_cd_image`), and per-sector tag import (`import_sector_tags`) |
 | `sidecar.c` | CICM XML, Aaru JSON, and dump hardware JSON export (`export_sidecar_files`) |
 
 **Dependencies:** Links only against `libaaruformat` (shared library). Includes OBMAFS3 headers (`enums.h`, `obmafs3_ioctl.h`, `tags.h`) but does not link `libobmafs`.

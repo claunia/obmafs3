@@ -239,4 +239,34 @@ struct obmafs3_ioctl_set_media_image_arg
 
 #define OBMAFS3_IOC_SET_MEDIA_IMAGE _IOW('O', 12, struct obmafs3_ioctl_set_media_image_arg)
 
+/* ================================================================== */
+/*  Sector tag ioctls                                                  */
+/* ================================================================== */
+
+#ifndef SECTOR_TAG_DATA_MAX
+#define SECTOR_TAG_DATA_MAX 64
+#endif
+
+/** Write a per-sector tag to a media image file. */
+struct obmafs3_ioctl_sector_tag_write_arg
+{
+    int64_t  sector;                       /**< Logical sector number */
+    uint16_t tag_type;                     /**< SectorTagType enum value */
+    uint16_t data_length;                  /**< Actual bytes of tag data */
+    uint8_t  data[SECTOR_TAG_DATA_MAX];    /**< Tag data */
+};
+
+#define OBMAFS3_IOC_SET_SECTOR_TAG _IOW('O', 13, struct obmafs3_ioctl_sector_tag_write_arg)
+
+/** Read a per-sector tag from a media image file. */
+struct obmafs3_ioctl_sector_tag_read_arg
+{
+    int64_t  sector;                       /**< Input: logical sector number */
+    uint16_t tag_type;                     /**< Input: SectorTagType enum value */
+    uint16_t data_length;                  /**< Output: actual bytes of tag data */
+    uint8_t  data[SECTOR_TAG_DATA_MAX];    /**< Output: tag data */
+};
+
+#define OBMAFS3_IOC_GET_SECTOR_TAG _IOWR('O', 14, struct obmafs3_ioctl_sector_tag_read_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

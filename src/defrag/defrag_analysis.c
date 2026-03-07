@@ -678,6 +678,16 @@ int defrag_analysis_run(struct analysis_state *state)
                  sizeof(struct btree_index_entry),
                  offsetof(struct btree_index_entry, child_lba));
 
+    /* Sector Tag Data tree (hash-keyed) */
+    analyse_tree(state, ctx->sb.sector_tag_data_lba, "SectorTagData",
+                 sizeof(struct btree_index_entry),
+                 offsetof(struct btree_index_entry, child_lba));
+
+    /* Sector Tag Ref tree (composite-keyed) */
+    analyse_tree(state, ctx->sb.sector_tag_ref_lba, "SectorTagRef",
+                 sizeof(struct sector_tag_ref_index_entry),
+                 offsetof(struct sector_tag_ref_index_entry, child_lba));
+
     /* ---- Phase 2: Walk dedup tree list and dedup data blocks ---- */
     atomic_store(&state->phase, ANALYSIS_PHASE_DEDUP);
 

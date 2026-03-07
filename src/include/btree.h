@@ -285,4 +285,42 @@ struct __attribute__((packed)) cd_subchannel_record
     uint8_t  data[CD_SUBCHANNEL_DATA_SIZE];  ///< Inline subchannel data
 };
 
+/* ---- Sector Tag B+Trees (hash-dedup variant) ---- */
+
+/// Maximum inline sector tag data size (covers all known tag types).
+#define SECTOR_TAG_DATA_MAX 64
+
+/**
+ * Sector Tag Data Tree record.  Hash-keyed dictionary of unique tag blobs.
+ * Key: XXH64(tag_type || data[0..data_length-1]).
+ */
+struct __attribute__((packed)) sector_tag_data_record
+{
+    uint64_t hash;                          ///< XXH64(tag_type || data)
+    uint16_t tag_type;                      ///< SectorTagType enum value
+    uint16_t data_length;                   ///< Actual bytes of tag data
+    uint8_t  data[SECTOR_TAG_DATA_MAX];     ///< Inline tag data
+};
+
+/**
+ * Sector Tag Ref Tree record.  Maps (inode_id, sector, tag_type) to
+ * a hash in the Sector Tag Data Tree.
+ */
+struct __attribute__((packed)) sector_tag_ref_record
+{
+    uint64_t inode_id;     ///< Image inode
+    int64_t  sector;       ///< Logical sector number
+    uint16_t tag_type;     ///< SectorTagType discriminator
+    uint64_t tag_hash;     ///< XXH64(tag_type || data) -> key into data tree
+};
+
+/// Index entry for the Sector Tag Ref Tree.
+struct __attribute__((packed)) sector_tag_ref_index_entry
+{
+    uint64_t inode_id;     ///< Smallest inode_id reachable through child
+    int64_t  sector;       ///< Smallest sector reachable through child
+    uint16_t tag_type;     ///< Smallest tag_type reachable through child
+    uint64_t child_lba;    ///< LBA of the child node
+};
+
 #endif /* OBMAFS3_BTREE_H */

@@ -79,7 +79,16 @@ struct __attribute__((packed)) obmafs3_sb
     uint64_t rocompat_flags;     ///< Feature flags requiring read-only mount if unknown
     uint64_t incompatible_flags; ///< Feature flags that must be understood to mount at all
     uint8_t  volume_label[256];  ///< Volume label of the filesystem
-    uint8_t  checksum[32];       ///< Checksum of the superblock (XXH64, 8 bytes used, 24 zeroed)
+    uint8_t  checksum[32];       ///< Checksum of V1 portion (bytes 0..525 with this field zeroed)
+
+    /* ---- Extension fields (bytes 526..4063) ---- */
+    uint64_t sector_tag_data_lba;  ///< LBA of the Sector Tag Data B+Tree header (0 = none)
+    uint64_t sector_tag_ref_lba;   ///< LBA of the Sector Tag Ref B+Tree header (0 = none)
+    uint8_t  reserved[3506];       ///< Zero-filled, reserved for future expansion
+    uint8_t  checksum2[32];        ///< Checksum of extension area (bytes 526..4095 with this field zeroed)
 };
+
+/// Size of the original (V1) portion of the superblock, covered by checksum.
+#define OBMAFS3_SB_V1_SIZE 526
 
 #endif /* OBMAFS3_SUPERBLOCK_H */

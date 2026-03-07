@@ -756,9 +756,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         return NULL;
     }
 
-    /* Progress reporting — 19 discrete steps */
+    /* Progress reporting — 21 discrete steps */
     int       step        = 0;
-    const int total_steps = 19;
+    const int total_steps = 21;
 
 #define PROGRESS(desc)                                                                     \
     do                                                                                     \
@@ -975,6 +975,48 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
             int rc = walk_inode_btree_nodes(ctx, ctx->refcount_hdr.root_node_lba, sizeof(struct btree_index_entry),
                                             __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0,
                                             NULL);
+            if(rc == OBMAFS3_OK)
+            {
+                for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
+                free(nodes);
+            }
+        }
+    }
+
+    /* Sector Tag Data tree header and nodes (if present) */
+    PROGRESS("sector tag data tree");
+    if(ctx->sb.sector_tag_data_lba != 0)
+    {
+        MARK(ctx->sb.sector_tag_data_lba);
+        if(ctx->sector_tag_data_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes = NULL;
+            uint64_t  count = 0;
+            int rc = walk_inode_btree_nodes(ctx, ctx->sector_tag_data_hdr.root_node_lba,
+                                            sizeof(struct btree_index_entry),
+                                            __builtin_offsetof(struct btree_index_entry, child_lba), &nodes, &count, 0,
+                                            NULL);
+            if(rc == OBMAFS3_OK)
+            {
+                for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
+                free(nodes);
+            }
+        }
+    }
+
+    /* Sector Tag Ref tree header and nodes (if present) */
+    PROGRESS("sector tag ref tree");
+    if(ctx->sb.sector_tag_ref_lba != 0)
+    {
+        MARK(ctx->sb.sector_tag_ref_lba);
+        if(ctx->sector_tag_ref_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes = NULL;
+            uint64_t  count = 0;
+            int rc = walk_inode_btree_nodes(ctx, ctx->sector_tag_ref_hdr.root_node_lba,
+                                            sizeof(struct sector_tag_ref_index_entry),
+                                            __builtin_offsetof(struct sector_tag_ref_index_entry, child_lba), &nodes,
+                                            &count, 0, NULL);
             if(rc == OBMAFS3_OK)
             {
                 for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);

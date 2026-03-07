@@ -436,6 +436,28 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
                 return rc;
             }
         }
+
+        if(c->sb.sector_tag_data_lba != 0)
+        {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.sector_tag_data_lba, &c->sector_tag_data_hdr, &cs_ok);
+            if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            {
+                close(fd);
+                free(c);
+                return rc;
+            }
+        }
+
+        if(c->sb.sector_tag_ref_lba != 0)
+        {
+            rc = obmafs3_btree_header_read_lenient(c, c->sb.sector_tag_ref_lba, &c->sector_tag_ref_hdr, &cs_ok);
+            if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            {
+                close(fd);
+                free(c);
+                return rc;
+            }
+        }
     }
     else
     {
@@ -535,6 +557,28 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         if(c->sb.refcount_lba != 0)
         {
             rc = obmafs3_btree_header_read(c, c->sb.refcount_lba, &c->refcount_hdr);
+            if(rc != OBMAFS3_OK)
+            {
+                close(fd);
+                free(c);
+                return rc;
+            }
+        }
+
+        if(c->sb.sector_tag_data_lba != 0)
+        {
+            rc = obmafs3_btree_header_read(c, c->sb.sector_tag_data_lba, &c->sector_tag_data_hdr);
+            if(rc != OBMAFS3_OK)
+            {
+                close(fd);
+                free(c);
+                return rc;
+            }
+        }
+
+        if(c->sb.sector_tag_ref_lba != 0)
+        {
+            rc = obmafs3_btree_header_read(c, c->sb.sector_tag_ref_lba, &c->sector_tag_ref_hdr);
             if(rc != OBMAFS3_OK)
             {
                 close(fd);
@@ -779,13 +823,25 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
     else
         bitmap_blks = 1 + (bitmap_bytes - first_block_capacity + block_size - 1) / block_size;
 
-    sb.bitmap_lba    = 14; /* bitmap starts at block 14 */
+    sb.bitmap_lba    = 16; /* bitmap starts after sector tag headers */
     sb.bitmap_blocks = bitmap_blks;
     sb.next_inode_id = 3; /* root inode is 2, next is 3 */
     strncpy((char *)sb.volume_label, label, sizeof(sb.volume_label) - 1);
 
-    /* Compute superblock checksum (checksum field is already zeroed) */
-    obmafs3_checksum_block(&sb, sizeof(sb), sb.checksum);
+    /* Sector tag trees: blocks 14 and 15 (right after refcount header).
+     * Set the rocompat flag so older code mounts read-only. */
+    sb.sector_tag_data_lba = 14;
+    sb.sector_tag_ref_lba  = 15;
+    sb.rocompat_flags     |= OBMAFS3_ROCOMPAT_SECTOR_TAGS;
+
+    /* Compute V1 checksum (covers bytes 0..OBMAFS3_SB_V1_SIZE-1) */
+    memset(sb.checksum, 0, sizeof(sb.checksum));
+    obmafs3_checksum_block(&sb, OBMAFS3_SB_V1_SIZE, sb.checksum);
+
+    /* Compute extension checksum (covers bytes 526..4095) */
+    memset(sb.checksum2, 0, sizeof(sb.checksum2));
+    obmafs3_checksum_block((const uint8_t *)&sb + OBMAFS3_SB_V1_SIZE,
+                           sizeof(sb) - OBMAFS3_SB_V1_SIZE, sb.checksum2);
 
     rc = write_block(fd, block_size, 0, &sb, sizeof(sb));
     if(rc != OBMAFS3_OK)
@@ -1063,7 +1119,39 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
         return rc;
     }
 
-    /* --- Blocks 14..14+N-1: Allocation bitmap --- */
+    /* --- Sector Tag Data tree header (empty) --- */
+    struct btree_header std_hdr;
+    memset(&std_hdr, 0, sizeof(std_hdr));
+    std_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    std_hdr.data_type = kBtreeDataTypeSectorTagDataEntry;
+    std_hdr.node_size = (uint16_t)block_size;
+    std_hdr.tree_type = kBtreeTypeSectorTagData;
+    obmafs3_checksum_block(&std_hdr, sizeof(std_hdr), std_hdr.checksum);
+
+    rc = write_block(fd, block_size, 14, &std_hdr, sizeof(std_hdr));
+    if(rc != OBMAFS3_OK)
+    {
+        close(fd);
+        return rc;
+    }
+
+    /* --- Sector Tag Ref tree header (empty) --- */
+    struct btree_header str_hdr;
+    memset(&str_hdr, 0, sizeof(str_hdr));
+    str_hdr.magic     = OBMAFS3_BTREE_HDR_MAGIC;
+    str_hdr.data_type = kBtreeDataTypeSectorTagRefEntry;
+    str_hdr.node_size = (uint16_t)block_size;
+    str_hdr.tree_type = kBtreeTypeSectorTagRef;
+    obmafs3_checksum_block(&str_hdr, sizeof(str_hdr), str_hdr.checksum);
+
+    rc = write_block(fd, block_size, 15, &str_hdr, sizeof(str_hdr));
+    if(rc != OBMAFS3_OK)
+    {
+        close(fd);
+        return rc;
+    }
+
+    /* --- Blocks after sector tag headers: Allocation bitmap --- */
     {
         /* Build the flat bitmap data */
         uint8_t *bitmap = calloc(1, (size_t)bitmap_bytes);
@@ -1073,8 +1161,9 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
             DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
 
-        /* Mark blocks 0 through (14 + bitmap_blks - 1) as allocated */
-        uint64_t reserved = 14 + bitmap_blks;
+        /* Mark blocks 0 through (16 + bitmap_blks - 1) as allocated.
+         * This includes: superblock(1) + tree headers(15) + bitmap. */
+        uint64_t reserved = 16 + bitmap_blks;
         for(uint64_t b = 0; b < reserved; b++) bitmap[b / 8] |= (1u << (b % 8));
 
         /* Mark the last block (backup superblock) as allocated */
@@ -1122,7 +1211,7 @@ int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, u
                 data_remaining -= copy;
             }
 
-            rc = write_block(fd, block_size, 14 + i, blk, (size_t)block_size);
+            rc = write_block(fd, block_size, sb.bitmap_lba + i, blk, (size_t)block_size);
             if(rc != OBMAFS3_OK)
             {
                 free(blk);

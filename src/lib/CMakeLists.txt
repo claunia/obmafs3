@@ -17,6 +17,7 @@ add_library(obmafs STATIC
     dedup_housekeeping.c
     ecc_cd.c
     refcount.c
+    sector_tag.c
     io.c
 )
 

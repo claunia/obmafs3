@@ -94,7 +94,8 @@ struct obmafs3_thread_bufs
 
 /* Feature flags — none defined yet; all bits are reserved for future use. */
 #define OBMAFS3_COMPAT_FLAGS_KNOWN   0ULL  ///< Mask of known compatible feature flags
-#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN 0ULL  ///< Mask of known read-only compatible feature flags
+#define OBMAFS3_ROCOMPAT_SECTOR_TAGS (1ULL << 0)  ///< Sector tags feature (hash-dedup per-sector side data)
+#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN OBMAFS3_ROCOMPAT_SECTOR_TAGS  ///< Mask of known read-only compatible feature flags
 #define OBMAFS3_INCOMPAT_FLAGS_KNOWN 0ULL  ///< Mask of known incompatible feature flags
 
 /** Filesystem context */
@@ -112,6 +113,8 @@ struct obmafs3_ctx
     struct btree_header   metadata_hdr;            ///< Cached metadata tree header
     struct btree_header   metadata_idx_hdr;        ///< Cached metadata index tree header
     struct btree_header   refcount_hdr;            ///< Cached refcount tree header
+    struct btree_header   sector_tag_data_hdr;      ///< Cached sector tag data tree header
+    struct btree_header   sector_tag_ref_hdr;       ///< Cached sector tag ref tree header
     uint8_t              *bitmap;                  ///< In-memory allocation bitmap
     uint64_t              bitmap_size;             ///< Size of allocation bitmap in bytes
     uint64_t              next_free_lba;           ///< Allocation hint (persisted in bitmap header)
@@ -356,6 +359,13 @@ int obmafs3_cd_subchannel_get_location(struct obmafs3_ctx *ctx, uint64_t hash, u
                                        uint64_t *leaf_lba, uint64_t *record_offset);
 int obmafs3_cd_subchannel_put(struct obmafs3_ctx *ctx, uint64_t hash, const uint8_t data[CD_SUBCHANNEL_DATA_SIZE]);
 int obmafs3_cd_subchannel_delete(struct obmafs3_ctx *ctx, uint64_t hash);
+
+/* --- Sector tag operations (hash-dedup variant) --- */
+int obmafs3_sector_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id, int64_t sector, uint16_t tag_type,
+                           void *data, uint16_t *data_length);
+int obmafs3_sector_tag_put(struct obmafs3_ctx *ctx, uint64_t inode_id, int64_t sector, uint16_t tag_type,
+                           const void *data, uint16_t data_length);
+int obmafs3_sector_tag_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id);
 
 /* --- Image metadata operations --- */
 int  obmafs3_metadata_get(struct obmafs3_ctx *ctx, uint64_t inode_id, const char *key, char *value, size_t value_size);

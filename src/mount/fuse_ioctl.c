@@ -885,6 +885,29 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             return rc == OBMAFS3_OK ? 0 : -EIO;
         }
 
+        case OBMAFS3_IOC_SET_SECTOR_TAG:
+        {
+            if(ffctx->inode.file_type != kFileTypeMediaImage) FUSE_RETURN(-ENOTTY, "");
+            const struct obmafs3_ioctl_sector_tag_write_arg *sta =
+                (const struct obmafs3_ioctl_sector_tag_write_arg *)data;
+            if(!sta || sta->data_length > SECTOR_TAG_DATA_MAX) FUSE_RETURN(-EINVAL, "");
+            int rc = obmafs3_sector_tag_put(g_ctx, ffctx->inode_id, sta->sector,
+                                            sta->tag_type, sta->data, sta->data_length);
+            return rc == OBMAFS3_OK ? 0 : -EIO;
+        }
+
+        case OBMAFS3_IOC_GET_SECTOR_TAG:
+        {
+            if(ffctx->inode.file_type != kFileTypeMediaImage) FUSE_RETURN(-ENOTTY, "");
+            struct obmafs3_ioctl_sector_tag_read_arg *sta =
+                (struct obmafs3_ioctl_sector_tag_read_arg *)data;
+            if(!sta) FUSE_RETURN(-EINVAL, "");
+            int rc = obmafs3_sector_tag_get(g_ctx, ffctx->inode_id, sta->sector,
+                                            sta->tag_type, sta->data, &sta->data_length);
+            if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
+            return rc == OBMAFS3_OK ? 0 : -EIO;
+        }
+
         default:
             FUSE_RETURN(-ENOTTY, "");
     }

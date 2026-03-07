@@ -361,7 +361,10 @@ void validate_superblock_fields(struct obmafs3_sb *sb, int fd, uint64_t file_siz
     {
         /* Recompute superblock checksum before writing */
         memset(sb->checksum, 0, sizeof(sb->checksum));
-        obmafs3_checksum_block(sb, sizeof(*sb), sb->checksum);
+        obmafs3_checksum_block(sb, OBMAFS3_SB_V1_SIZE, sb->checksum);
+        memset(sb->checksum2, 0, sizeof(sb->checksum2));
+        obmafs3_checksum_block((const uint8_t *)sb + OBMAFS3_SB_V1_SIZE,
+                               sizeof(*sb) - OBMAFS3_SB_V1_SIZE, sb->checksum2);
 
         ssize_t n = pwrite(fd, sb, sizeof(*sb), 0);
         if(n < 0 || (size_t)n != sizeof(*sb))

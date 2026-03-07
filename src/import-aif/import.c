@@ -295,3 +295,105 @@ int import_cd_image(void *aaruf_ctx, int fd, const ImageInfo *info)
     aaruf_ecc_cd_free(ecc_ctx);
     return 0;
 }
+
+/**
+ * Import per-sector tags from a non-CD media image.
+ *
+ * Queries libaaruformat for available sector tag types, then iterates
+ * all sectors and writes each tag via the OBMAFS3_IOC_SET_SECTOR_TAG
+ * ioctl.  CD-specific tags (sync, header, subchannel, etc.) are
+ * skipped — they are handled by the CD import path.
+ *
+ * @param aaruf_ctx  libaaruformat context.
+ * @param fd         Open file descriptor on the mounted OBMAFS3 file.
+ * @param info       ImageInfo from libaaruformat.
+ * @return 0 on success, -1 on error.
+ */
+int import_sector_tags(void *aaruf_ctx, int fd, const ImageInfo *info)
+{
+    /* Query which sector tags are available */
+    uint8_t stag_buf[22]; /* one bool per SectorTagType (MaxSectorTag+1) */
+    size_t  stag_len = sizeof(stag_buf);
+    int     strc     = aaruf_get_readable_sector_tags(aaruf_ctx, stag_buf, &stag_len);
+    if(strc != 0 || stag_len == 0) return 0; /* no sector tags available */
+
+    /* Non-CD sector tag types we want to import.
+     * CD-specific tags (1..11) are handled by the CD import path. */
+    static const struct
+    {
+        int      aaruf_tag;  /* SectorTagType from libaaruformat */
+        uint16_t obmafs_tag; /* our enum value */
+        uint16_t max_size;   /* maximum expected tag size */
+    } tag_map[] = {
+        { 0,  0, 12}, /* AppleSonyTagAaru    -> 12 bytes */
+        {12, 12,  1}, /* DvdCmi              -> per-sector CMI */
+        {13, 13, 32}, /* FloppyAddressMark   -> variable */
+        {14, 14,  5}, /* DvdSectorTitleKey   -> 5 bytes */
+        {15, 15,  5}, /* DvdTitleKeyDecrypted -> 5 bytes */
+        {16, 16,  1}, /* DvdSectorInformation -> 1 byte */
+        {17, 17,  3}, /* DvdSectorNumber     -> 3 bytes */
+        {18, 18,  2}, /* DvdSectorIedAaru    -> 2 bytes */
+        {19, 19,  4}, /* DvdSectorEdcAaru    -> 4 bytes */
+        {20, 20, 20}, /* AppleProfileTagAaru -> 20 bytes */
+        {21, 21, 24}, /* PriamDataTowerTagAaru -> 24 bytes */
+    };
+    int n_tags = (int)(sizeof(tag_map) / sizeof(tag_map[0]));
+
+    /* Check which tags are actually present */
+    int any_present = 0;
+    for(int t = 0; t < n_tags; t++)
+    {
+        if(tag_map[t].aaruf_tag < (int)stag_len && stag_buf[tag_map[t].aaruf_tag])
+            any_present = 1;
+    }
+    if(!any_present)
+    {
+        ui_info("Sector tags:", "none available");
+        return 0;
+    }
+
+    uint64_t sectors  = info->Sectors;
+    uint64_t imported = 0;
+    uint8_t  tag_data[SECTOR_TAG_DATA_MAX];
+
+    for(int t = 0; t < n_tags; t++)
+    {
+        if(tag_map[t].aaruf_tag >= (int)stag_len || !stag_buf[tag_map[t].aaruf_tag])
+            continue;
+
+        ui_info("Importing sector tag:", "type %d", tag_map[t].aaruf_tag);
+
+        for(uint64_t s = 0; s < sectors; s++)
+        {
+            uint32_t length = tag_map[t].max_size;
+            if(length > SECTOR_TAG_DATA_MAX) length = SECTOR_TAG_DATA_MAX;
+
+            int rrc = aaruf_read_sector_tag(aaruf_ctx, s, false, tag_data, &length, tag_map[t].aaruf_tag);
+            if(rrc != AARUF_STATUS_OK) continue;
+
+            struct obmafs3_ioctl_sector_tag_write_arg arg;
+            memset(&arg, 0, sizeof(arg));
+            arg.sector      = (int64_t)s;
+            arg.tag_type    = tag_map[t].obmafs_tag;
+            arg.data_length = (uint16_t)length;
+            memcpy(arg.data, tag_data, length);
+
+            if(ioctl(fd, OBMAFS3_IOC_SET_SECTOR_TAG, &arg) != 0)
+            {
+                ui_error("SET_SECTOR_TAG failed at sector %" PRIu64 " tag %d (errno=%d)",
+                         s, tag_map[t].aaruf_tag, errno);
+                return -1;
+            }
+
+            imported++;
+            if((imported % 5000) == 0)
+                ui_progress("Sector tags", s + 1, sectors);
+        }
+
+        ui_progress("Sector tags", sectors, sectors);
+        ui_progress_clear();
+    }
+
+    ui_ok("Imported %" PRIu64 " sector tag entries", imported);
+    return 0;
+}
