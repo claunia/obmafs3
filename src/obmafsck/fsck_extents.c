@@ -877,11 +877,11 @@ static void check_file_size_vs_extents(struct obmafs3_ctx *ctx, int auto_yes, in
                 /* Skip directories — they have no data extents */
                 if(rec.file_type == kFileTypeDirectory) continue;
 
-                /* Skip media/CD images and subchannel sidecars — file_size
+                /* Skip media/CD/Nintendo images and subchannel sidecars — file_size
                  * reflects logical disk size, not extent capacity, because
                  * data is stored via dedup / CD B+Trees */
                 if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeCompactDiscImage ||
-                   rec.file_type == kFileTypeSubchannelFile)
+                   rec.file_type == kFileTypeSubchannelFile || rec.file_type == kFileTypeNintendo)
                     continue;
 
                 /* Sum inline extents */
