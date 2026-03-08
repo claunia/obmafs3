@@ -157,6 +157,7 @@ int obmafs3_junk_map_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t of
         uint64_t new_lba;
         rc = obmafs3_btree_alloc_node(ctx, &ctx->junk_map_hdr, hdr_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
+        ctx->junk_map_hdr.total_nodes++;
 
         uint8_t *buf = calloc(1, bsz);
         if(!buf) return OBMAFS3_ERR_NOMEM;
@@ -275,6 +276,7 @@ int obmafs3_junk_map_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t of
     uint64_t right_lba;
     rc = obmafs3_btree_alloc_node(ctx, &ctx->junk_map_hdr, hdr_lba, &right_lba);
     if(rc != OBMAFS3_OK) { fprintf(stderr, "[junk_map] alloc_node for split failed: rc=%d\n", rc); free(tmp); free(buf); return rc; }
+    ctx->junk_map_hdr.total_nodes++;
 
     uint8_t *rbuf = calloc(1, bsz);
     if(!rbuf) { free(tmp); free(buf); obmafs3_btree_header_write(ctx, hdr_lba, &ctx->junk_map_hdr); return OBMAFS3_ERR_NOMEM; }
@@ -409,6 +411,7 @@ int obmafs3_junk_map_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t of
             uint64_t idx_right_lba;
             rc = obmafs3_btree_alloc_node(ctx, &ctx->junk_map_hdr, hdr_lba, &idx_right_lba);
             if(rc != OBMAFS3_OK) { free(idx_tmp); free(buf); obmafs3_btree_header_write(ctx, hdr_lba, &ctx->junk_map_hdr); return rc; }
+            ctx->junk_map_hdr.total_nodes++;
 
             uint8_t *idx_rbuf = calloc(1, bsz);
             if(!idx_rbuf) { free(idx_tmp); free(buf); obmafs3_btree_header_write(ctx, hdr_lba, &ctx->junk_map_hdr); return OBMAFS3_ERR_NOMEM; }
@@ -453,6 +456,7 @@ int obmafs3_junk_map_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t of
     uint64_t new_root_lba;
     rc = obmafs3_btree_alloc_node(ctx, &ctx->junk_map_hdr, hdr_lba, &new_root_lba);
     if(rc != OBMAFS3_OK) { free(buf); return rc; }
+    ctx->junk_map_hdr.total_nodes++;
 
     /* Left child's min key — read from the left child node.
      * 'lba' points to the left child (the old root or split parent).
