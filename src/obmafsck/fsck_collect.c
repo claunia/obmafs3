@@ -1025,6 +1025,27 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         }
     }
 
+    /* Junk Map tree header and nodes (if present) */
+    PROGRESS("junk map tree");
+    if(ctx->sb.junk_map_lba != 0)
+    {
+        MARK(ctx->sb.junk_map_lba);
+        if(ctx->junk_map_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes = NULL;
+            uint64_t  count = 0;
+            int rc = walk_inode_btree_nodes(ctx, ctx->junk_map_hdr.root_node_lba,
+                                            sizeof(struct junk_map_index_entry),
+                                            __builtin_offsetof(struct junk_map_index_entry, child_lba), &nodes,
+                                            &count, 0, NULL);
+            if(rc == OBMAFS3_OK)
+            {
+                for(uint64_t i = 0; i < count; i++) MARK(nodes[i]);
+                free(nodes);
+            }
+        }
+    }
+
     /* Bitmap blocks */
     PROGRESS("bitmap blocks");
     for(uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++) MARK(ctx->sb.bitmap_lba + i);

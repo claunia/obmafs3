@@ -477,6 +477,11 @@ void defrag_all_trees(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
         defrag_tree(ctx, "refcount", ctx->sb.refcount_lba, &ctx->refcount_hdr, sizeof(struct btree_index_entry),
                     __builtin_offsetof(struct btree_index_entry, child_lba), 1, auto_yes, auto_no);
 
+    /* Junk map */
+    if(ctx->sb.junk_map_lba != 0)
+        defrag_tree(ctx, "junk map", ctx->sb.junk_map_lba, &ctx->junk_map_hdr, sizeof(struct junk_map_index_entry),
+                    __builtin_offsetof(struct junk_map_index_entry, child_lba), 1, auto_yes, auto_no);
+
     /* Multi-block trees */
     printf("  Checking multi-block trees:\n");
 

@@ -379,6 +379,14 @@ int main(int argc, char *argv[])
                     sb.sector_tag_ref_lba, rc);
     }
 
+    if(sb.junk_map_lba != 0)
+    {
+        rc = obmafs3_btree_header_read_lenient(ctx, sb.junk_map_lba, &ctx->junk_map_hdr, &cs_tmp);
+        if(rc != OBMAFS3_OK && rc != OBMAFS3_ERR_CHECKSUM)
+            fprintf(stderr, "Warning: cannot read junk map tree header at LBA %" PRIu64 " (error %d)\n",
+                    sb.junk_map_lba, rc);
+    }
+
     int errors = 0;
 
     /* ---- Dedup-stats-only fast path: skip all integrity checks ---- */
@@ -1747,6 +1755,62 @@ int main(int argc, char *argv[])
                                        "SectorTagRef", "  ", auto_yes, auto_no, &errors);
                 verify_fix_free_nodes(ctx, &ctx->sector_tag_ref_hdr, ctx->sb.sector_tag_ref_lba,
                                       "SectorTagRef", "  ", auto_yes, auto_no, &errors);
+            }
+            else
+            {
+                result_bad("Node checksums:", "could not walk tree");
+                errors++;
+            }
+        }
+    }
+
+    /* Junk map tree */
+    if(ctx->sb.junk_map_lba != 0)
+    {
+        printf("\n  %sJunk Map tree%s\n", CLR_BOLD, CLR_RESET);
+
+        if(ctx->junk_map_hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+            result_ok("Magic:", "0x%016" PRIx64, ctx->junk_map_hdr.magic);
+        else
+            result_bad("Magic:", "0x%016" PRIx64, ctx->junk_map_hdr.magic);
+
+        {
+            int cs_ok = 0;
+            obmafs3_btree_header_read_lenient(ctx, ctx->sb.junk_map_lba, &ctx->junk_map_hdr, &cs_ok);
+            if(cs_ok)
+                result_ok("Header checksum:", "");
+            else
+                result_bad("Header checksum:", "mismatch");
+            if(!cs_ok) errors++;
+        }
+
+        if(ctx->junk_map_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes      = NULL;
+            uint64_t  node_count = 0;
+            int wrc = walk_inode_btree_nodes(ctx, ctx->junk_map_hdr.root_node_lba,
+                                             sizeof(struct junk_map_index_entry),
+                                             __builtin_offsetof(struct junk_map_index_entry, child_lba),
+                                             &nodes, &node_count, ctx->junk_map_hdr.total_nodes, "JunkMap");
+            if(wrc == OBMAFS3_OK)
+            {
+                uint64_t bad = 0, cs_fix = 0;
+                verify_btree_node_checksums(ctx, nodes, node_count, "JunkMap", auto_yes, auto_no, &bad, &cs_fix);
+                free(nodes);
+                if(bad > 0)
+                {
+                    if(cs_fix > 0)
+                        result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+                    else
+                        result_bad("Node checksums:", "%" PRIu64 " bad", bad);
+                    errors += (int)(bad - cs_fix);
+                }
+                else
+                    result_ok("Node checksums:", "");
+                verify_fix_total_nodes(ctx, &ctx->junk_map_hdr, ctx->sb.junk_map_lba, node_count,
+                                       "JunkMap", "  ", auto_yes, auto_no, &errors);
+                verify_fix_free_nodes(ctx, &ctx->junk_map_hdr, ctx->sb.junk_map_lba,
+                                      "JunkMap", "  ", auto_yes, auto_no, &errors);
             }
             else
             {
