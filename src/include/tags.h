@@ -110,7 +110,8 @@ typedef enum
     kDVD_DiscKey_Decrypted = 73,  ///< Decrypted DVD disc key,
     kDVD_PFI_2ndLayer      = 74,  ///< DVD Physical Format Information for the second layer
     kFloppy_WriteProtect   = 75,  ///< Write protection status of the floppy disk
-    kMaxMediaTag           = kFloppy_WriteProtect
+    kNintendoWiiUDiscKey   = 76,  ///< Nintendo Wii U disc key (16 bytes, from non-readable disc area)
+    kMaxMediaTag           = kNintendoWiiUDiscKey
 } Obmafs3MediaTagType;
 
 #endif /* OBMAFS3_TAGS_H */

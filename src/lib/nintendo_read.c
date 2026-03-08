@@ -33,6 +33,7 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
+#include "aes128.h"
 #include "nintendo.h"
 #include "btree.h"
 #include "defs.h"
@@ -222,6 +223,116 @@ static int read_wii(struct obmafs3_ctx *ctx, const struct inode_record *inode, u
     return OBMAFS3_OK;
 }
 
+/* ---- Wii U read ---- */
+
+/*
+ * Wii U sectors from offset 0x18000 onward are AES-128-CBC encrypted
+ * with IV = zeros.  SI/UP/GI partitions use the disc key; GM partitions
+ * use a per-title key.  The import path stores decrypted data, so we
+ * re-encrypt with the correct partition key to reconstruct the original.
+ *
+ * Plaintext sectors (0-2 and each partition's header sector) are stored
+ * verbatim and returned as-is.
+ */
+
+#define WIIU_SECTOR_SIZE      0x8000
+#define WIIU_ENCRYPTED_OFFSET 0x18000
+
+static int read_wiiu(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset,
+                     void *buf, size_t size, const struct ngc_ri *ri)
+{
+    uint8_t *out = (uint8_t *)buf;
+    uint64_t pos = offset;
+    size_t   rem = size;
+
+    while(rem > 0)
+    {
+        /* Align to Wii U sector boundaries */
+        uint64_t sec_idx  = pos / WIIU_SECTOR_SIZE;
+        uint64_t sec_off  = pos % WIIU_SECTOR_SIZE;
+        uint64_t sec_base = sec_idx * WIIU_SECTOR_SIZE;
+
+        size_t avail = WIIU_SECTOR_SIZE - (size_t)sec_off;
+        size_t ch    = rem < avail ? rem : avail;
+
+        /* Read the stored (decrypted/plaintext) sector from dedup */
+        uint8_t sector[WIIU_SECTOR_SIZE];
+        int rc = obmafs3_read_media_image_data(ctx, inode, sec_base, sector, WIIU_SECTOR_SIZE,
+                                               NGC_SECTOR_SIZE, NULL, NULL);
+        if(rc != OBMAFS3_OK) return rc;
+
+        /*
+         * Determine if this sector needs re-encryption.
+         * Plaintext sectors:
+         *   - Before the encrypted area (offset < 0x18000, i.e. sectors 0-2)
+         *   - Partition header sectors (each partition's start_sector)
+         */
+        int is_plain = 0;
+
+        if(sec_base < WIIU_ENCRYPTED_OFFSET)
+        {
+            is_plain = 1;
+        }
+        else
+        {
+            for(int p = 0; p < ri->part_count; p++)
+            {
+                if(sec_base == ri->parts[p].data_offset)
+                {
+                    is_plain = 1;
+                    break;
+                }
+            }
+        }
+
+        if(!is_plain)
+        {
+            /* Find the partition this sector belongs to and re-encrypt with its key */
+            const uint8_t *key = NULL;
+            for(int p = 0; p < ri->part_count; p++)
+            {
+                uint64_t p_start = ri->parts[p].data_offset;
+                uint64_t p_end   = p_start + ri->parts[p].data_size;
+                if(sec_base >= p_start && sec_base < p_end)
+                {
+                    key = ri->parts[p].title_key;
+                    break;
+                }
+            }
+
+            /* If sector falls outside all partitions, use the first partition's key
+             * (disc key stored with SI/UP partitions) */
+            if(!key && ri->part_count > 0)
+                key = ri->parts[0].title_key;
+
+            if(key)
+            {
+                struct aes128_ctx aes;
+                uint8_t           iv[16];
+                uint8_t           enc[WIIU_SECTOR_SIZE];
+                memset(iv, 0, sizeof(iv));
+                aes128_init(&aes, key);
+                aes128_cbc_encrypt(&aes, iv, sector, enc, WIIU_SECTOR_SIZE);
+                memcpy(out, enc + sec_off, ch);
+            }
+            else
+            {
+                memcpy(out, sector + sec_off, ch);
+            }
+        }
+        else
+        {
+            memcpy(out, sector + sec_off, ch);
+        }
+
+        out += ch;
+        pos += ch;
+        rem -= ch;
+    }
+
+    return OBMAFS3_OK;
+}
+
 /* ---- Public entry point ---- */
 
 int obmafs3_read_nintendo_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode,
@@ -231,5 +342,7 @@ int obmafs3_read_nintendo_image_data(struct obmafs3_ctx *ctx, const struct inode
     int rc = load_info(ctx, inode->inode_id, &ri);
     if(rc != OBMAFS3_OK || ri.disc_type == 0)
         return read_gc(ctx, inode, offset, buf, size);
+    if(ri.disc_type == 2)
+        return read_wiiu(ctx, inode, offset, buf, size, &ri);
     return read_wii(ctx, inode, offset, buf, size, &ri);
 }
