@@ -688,6 +688,11 @@ int defrag_analysis_run(struct analysis_state *state)
                  sizeof(struct sector_tag_ref_index_entry),
                  offsetof(struct sector_tag_ref_index_entry, child_lba));
 
+    /* Junk Map tree (composite-keyed) */
+    analyse_tree(state, ctx->sb.junk_map_lba, "JunkMap",
+                 sizeof(struct junk_map_index_entry),
+                 offsetof(struct junk_map_index_entry, child_lba));
+
     /* ---- Phase 2: Walk dedup tree list and dedup data blocks ---- */
     atomic_store(&state->phase, ANALYSIS_PHASE_DEDUP);
 

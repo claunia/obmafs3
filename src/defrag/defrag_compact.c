@@ -2763,6 +2763,7 @@ static int compact_trees(struct compact_state *state)
     ADD_TREE("CdSuffix",     ctx->sb.cd_suffix_lba,     struct btree_index_entry,        child_lba, 1);
     ADD_TREE("CdSubchannel", ctx->sb.cd_subchannel_lba, struct btree_index_entry,        child_lba, 1);
     ADD_TREE("Refcount",     ctx->sb.refcount_lba,      struct btree_index_entry,        child_lba, 1);
+    ADD_TREE("JunkMap",      ctx->sb.junk_map_lba,      struct junk_map_index_entry,     child_lba, 1);
 
     /* Add dedup trees from the tree list */
     if(ctx->sb.dedup_lba != 0)
@@ -3022,6 +3023,7 @@ static int compact_trees(struct compact_state *state)
         else if(old_lba == ctx->sb.cd_suffix_lba)    ctx->sb.cd_suffix_lba = new_lba;
         else if(old_lba == ctx->sb.cd_subchannel_lba) ctx->sb.cd_subchannel_lba = new_lba;
         else if(old_lba == ctx->sb.refcount_lba)     ctx->sb.refcount_lba = new_lba;
+        else if(old_lba == ctx->sb.junk_map_lba)     ctx->sb.junk_map_lba = new_lba;
     }
 
     /* Update tree list entries for dedup trees */
