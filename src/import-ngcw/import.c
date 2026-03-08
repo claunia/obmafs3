@@ -164,46 +164,151 @@ int ngcw_import_gc(int iso_fd, int out_fd, const uint8_t *header, uint64_t disc_
         }
 
         /* Classify sectors and build the output block in-place:
-         * zero junk sectors in block_buf, record seeds, keep data sectors. */
-        for(size_t s = 0; s < block_bytes; s += NGC_SECTOR_SIZE)
+         * zero junk sectors in block_buf, record seeds, keep data sectors.
+         *
+         * When the full-block LFG check fails (mixed block), we still
+         * try per-run seed extraction on contiguous non-data sectors.
+         * The LFG seed is the same for the entire 0x8000-aligned block —
+         * only the stream position differs. */
+
+        /* First pass: classify each sector as data or non-data */
+        int sector_is_data[GC_SECTORS_PER_BLOCK];
+        int num_sectors = (int)(block_bytes / NGC_SECTOR_SIZE);
+        if(block_bytes % NGC_SECTOR_SIZE) num_sectors++;
+
+        for(int si = 0; si < num_sectors; si++)
         {
-            uint64_t offset     = block_off + s;
-            size_t   sector_len = NGC_SECTOR_SIZE;
-            if(s + sector_len > block_bytes) sector_len = block_bytes - s;
+            uint64_t offset = block_off + (uint64_t)si * NGC_SECTOR_SIZE;
+            size_t   slen   = NGC_SECTOR_SIZE;
+            if((uint64_t)si * NGC_SECTOR_SIZE + slen > block_bytes)
+                slen = block_bytes - (size_t)si * NGC_SECTOR_SIZE;
 
-            int is_data;
             if(offset < sys_end)
-                is_data = 1;
+                sector_is_data[si] = 1;
             else
-                is_data = ngc_is_data_region(&data_map, offset, sector_len);
+                sector_is_data[si] = ngc_is_data_region(&data_map, offset, slen);
+        }
 
-            if(is_data)
+        /* If the full block is LFG junk, use the block seed for all non-data sectors */
+        if(block_is_lfg)
+        {
+            for(int si = 0; si < num_sectors; si++)
             {
-                data_sectors++;
-            }
-            else if(block_is_lfg)
-            {
-                memset(block_buf + s, 0, sector_len);
-                ngcw_junk_collector_add(jc, offset, sector_len, 0xFFFF, block_seed);
-                junk_sectors++;
-            }
-            else
-            {
-                int all_zero = 1;
-                for(size_t b = 0; b < sector_len; b++)
-                {
-                    if(block_buf[s + b] != 0) { all_zero = 0; break; }
-                }
+                size_t s    = (size_t)si * NGC_SECTOR_SIZE;
+                size_t slen = NGC_SECTOR_SIZE;
+                if(s + slen > block_bytes) slen = block_bytes - s;
 
-                if(all_zero)
+                if(sector_is_data[si])
                 {
-                    zero_sectors++;
-                    junk_sectors++;
+                    data_sectors++;
                 }
                 else
                 {
-                    /* Unknown non-zero content outside FST — keep verbatim */
+                    memset(block_buf + s, 0, slen);
+                    ngcw_junk_collector_add(jc, block_off + s, slen, 0xFFFF, block_seed);
+                    junk_sectors++;
+                }
+            }
+        }
+        else
+        {
+            /* Mixed block: find contiguous runs of non-data sectors and
+             * attempt LFG seed extraction on each run.  The LFG stream
+             * is 0x8000-aligned, so data_offset = run_start within the block. */
+            int si = 0;
+            while(si < num_sectors)
+            {
+                if(sector_is_data[si])
+                {
                     data_sectors++;
+                    si++;
+                    continue;
+                }
+
+                /* Find the extent of this contiguous non-data run */
+                int run_start = si;
+                while(si < num_sectors && !sector_is_data[si]) si++;
+                int run_end = si; /* exclusive */
+
+                size_t run_byte_start = (size_t)run_start * NGC_SECTOR_SIZE;
+                size_t run_byte_end   = (size_t)run_end * NGC_SECTOR_SIZE;
+                if(run_byte_end > block_bytes) run_byte_end = block_bytes;
+                size_t run_bytes = run_byte_end - run_byte_start;
+
+                /* Try LFG seed extraction on this run */
+                int      run_has_seed = 0;
+                uint32_t run_seed[NGC_LFG_SEED_SIZE];
+                if(run_bytes >= NGC_LFG_K * sizeof(uint32_t))
+                {
+                    size_t matched = ngc_lfg_get_seed(block_buf + run_byte_start,
+                                                      run_bytes, run_byte_start, run_seed);
+                    if(matched >= run_bytes)
+                        run_has_seed = 1;
+                }
+
+                /* Classify each sector in this run */
+                for(int ri = run_start; ri < run_end; ri++)
+                {
+                    size_t s    = (size_t)ri * NGC_SECTOR_SIZE;
+                    size_t slen = NGC_SECTOR_SIZE;
+                    if(s + slen > block_bytes) slen = block_bytes - s;
+
+                    if(run_has_seed)
+                    {
+                        /* Verify this individual sector against the seed */
+                        struct ngc_lfg_ctx lfg;
+                        uint32_t           sc[NGC_LFG_SEED_SIZE];
+                        memcpy(sc, run_seed, sizeof(sc));
+                        ngc_lfg_set_seed(&lfg, sc);
+
+                        /* Advance to this sector's position */
+                        if(s > 0)
+                        {
+                            uint8_t discard[4096];
+                            size_t  adv = s;
+                            while(adv > 0)
+                            {
+                                size_t step = adv > sizeof(discard) ? sizeof(discard) : adv;
+                                ngc_lfg_get_bytes(&lfg, discard, step);
+                                adv -= step;
+                            }
+                        }
+
+                        uint8_t expected[NGC_SECTOR_SIZE];
+                        ngc_lfg_get_bytes(&lfg, expected, slen);
+
+                        if(memcmp(block_buf + s, expected, slen) == 0)
+                        {
+                            memset(block_buf + s, 0, slen);
+                            ngcw_junk_collector_add(jc, block_off + s, slen, 0xFFFF, run_seed);
+                            junk_sectors++;
+                        }
+                        else
+                        {
+                            /* Doesn't match LFG — keep verbatim */
+                            data_sectors++;
+                        }
+                    }
+                    else
+                    {
+                        /* No seed available — check if zero-fill */
+                        int all_zero = 1;
+                        for(size_t b = 0; b < slen; b++)
+                        {
+                            if(block_buf[s + b] != 0) { all_zero = 0; break; }
+                        }
+
+                        if(all_zero)
+                        {
+                            zero_sectors++;
+                            junk_sectors++;
+                        }
+                        else
+                        {
+                            /* Unknown non-zero content outside FST — keep verbatim */
+                            data_sectors++;
+                        }
+                    }
                 }
             }
         }
