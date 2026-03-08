@@ -163,14 +163,14 @@ int ngcw_import_gc(int iso_fd, int out_fd, const uint8_t *header, uint64_t disc_
                 block_is_lfg = 1;
         }
 
-        /* Write sectors */
+        /* Classify sectors and build the output block in-place:
+         * zero junk sectors in block_buf, record seeds, keep data sectors. */
         for(size_t s = 0; s < block_bytes; s += NGC_SECTOR_SIZE)
         {
             uint64_t offset     = block_off + s;
             size_t   sector_len = NGC_SECTOR_SIZE;
             if(s + sector_len > block_bytes) sector_len = block_bytes - s;
 
-            /* Is this sector in the system area or a file region? */
             int is_data;
             if(offset < sys_end)
                 is_data = 1;
@@ -179,67 +179,42 @@ int ngcw_import_gc(int iso_fd, int out_fd, const uint8_t *header, uint64_t disc_
 
             if(is_data)
             {
-                /* Real data — write to dedup */
-                ssize_t w = write(out_fd, block_buf + s, sector_len);
-                if(w < (ssize_t)sector_len)
-                {
-                    fprintf(stderr, "\nError: write failed at offset 0x%lX\n", (unsigned long)offset);
-                    ngc_data_map_free(&data_map);
-                    return -1;
-                }
                 data_sectors++;
+            }
+            else if(block_is_lfg)
+            {
+                memset(block_buf + s, 0, sector_len);
+                ngcw_junk_collector_add(jc, offset, sector_len, 0xFFFF, block_seed);
+                junk_sectors++;
             }
             else
             {
-                /* Unused sector — not in any FST file region.
-                 * Write zeroes as placeholder to preserve 1:1 offset mapping.
-                 * If the block matched LFG, record seed so the read path
-                 * can reconstruct the original junk bytes on the fly. */
-                static const uint8_t zero_sector[NGC_SECTOR_SIZE] = {0};
-
-                if(block_is_lfg)
+                int all_zero = 1;
+                for(size_t b = 0; b < sector_len; b++)
                 {
-                    ngcw_junk_collector_add(jc, offset, sector_len, 0xFFFF, block_seed);
+                    if(block_buf[s + b] != 0) { all_zero = 0; break; }
+                }
+
+                if(all_zero)
+                {
+                    zero_sectors++;
                     junk_sectors++;
                 }
                 else
                 {
-                    /* Check if sector is already all zeroes */
-                    int all_zero = 1;
-                    for(size_t b = 0; b < sector_len; b++)
-                    {
-                        if(block_buf[s + b] != 0) { all_zero = 0; break; }
-                    }
-
-                    if(all_zero)
-                    {
-                        zero_sectors++;
-                        junk_sectors++;
-                    }
-                    else
-                    {
-                        /* Unknown non-zero content outside FST — write actual data */
-                        ssize_t w = write(out_fd, block_buf + s, sector_len);
-                        if(w < (ssize_t)sector_len)
-                        {
-                            fprintf(stderr, "\nError: write failed at offset 0x%lX\n", (unsigned long)offset);
-                            ngc_data_map_free(&data_map);
-                            return -1;
-                        }
-                        data_sectors++;
-                        continue;
-                    }
-                }
-
-                /* Write zeroes as placeholder */
-                ssize_t w = write(out_fd, zero_sector, sector_len);
-                if(w < (ssize_t)sector_len)
-                {
-                    fprintf(stderr, "\nError: write failed at offset 0x%lX\n", (unsigned long)offset);
-                    ngc_data_map_free(&data_map);
-                    return -1;
+                    /* Unknown non-zero content outside FST — keep verbatim */
+                    data_sectors++;
                 }
             }
+        }
+
+        /* Write the entire block in one call */
+        ssize_t w = write(out_fd, block_buf, block_bytes);
+        if(w < (ssize_t)block_bytes)
+        {
+            fprintf(stderr, "\nError: write failed at offset 0x%lX\n", (unsigned long)block_off);
+            ngc_data_map_free(&data_map);
+            return -1;
         }
     }
 
