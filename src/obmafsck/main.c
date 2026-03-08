@@ -2226,6 +2226,7 @@ int main(int argc, char *argv[])
                                 {"Metadata",       &ctx->metadata_hdr},
                                 {"Metadata index", &ctx->metadata_idx_hdr},
                                 {"Refcount",       &ctx->refcount_hdr},
+                                {"Junk map",       &ctx->junk_map_hdr},
                             };
                             for(int ti = 0; ti < (int)(sizeof(trees) / sizeof(trees[0])); ti++)
                             {

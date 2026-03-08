@@ -1298,6 +1298,9 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         /* Refcount tree */
         if(ctx->sb.refcount_lba != 0) MARK_FREE_CHAIN(&ctx->refcount_hdr, 1);
 
+        /* Junk map tree */
+        if(ctx->sb.junk_map_lba != 0) MARK_FREE_CHAIN(&ctx->junk_map_hdr, 1);
+
         /* Dedup trees (each has its own header and free chain) */
         if(ctx->sb.dedup_lba != 0)
         {
