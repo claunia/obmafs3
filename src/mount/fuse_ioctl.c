@@ -38,6 +38,10 @@
 #include "fuse_ops_internal.h"
 #include "obmafs3_ioctl.h"
 
+#include "defs.h"
+#include "obmafs.h"
+
+#include <inttypes.h>
 #include <limits.h>
 
 /* ------------------------------------------------------------------ */
@@ -723,7 +727,8 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_SET_MEDIA_TAG:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage &&
+               ffctx->inode.file_type != kFileTypeNintendo)
                 FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_tag_arg *tag_arg = (struct obmafs3_ioctl_tag_arg *)data;
             if(!tag_arg || tag_arg->data_length > OBMAFS3_IOC_MAX_TAG_DATA) FUSE_RETURN(-EINVAL, "");
@@ -734,7 +739,9 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_GET_MEDIA_TAG:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage) FUSE_RETURN(-ENOTTY, "");
+            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage &&
+               ffctx->inode.file_type != kFileTypeNintendo)
+                FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_tag_arg *tag_arg = (struct obmafs3_ioctl_tag_arg *)data;
             if(!tag_arg) FUSE_RETURN(-EINVAL, "");
             void    *buf;
@@ -790,7 +797,8 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_SET_METADATA:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage &&
+               ffctx->inode.file_type != kFileTypeNintendo)
                 FUSE_RETURN(-ENOTTY, "");
             const struct obmafs3_ioctl_metadata_set_arg *sa = (const struct obmafs3_ioctl_metadata_set_arg *)data;
             int rc = obmafs3_metadata_put(g_ctx, ffctx->inode.inode_id, sa->key, sa->value);
@@ -799,7 +807,8 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_GET_METADATA:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage &&
+               ffctx->inode.file_type != kFileTypeNintendo)
                 FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_metadata_get_arg *ga = (struct obmafs3_ioctl_metadata_get_arg *)data;
             int rc = obmafs3_metadata_get(g_ctx, ffctx->inode.inode_id, ga->key, ga->value, METADATA_VALUE_MAX);
@@ -809,7 +818,8 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_DELETE_METADATA:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage &&
+               ffctx->inode.file_type != kFileTypeNintendo)
                 FUSE_RETURN(-ENOTTY, "");
             const struct obmafs3_ioctl_metadata_delete_arg *da = (const struct obmafs3_ioctl_metadata_delete_arg *)data;
             int rc = obmafs3_metadata_delete(g_ctx, ffctx->inode.inode_id, da->key);
@@ -819,7 +829,8 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_LIST_METADATA:
         {
-            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage)
+            if(ffctx->inode.file_type != kFileTypeMediaImage && ffctx->inode.file_type != kFileTypeCompactDiscImage &&
+               ffctx->inode.file_type != kFileTypeNintendo)
                 FUSE_RETURN(-ENOTTY, "");
             struct obmafs3_ioctl_metadata_list_arg *la = (struct obmafs3_ioctl_metadata_list_arg *)data;
             char                                  **keys;
@@ -905,6 +916,76 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             int rc = obmafs3_sector_tag_get(g_ctx, ffctx->inode_id, sta->sector,
                                             sta->tag_type, sta->data, &sta->data_length);
             if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
+            return rc == OBMAFS3_OK ? 0 : -EIO;
+        }
+
+            /* ---- Nintendo disc image ioctl ---- */
+
+        case OBMAFS3_IOC_SET_NINTENDO_IMAGE:
+        {
+            /* Only allow conversion of empty files */
+            if(ffctx->inode.file_size != 0) FUSE_RETURN(-ENOTEMPTY, "");
+            const struct obmafs3_ioctl_set_nintendo_image_arg *nia =
+                (const struct obmafs3_ioctl_set_nintendo_image_arg *)data;
+            if(!nia) FUSE_RETURN(-EINVAL, "");
+
+            ffctx->inode.file_type       = kFileTypeNintendo;
+            ffctx->inode.sector_count    = 0;
+            ffctx->inode.sector_map_size = 0;
+            ffctx->sector_size           = NGC_SECTOR_SIZE;
+
+            /* Set the rocompat flag for Nintendo support */
+            if(!(g_ctx->sb.rocompat_flags & OBMAFS3_ROCOMPAT_NINTENDO))
+            {
+                g_ctx->sb.rocompat_flags |= OBMAFS3_ROCOMPAT_NINTENDO;
+                obmafs3_sb_write(g_ctx->fd, &g_ctx->sb);
+            }
+
+            /* Persist disc type, disc size, and partition descriptors as metadata */
+            {
+                char val[256];
+                snprintf(val, sizeof(val), "%u", nia->disc_type);
+                obmafs3_metadata_put(g_ctx, ffctx->inode_id, "__ngc_disc_type__", val);
+                snprintf(val, sizeof(val), "%" PRIu64, nia->disc_size);
+                obmafs3_metadata_put(g_ctx, ffctx->inode_id, "__ngc_disc_size__", val);
+                snprintf(val, sizeof(val), "%u", nia->partition_count);
+                obmafs3_metadata_put(g_ctx, ffctx->inode_id, "__ngc_part_count__", val);
+
+                for(int i = 0; i < nia->partition_count && i < OBMAFS3_NGC_MAX_PARTITIONS; i++)
+                {
+                    char key[64];
+                    snprintf(key, sizeof(key), "__ngc_part_%d_data_offset__", i);
+                    snprintf(val, sizeof(val), "%" PRIu64, nia->partitions[i].data_offset);
+                    obmafs3_metadata_put(g_ctx, ffctx->inode_id, key, val);
+
+                    snprintf(key, sizeof(key), "__ngc_part_%d_data_size__", i);
+                    snprintf(val, sizeof(val), "%" PRIu64, nia->partitions[i].data_size);
+                    obmafs3_metadata_put(g_ctx, ffctx->inode_id, key, val);
+
+                    snprintf(key, sizeof(key), "__ngc_part_%d_title_key__", i);
+                    /* Store title key as hex string */
+                    char *p = val;
+                    for(int b = 0; b < 16; b++) p += sprintf(p, "%02x", nia->partitions[i].title_key[b]);
+                    obmafs3_metadata_put(g_ctx, ffctx->inode_id, key, val);
+                }
+            }
+
+            int rc = obmafs3_inode_put(g_ctx, &ffctx->inode);
+            return rc == OBMAFS3_OK ? 0 : -EIO;
+        }
+
+        case OBMAFS3_IOC_ADD_JUNK_ENTRY:
+        {
+            if(ffctx->inode.file_type != kFileTypeNintendo) FUSE_RETURN(-ENOTTY, "");
+            const struct obmafs3_ioctl_add_junk_entry_arg *jea =
+                (const struct obmafs3_ioctl_add_junk_entry_arg *)data;
+            if(!jea || jea->length == 0) FUSE_RETURN(-EINVAL, "");
+
+            int rc = obmafs3_junk_map_put(g_ctx, ffctx->inode_id, jea->offset, jea->length,
+                                          jea->partition_index, jea->seed);
+            if(rc != OBMAFS3_OK)
+                fprintf(stderr, "[ioctl] junk_map_put failed: rc=%d inode=%" PRIu64 " offset=0x%" PRIx64 "\n",
+                        rc, ffctx->inode_id, jea->offset);
             return rc == OBMAFS3_OK ? 0 : -EIO;
         }
 

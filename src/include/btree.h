@@ -323,4 +323,26 @@ struct __attribute__((packed)) sector_tag_ref_index_entry
     uint64_t child_lba;    ///< LBA of the child node
 };
 
+/* ---- Junk Map B+Tree (Nintendo disc junk/padding seeds) ---- */
+
+/// Junk map leaf record: one junk region with its LFG seed inline.
+/// Keyed by composite (inode_id, offset).
+/// Records per leaf (4096-byte block): (4096 - 70) / 94 = 42.
+struct __attribute__((packed)) junk_map_record
+{
+    uint64_t inode_id;                     ///< Image inode
+    uint64_t offset;                       ///< Disc offset (GC) or logical offset in partition (Wii)
+    uint64_t length;                       ///< Junk region length in bytes
+    uint16_t partition_index;              ///< Partition index (0xFFFF = GC / outside partitions)
+    uint32_t seed[NGC_LFG_SEED_SIZE];     ///< 17-word LFG seed (big-endian)
+};
+
+/// Index entry for the Junk Map B+Tree.
+struct __attribute__((packed)) junk_map_index_entry
+{
+    uint64_t inode_id;     ///< Smallest inode_id reachable through child
+    uint64_t offset;       ///< Smallest offset reachable through child
+    uint64_t child_lba;    ///< LBA of the child node
+};
+
 #endif /* OBMAFS3_BTREE_H */

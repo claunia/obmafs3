@@ -269,4 +269,54 @@ struct obmafs3_ioctl_sector_tag_read_arg
 
 #define OBMAFS3_IOC_GET_SECTOR_TAG _IOWR('O', 14, struct obmafs3_ioctl_sector_tag_read_arg)
 
+/* ================================================================== */
+/*  Nintendo disc image ioctl                                          */
+/* ================================================================== */
+
+/**
+ * Maximum number of Wii partitions we support per disc.
+ * Real discs have 1-4 partitions (game + update + channel).
+ */
+#define OBMAFS3_NGC_MAX_PARTITIONS 8
+
+/**
+ * Per-partition descriptor passed during SET_NINTENDO_IMAGE.
+ * For Wii: contains the AES title key (already decrypted from the ticket).
+ * For GameCube: unused (no partitions).
+ */
+struct obmafs3_ioctl_ngc_partition_arg
+{
+    uint64_t data_offset;                      /**< Byte offset of partition data on disc */
+    uint64_t data_size;                        /**< Size of partition data in bytes */
+    uint8_t  title_key[16];                    /**< Decrypted AES-128 title key */
+};
+
+/**
+ * Convert an empty regular file to a Nintendo disc image.
+ * Sets the file type to kFileTypeNintendo and initialises the
+ * Nintendo sector map.
+ *
+ * disc_type: 0 = GameCube, 1 = Wii
+ */
+struct obmafs3_ioctl_set_nintendo_image_arg
+{
+    uint8_t  disc_type;                        /**< 0 = GameCube, 1 = Wii */
+    uint64_t disc_size;                        /**< Total disc size in bytes */
+    uint16_t partition_count;                  /**< Number of partitions (0 for GC) */
+    struct obmafs3_ioctl_ngc_partition_arg partitions[OBMAFS3_NGC_MAX_PARTITIONS];
+};
+
+#define OBMAFS3_IOC_SET_NINTENDO_IMAGE _IOW('O', 15, struct obmafs3_ioctl_set_nintendo_image_arg)
+
+/** Add one junk map entry for a Nintendo disc image. */
+struct obmafs3_ioctl_add_junk_entry_arg
+{
+    uint64_t offset;           /**< Disc offset (GC) or logical offset in partition (Wii) */
+    uint64_t length;           /**< Junk region length in bytes */
+    uint16_t partition_index;  /**< Partition index (0xFFFF = GC / outside partitions) */
+    uint32_t seed[17];         /**< LFG seed (17 × uint32, big-endian) */
+};
+
+#define OBMAFS3_IOC_ADD_JUNK_ENTRY _IOW('O', 16, struct obmafs3_ioctl_add_junk_entry_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

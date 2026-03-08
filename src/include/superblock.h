@@ -84,7 +84,8 @@ struct __attribute__((packed)) obmafs3_sb
     /* ---- Extension fields (bytes 526..4063) ---- */
     uint64_t sector_tag_data_lba;  ///< LBA of the Sector Tag Data B+Tree header (0 = none)
     uint64_t sector_tag_ref_lba;   ///< LBA of the Sector Tag Ref B+Tree header (0 = none)
-    uint8_t  reserved[3506];       ///< Zero-filled, reserved for future expansion
+    uint64_t junk_map_lba;         ///< LBA of the Junk Map B+Tree header (0 = none)
+    uint8_t  reserved[3498];       ///< Zero-filled, reserved for future expansion
     uint8_t  checksum2[32];        ///< Checksum of extension area (bytes 526..4095 with this field zeroed)
 };
 

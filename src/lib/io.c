@@ -586,6 +586,17 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
                 return rc;
             }
         }
+
+        if(c->sb.junk_map_lba != 0)
+        {
+            rc = obmafs3_btree_header_read(c, c->sb.junk_map_lba, &c->junk_map_hdr);
+            if(rc != OBMAFS3_OK)
+            {
+                close(fd);
+                free(c);
+                return rc;
+            }
+        }
     }
 
     /* Load allocation bitmap (skip when asked, e.g. for fsck) */

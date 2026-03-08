@@ -49,6 +49,7 @@
 #define FSTYPE_XATTR_NAME  "system.obmafs3.fstype"
 #define FSTYPE_XATTR_VALUE "obmafs3"
 
+
 /** Map MediaTagType ordinal to xattr suffix name.  NULL = unused slot. */
 static const char *media_tag_xattr_names[] = {
     [kCdTableOfContents]             = "cd_toc",
@@ -167,7 +168,7 @@ static int is_metadata_xattr(const char *name)
 }
 
 /** Return true if the file type is a disk or CD image. */
-static int is_image_file_type(uint8_t ft) { return ft == kFileTypeMediaImage || ft == kFileTypeCompactDiscImage; }
+static int is_image_file_type(uint8_t ft) { return ft == kFileTypeMediaImage || ft == kFileTypeCompactDiscImage || ft == kFileTypeNintendo; }
 
 /* ------------------------------------------------------------------ */
 /*  xattr FUSE callbacks                                               */
@@ -192,8 +193,8 @@ static int obmafs3_fuse_getxattr_impl(const char *path, const char *name, char *
         return (int)vlen;
     }
 
-    int want_mediatag = is_mediatag_xattr(name);
-    int want_metadata = is_metadata_xattr(name);
+    int want_mediatag  = is_mediatag_xattr(name);
+    int want_metadata  = is_metadata_xattr(name);
 
     if(!want_mediatag && !want_metadata) return -ENODATA;
 
@@ -276,8 +277,8 @@ static int obmafs3_fuse_setxattr_impl(const char *path, const char *name, const 
 {
     (void)flags;
 
-    int want_mediatag = is_mediatag_xattr(name);
-    int want_metadata = is_metadata_xattr(name);
+    int want_mediatag  = is_mediatag_xattr(name);
+    int want_metadata  = is_metadata_xattr(name);
 
     if(!want_mediatag && !want_metadata) return -ENOTSUP;
 

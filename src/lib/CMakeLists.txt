@@ -19,6 +19,11 @@ add_library(obmafs STATIC
     refcount.c
     sector_tag.c
     io.c
+    aes128.c
+    sha1.c
+    nintendo.c
+    nintendo_read.c
+    junk_map.c
 )
 
 target_include_directories(obmafs PUBLIC

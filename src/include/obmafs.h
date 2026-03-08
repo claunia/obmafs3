@@ -95,7 +95,8 @@ struct obmafs3_thread_bufs
 /* Feature flags — none defined yet; all bits are reserved for future use. */
 #define OBMAFS3_COMPAT_FLAGS_KNOWN   0ULL  ///< Mask of known compatible feature flags
 #define OBMAFS3_ROCOMPAT_SECTOR_TAGS (1ULL << 0)  ///< Sector tags feature (hash-dedup per-sector side data)
-#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN OBMAFS3_ROCOMPAT_SECTOR_TAGS  ///< Mask of known read-only compatible feature flags
+#define OBMAFS3_ROCOMPAT_NINTENDO    (1ULL << 1)  ///< Nintendo GameCube/Wii disc image support
+#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO)  ///< Mask of known read-only compatible feature flags
 #define OBMAFS3_INCOMPAT_FLAGS_KNOWN 0ULL  ///< Mask of known incompatible feature flags
 
 /** Filesystem context */
@@ -115,6 +116,7 @@ struct obmafs3_ctx
     struct btree_header   refcount_hdr;            ///< Cached refcount tree header
     struct btree_header   sector_tag_data_hdr;      ///< Cached sector tag data tree header
     struct btree_header   sector_tag_ref_hdr;       ///< Cached sector tag ref tree header
+    struct btree_header   junk_map_hdr;             ///< Cached junk map tree header
     uint8_t              *bitmap;                  ///< In-memory allocation bitmap
     uint64_t              bitmap_size;             ///< Size of allocation bitmap in bytes
     uint64_t              next_free_lba;           ///< Allocation hint (persisted in bitmap header)
@@ -333,6 +335,16 @@ int   obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_rec
                                  size_t size);
 int   obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_record *sub_inode, uint64_t offset,
                                    void *buf, size_t size);
+
+int obmafs3_read_nintendo_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset,
+                                     void *buf, size_t size);
+
+/* --- Junk map B+Tree operations (Nintendo disc junk seeds) --- */
+int obmafs3_junk_map_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t offset, uint64_t length,
+                         uint16_t partition_index, const uint32_t seed[NGC_LFG_SEED_SIZE]);
+int obmafs3_junk_map_lookup(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t offset,
+                            struct junk_map_record *record);
+int obmafs3_junk_map_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id);
 
 /* --- Media tag operations --- */
 int  obmafs3_media_tag_get(struct obmafs3_ctx *ctx, uint64_t inode_id, uint16_t tag_type, void **data,

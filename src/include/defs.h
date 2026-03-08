@@ -33,6 +33,7 @@
 #ifndef OBMAFS3_DEFS_H
 #define OBMAFS3_DEFS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* "TREELIST" as little-endian uint64 */
@@ -50,8 +51,9 @@
 /// Discriminator values for sector_map_header.
 enum sector_map_type
 {
-    kSectorMapTypeNormal = 0,  ///< Normal (non-CD) sector map
-    kSectorMapTypeCd     = 1   ///< CD sector map
+    kSectorMapTypeNormal   = 0,  ///< Normal (non-CD) sector map
+    kSectorMapTypeCd       = 1,  ///< CD sector map
+    kSectorMapTypeNintendo = 2   ///< Nintendo GameCube/Wii disc sector map
 };
 
 #define OBMAFS3_DEFAULT_BLOCK_SIZE       4096
@@ -98,7 +100,7 @@ struct __attribute__((packed)) tree_list_entry
 struct __attribute__((packed)) sector_map_header
 {
     uint64_t magic;         ///< OBMAFS3_SECTOR_MAP_MAGIC ("SECTORMP")
-    uint8_t  type;          ///< Discriminator: kSectorMapTypeNormal or kSectorMapTypeCd
+    uint8_t  type;          ///< Discriminator: kSectorMapTypeNormal, kSectorMapTypeCd, or kSectorMapTypeNintendo
     uint16_t version;       ///< On-disk format version (OBMAFS3_SECTOR_MAP_VERSION)
     uint8_t  checksum[32];  ///< XXH64 checksum of header (with this field zeroed) + all entries
 };
@@ -180,6 +182,23 @@ struct __attribute__((packed)) bitmap_header
     uint64_t next_free_lba;  ///< Allocation hint: next LBA to try when searching for free space
     uint8_t  checksum[32];   ///< Checksum of the bitmap data
 };
+
+/* ---- Nintendo GameCube / Wii disc constants ---- */
+#define NGC_SECTOR_SIZE      2048     ///< GameCube/Wii logical sector size
+#define WII_GROUP_SIZE       0x8000   ///< Wii encrypted group size (32 KiB)
+#define WII_GROUP_DATA_SIZE  0x7C00   ///< Wii user data per group (31 KiB)
+#define WII_GROUP_HASH_SIZE  0x0400   ///< Wii hash block per group (1 KiB)
+#define WII_H0_COUNT         31       ///< Number of H0 hashes per group
+#define WII_SUBGROUP_SIZE    8        ///< Groups per subgroup (for H1/H2)
+#define WII_H3_TABLE_SIZE    0x18000  ///< H3 hash table size (96 KiB)
+#define WII_AES_KEY_SIZE     16       ///< AES-128 key size
+#define WII_AES_BLOCK_SIZE   16       ///< AES block size
+
+/* ---- Nintendo junk seed constants ---- */
+
+#ifndef NGC_LFG_SEED_SIZE
+#define NGC_LFG_SEED_SIZE 17  ///< LFG seed word count (must match nintendo.h)
+#endif
 
 /// Context for CD-ROM EDC/ECC computation and verification.
 typedef struct CdEccContext

@@ -61,7 +61,8 @@ enum obmafs3_btree_type
     kBtreeTypeMetadataIndex = 9,
     kBtreeTypeRefcount      = 10,
     kBtreeTypeSectorTagData = 11,
-    kBtreeTypeSectorTagRef  = 12
+    kBtreeTypeSectorTagRef  = 12,
+    kBtreeTypeJunkMap       = 13
 };
 
 /// Identifies the record format stored in a B+Tree.
@@ -79,7 +80,8 @@ enum obmafs3_btree_data_type
     kBtreeDataTypeMetadataIndexEntry = 9,
     kBtreeDataTypeRefcountEntry      = 10,
     kBtreeDataTypeSectorTagDataEntry  = 11,
-    kBtreeDataTypeSectorTagRefEntry   = 12
+    kBtreeDataTypeSectorTagRefEntry   = 12,
+    kBtreeDataTypeJunkMapEntry        = 13
 };
 
 /// Inode file type stored in inode_record::file_type.
@@ -90,7 +92,8 @@ enum obmafs3_file_type
     kFileTypeMediaImage       = 2,
     kFileTypeSymlink          = 3,
     kFileTypeCompactDiscImage = 4,
-    kFileTypeSubchannelFile   = 5
+    kFileTypeSubchannelFile   = 5,
+    kFileTypeNintendo         = 6
 };
 
 /// CD sector encoding mode.
