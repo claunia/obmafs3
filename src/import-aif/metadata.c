@@ -156,31 +156,37 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
 {
     struct obmafs3_ioctl_metadata_set_arg meta;
 
+    memset(&meta, 0, sizeof(meta));
+    strncpy(meta.key, "ImportApplication", METADATA_KEY_MAX - 1);
+    strncpy(meta.value, "import-aif (OBMAFS3)", METADATA_VALUE_MAX - 1);
+    if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+        ui_warn("Failed to set metadata 'ImportApplication'");
+
     if(info->Application[0])
     {
         memset(&meta, 0, sizeof(meta));
-        strncpy(meta.key, "application", METADATA_KEY_MAX - 1);
+        strncpy(meta.key, "Application", METADATA_KEY_MAX - 1);
         strncpy(meta.value, info->Application, METADATA_VALUE_MAX - 1);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-            ui_warn("Failed to set metadata 'application'");
+            ui_warn("Failed to set metadata 'Application'");
     }
 
     if(info->ApplicationVersion[0])
     {
         memset(&meta, 0, sizeof(meta));
-        strncpy(meta.key, "application_version", METADATA_KEY_MAX - 1);
+        strncpy(meta.key, "ApplicationVersion", METADATA_KEY_MAX - 1);
         strncpy(meta.value, info->ApplicationVersion, METADATA_VALUE_MAX - 1);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-            ui_warn("Failed to set metadata 'application_version'");
+            ui_warn("Failed to set metadata 'ApplicationVersion'");
     }
 
     /* Store media type as a numeric string */
     {
         memset(&meta, 0, sizeof(meta));
-        strncpy(meta.key, "media_type", METADATA_KEY_MAX - 1);
+        strncpy(meta.key, "AaruMediaType", METADATA_KEY_MAX - 1);
         snprintf(meta.value, METADATA_VALUE_MAX, "%d", info->MediaType);
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-            ui_warn("Failed to set metadata 'media_type'");
+            ui_warn("Failed to set metadata 'AaruMediaType'");
     }
 
     /* Store CHS geometry if available */
@@ -189,11 +195,11 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
         if(aaruf_get_geometry(aaruf_ctx, &cylinders, &heads, &sectors_per_track) == AARUF_STATUS_OK)
         {
             memset(&meta, 0, sizeof(meta));
-            strncpy(meta.key, "geometry", METADATA_KEY_MAX - 1);
+            strncpy(meta.key, "Geometry", METADATA_KEY_MAX - 1);
             snprintf(meta.value, METADATA_VALUE_MAX, "%" PRIu32 "/%" PRIu32 "/%" PRIu32, cylinders, heads,
                      sectors_per_track);
             if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-                ui_warn("Failed to set metadata 'geometry'");
+                ui_warn("Failed to set metadata 'Geometry'");
         }
     }
 
@@ -203,24 +209,24 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
         if(aaruf_get_media_sequence(aaruf_ctx, &sequence, &last_sequence) == AARUF_STATUS_OK && sequence > 0)
         {
             memset(&meta, 0, sizeof(meta));
-            strncpy(meta.key, "media_sequence", METADATA_KEY_MAX - 1);
+            strncpy(meta.key, "MediaSequence", METADATA_KEY_MAX - 1);
             snprintf(meta.value, METADATA_VALUE_MAX, "%" PRId32 "/%" PRId32, sequence, last_sequence);
             if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
-                ui_warn("Failed to set metadata 'media_sequence'");
+                ui_warn("Failed to set metadata 'MediaSequence'");
         }
     }
 
     /* Store UTF-16LE string metadata fields (converted to UTF-8) */
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_creator, "dumper");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_comments, "comments");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_title, "title");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_manufacturer, "manufacturer");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_model, "model");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_serial_number, "serial_number");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_barcode, "barcode");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_part_number, "part_number");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_manufacturer, "drive_manufacturer");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_model, "drive_model");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_serial_number, "drive_serial_number");
-    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_firmware_revision, "drive_firmware_revision");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_creator, "Dumper");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_comments, "Comments");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_title, "Title");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_manufacturer, "Manufacturer");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_model, "Model");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_serial_number, "SerialNumber");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_barcode, "Barcode");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_media_part_number, "PartNumber");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_manufacturer, "DriveManufacturer");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_model, "DriveModel");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_serial_number, "DriveSerialNumber");
+    import_utf16_metadata(aaruf_ctx, fd, aaruf_get_drive_firmware_revision, "DriveFirmwareRevision");
 }
