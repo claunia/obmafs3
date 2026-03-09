@@ -45,61 +45,129 @@
  */
 int import_flat_image(void *aaruf_ctx, int fd, const ImageInfo *info)
 {
-    uint32_t buf_cap = (uint32_t)info->SectorSize;
-    uint64_t sectors = info->Sectors;
+    uint32_t sector_size = (uint32_t)info->SectorSize;
+    uint64_t sectors     = info->Sectors;
 
-    uint8_t *buf = malloc(buf_cap);
-    if(!buf) return -1;
+    /*
+     * Batch multiple sectors into a single write() to reduce syscall overhead.
+     * We read sectors one at a time (libaaruformat API limitation) but accumulate
+     * them in a write buffer and flush periodically.
+     */
+    #define WRITE_BATCH_SECTORS 64
+    uint32_t batch_cap = sector_size * WRITE_BATCH_SECTORS;
+    uint8_t *batch_buf = malloc(batch_cap);
+    if(!batch_buf) return -1;
+
+    /* Temporary buffer for a single sector (may grow if aaruf returns a larger size) */
+    uint32_t sec_cap = sector_size;
+    uint8_t *sec_buf = malloc(sec_cap);
+    if(!sec_buf) { free(batch_buf); return -1; }
 
     ui_info("Sectors:", "%" PRIu64, sectors);
-    ui_info("Sector size:", "%u bytes", (unsigned)buf_cap);
+    ui_info("Sector size:", "%u bytes", (unsigned)sector_size);
+
+    uint32_t batch_used = 0; /* bytes accumulated in batch_buf */
 
     for(uint64_t s = 0; s < sectors; s++)
     {
-        uint32_t length = buf_cap;
+        uint32_t length = sec_cap;
         uint8_t  status = 0;
 
-        int rrc = aaruf_read_sector(aaruf_ctx, s, false, buf, &length, &status);
+        int rrc = aaruf_read_sector(aaruf_ctx, s, false, sec_buf, &length, &status);
 
-        if(rrc == AARUF_ERROR_BUFFER_TOO_SMALL && length > buf_cap)
+        if(rrc == AARUF_ERROR_BUFFER_TOO_SMALL && length > sec_cap)
         {
-            uint8_t *tmp = realloc(buf, length);
+            uint8_t *tmp = realloc(sec_buf, length);
             if(!tmp)
             {
                 ui_progress_clear();
                 ui_error("Out of memory re-allocating sector buffer to %u bytes", length);
-                free(buf);
+                free(sec_buf);
+                free(batch_buf);
                 return -1;
             }
-            buf     = tmp;
-            buf_cap = length;
-            rrc     = aaruf_read_sector(aaruf_ctx, s, false, buf, &length, &status);
+            sec_buf = tmp;
+            sec_cap = length;
+            rrc     = aaruf_read_sector(aaruf_ctx, s, false, sec_buf, &length, &status);
         }
 
         if(rrc != AARUF_STATUS_OK)
         {
-            memset(buf, 0, buf_cap);
-            length = buf_cap;
+            memset(sec_buf, 0, sector_size);
+            length = sector_size;
         }
 
-        ssize_t written = write(fd, buf, length);
-        if(written < 0 || (uint32_t)written != length)
+        /* If this sector has an unexpected size, flush the batch and write it alone */
+        if(length != sector_size)
         {
-            ui_progress_clear();
-            ui_error("Write failed at sector %" PRIu64 " (errno=%d)", s, errno);
-            free(buf);
-            return -1;
+            if(batch_used > 0)
+            {
+                ssize_t written = write(fd, batch_buf, batch_used);
+                if(written < 0 || (size_t)written != batch_used)
+                {
+                    ui_progress_clear();
+                    ui_error("Write failed at sector %" PRIu64 " (errno=%d)", s, errno);
+                    free(sec_buf);
+                    free(batch_buf);
+                    return -1;
+                }
+                batch_used = 0;
+            }
+            ssize_t written = write(fd, sec_buf, length);
+            if(written < 0 || (uint32_t)written != length)
+            {
+                ui_progress_clear();
+                ui_error("Write failed at sector %" PRIu64 " (errno=%d)", s, errno);
+                free(sec_buf);
+                free(batch_buf);
+                return -1;
+            }
+        }
+        else
+        {
+            memcpy(batch_buf + batch_used, sec_buf, sector_size);
+            batch_used += sector_size;
+
+            /* Flush when batch is full */
+            if(batch_used >= batch_cap)
+            {
+                ssize_t written = write(fd, batch_buf, batch_used);
+                if(written < 0 || (size_t)written != batch_used)
+                {
+                    ui_progress_clear();
+                    ui_error("Write failed at sector %" PRIu64 " (errno=%d)", s, errno);
+                    free(sec_buf);
+                    free(batch_buf);
+                    return -1;
+                }
+                batch_used = 0;
+            }
         }
 
         if((s % 1000) == 0 || s + 1 == sectors)
             ui_progress("Importing", s + 1, sectors);
     }
 
+    /* Flush remaining sectors */
+    if(batch_used > 0)
+    {
+        ssize_t written = write(fd, batch_buf, batch_used);
+        if(written < 0 || (size_t)written != batch_used)
+        {
+            ui_progress_clear();
+            ui_error("Write failed at final flush (errno=%d)", errno);
+            free(sec_buf);
+            free(batch_buf);
+            return -1;
+        }
+    }
+
     ui_progress("Importing", sectors, sectors);
     ui_progress_clear();
     ui_ok("Imported %" PRIu64 " sectors", sectors);
 
-    free(buf);
+    free(sec_buf);
+    free(batch_buf);
     return 0;
 }
 
