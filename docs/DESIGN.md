@@ -117,7 +117,7 @@ A byte-identical **backup copy** of the full 4096-byte superblock is stored at t
 - `revision` — On-disk format revision (e.g. `20260224`). Set to `OBMAFS3_REVISION` at creation time. If a tool reads a revision higher than the one it was compiled with, mounting is refused (`OBMAFS3_ERR_REVISION`) to prevent corruption by older code that does not understand the newer layout.
 - `compatible_flags` — Bitmask of optional feature flags that are safe to ignore. An implementation that does not recognise a set bit may mount the filesystem normally with full read-write access. No flags are currently defined.
 - `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. Currently defined: `OBMAFS3_ROCOMPAT_SECTOR_TAGS` (bit 0) — per-sector tag storage.
-- `incompatible_flags` — Bitmask of feature flags that prevent mounting entirely when unknown. If any bits outside `OBMAFS3_INCOMPAT_FLAGS_KNOWN` are set, the implementation must refuse to mount (`OBMAFS3_ERR_INCOMPAT`). No flags are currently defined.
+- `incompatible_flags` — Bitmask of feature flags that prevent mounting entirely when unknown. If any bits outside `OBMAFS3_INCOMPAT_FLAGS_KNOWN` are set, the implementation must refuse to mount (`OBMAFS3_ERR_INCOMPAT`). Currently defined: `OBMAFS3_INCOMPAT_LZMA` (bit 0) — set when LZMA-compressed blocks are present.
 - `sector_tag_data_lba` — LBA of the Sector Tag Data B+Tree header. A hash-keyed dictionary of unique per-sector tag blobs. 0 if sector tags are not enabled.
 - `sector_tag_ref_lba` — LBA of the Sector Tag Ref B+Tree header. A composite-keyed tree mapping `(inode_id, sector, tag_type)` to tag hashes in the data tree. 0 if sector tags are not enabled.
 - `checksum2` — Checksum of the extension area (bytes 526–4095), computed with this field zeroed. All-zero when no extension fields are in use.
@@ -243,7 +243,8 @@ enum obmafs3_file_type {
 
 enum obmafs3_compression {
     kCompressionNone = 0,
-    kCompressionZstd = 1
+    kCompressionZstd = 1,
+    kCompressionLzma = 2
 };
 
 enum obmafs3_checksum_type {
@@ -354,7 +355,7 @@ struct extent_run {                          /* packed, 24 bytes */
 };
 ```
 
-When `logical_blocks == block_count` the data is stored uncompressed (one physical block per logical block). When `logical_blocks > block_count` the physical blocks contain a `block_header` followed by ZSTD-compressed data covering `logical_blocks × block_size` bytes.
+When `logical_blocks == block_count` the data is stored uncompressed (one physical block per logical block). When `logical_blocks > block_count` the physical blocks contain a `block_header` followed by compressed data (ZSTD or LZMA) covering `logical_blocks × block_size` bytes.
 ```
 
 If a file requires more than 8 extents, additional extents are stored in the Overflow Tree.
@@ -727,7 +728,7 @@ When a file is written to the filesystem:
 
 1. **Type detection**: If the file is detected as a disk image (by extension or explicit API flag), it is stored as a `kFileTypeMediaImage`. Otherwise it is stored as `kFileTypeRegular`.
 
-2. **Regular files**: Data blocks are written with a `block_header`, optionally compressed with ZSTD. The data capacity per standard block is `block_size - sizeof(block_header)` = **4038 bytes** (for default 4096-byte blocks).
+2. **Regular files**: Data blocks are written with a `block_header`, optionally compressed with ZSTD or LZMA. The data capacity per standard block is `block_size - sizeof(block_header)` = **4038 bytes** (for default 4096-byte blocks).
 
 3. **Media image files**: The image is processed sector by sector:
    - An XXH64 hash is computed for each sector.
@@ -1142,7 +1143,7 @@ struct compress_pool {
 ### Worker threads
 
 - **Count**: `min(sysconf(_SC_NPROCESSORS_ONLN), 32)` threads, minimum 1.
-- **Persistent ZSTD contexts**: Each worker creates its own `ZSTD_CCtx` (full level) and `ZSTD_CCtx` (probe, level 1) on startup. Contexts are reused across all jobs, avoiding allocation overhead.
+- **Persistent ZSTD contexts**: Each worker creates its own `ZSTD_CCtx` (full level) and `ZSTD_CCtx` (probe, level 1) on startup. Contexts are reused across all jobs, avoiding allocation overhead. LZMA compression does not require persistent contexts (the LZMA SDK API is stateless buffer-to-buffer).
 - **Priority**: Workers check the **async queue first** (dedup jobs), then process batch jobs. This ensures dedup compression — which is latency-sensitive because the write path is waiting for a fresh buffer — gets priority.
 
 ### Generation-based wake
@@ -1277,7 +1278,7 @@ All data blocks (regular file data and dedup data) are prepended with a block he
 struct block_header {                        /* packed, 58 bytes */
     uint64_t magic;            /* "OBMABLCK" (0x4B434C42414D424F) */
     uint8_t  flags;            /* 0x01 = COMPRESSED */
-    uint8_t  compression_type; /* 0 = None, 1 = ZSTD */
+    uint8_t  compression_type; /* 0 = None, 1 = ZSTD, 2 = LZMA */
     uint64_t original_size;    /* Original payload size before compression */
     uint64_t compressed_size;  /* On-disk payload size (after compression) */
     uint8_t  checksum[32];     /* Checksum of the payload data */
@@ -1285,7 +1286,10 @@ struct block_header {                        /* packed, 58 bytes */
 ```
 
 **Flags:**
-- `OBMAFS3_BLOCK_FLAG_COMPRESSED` (0x01) — Payload is ZSTD-compressed.
+- `OBMAFS3_BLOCK_FLAG_COMPRESSED` (0x01) — Payload is compressed (algorithm indicated by `compression_type`).
+
+**LZMA payload format:**
+When `compression_type == kCompressionLzma`, the compressed payload starts with a 5-byte LZMA properties header (lc, lp, pb, dictionary size) followed by the compressed data. The `compressed_size` field covers both the properties and the compressed data.
 
 **Checksum coverage:**
 - For **compressed** blocks: the checksum covers the `compressed_size` bytes of compressed payload.
@@ -1295,18 +1299,18 @@ The effective data capacity per standard 4096-byte block is `4096 - 58 = 4038` b
 
 ### Dedup Block Compression
 
-Dedup data blocks (4 MiB default) are compressed with ZSTD when the compressed output is smaller than the original. The compression process:
+Dedup data blocks (4 MiB default) are compressed with the configured algorithm (ZSTD or LZMA) when the compressed output is smaller than the original. The compression process:
 
-1. The raw dedup payload (`original_size` bytes after the header) is compressed with ZSTD at the configured compression level.
+1. The raw dedup payload (`original_size` bytes after the header) is compressed with the configured algorithm at the configured level.
 2. If the compressed size is smaller than the original:
    - `flags` is set to `OBMAFS3_BLOCK_FLAG_COMPRESSED`.
-   - `compression_type` is set to `kCompressionZstd`.
-   - `compressed_size` records the compressed payload size.
+   - `compression_type` is set to `kCompressionZstd` or `kCompressionLzma`.
+   - `compressed_size` records the compressed payload size (for LZMA, this includes the 5-byte properties header).
    - The checksum is computed over the compressed data.
    - The compressed payload replaces the raw data after the header; the remainder of the block is zero-filled.
 3. If compression does not save space, the block is stored uncompressed with `flags = 0` and `compressed_size = original_size`.
 
-On read, if a dedup block has the `COMPRESSED` flag set, the payload is decompressed into a temporary buffer before extracting individual sectors.
+On read, if a dedup block has the `COMPRESSED` flag set, the payload is decompressed (dispatched by `compression_type`) into a temporary buffer before extracting individual sectors.
 
 ---
 
@@ -1327,12 +1331,44 @@ Checksums are applied to:
 
 ## Compression
 
-The only supported compression algorithm is **ZSTD** (Zstandard). The compression level is configurable (default: 15). Compression is applied to:
+Two compression algorithms are supported: **ZSTD** (Zstandard) and **LZMA** (from the LZMA SDK 26.00, public domain). The algorithm is selectable at mount time; blocks from both algorithms can coexist in the same filesystem. Compression is applied to:
 
 - Regular file data block groups (when `--compression=1` is used on mount) — see [Block Group Compression](#block-group-compression)
 - Dedup data blocks (when compression is enabled) — see [Compression Pool](#compression-pool)
 
-Compression is transparent: the read path checks the `flags` field of each `block_header` and decompresses when needed.
+Compression is transparent: the read path checks `block_header.compression_type` and dispatches to the appropriate decompressor.
+
+### Algorithm selection
+
+| Mount option | Values | Default |
+|---|---|---|
+| `--compression` | `0` (off), `1` (on) | `1` |
+| `--compression-algo` | `zstd`, `lzma` | `zstd` |
+| `--zstd-level` | 1–15 | 15 |
+| `--lzma-level` | 0–9 | 5 |
+| `--lzma-dict` | 4K–128M | 64K |
+
+Changing the algorithm only affects new writes. Existing blocks are never re-compressed.
+
+### LZMA specifics
+
+LZMA compression uses the `LzmaCompress()`/`LzmaUncompress()` API from the vendored LZMA SDK (`3rdparty/lzma2600/`). On ARM64, the optimized assembly decoder (`Asm/arm64/LzmaDecOpt.S`) is used automatically.
+
+The 5-byte LZMA properties header (encoding lc, lp, pb, and dictionary size) is prepended to the compressed payload. The `block_header.compressed_size` covers both the properties and compressed data.
+
+LZMA typically achieves 20–30% better compression ratios than ZSTD at comparable quality levels but is 5–10× slower to compress and 2–3× slower to decompress. It is best suited for cold archival data where space savings outweigh write speed.
+
+### LZMA dictionary size
+
+The default dictionary size is 64 KiB, matching the compression group size. Larger dictionaries improve ratio on repetitive data but increase encoder memory usage (~`dict_size × 11.5 + 6 MiB` per thread).
+
+### Compressibility probe
+
+Before attempting expensive compression (ZSTD level > 3, or any LZMA level), a fast ZSTD level-1 probe is performed. If the probe cannot reduce data size by at least 10%, the full compression is skipped. This heuristic works for both algorithms since incompressible data is incompressible regardless of the algorithm.
+
+### Incompatible feature flag
+
+The first time an LZMA-compressed block is written, `OBMAFS3_INCOMPAT_LZMA` (bit 0 of `incompatible_flags`) is set in the superblock. Older implementations that do not understand LZMA will refuse to mount the filesystem. A filesystem can contain both ZSTD and LZMA blocks; each block self-describes its algorithm via `compression_type`.
 
 Compression is performed by a shared, persistent thread pool rather than per-file background threads. See the [Compression Pool](#compression-pool) section for the architecture.
 
