@@ -116,7 +116,7 @@ A byte-identical **backup copy** of the full 4096-byte superblock is stored at t
 - `dedup_clump_size` — Number of nodes to pre-allocate per growth for dedup B+Trees. 0 uses the default of 1024 (see [Clump Allocation](#clump-allocation)).
 - `revision` — On-disk format revision (e.g. `20260224`). Set to `OBMAFS3_REVISION` at creation time. If a tool reads a revision higher than the one it was compiled with, mounting is refused (`OBMAFS3_ERR_REVISION`) to prevent corruption by older code that does not understand the newer layout.
 - `compatible_flags` — Bitmask of optional feature flags that are safe to ignore. An implementation that does not recognise a set bit may mount the filesystem normally with full read-write access. No flags are currently defined.
-- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. Currently defined: `OBMAFS3_ROCOMPAT_SECTOR_TAGS` (bit 0) — per-sector tag storage.
+- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. Currently defined: `OBMAFS3_ROCOMPAT_SECTOR_TAGS` (bit 0) — per-sector tag storage; `OBMAFS3_ROCOMPAT_NINTENDO` (bit 1) — Nintendo disc image support; `OBMAFS3_ROCOMPAT_PS3` (bit 2) — PS3 disc image support.
 - `incompatible_flags` — Bitmask of feature flags that prevent mounting entirely when unknown. If any bits outside `OBMAFS3_INCOMPAT_FLAGS_KNOWN` are set, the implementation must refuse to mount (`OBMAFS3_ERR_INCOMPAT`). Currently defined: `OBMAFS3_INCOMPAT_LZMA` (bit 0) — set when LZMA-compressed blocks are present.
 - `sector_tag_data_lba` — LBA of the Sector Tag Data B+Tree header. A hash-keyed dictionary of unique per-sector tag blobs. 0 if sector tags are not enabled.
 - `sector_tag_ref_lba` — LBA of the Sector Tag Ref B+Tree header. A composite-keyed tree mapping `(inode_id, sector, tag_type)` to tag hashes in the data tree. 0 if sector tags are not enabled.
@@ -238,7 +238,8 @@ enum obmafs3_file_type {
     kFileTypeSymlink          = 3,
     kFileTypeCompactDiscImage = 4,
     kFileTypeSubchannelFile   = 5,
-    kFileTypeNintendo         = 6
+    kFileTypeNintendo         = 6,
+    kFileTypePS3Image         = 7
 };
 
 enum obmafs3_compression {
@@ -2228,5 +2229,139 @@ The Lagged Fibonacci Generator is a port of Dolphin Emulator's implementation (C
 
 ### Integration with fsck and defrag
 
-- **obmafsck:** Recognizes `kBtreeTypeJunkMap` (type 13). Validates the B+Tree structure, collects free-chain blocks (including the junk map tree), includes junk map blocks in the expected bitmap, and includes `kFileTypeNintendo` files in dedup statistics and file-size-vs-extent exemptions (file_size reflects virtual disc size, not extent capacity).
+- **obmafsck:** Recognizes `kBtreeTypeJunkMap` (type 13). Validates the B+Tree structure, collects free-chain blocks (including the junk map tree), includes junk map blocks in the expected bitmap, and includes `kFileTypeNintendo` and `kFileTypePS3Image` files in dedup statistics and file-size-vs-extent exemptions (file_size reflects virtual disc size, not extent capacity).
 - **defrag:** Analysis phase scans junk map B+Tree blocks. Compaction phase handles junk map tree relocation. The junk map tree uses single-block nodes (JUNK_MAP_NODE_BLOCKS = 1).
+
+---
+
+## PlayStation 3 Disc Image Support
+
+OBMAFS3 supports importing encrypted PlayStation 3 Blu-ray disc images with per-sector AES-128-CBC decryption on import and re-encryption on read, producing byte-identical output.
+
+### Overview
+
+PS3 game discs are standard Blu-ray discs (25/50 GB) with sector-level AES-128-CBC encryption. Not all sectors are encrypted — filesystem metadata (UDF/ISO 9660 structures) and some system files remain plaintext. The encryption region map is stored in sector 0 of the disc.
+
+The disc key is derived from `d1` (a 16-byte value extracted from the disc via special SCSI commands during dumping). The key derivation uses:
+
+```
+disc_key = AES-128-CBC-encrypt(ERK, ERK_IV, d1)
+```
+
+Where ERK (`0x380BCF0B53455B3C7817AB4FA3BA90ED`) and ERK_IV (`0x69474772AF6FDAB342743AEFAA186287`) are hardcoded PS3 constants.
+
+Each encrypted sector is independently encrypted with:
+- Key = disc_key
+- IV = sector number as a 128-bit big-endian integer
+
+### On-Disk Additions
+
+**New file type:**
+```c
+kFileTypePS3Image = 7   /* PS3 disc image */
+```
+
+**New rocompat flag:**
+```c
+OBMAFS3_ROCOMPAT_PS3 (1 << 2)   /* PS3 disc image support */
+```
+
+**New ioctl (17):**
+```c
+struct obmafs3_ioctl_ps3_region {
+    uint32_t start_sector;  /* First sector of unencrypted region */
+    uint32_t end_sector;    /* Last sector of unencrypted region (inclusive) */
+};
+
+struct obmafs3_ioctl_set_ps3_image_arg {
+    uint64_t disc_size;     /* Total disc size in bytes */
+    uint8_t  disc_key[16];  /* Derived AES-128 disc key */
+    uint16_t region_count;  /* Number of unencrypted regions */
+    struct obmafs3_ioctl_ps3_region regions[32];
+};
+```
+
+**New media tags:**
+
+| Tag | Value | Size | Description |
+|-----|-------|------|-------------|
+| `kPS3DiscKey` | 77 | 16 B | Derived AES disc key |
+| `kPS3D1` | 78 | 16 B | d1 key data from disc |
+| `kPS3D2` | 79 | 16 B | d2 key data from disc |
+| `kPS3PIC` | 80 | 115 B | Permanent Information & Control |
+| `kPS3EncryptionMap` | 81 | variable | Serialized region table from sector 0 |
+
+### Sector 0 Encryption Map
+
+Format (all fields big-endian):
+```
++0x00: uint32  region_count    — number of unencrypted regions
++0x04: uint32  unknown         — reserved
++0x08: region_count × { uint32 start_sector, uint32 end_sector }
+```
+
+Sectors within the listed ranges are unencrypted; all other sectors are encrypted.
+
+### Sector 1 Disc Info
+
+```
++0x00: "PlayStation3" (12 bytes)
++0x10: Disc ID (32 bytes, space-padded, e.g. "BLES-01711")
+```
+
+### Read Path
+
+`obmafs3_read_ps3_image_data()` in `src/lib/ps3_read.c`:
+1. Reads decrypted sectors from dedup via `obmafs3_read_media_image_data()`
+2. Loads PS3 info from metadata (disc_key, region map)
+3. For each sector in the output buffer:
+   - If in an unencrypted region: returns as-is
+   - If encrypted: re-encrypts with `AES-128-CBC(disc_key, IV=sector_number_be128)`
+
+### `import-ps3` — PlayStation 3 disc importer
+
+Imports an encrypted PS3 ISO disc image into a mounted OBMAFS3 filesystem.
+
+Usage: `import-ps3 <input.iso> <output-path-on-obmafs>`
+       `import-ps3 <input.iso> <key-or-ird-file> <output-path-on-obmafs>`
+
+Auto-detects sidecar files: `.ird`, `.d1`, `.key`, `.dkey`. Supports `.dkey` text files (hex-encoded disc key, skips derivation).
+
+**Import pipeline:**
+
+1. **Phase 1:** Open ISO, read sector 0 (encryption region map), read sector 1 (disc info)
+2. **Phase 2:** Load keys: IRD → parse d1/d2/PIC/metadata; key file → load d1; dkey file → use directly
+3. **Phase 3:** Create output file via `OBMAFS3_IOC_SET_PS3_IMAGE` ioctl
+4. **Phase 4:** Sector import: plaintext sectors verbatim, encrypted sectors decrypted with per-sector IV, batched writes (64 sectors per `write()` call)
+5. **Phase 5:** Store media tags: disc key, d1, d2, PIC, encryption map, BD Disc Information (from `.di.bin` sidecar if present)
+6. **Phase 6:** Parse `PS3_GAME/PARAM.SFO` via minimal ISO 9660 directory walker + SFO binary parser; store metadata
+7. **Phase 7 (IRD only):** Write full IRD as sidecar file (`<output>.ird`), only after successful import
+
+**IRD support:**
+
+The IRD (ISO Rebuild Data) file contains d1, d2, PIC, game metadata, and file checksums. The import tool parses IRD versions 6–9 (gzip-compressed, .NET BinaryReader string encoding). The full IRD is stored as a sidecar file for archival; d1, d2, and PIC are extracted and stored as media tags.
+
+**PARAM.SFO metadata:**
+
+| SFO Key | Metadata key |
+|---------|-------------|
+| `TITLE` | Title |
+| `TITLE_ID` | GameID |
+| `PS3_SYSTEM_VER` | FirmwareVersion |
+| `VERSION` | GameVersion |
+| `APP_VER` | AppVersion |
+| `CATEGORY` | Category |
+| `CONTENT_ID` | ContentID |
+
+**Source files:**
+
+| File | Contents |
+|------|----------|
+| `import_ps3.h` | Header: constants, structs, declarations |
+| `main.c` | Entry point, key/IRD auto-detection, phase orchestration |
+| `disc.c` | Sector 0/1 parsing, key derivation, per-sector IV computation; PS3 crypto constants |
+| `ird.c` | IRD file parser (multi-version, gzip decompression) |
+| `iso9660.c` | Minimal ISO 9660 PVD + directory walker |
+| `sfo.c` | PARAM.SFO binary parser |
+| `import.c` | Sector import with per-region decryption, batched writes |
+| `metadata.c` | Metadata/media tag storage |
