@@ -128,6 +128,11 @@ static const char *media_tag_xattr_names[] = {
     [kDVD_PFI_2ndLayer]              = "dvd_pfi_2nd_layer",
     [kFloppy_WriteProtect]           = "floppy_write_protect",
     [kNintendoWiiUDiscKey]           = "nintendo_wiiu_disc_key",
+    [kPS3DiscKey]                    = "ps3_disc_key",
+    [kPS3D1]                         = "ps3_d1",
+    [kPS3D2]                         = "ps3_d2",
+    [kPS3PIC]                        = "ps3_pic",
+    [kPS3EncryptionMap]              = "ps3_encryption_map",
 };
 
 #define MEDIA_TAG_XATTR_COUNT (sizeof(media_tag_xattr_names) / sizeof(media_tag_xattr_names[0]))
@@ -169,7 +174,7 @@ static int is_metadata_xattr(const char *name)
 }
 
 /** Return true if the file type is a disk or CD image. */
-static int is_image_file_type(uint8_t ft) { return ft == kFileTypeMediaImage || ft == kFileTypeCompactDiscImage || ft == kFileTypeNintendo; }
+static int is_image_file_type(uint8_t ft) { return ft == kFileTypeMediaImage || ft == kFileTypeCompactDiscImage || ft == kFileTypeNintendo || ft == kFileTypePS3Image; }
 
 /* ------------------------------------------------------------------ */
 /*  xattr FUSE callbacks                                               */

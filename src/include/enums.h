@@ -94,7 +94,8 @@ enum obmafs3_file_type
     kFileTypeSymlink          = 3,
     kFileTypeCompactDiscImage = 4,
     kFileTypeSubchannelFile   = 5,
-    kFileTypeNintendo         = 6
+    kFileTypeNintendo         = 6,
+    kFileTypePS3Image         = 7
 };
 
 /// CD sector encoding mode.

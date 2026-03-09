@@ -319,4 +319,26 @@ struct obmafs3_ioctl_add_junk_entry_arg
 
 #define OBMAFS3_IOC_ADD_JUNK_ENTRY _IOW('O', 16, struct obmafs3_ioctl_add_junk_entry_arg)
 
+/* ================================================================== */
+/*  PS3 disc image ioctl                                               */
+/* ================================================================== */
+
+#define OBMAFS3_PS3_MAX_REGIONS 32
+
+struct obmafs3_ioctl_ps3_region
+{
+    uint32_t start_sector;  /**< First sector of unencrypted region */
+    uint32_t end_sector;    /**< Last sector of unencrypted region (inclusive) */
+};
+
+struct obmafs3_ioctl_set_ps3_image_arg
+{
+    uint64_t disc_size;     /**< Total disc size in bytes */
+    uint8_t  disc_key[16];  /**< Derived AES-128 disc key */
+    uint16_t region_count;  /**< Number of unencrypted regions */
+    struct obmafs3_ioctl_ps3_region regions[OBMAFS3_PS3_MAX_REGIONS];
+};
+
+#define OBMAFS3_IOC_SET_PS3_IMAGE _IOW('O', 17, struct obmafs3_ioctl_set_ps3_image_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

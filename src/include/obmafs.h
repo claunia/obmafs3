@@ -96,7 +96,8 @@ struct obmafs3_thread_bufs
 #define OBMAFS3_COMPAT_FLAGS_KNOWN   0ULL  ///< Mask of known compatible feature flags
 #define OBMAFS3_ROCOMPAT_SECTOR_TAGS (1ULL << 0)  ///< Sector tags feature (hash-dedup per-sector side data)
 #define OBMAFS3_ROCOMPAT_NINTENDO    (1ULL << 1)  ///< Nintendo GameCube/Wii disc image support
-#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO)  ///< Mask of known read-only compatible feature flags
+#define OBMAFS3_ROCOMPAT_PS3         (1ULL << 2)  ///< PS3 disc image support
+#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO | OBMAFS3_ROCOMPAT_PS3)  ///< Mask of known read-only compatible feature flags
 #define OBMAFS3_INCOMPAT_LZMA         (1ULL << 0)  ///< LZMA compressed blocks present
 #define OBMAFS3_INCOMPAT_FLAGS_KNOWN  OBMAFS3_INCOMPAT_LZMA  ///< Mask of known incompatible feature flags
 
@@ -342,6 +343,10 @@ int   obmafs3_read_subchannel_data(struct obmafs3_ctx *ctx, const struct inode_r
 
 int obmafs3_read_nintendo_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset,
                                      void *buf, size_t size);
+
+/* --- PS3 disc image read path (re-encryption) --- */
+int obmafs3_read_ps3_image_data(struct obmafs3_ctx *ctx, const struct inode_record *inode, uint64_t offset, void *buf,
+                                size_t size);
 
 /* --- Junk map B+Tree operations (Nintendo disc junk seeds) --- */
 int obmafs3_junk_map_put(struct obmafs3_ctx *ctx, uint64_t inode_id, uint64_t offset, uint64_t length,

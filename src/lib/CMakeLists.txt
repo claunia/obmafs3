@@ -23,6 +23,7 @@ add_library(obmafs STATIC
     sha1.c
     nintendo.c
     nintendo_read.c
+    ps3_read.c
     junk_map.c
 )
 

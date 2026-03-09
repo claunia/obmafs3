@@ -148,11 +148,13 @@ static int obmafs3_fuse_write_impl(const char *path, const char *buf, size_t siz
         ip = &inode;
     }
 
-    if(ip->file_type == kFileTypeMediaImage || ip->file_type == kFileTypeNintendo)
+    if(ip->file_type == kFileTypeMediaImage || ip->file_type == kFileTypeNintendo || ip->file_type == kFileTypePS3Image)
     {
         uint16_t ss = ffctx ? ffctx->sector_size : 0;
         if(ip->file_type == kFileTypeNintendo)
             ss = NGC_SECTOR_SIZE;
+        else if(ip->file_type == kFileTypePS3Image)
+            ss = 2048;
         else if(ss == 0)
         {
             uint64_t    parent_id;
@@ -479,7 +481,7 @@ static int obmafs3_fuse_unlink_impl(const char *path)
         /* Last reference — free data blocks, media tags, and inode */
         obmafs3_free_file_blocks(g_ctx, &inode);
 
-        if(inode.file_type == kFileTypeMediaImage || inode.file_type == kFileTypeNintendo)
+        if(inode.file_type == kFileTypeMediaImage || inode.file_type == kFileTypeNintendo || inode.file_type == kFileTypePS3Image)
             obmafs3_media_tag_delete_all(g_ctx, cat_entry.inode_id);
 
         if(inode.file_type == kFileTypeNintendo)
@@ -534,7 +536,7 @@ static int replace_dest(const struct catalog_record *dst, uint64_t dst_parent, c
         else
         {
             obmafs3_free_file_blocks(g_ctx, &inode);
-            if(inode.file_type == kFileTypeMediaImage || inode.file_type == kFileTypeNintendo)
+            if(inode.file_type == kFileTypeMediaImage || inode.file_type == kFileTypeNintendo || inode.file_type == kFileTypePS3Image)
                 obmafs3_media_tag_delete_all(g_ctx, dst->inode_id);
             if(inode.file_type == kFileTypeNintendo)
                 obmafs3_junk_map_delete_all(g_ctx, dst->inode_id);

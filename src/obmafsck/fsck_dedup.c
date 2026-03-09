@@ -269,7 +269,7 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
                     {
                         struct inode_record rec;
                         memcpy(&rec, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(rec), sizeof(rec));
-                        if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeNintendo)
+                        if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeNintendo || rec.file_type == kFileTypePS3Image)
                         {
                             total_media_files++;
                             total_media_file_size += rec.file_size;

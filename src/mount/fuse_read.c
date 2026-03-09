@@ -211,6 +211,7 @@ static int obmafs3_fuse_open_impl(const char *path, struct fuse_file_info *fi)
 
     if(fctx->inode.file_type == kFileTypeMediaImage) fctx->sector_size = lookup_disk_image_sector_size(name);
     else if(fctx->inode.file_type == kFileTypeNintendo) fctx->sector_size = NGC_SECTOR_SIZE;
+    else if(fctx->inode.file_type == kFileTypePS3Image) fctx->sector_size = 2048;
 
     fi->fh = (uint64_t)(uintptr_t)fctx;
     return 0;
@@ -285,6 +286,10 @@ static int obmafs3_fuse_read_impl(const char *path, char *buf, size_t size, off_
     else if(ip->file_type == kFileTypeNintendo)
     {
         rc = obmafs3_read_nintendo_image_data(g_ctx, ip, (uint64_t)offset, buf, size);
+    }
+    else if(ip->file_type == kFileTypePS3Image)
+    {
+        rc = obmafs3_read_ps3_image_data(g_ctx, ip, (uint64_t)offset, buf, size);
     }
     else
     {
