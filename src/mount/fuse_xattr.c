@@ -127,6 +127,7 @@ static const char *media_tag_xattr_names[] = {
     [kDVD_DiscKey_Decrypted]         = "dvd_disc_key_decrypted",
     [kDVD_PFI_2ndLayer]              = "dvd_pfi_2nd_layer",
     [kFloppy_WriteProtect]           = "floppy_write_protect",
+    [kNintendoWiiUDiscKey]           = "nintendo_wiiu_disc_key",
 };
 
 #define MEDIA_TAG_XATTR_COUNT (sizeof(media_tag_xattr_names) / sizeof(media_tag_xattr_names[0]))
