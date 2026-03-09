@@ -28,6 +28,9 @@ set(ZSTD_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC   ON  CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd)
 
+# ---------- Vendored LZMA SDK ----------
+add_subdirectory(3rdparty/lzma2600)
+
 # ---------- Fetch libaaruformat ----------
 FetchContent_Declare(
     libaaruformat

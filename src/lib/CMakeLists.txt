@@ -35,5 +35,6 @@ find_package(Threads REQUIRED)
 target_link_libraries(obmafs PUBLIC
     xxhash
     libzstd_static
+    lzma_static
     Threads::Threads
 )

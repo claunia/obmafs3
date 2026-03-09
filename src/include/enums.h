@@ -37,7 +37,8 @@
 enum obmafs3_compression
 {
     kCompressionNone = 0,
-    kCompressionZstd = 1
+    kCompressionZstd = 1,
+    kCompressionLzma = 2
 };
 
 /// Supported checksum algorithms.

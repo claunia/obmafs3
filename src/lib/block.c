@@ -33,6 +33,7 @@
 #include "debug.h"
 #include "obmafs.h"
 
+#include <LzmaLib.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,8 +56,10 @@ struct compress_job
     const uint8_t *group_data;  ///< pointer to assembled group data
     size_t         grp_bytes;   ///< input size in bytes
     uint64_t       grp_count;   ///< logical blocks in this group
-    int            level;       ///< ZSTD compression level
+    int            level;       ///< compression level (ZSTD or LZMA)
     uint64_t       block_size;  ///< filesystem block size
+    uint8_t        algo;        ///< compression algorithm (kCompressionZstd or kCompressionLzma)
+    uint32_t       lzma_dict;   ///< LZMA dictionary size (only used when algo == kCompressionLzma)
 
     /* Per-job resources — allocated by caller */
     uint8_t *comp_buf;       ///< output buffer (must be large enough)
@@ -105,8 +108,15 @@ static int compress_worker_run(struct compress_batch *batch, ZSTD_CCtx *probe_cc
         if(!worth) continue;
 
         size_t comp_size = job->comp_buf_size - sizeof(struct block_header);
-        int    rc = obmafs3_compress(cctx, job->group_data, job->grp_bytes, job->comp_buf + sizeof(struct block_header),
-                                     &comp_size, job->level);
+        int    rc;
+        if(job->algo == kCompressionLzma)
+            rc = obmafs3_compress_lzma(job->group_data, job->grp_bytes,
+                                       job->comp_buf + sizeof(struct block_header),
+                                       &comp_size, job->level, job->lzma_dict);
+        else
+            rc = obmafs3_compress(cctx, job->group_data, job->grp_bytes,
+                                  job->comp_buf + sizeof(struct block_header),
+                                  &comp_size, job->level);
         if(rc != OBMAFS3_OK) continue;
 
         uint64_t total_on_disk = sizeof(struct block_header) + comp_size;
@@ -118,7 +128,7 @@ static int compress_worker_run(struct compress_batch *batch, ZSTD_CCtx *probe_cc
         memset(&bhdr, 0, sizeof(bhdr));
         bhdr.magic            = OBMAFS3_BLOCK_MAGIC;
         bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
-        bhdr.compression_type = kCompressionZstd;
+        bhdr.compression_type = job->algo;
         bhdr.original_size    = job->grp_bytes;
         bhdr.compressed_size  = comp_size;
         obmafs3_checksum_block(job->comp_buf + sizeof(bhdr), comp_size, bhdr.checksum);
@@ -552,6 +562,73 @@ static int compression_worthwhile(ZSTD_CCtx *cctx, const void *src, size_t src_s
     if(ZSTD_isError(result)) return 0;
     /* If level-1 can't reduce size by at least 10%, skip the expensive attempt */
     return result < (src_size * 9 / 10);
+}
+
+/* ---- LZMA compression/decompression ---- */
+
+/**
+ * Compress data using LZMA.
+ *
+ * The 5-byte LZMA properties header is prepended to the compressed output.
+ * `*dst_size` on input must be the capacity of @p dst; on output it reflects
+ * the total written (props + compressed payload).
+ */
+int obmafs3_compress_lzma(const void *src, size_t src_size, void *dst, size_t *dst_size, int level, uint32_t dict_size)
+{
+    if(*dst_size < LZMA_PROPS_SIZE) return OBMAFS3_ERR_IO;
+
+    uint8_t *out     = (uint8_t *)dst;
+    size_t   props_sz = LZMA_PROPS_SIZE;
+    size_t   dest_len = *dst_size - LZMA_PROPS_SIZE;
+
+    int rc = LzmaCompress(out + LZMA_PROPS_SIZE, &dest_len, (const unsigned char *)src, src_size,
+                          out, &props_sz, level, dict_size, -1, -1, -1, -1, 1);
+
+    if(rc != SZ_OK) return OBMAFS3_ERR_IO;
+
+    *dst_size = LZMA_PROPS_SIZE + dest_len;
+    return OBMAFS3_OK;
+}
+
+/**
+ * Decompress LZMA-compressed data.
+ *
+ * Expects 5-byte LZMA properties header at the start of @p src.
+ */
+int obmafs3_decompress_lzma(const void *src, size_t src_size, void *dst, size_t dst_size)
+{
+    if(src_size < LZMA_PROPS_SIZE) return OBMAFS3_ERR_IO;
+
+    const uint8_t *in       = (const uint8_t *)src;
+    size_t          dest_len = dst_size;
+    SizeT           src_len  = (SizeT)(src_size - LZMA_PROPS_SIZE);
+
+    int rc = LzmaUncompress((unsigned char *)dst, &dest_len, in + LZMA_PROPS_SIZE, &src_len, in, LZMA_PROPS_SIZE);
+
+    if(rc != SZ_OK) return OBMAFS3_ERR_IO;
+    return OBMAFS3_OK;
+}
+
+/**
+ * Dispatch compression to the configured algorithm.
+ * Returns OBMAFS3_OK on success; *dst_size set to compressed output size.
+ */
+int obmafs3_compress_dispatch(struct obmafs3_ctx *ctx, const void *src, size_t src_size, void *dst, size_t *dst_size)
+{
+    if(ctx->compression_algo == kCompressionLzma)
+        return obmafs3_compress_lzma(src, src_size, dst, dst_size, ctx->lzma_level, ctx->lzma_dict_size);
+    return obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, src, src_size, dst, dst_size, ctx->zstd_level);
+}
+
+/**
+ * Dispatch decompression based on the block header's compression_type.
+ */
+int obmafs3_decompress_dispatch(struct obmafs3_ctx *ctx, uint8_t compression_type, const void *src, size_t src_size,
+                                void *dst, size_t dst_size)
+{
+    if(compression_type == kCompressionLzma)
+        return obmafs3_decompress_lzma(src, src_size, dst, dst_size);
+    return obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, src, src_size, dst, dst_size);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1322,7 +1399,7 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
             /* Full extent read → decompress directly into out_buf */
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
+                int rc = obmafs3_decompress_dispatch(ctx, bhdr.compression_type, phys_buf + sizeof(bhdr),
                                             (size_t)bhdr.compressed_size, out_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) return rc;
             }
@@ -1337,7 +1414,7 @@ static int read_extent_blocks(struct obmafs3_ctx *ctx, const struct extent_descr
             uint8_t *decomp = obmafs3_get_thread_bufs(ctx)->io_buf2;
             if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
             {
-                int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
+                int rc = obmafs3_decompress_dispatch(ctx, bhdr.compression_type, phys_buf + sizeof(bhdr),
                                             (size_t)bhdr.compressed_size, decomp, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK) return rc;
             }
@@ -1479,7 +1556,7 @@ int obmafs3_read_file_data(struct obmafs3_ctx *ctx, const struct inode_record *i
 
                 if(bhdr.flags & OBMAFS3_BLOCK_FLAG_COMPRESSED)
                 {
-                    int rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, phys_buf + sizeof(bhdr),
+                    int rc = obmafs3_decompress_dispatch(ctx, bhdr.compression_type, phys_buf + sizeof(bhdr),
                                                 (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                     if(rc != OBMAFS3_OK) return rc;
                 }
@@ -1979,9 +2056,11 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
                 jobs[gi].group_data    = grp_bufs[gi];
                 jobs[gi].grp_bytes     = grp_sizes[gi];
                 jobs[gi].grp_count     = grp_counts[gi];
-                jobs[gi].level         = ctx->zstd_level;
+                jobs[gi].level         = (ctx->compression_algo == kCompressionLzma) ? ctx->lzma_level : ctx->zstd_level;
                 jobs[gi].block_size    = block_size;
                 jobs[gi].comp_buf_size = comp_buf_cap;
+                jobs[gi].algo          = (uint8_t)ctx->compression_algo;
+                jobs[gi].lzma_dict     = ctx->lzma_dict_size;
                 any_compressible       = 1;
             }
 
@@ -2023,6 +2102,14 @@ static int write_file_data_append(struct obmafs3_ctx *ctx, struct inode_record *
                 if(rc != OBMAFS3_OK) goto cleanup;
             }
             phys_count = phys_needed;
+
+            /* Set LZMA incompat flag on first LZMA block */
+            if(jobs[gi].algo == kCompressionLzma &&
+               !(ctx->sb.incompatible_flags & OBMAFS3_INCOMPAT_LZMA))
+            {
+                ctx->sb.incompatible_flags |= OBMAFS3_INCOMPAT_LZMA;
+                obmafs3_sb_write(ctx->fd, &ctx->sb);
+            }
         }
         else
         {
@@ -2314,10 +2401,11 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
              * Use a SEPARATE ZSTD context for the probe — sharing the same
              * cctx between a level-1 probe and a high-level compression
              * triggers a stale-window assertion in ZSTD's btopt match finder. */
+            int probe_level = (ctx->compression_algo == kCompressionLzma) ? ctx->lzma_level : ctx->zstd_level;
             int worth = compression_worthwhile(obmafs3_get_thread_bufs(ctx)->zstd_probe_cctx, group_data, grp_bytes,
-                                               comp_out + sizeof(struct block_header), comp_cap, ctx->zstd_level);
-            rc        = worth ? obmafs3_compress(obmafs3_get_thread_bufs(ctx)->zstd_cctx, group_data, grp_bytes,
-                                                 comp_out + sizeof(struct block_header), &comp_size, ctx->zstd_level)
+                                               comp_out + sizeof(struct block_header), comp_cap, probe_level);
+            rc        = worth ? obmafs3_compress_dispatch(ctx, group_data, grp_bytes,
+                                                         comp_out + sizeof(struct block_header), &comp_size)
                               : OBMAFS3_ERR_IO;
             if(rc == OBMAFS3_OK)
             {
@@ -2340,11 +2428,19 @@ int obmafs3_write_file_data(struct obmafs3_ctx *ctx, struct inode_record *inode,
                     memset(&bhdr, 0, sizeof(bhdr));
                     bhdr.magic            = OBMAFS3_BLOCK_MAGIC;
                     bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
-                    bhdr.compression_type = kCompressionZstd;
+                    bhdr.compression_type = (uint8_t)ctx->compression_algo;
                     bhdr.original_size    = grp_bytes;
                     bhdr.compressed_size  = comp_size;
                     obmafs3_checksum_block(comp_out + sizeof(bhdr), comp_size, bhdr.checksum);
                     memcpy(comp_out, &bhdr, sizeof(bhdr));
+
+                    /* Set the LZMA incompat flag if needed */
+                    if(ctx->compression_algo == kCompressionLzma &&
+                       !(ctx->sb.incompatible_flags & OBMAFS3_INCOMPAT_LZMA))
+                    {
+                        ctx->sb.incompatible_flags |= OBMAFS3_INCOMPAT_LZMA;
+                        obmafs3_sb_write(ctx->fd, &ctx->sb);
+                    }
 
                     /* Zero-pad the last physical block */
                     size_t used             = sizeof(bhdr) + comp_size;

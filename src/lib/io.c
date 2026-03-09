@@ -218,10 +218,13 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "calloc ctx");
     }
 
-    c->fd          = fd;
-    c->compression = 1;  /* compression on by default */
-    c->zstd_level  = 15; /* ZSTD level 15 by default */
-    c->warmup_done = 1;  /* default: no warmup pending */
+    c->fd               = fd;
+    c->compression      = 1;                   /* compression on by default */
+    c->compression_algo = kCompressionZstd;     /* ZSTD by default */
+    c->zstd_level       = 15;                   /* ZSTD level 15 by default */
+    c->lzma_level       = 5;                    /* LZMA level 5 by default */
+    c->lzma_dict_size   = 65536;                /* 64 KiB dictionary (matches compression group size) */
+    c->warmup_done      = 1;                    /* default: no warmup pending */
     pthread_mutex_init(&c->warmup_mutex, NULL);
     pthread_cond_init(&c->warmup_cond, NULL);
 

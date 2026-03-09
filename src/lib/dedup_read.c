@@ -665,17 +665,17 @@ int obmafs3_read_media_image_data(struct obmafs3_ctx *ctx, const struct inode_re
                     /* Store back into persistent cache so it survives */
                     if(dbc) dbc->decomp_buf = decomp_buf;
                 }
-                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr),
+                rc = obmafs3_decompress_dispatch(ctx, bhdr.compression_type, dedup_buf + sizeof(bhdr),
                                         (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
                     fprintf(stderr,
                             "[read_media_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64
                             " block_offset=%" PRIu64 " sector=%" PRId64 " compressed_size=%" PRIu64
-                            " original_size=%" PRIu64 " needed_std=%" PRIu64 " flags=0x%02x\n",
+                            " original_size=%" PRIu64 " needed_std=%" PRIu64 " flags=0x%02x type=%u\n",
                             de.block_lba, de.hash, de.block_offset,
                             (int64_t)(offset + bytes_read) / (int64_t)sector_size, bhdr.compressed_size,
-                            bhdr.original_size, needed_std, bhdr.flags);
+                            bhdr.original_size, needed_std, bhdr.flags, (unsigned)bhdr.compression_type);
                     free(de_results);
                     if(owns_leaf_cache) free(lc->leaf_buf);
                     free(sme_batch);
@@ -1083,16 +1083,16 @@ int obmafs3_read_cd_image_data(struct obmafs3_ctx *ctx, const struct inode_recor
                         goto fail;
                     }
                 }
-                rc = obmafs3_decompress(obmafs3_get_thread_bufs(ctx)->zstd_dctx, dedup_buf + sizeof(bhdr),
+                rc = obmafs3_decompress_dispatch(ctx, bhdr.compression_type, dedup_buf + sizeof(bhdr),
                                         (size_t)bhdr.compressed_size, decomp_buf, (size_t)bhdr.original_size);
                 if(rc != OBMAFS3_OK)
                 {
                     fprintf(stderr,
                             "[read_cd_image] DECOMPRESS FAILED lba=%" PRIu64 " hash=%" PRIu64 " block_offset=%" PRIu64
                             " sector=%" PRId64 " compressed_size=%" PRIu64 " original_size=%" PRIu64
-                            " needed_std=%" PRIu64 " flags=0x%02x\n",
+                            " needed_std=%" PRIu64 " flags=0x%02x type=%u\n",
                             de.block_lba, de.hash, de.block_offset, sector_num, bhdr.compressed_size,
-                            bhdr.original_size, needed_std, bhdr.flags);
+                            bhdr.original_size, needed_std, bhdr.flags, (unsigned)bhdr.compression_type);
                     goto fail;
                 }
                 cached_compressed = 1;

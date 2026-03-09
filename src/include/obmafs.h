@@ -97,7 +97,8 @@ struct obmafs3_thread_bufs
 #define OBMAFS3_ROCOMPAT_SECTOR_TAGS (1ULL << 0)  ///< Sector tags feature (hash-dedup per-sector side data)
 #define OBMAFS3_ROCOMPAT_NINTENDO    (1ULL << 1)  ///< Nintendo GameCube/Wii disc image support
 #define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO)  ///< Mask of known read-only compatible feature flags
-#define OBMAFS3_INCOMPAT_FLAGS_KNOWN 0ULL  ///< Mask of known incompatible feature flags
+#define OBMAFS3_INCOMPAT_LZMA         (1ULL << 0)  ///< LZMA compressed blocks present
+#define OBMAFS3_INCOMPAT_FLAGS_KNOWN  OBMAFS3_INCOMPAT_LZMA  ///< Mask of known incompatible feature flags
 
 /** Filesystem context */
 struct obmafs3_ctx
@@ -122,7 +123,10 @@ struct obmafs3_ctx
     uint64_t              next_free_lba;           ///< Allocation hint (persisted in bitmap header)
     pthread_mutex_t       bitmap_lock;             ///< Protects bitmap alloc/free from concurrent access
     int                   compression;             ///< Non-zero to compress data blocks on write
+    int                   compression_algo;         ///< Compression algorithm (kCompressionZstd or kCompressionLzma)
     int                   zstd_level;              ///< ZSTD compression level (1-15)
+    int                   lzma_level;              ///< LZMA compression level (0-9)
+    uint32_t              lzma_dict_size;           ///< LZMA dictionary size in bytes
     pthread_key_t         tls_key;                 ///< Thread-local scratch buffers (obmafs3_thread_bufs)
     pthread_rwlock_t      tree_lock;               ///< Serialises writers; readers take shared lock
     uint8_t              *rc_leaf_buf;             ///< Cached refcount B+Tree leaf node
@@ -444,6 +448,11 @@ void     obmafs3_checksum_block(const void *data, size_t size, uint8_t *out);
 int obmafs3_compress(struct ZSTD_CCtx_s *cctx, const void *src, size_t src_size, void *dst, size_t *dst_size,
                      int level);
 int obmafs3_decompress(struct ZSTD_DCtx_s *dctx, const void *src, size_t src_size, void *dst, size_t dst_size);
+int obmafs3_compress_lzma(const void *src, size_t src_size, void *dst, size_t *dst_size, int level, uint32_t dict_size);
+int obmafs3_decompress_lzma(const void *src, size_t src_size, void *dst, size_t dst_size);
+int obmafs3_compress_dispatch(struct obmafs3_ctx *ctx, const void *src, size_t src_size, void *dst, size_t *dst_size);
+int obmafs3_decompress_dispatch(struct obmafs3_ctx *ctx, uint8_t compression_type, const void *src, size_t src_size,
+                                void *dst, size_t dst_size);
 
 /* --- Filesystem creation --- */
 int obmafs3_create(const char *path, uint64_t total_size, uint64_t block_size, uint64_t dedup_block_size,

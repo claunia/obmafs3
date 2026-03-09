@@ -33,6 +33,9 @@
 
 #include "dedup_internal.h"
 
+#include <LzmaLib.h>
+#include <zstd.h>
+
 /* ------------------------------------------------------------------ */
 /*  Background compression via the shared pool                         */
 /* ------------------------------------------------------------------ */
@@ -79,16 +82,18 @@ static int bg_do_compress_and_write(struct obmafs3_ctx *ctx, ZSTD_CCtx *cctx, ui
     if(ctx->compression && bhdr.original_size > 0)
     {
         size_t   comp_bound = ZSTD_compressBound((size_t)bhdr.original_size);
+        /* LZMA adds 5 bytes of props overhead, and may expand slightly */
+        if(comp_bound < bhdr.original_size + 256) comp_bound = (size_t)bhdr.original_size + 256;
         uint8_t *comp_buf   = malloc(comp_bound);
         if(comp_buf)
         {
             size_t comp_size = comp_bound;
-            int    crc = obmafs3_compress(cctx, data + sizeof(bhdr), (size_t)bhdr.original_size, comp_buf, &comp_size,
-                                          ctx->zstd_level);
+            int    crc = obmafs3_compress_dispatch(ctx, data + sizeof(bhdr), (size_t)bhdr.original_size,
+                                                   comp_buf, &comp_size);
             if(crc == OBMAFS3_OK && comp_size < bhdr.original_size)
             {
                 bhdr.flags            = OBMAFS3_BLOCK_FLAG_COMPRESSED;
-                bhdr.compression_type = kCompressionZstd;
+                bhdr.compression_type = (uint8_t)ctx->compression_algo;
                 bhdr.compressed_size  = comp_size;
                 obmafs3_checksum_block(comp_buf, comp_size, bhdr.checksum);
                 write_size          = sizeof(bhdr) + comp_size;

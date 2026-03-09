@@ -44,10 +44,13 @@ struct obmafs3_options
     const char *device;
     const char *disk_images;
     int         show_help;
-    int         compression; /* -1 = not set (use default) */
-    int         zstd_level;  /* -1 = not set (use default) */
-    const char *cache_limit;  /* NULL = not set (use default 8G) */
-    const char *keyset_limit; /* NULL = not set (use default 4G) */
+    int         compression;      /* -1 = not set (use default) */
+    int         zstd_level;       /* -1 = not set (use default) */
+    const char *compression_algo; /* NULL = not set (use default zstd) */
+    int         lzma_level;       /* -1 = not set (use default) */
+    const char *lzma_dict;        /* NULL = not set (use default 64K) */
+    const char *cache_limit;      /* NULL = not set (use default 8G) */
+    const char *keyset_limit;     /* NULL = not set (use default 4G) */
 };
 
 #define OPTION(t, p) {t, offsetof(struct obmafs3_options, p), 1}
@@ -59,6 +62,9 @@ static const struct fuse_opt option_spec[] = {
     OPTION("--help", show_help),
     {"--compression=%d", offsetof(struct obmafs3_options, compression), 0},
     { "--zstd-level=%d", offsetof(struct obmafs3_options,  zstd_level), 0},
+    OPTION("--compression-algo=%s", compression_algo),
+    {"--lzma-level=%d", offsetof(struct obmafs3_options, lzma_level), 0},
+    OPTION("--lzma-dict=%s", lzma_dict),
     OPTION("--cache-limit=%s", cache_limit),
     OPTION("--keyset-limit=%s", keyset_limit),
     FUSE_OPT_END
@@ -75,7 +81,11 @@ static void show_help(const char *progname)
            "OBMAFS3 options:\n"
            "    --device=<path>        Path to the OBMAFS3 filesystem image\n"
            "    --compression=<0|1>    Enable (1) or disable (0) compression (default: 1)\n"
+           "    --compression-algo=<algo>  Compression algorithm: zstd (default) or lzma\n"
            "    --zstd-level=<1-15>    ZSTD compression level (default: 15)\n"
+           "    --lzma-level=<0-9>     LZMA compression level (default: 5)\n"
+           "    --lzma-dict=<size>     LZMA dictionary size (default: 64K)\n"
+           "                           Accepts suffixes: K, M (e.g. 256K, 1M)\n"
            "    --cache-limit=<size>   Node-cache RAM ceiling (default: 8G)\n"
            "                           Accepts suffixes: K, M, G (e.g. 2G, 512M)\n"
            "    --keyset-limit=<size>  Key-set RAM ceiling (default: 4G)\n"
@@ -104,6 +114,7 @@ int main(int argc, char *argv[])
     memset(&opts, 0, sizeof(opts));
     opts.compression = -1; /* sentinel: use default */
     opts.zstd_level  = -1; /* sentinel: use default */
+    opts.lzma_level  = -1; /* sentinel: use default */
 
     if(fuse_opt_parse(&args, &opts, option_spec, NULL) == -1) return 1;
 
@@ -216,6 +227,20 @@ int main(int argc, char *argv[])
         }
 
         if(opts.compression != -1) g_ctx->compression = (opts.compression != 0);
+        if(opts.compression_algo)
+        {
+            if(strcmp(opts.compression_algo, "zstd") == 0)
+                g_ctx->compression_algo = kCompressionZstd;
+            else if(strcmp(opts.compression_algo, "lzma") == 0)
+                g_ctx->compression_algo = kCompressionLzma;
+            else
+            {
+                fprintf(stderr, "Error: --compression-algo must be 'zstd' or 'lzma'\n");
+                obmafs3_close(g_ctx);
+                g_ctx = NULL;
+                return 1;
+            }
+        }
         if(opts.zstd_level != -1)
         {
             if(opts.zstd_level < 1 || opts.zstd_level > 15)
@@ -226,6 +251,45 @@ int main(int argc, char *argv[])
                 return 1;
             }
             g_ctx->zstd_level = opts.zstd_level;
+        }
+        if(opts.lzma_level != -1)
+        {
+            if(opts.lzma_level < 0 || opts.lzma_level > 9)
+            {
+                fprintf(stderr, "Error: --lzma-level must be between 0 and 9\n");
+                obmafs3_close(g_ctx);
+                g_ctx = NULL;
+                return 1;
+            }
+            g_ctx->lzma_level = opts.lzma_level;
+        }
+        if(opts.lzma_dict)
+        {
+            char              *end = NULL;
+            unsigned long long val = strtoull(opts.lzma_dict, &end, 10);
+            if(end && *end)
+            {
+                switch(*end)
+                {
+                    case 'k':
+                    case 'K': val *= 1024ULL; break;
+                    case 'm':
+                    case 'M': val *= 1024ULL * 1024; break;
+                    default:
+                        fprintf(stderr, "Error: --lzma-dict: unknown suffix '%c'\n", *end);
+                        obmafs3_close(g_ctx);
+                        g_ctx = NULL;
+                        return 1;
+                }
+            }
+            if(val < 4096 || val > 128ULL * 1024 * 1024)
+            {
+                fprintf(stderr, "Error: --lzma-dict must be between 4K and 128M\n");
+                obmafs3_close(g_ctx);
+                g_ctx = NULL;
+                return 1;
+            }
+            g_ctx->lzma_dict_size = (uint32_t)val;
         }
     }
 
