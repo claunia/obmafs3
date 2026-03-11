@@ -644,25 +644,78 @@ static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_ar
 /*  Result set                                                         */
 /* ------------------------------------------------------------------ */
 
+/** A single metadata key/value pair. */
+struct meta_pair
+{
+    char key[METADATA_KEY_MAX];
+    char value[METADATA_VALUE_MAX];
+};
+
+/** Per-result metadata (growable array of key/value pairs). */
+struct meta_list
+{
+    struct meta_pair *pairs;
+    uint32_t          count;
+    uint32_t          cap;
+};
+
+static void ml_init(struct meta_list *ml)
+{
+    ml->pairs = NULL;
+    ml->count = 0;
+    ml->cap   = 0;
+}
+
+static void ml_free(struct meta_list *ml)
+{
+    free(ml->pairs);
+    ml_init(ml);
+}
+
+static int ml_add(struct meta_list *ml, const char *key, const char *value)
+{
+    if(ml->count >= ml->cap)
+    {
+        uint32_t nc = ml->cap ? ml->cap * 2 : 8;
+        struct meta_pair *tmp = realloc(ml->pairs, nc * sizeof(struct meta_pair));
+        if(!tmp) return -1;
+        ml->pairs = tmp;
+        ml->cap   = nc;
+    }
+    strncpy(ml->pairs[ml->count].key, key, METADATA_KEY_MAX - 1);
+    ml->pairs[ml->count].key[METADATA_KEY_MAX - 1] = '\0';
+    strncpy(ml->pairs[ml->count].value, value, METADATA_VALUE_MAX - 1);
+    ml->pairs[ml->count].value[METADATA_VALUE_MAX - 1] = '\0';
+    ml->count++;
+    return 0;
+}
+
 /** Growable array of path strings collected from paginated queries. */
 struct result_set
 {
-    char   **paths; /**< Heap-allocated array of strdup'd paths */
-    uint32_t count; /**< Number of entries */
-    uint32_t cap;   /**< Allocated capacity */
+    char            **paths;    /**< Heap-allocated array of strdup'd paths */
+    struct meta_list *metadata; /**< Per-result metadata (NULL if not fetched) */
+    uint32_t          count;    /**< Number of entries */
+    uint32_t          cap;      /**< Allocated capacity */
 };
 
 static void rs_init(struct result_set *rs)
 {
-    rs->paths = NULL;
-    rs->count = 0;
-    rs->cap   = 0;
+    rs->paths    = NULL;
+    rs->metadata = NULL;
+    rs->count    = 0;
+    rs->cap      = 0;
 }
 
 static void rs_free(struct result_set *rs)
 {
     for(uint32_t i = 0; i < rs->count; i++) free(rs->paths[i]);
     free(rs->paths);
+    if(rs->metadata)
+    {
+        for(uint32_t i = 0; i < rs->count; i++) ml_free(&rs->metadata[i]);
+        free(rs->metadata);
+    }
     rs_init(rs);
 }
 
@@ -688,6 +741,84 @@ static int rs_add(struct result_set *rs, const char *path)
     }
     rs->count++;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Metadata fetch                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Fetch all metadata key/value pairs for a file by opening it and
+ * issuing LIST_METADATA + GET_METADATA ioctls.
+ *
+ * @param mountpoint  Filesystem mount path.
+ * @param rel_path    Path relative to the mount root (starts with /).
+ * @param ml          Output meta_list (must be ml_init'd by caller).
+ * @return 0 on success, -1 on failure.
+ */
+static int fetch_file_metadata(const char *mountpoint, const char *rel_path, struct meta_list *ml)
+{
+    char fullpath[4096];
+    snprintf(fullpath, sizeof(fullpath), "%s%s", mountpoint, rel_path);
+
+    int fd = open(fullpath, O_RDONLY);
+    if(fd < 0) return -1;
+
+    /* List all keys (paginated, up to 256 keys) */
+    char    keys[256][METADATA_KEY_MAX];
+    uint32_t nkeys = 0;
+
+    uint32_t list_offset = 0;
+    while(nkeys < 256)
+    {
+        struct obmafs3_ioctl_metadata_list_arg la;
+        memset(&la, 0, sizeof(la));
+        la.offset = list_offset;
+
+        if(ioctl(fd, OBMAFS3_IOC_LIST_METADATA, &la) != 0) break;
+        if(la.count == 0) break;
+
+        for(uint32_t i = 0; i < la.count && nkeys < 256; i++)
+        {
+            memcpy(keys[nkeys], la.keys[i], METADATA_KEY_MAX);
+            nkeys++;
+        }
+        list_offset += la.count;
+        if(la.count < 16) break;
+    }
+
+    /* Get value for each key */
+    for(uint32_t i = 0; i < nkeys; i++)
+    {
+        struct obmafs3_ioctl_metadata_get_arg ga;
+        memset(&ga, 0, sizeof(ga));
+        memcpy(ga.key, keys[i], METADATA_KEY_MAX);
+
+        if(ioctl(fd, OBMAFS3_IOC_GET_METADATA, &ga) == 0)
+            ml_add(ml, ga.key, ga.value);
+    }
+
+    close(fd);
+    return 0;
+}
+
+/**
+ * Fetch metadata for all results in a result set.
+ *
+ * @param mountpoint  Filesystem mount path.
+ * @param rs          Result set (must have count > 0).
+ */
+static void rs_fetch_metadata(const char *mountpoint, struct result_set *rs)
+{
+    if(rs->count == 0) return;
+    rs->metadata = calloc(rs->count, sizeof(struct meta_list));
+    if(!rs->metadata) return;
+
+    for(uint32_t i = 0; i < rs->count; i++)
+    {
+        ml_init(&rs->metadata[i]);
+        fetch_file_metadata(mountpoint, rs->paths[i], &rs->metadata[i]);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -749,7 +880,15 @@ static int export_txt(const struct result_set *rs, const char *filepath)
         return -1;
     }
 
-    for(uint32_t i = 0; i < rs->count; i++) fprintf(fp, "%s\n", rs->paths[i]);
+    for(uint32_t i = 0; i < rs->count; i++)
+    {
+        fprintf(fp, "%s\n", rs->paths[i]);
+        if(rs->metadata && rs->metadata[i].count > 0)
+        {
+            for(uint32_t j = 0; j < rs->metadata[i].count; j++)
+                fprintf(fp, "  %s = %s\n", rs->metadata[i].pairs[j].key, rs->metadata[i].pairs[j].value);
+        }
+    }
 
     fclose(fp);
     printf("Exported %u result(s) to %s\n", rs->count, filepath);
@@ -757,10 +896,45 @@ static int export_txt(const struct result_set *rs, const char *filepath)
 }
 
 /**
+ * Write a single JSON result entry to @p fp.  If metadata is available,
+ * writes an object with "path" and "metadata"; otherwise a plain string.
+ */
+static void json_write_result(FILE *fp, const char *path, const struct meta_list *ml)
+{
+    if(ml && ml->count > 0)
+    {
+        fprintf(fp, "{\"path\": \"");
+        json_escape(fp, path);
+        fprintf(fp, "\", \"metadata\": {");
+        for(uint32_t j = 0; j < ml->count; j++)
+        {
+            if(j > 0) fputc(',', fp);
+            fprintf(fp, " \"");
+            json_escape(fp, ml->pairs[j].key);
+            fprintf(fp, "\": \"");
+            json_escape(fp, ml->pairs[j].value);
+            fputc('"', fp);
+        }
+        fprintf(fp, " }}");
+    }
+    else
+    {
+        fputc('"', fp);
+        json_escape(fp, path);
+        fputc('"', fp);
+    }
+}
+
+/**
  * Export the result set as a JSON file.
  *
- * Format:
+ * Without metadata:
  *   { "count": N, "results": [ "path1", "path2", ... ] }
+ *
+ * With metadata:
+ *   { "count": N, "results": [
+ *       { "path": "...", "metadata": { "key": "val", ... } }, ...
+ *   ] }
  *
  * @return 0 on success, -1 on error.
  */
@@ -777,9 +951,8 @@ static int export_json(const struct result_set *rs, const char *filepath)
 
     for(uint32_t i = 0; i < rs->count; i++)
     {
-        fprintf(fp, "%s\n    \"", i ? "," : "");
-        json_escape(fp, rs->paths[i]);
-        fputc('"', fp);
+        fprintf(fp, "%s\n    ", i ? "," : "");
+        json_write_result(fp, rs->paths[i], rs->metadata ? &rs->metadata[i] : NULL);
     }
 
     fprintf(fp, "\n  ]\n}\n");
@@ -883,9 +1056,11 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
 
 /**
  * Execute a parsed query interactively: print results, show count,
- * offer export.
+ * offer export.  If @p show_metadata is set, fetches and displays
+ * metadata for each result.
  */
-static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
+static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
+                          const char *mountpoint, int show_metadata)
 {
     struct result_set rs;
     rs_init(&rs);
@@ -896,8 +1071,18 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
         return;
     }
 
+    if(show_metadata && rs.count > 0)
+        rs_fetch_metadata(mountpoint, &rs);
+
     for(uint32_t i = 0; i < rs.count; i++)
+    {
         printf("  %s\n", rs.paths[i]);
+        if(rs.metadata && rs.metadata[i].count > 0)
+        {
+            for(uint32_t j = 0; j < rs.metadata[i].count; j++)
+                printf("    %s = %s\n", rs.metadata[i].pairs[j].key, rs.metadata[i].pairs[j].value);
+        }
+    }
 
     printf("\n%u result(s)\n", rs.count);
 
@@ -917,7 +1102,8 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
  * @return 0 on success, non-zero on error.
  */
 static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
-                               const char *format, const char *output)
+                               const char *format, const char *output,
+                               const char *mountpoint, int show_metadata)
 {
     struct result_set rs;
     rs_init(&rs);
@@ -927,6 +1113,9 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
         rs_free(&rs);
         return 1;
     }
+
+    if(show_metadata && rs.count > 0)
+        rs_fetch_metadata(mountpoint, &rs);
 
     const char *fmt = format ? format : "txt";
 
@@ -953,16 +1142,22 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
         printf("{\n  \"count\": %u,\n  \"results\": [", rs.count);
         for(uint32_t i = 0; i < rs.count; i++)
         {
-            printf("%s\n    \"", i ? "," : "");
-            json_escape(stdout, rs.paths[i]);
-            putchar('"');
+            printf("%s\n    ", i ? "," : "");
+            json_write_result(stdout, rs.paths[i], rs.metadata ? &rs.metadata[i] : NULL);
         }
         printf("\n  ]\n}\n");
     }
     else if(strcasecmp(fmt, "txt") == 0)
     {
         for(uint32_t i = 0; i < rs.count; i++)
+        {
             printf("%s\n", rs.paths[i]);
+            if(rs.metadata && rs.metadata[i].count > 0)
+            {
+                for(uint32_t j = 0; j < rs.metadata[i].count; j++)
+                    printf("  %s = %s\n", rs.metadata[i].pairs[j].key, rs.metadata[i].pairs[j].value);
+            }
+        }
     }
     else
     {
@@ -1059,23 +1254,25 @@ static void usage(const char *prog)
             "  -q, --query <query>    Run a single query and exit\n"
             "  -f, --format <fmt>     Output format: txt (default) or json\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
+            "  -m, --metadata         Include all metadata for each result\n"
             "  -h, --help             Show this help message\n"
             "\n"
             "Interactive mode (default):\n"
             "  %s <mountpoint>\n"
+            "  %s -m <mountpoint>                         (with metadata)\n"
             "\n"
             "Batch mode:\n"
             "  %s -q 'artist = \"Iron Maiden\"' /mnt/archive\n"
-            "  %s -q 'year N> \"1985\"' -f json /mnt/archive\n"
+            "  %s -q 'year N> \"1985\"' -f json -m /mnt/archive\n"
             "  %s -q 'genre = \"Rock\"' -f txt -o results.txt /mnt/archive\n",
-            prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Read-eval-print loop                                               */
 /* ------------------------------------------------------------------ */
 
-static void repl(const char *mountpoint, int query_fd)
+static void repl(const char *mountpoint, int query_fd, int show_metadata)
 {
     char line[4096];
 
@@ -1115,7 +1312,7 @@ static void repl(const char *mountpoint, int query_fd)
 
         /* Parse and execute as a query */
         struct obmafs3_ioctl_metadata_query_arg qa;
-        if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa);
+        if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa, mountpoint, show_metadata);
     }
 }
 
@@ -1128,23 +1325,26 @@ int main(int argc, char *argv[])
     const char *query_str  = NULL;
     const char *format_str = NULL;
     const char *output_str = NULL;
+    int         show_meta  = 0;
 
     static struct option long_opts[] = {
-        {"query",  required_argument, NULL, 'q'},
-        {"format", required_argument, NULL, 'f'},
-        {"output", required_argument, NULL, 'o'},
-        {"help",   no_argument,       NULL, 'h'},
+        {"query",    required_argument, NULL, 'q'},
+        {"format",   required_argument, NULL, 'f'},
+        {"output",   required_argument, NULL, 'o'},
+        {"metadata", no_argument,       NULL, 'm'},
+        {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:h", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:mh", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
             case 'q': query_str  = optarg; break;
             case 'f': format_str = optarg; break;
             case 'o': output_str = optarg; break;
+            case 'm': show_meta  = 1;      break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -1179,14 +1379,14 @@ int main(int argc, char *argv[])
             close(query_fd);
             return 1;
         }
-        rc = execute_query_batch(query_fd, &qa, format_str, output_str);
+        rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta);
     }
     else
     {
         /* Interactive REPL mode */
         if(format_str || output_str)
             fprintf(stderr, "Warning: --format and --output are ignored in interactive mode\n");
-        repl(mountpoint, query_fd);
+        repl(mountpoint, query_fd, show_meta);
     }
 
     close(query_fd);
