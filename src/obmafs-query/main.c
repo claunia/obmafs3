@@ -1650,6 +1650,125 @@ static void execute_explain(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
     printf("  Final result: %u matches\n\n", total);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Streaming output                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Execute a query in streaming mode: print each result as it arrives
+ * from the paginated ioctl calls, without buffering the full result set.
+ *
+ * Supports "txt" (one path per line) and "jsonl" (one JSON object per line).
+ * Metadata can be fetched and printed per-result if requested.
+ *
+ * Incompatible with sorting (requires all results), table/csv (needs
+ * column widths), and regular JSON (needs wrapping array).
+ *
+ * @param fd            File descriptor on the OBMAFS3 mount.
+ * @param qa            Parsed query argument.
+ * @param format        "txt" or "jsonl" (NULL defaults to "txt").
+ * @param mountpoint    Mount path (for metadata fetch).
+ * @param show_metadata Whether to fetch and show metadata per result.
+ * @param max_results   Stop after N results (0 = unlimited).
+ * @param key_filter    Comma-separated key filter, or NULL for all.
+ * @return 0 on success, non-zero on error.
+ */
+static int execute_query_stream(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
+                                const char *format, const char *mountpoint,
+                                int show_metadata, uint32_t max_results,
+                                const char *key_filter)
+{
+    const char *fmt = format ? format : "txt";
+    int is_jsonl = (strcasecmp(fmt, "jsonl") == 0);
+
+    if(!is_jsonl && strcasecmp(fmt, "txt") != 0)
+    {
+        fprintf(stderr, "Error: streaming mode only supports 'txt' and 'jsonl' formats\n");
+        return 1;
+    }
+
+    uint32_t offset = 0;
+    uint32_t emitted = 0;
+    qa->cursor_id = 0;
+
+    while(1)
+    {
+        qa->offset = offset;
+        qa->count  = 0;
+        qa->total  = 0;
+
+        if(ioctl(fd, OBMAFS3_IOC_QUERY_METADATA, qa) != 0)
+        {
+            fprintf(stderr, "Error: ioctl QUERY_METADATA failed: %s\n", strerror(errno));
+            return 1;
+        }
+
+        if(qa->count == 0) break;
+
+        for(uint32_t i = 0; i < qa->count; i++)
+        {
+            const char *path = qa->paths[i];
+
+            if(is_jsonl)
+            {
+                printf("{\"path\": \"");
+                json_escape(stdout, path);
+                putchar('"');
+
+                if(show_metadata)
+                {
+                    struct meta_list ml;
+                    ml_init(&ml);
+                    fetch_file_metadata(mountpoint, path, &ml);
+                    if(ml.count > 0)
+                    {
+                        printf(", \"metadata\": {");
+                        int first = 1;
+                        for(uint32_t j = 0; j < ml.count; j++)
+                        {
+                            if(!key_in_filter(ml.pairs[j].key, key_filter)) continue;
+                            if(!first) putchar(',');
+                            printf(" \"");
+                            json_escape(stdout, ml.pairs[j].key);
+                            printf("\": \"");
+                            json_escape(stdout, ml.pairs[j].value);
+                            putchar('"');
+                            first = 0;
+                        }
+                        printf(" }");
+                    }
+                    ml_free(&ml);
+                }
+
+                printf("}\n");
+            }
+            else
+            {
+                printf("%s\n", path);
+                if(show_metadata)
+                {
+                    struct meta_list ml;
+                    ml_init(&ml);
+                    fetch_file_metadata(mountpoint, path, &ml);
+                    for(uint32_t j = 0; j < ml.count; j++)
+                        if(key_in_filter(ml.pairs[j].key, key_filter))
+                            printf("  %s = %s\n", ml.pairs[j].key, ml.pairs[j].value);
+                    ml_free(&ml);
+                }
+            }
+
+            fflush(stdout);
+            emitted++;
+            if(max_results > 0 && emitted >= max_results) return 0;
+        }
+
+        offset += qa->count;
+        if(offset >= qa->total) break;
+    }
+
+    return 0;
+}
+
 /**
  * Execute a query in batch mode: collect results and write to the
  * given output file (or stdout) in the specified format.
@@ -1965,6 +2084,7 @@ static void usage(const char *prog)
             "  -q, --query <query>    Run a single query and exit\n"
             "  -c, --count            Count matching results only (no paths)\n"
             "  -l, --limit <N>        Return at most N results\n"
+            "  -S, --stream           Stream results as they arrive (txt/jsonl only)\n"
             "  -d, --distinct <key>   List all distinct values for a metadata key\n"
             "  -f, --format <fmt>     Output format: txt, json, table, or csv\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
@@ -2274,6 +2394,7 @@ int main(int argc, char *argv[])
     int         count_only   = 0;
     uint32_t    limit_n      = 0;
     const char *keys_str     = NULL;
+    int         streaming    = 0;
 
     static struct option long_opts[] = {
         {"query",    required_argument, NULL, 'q'},
@@ -2286,12 +2407,13 @@ int main(int argc, char *argv[])
         {"distinct", required_argument, NULL, 'd'},
         {"limit",    required_argument, NULL, 'l'},
         {"keys",     required_argument, NULL, 'k'},
+        {"stream",   no_argument,       NULL, 'S'},
         {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:l:k:h", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:l:k:Sh", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -2305,6 +2427,7 @@ int main(int argc, char *argv[])
             case 'd': distinct_str = optarg; break;
             case 'l': limit_n      = (uint32_t)strtoul(optarg, NULL, 10); break;
             case 'k': keys_str     = optarg; show_meta = 1; break;
+            case 'S': streaming    = 1;      break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -2352,6 +2475,14 @@ int main(int argc, char *argv[])
                 rc = 1;
             else
                 printf("%u\n", total);
+        }
+        else if(streaming)
+        {
+            if(sort_str)
+                fprintf(stderr, "Warning: --sort is ignored in streaming mode\n");
+            if(output_str)
+                fprintf(stderr, "Warning: --output is ignored in streaming mode (use shell redirection)\n");
+            rc = execute_query_stream(query_fd, &qa, format_str, mountpoint, show_meta, limit_n, keys_str);
         }
         else
         {
