@@ -29,6 +29,9 @@ All multi-byte values are stored **little-endian**. All on-disk structures use `
 | 16                  | Junk Map B+Tree header               | `BTREEHDR` |
 | 17 .. 17+N-1        | Allocation bitmap                    | `OBMABMAP` (0x50414D42414D424F) |
 | 16+N ..             | Data blocks, B+Tree nodes, dedup data| `OBMABLCK` / `BTREENDE` |
+| (dynamic)           | Numeric Metadata Index B+Tree header | `BTREEHDR` (allocated at first mount with numeric metadata) |
+| (dynamic)           | User-defined index registry blocks   | Linked list of registry entries |
+| (dynamic)           | Per-key secondary B+Tree headers     | `BTREEHDR` (one per user-defined index) |
 | total_blocks − 1    | Backup superblock                    | `OBMAFS_3` (0x335F5346414D424F) |
 
 The block size for regular data (catalog, inode, overflow, file data) defaults to **4096 bytes**.
@@ -116,7 +119,7 @@ A byte-identical **backup copy** of the full 4096-byte superblock is stored at t
 - `dedup_clump_size` — Number of nodes to pre-allocate per growth for dedup B+Trees. 0 uses the default of 1024 (see [Clump Allocation](#clump-allocation)).
 - `revision` — On-disk format revision (e.g. `20260224`). Set to `OBMAFS3_REVISION` at creation time. If a tool reads a revision higher than the one it was compiled with, mounting is refused (`OBMAFS3_ERR_REVISION`) to prevent corruption by older code that does not understand the newer layout.
 - `compatible_flags` — Bitmask of optional feature flags that are safe to ignore. An implementation that does not recognise a set bit may mount the filesystem normally with full read-write access. No flags are currently defined.
-- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. Currently defined: `OBMAFS3_ROCOMPAT_SECTOR_TAGS` (bit 0) — per-sector tag storage; `OBMAFS3_ROCOMPAT_NINTENDO` (bit 1) — Nintendo disc image support; `OBMAFS3_ROCOMPAT_PS3` (bit 2) — PS3 disc image support.
+- `rocompat_flags` — Bitmask of feature flags that require read-only mounting when unknown. If any bits outside `OBMAFS3_ROCOMPAT_FLAGS_KNOWN` are set, the implementation must mount read-only to avoid corrupting data that depends on the unknown feature. Currently defined: `OBMAFS3_ROCOMPAT_SECTOR_TAGS` (bit 0) — per-sector tag storage; `OBMAFS3_ROCOMPAT_NINTENDO` (bit 1) — Nintendo disc image support; `OBMAFS3_ROCOMPAT_PS3` (bit 2) — PS3 disc image support; `OBMAFS3_ROCOMPAT_NUMERIC_IDX` (bit 3) — numeric metadata index B+Tree present; `OBMAFS3_ROCOMPAT_USER_INDEXES` (bit 4) — user-defined secondary indexes present.
 - `incompatible_flags` — Bitmask of feature flags that prevent mounting entirely when unknown. If any bits outside `OBMAFS3_INCOMPAT_FLAGS_KNOWN` are set, the implementation must refuse to mount (`OBMAFS3_ERR_INCOMPAT`). Currently defined: `OBMAFS3_INCOMPAT_LZMA` (bit 0) — set when LZMA-compressed blocks are present.
 - `sector_tag_data_lba` — LBA of the Sector Tag Data B+Tree header. A hash-keyed dictionary of unique per-sector tag blobs. 0 if sector tags are not enabled.
 - `sector_tag_ref_lba` — LBA of the Sector Tag Ref B+Tree header. A composite-keyed tree mapping `(inode_id, sector, tag_type)` to tag hashes in the data tree. 0 if sector tags are not enabled.
@@ -269,7 +272,41 @@ enum obmafs3_query_op {
     kQueryOpLessEq     = 5,   /* strcmp <= 0 */
     kQueryOpContains   = 6,   /* strstr != NULL */
     kQueryOpStartsWith = 7,   /* strncmp prefix == 0 */
-    kQueryOpExists     = 8    /* key exists, value ignored */
+    kQueryOpExists     = 8,   /* key exists, value ignored */
+
+    /* Case-insensitive variants */
+    kQueryOpIEqual      = 9,  /* strcasecmp == 0 */
+    kQueryOpINotEqual   = 10, /* strcasecmp != 0 */
+    kQueryOpIContains   = 11, /* case-insensitive substring */
+    kQueryOpIStartsWith = 12, /* case-insensitive prefix */
+
+    /* Numeric comparisons (values parsed as int64_t) */
+    kQueryOpNumEqual    = 13,
+    kQueryOpNumNotEqual = 14,
+    kQueryOpNumGreater  = 15,
+    kQueryOpNumLess     = 16,
+    kQueryOpNumGreaterEq = 17,
+    kQueryOpNumLessEq   = 18,
+
+    /* Regular expressions (POSIX extended) */
+    kQueryOpRegex       = 19, /* case-sensitive */
+    kQueryOpIRegex      = 20, /* case-insensitive */
+
+    /* Suffix matching */
+    kQueryOpEndsWith    = 21,
+    kQueryOpIEndsWith   = 22,
+
+    /* Set membership (comma-separated value list) */
+    kQueryOpIn          = 23,
+    kQueryOpIIn         = 24,
+
+    /* Range matching (value = "low,high") */
+    kQueryOpBetween     = 25, /* lexicographic */
+    kQueryOpNumBetween  = 26, /* numeric */
+
+    /* Glob/wildcard matching (fnmatch) */
+    kQueryOpGlob        = 27,
+    kQueryOpIGlob       = 28
 };
 
 enum obmafs3_query_combine {
@@ -494,6 +531,65 @@ struct metadata_idx_index_entry {            /* packed, index payload */
 
 Both metadata trees use 8-block nodes and support full CRUD operations plus paginated key listing and reverse queries.
 
+#### Multi-value Metadata
+
+Metadata values may contain multiple sub-values separated by `\n` (newline). The **Comments** key is exempt — its newlines are treated as content, not separators. For query matching:
+- Positive operators (=, CONTAINS, IN, etc.): match if **any** sub-value matches
+- Negative operators (!=, I!=): match only if **all** sub-values pass
+
+The distinct, groupby, and stats functions split on `\n` and process each sub-value independently.
+
+#### Numeric Metadata Index B+Tree
+
+A secondary B+Tree sorted by `(key, int64_t value, inode_id)` for efficient numeric range queries. Unlike the reverse-index tree which stores string values and requires `strtoll` parsing during scans, this tree stores pre-parsed `int64_t` values, enabling true O(log n + k) range queries.
+
+```c
+struct metadata_numeric_idx_record {         /* packed, 272 bytes */
+    char     key[256];                   /* Metadata key */
+    int64_t  value;                      /* Numeric value (parsed from string) */
+    uint64_t inode_id;                   /* Disk image inode */
+};
+
+struct metadata_numeric_idx_index_entry {     /* packed, 280 bytes */
+    char     key[256];
+    int64_t  value;
+    uint64_t inode_id;
+    uint64_t child_lba;
+};
+```
+
+The tree header LBA is stored in the superblock extension area (`metadata_numeric_idx_lba`). Protected by `OBMAFS3_ROCOMPAT_NUMERIC_IDX` (bit 3). Built lazily at first mount: the mount process traverses the full metadata reverse-index tree, parses each value with `strtoll`, and inserts successfully-parsed entries. Maintained incrementally via hooks in `metadata_put` and `metadata_delete`.
+
+Numeric operators (`N=`, `N>`, `N<`, `N>=`, `N<=`, `NBETWEEN`) are routed through this tree when available, falling back to the string reverse-index scan otherwise.
+
+#### User-Defined Secondary Indexes
+
+Users can declare that specific metadata keys should have dedicated secondary B+Trees. Each per-key index contains only records for that key, providing faster scans than the global indexes.
+
+**Registry format** — a linked list of on-disk blocks:
+
+```c
+struct user_index_registry_block {           /* packed, 16 bytes header */
+    uint64_t next_lba;                   /* LBA of next block (0 = end) */
+    uint32_t entry_count;                /* Entries in this block */
+    uint32_t _pad;
+    /* followed by entry_count × user_index_registry_entry */
+};
+
+struct user_index_registry_entry {           /* packed, 272 bytes */
+    char     key[256];                   /* Metadata key this index covers */
+    uint8_t  value_type;                 /* 0 = string, 1 = numeric */
+    uint8_t  _pad[7];
+    uint64_t index_header_lba;           /* LBA of per-key B+Tree header */
+};
+```
+
+15 entries fit per 4096-byte block. Registry head LBA is stored in the superblock extension (`user_index_registry_lba`). Protected by `OBMAFS3_ROCOMPAT_USER_INDEXES` (bit 4).
+
+Each per-key tree reuses existing record formats: `metadata_numeric_idx_record` for numeric indexes, `metadata_idx_record` for string indexes. Operations use the parameterized `obmafs3_numidx_put_ex` / `obmafs3_numidx_delete_ex` / `obmafs3_numidx_collect_range_ex` functions.
+
+Query dispatch priority: per-key user index → global numeric index → string reverse-index scan.
+
 #### Multi-filter Metadata Queries
 
 The `OBMAFS3_IOC_QUERY_METADATA` ioctl accepts up to 4 filter conditions combined with AND or OR logic. Each filter specifies a key, a comparison operator (`enum obmafs3_query_op`), and a value. The query walks the reverse-index tree once per filter, collecting all inode IDs whose key matches and whose value satisfies the operator (lexicographic comparison for all ordered operators, `strstr` for contains, prefix `strncmp` for starts-with). Per-filter result sets are then intersected (AND) or unioned (OR) and resolved to filesystem paths.
@@ -505,7 +601,46 @@ struct obmafs3_query_filter {
     char    key[256];     /* Metadata key to match ("*" = any key) */
     char    value[1025];  /* Value operand (ignored for kQueryOpExists) */
     uint8_t op;           /* enum obmafs3_query_op */
+    uint8_t negate;       /* 1 = invert this filter's match (NOT) */
+    uint8_t group;        /* 0 = group A, 1 = group B */
 };
+```
+
+Filters may be negated (NOT prefix) and assigned to one of two groups for mixed AND/OR logic. Group 0 filters are combined with `combine`, group 1 with `combine1`, and the two group results with `group_combine`. The ioctl struct includes a `cursor_id` field for cursor-based pagination: the first call returns a cursor ID, subsequent calls reuse the cached inode ID set.
+
+#### Query Tool (obmafs-query)
+
+`obmafs-query` is an interactive and batch-mode metadata query tool that communicates with a mounted OBMAFS3 filesystem via ioctls.
+
+**Batch mode flags:**
+- `-q <query>` — run a query and exit
+- `-f <format>` — output format: txt (default), json, jsonl, table, csv
+- `-o <path>` — write to file
+- `-m` — include all metadata per result
+- `-k <keys>` — show only specified metadata keys
+- `-s <key>` — sort by metadata key or `path` (prefix `N:` for numeric)
+- `-r` — reverse sort order
+- `-l <N>` — limit results
+- `-c` — count only (no paths)
+- `-S` — streaming mode (one result at a time)
+- `-d <key>` — list distinct values
+- `-g <key>` — group by with counts
+- `-t <key>` — numeric statistics (min/max/avg/sum)
+
+**Interactive commands:** `distinct`, `groupby`, `stats`, `explain`, `create index`, `drop index`, `show indexes`, `resort`, `reverse`. Uses GNU readline for history and line editing with persistent `~/.obmafs_query_history`.
+
+**Exit codes:** 0 = results found, 1 = no results, 2 = error.
+
+#### Additional Ioctls
+
+| Ioctl | Number | Purpose |
+|-------|--------|---------|
+| `OBMAFS3_IOC_DISTINCT_METADATA` | 18 | Distinct values for a key |
+| `OBMAFS3_IOC_GROUPBY_METADATA` | 19 | Distinct values with per-value file counts |
+| `OBMAFS3_IOC_STATS_METADATA` | 20 | Numeric statistics (min/max/sum/count) |
+| `OBMAFS3_IOC_CREATE_INDEX` | 21 | Create a user-defined secondary index |
+| `OBMAFS3_IOC_DROP_INDEX` | 22 | Drop a user-defined secondary index |
+| `OBMAFS3_IOC_LIST_INDEXES` | 23 | List user-defined indexes |
 ```
 
 #### Wildcard Key Queries
