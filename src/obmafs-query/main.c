@@ -1685,7 +1685,7 @@ static int execute_query_stream(int fd, struct obmafs3_ioctl_metadata_query_arg 
     if(!is_jsonl && strcasecmp(fmt, "txt") != 0)
     {
         fprintf(stderr, "Error: streaming mode only supports 'txt' and 'jsonl' formats\n");
-        return 1;
+        return 2;
     }
 
     uint32_t offset = 0;
@@ -1701,7 +1701,7 @@ static int execute_query_stream(int fd, struct obmafs3_ioctl_metadata_query_arg 
         if(ioctl(fd, OBMAFS3_IOC_QUERY_METADATA, qa) != 0)
         {
             fprintf(stderr, "Error: ioctl QUERY_METADATA failed: %s\n", strerror(errno));
-            return 1;
+            return 2;
         }
 
         if(qa->count == 0) break;
@@ -1767,7 +1767,7 @@ static int execute_query_stream(int fd, struct obmafs3_ioctl_metadata_query_arg 
         if(offset >= qa->total) break;
     }
 
-    return 0;
+    return (emitted > 0) ? 0 : 1;
 }
 
 /**
@@ -1792,7 +1792,7 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
     if(execute_query_collect(fd, qa, &rs, max_results) != 0)
     {
         rs_free(&rs);
-        return 1;
+        return 2;
     }
 
     const char *fmt = format ? format : "txt";
@@ -1822,10 +1822,11 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
         {
             fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', 'table', or 'csv')\n", fmt);
             rs_free(&rs);
-            return 1;
+            return 2;
         }
+        int have_results = (rs.count > 0);
         rs_free(&rs);
-        return rc == 0 ? 0 : 1;
+        return (rc != 0) ? 2 : (have_results ? 0 : 1);
     }
 
     /* No output file — write to stdout */
@@ -1864,11 +1865,12 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
     {
         fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', 'table', or 'csv')\n", fmt);
         rs_free(&rs);
-        return 1;
+        return 2;
     }
 
+    int have_results = (rs.count > 0);
     rs_free(&rs);
-    return 0;
+    return have_results ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2694,9 +2696,12 @@ int main(int argc, char *argv[])
         {
             uint32_t total = execute_query_count(query_fd, &qa);
             if(total == (uint32_t)-1)
-                rc = 1;
+                rc = 2;
             else
+            {
                 printf("%u\n", total);
+                rc = (total > 0) ? 0 : 1;
+            }
         }
         else if(streaming)
         {
