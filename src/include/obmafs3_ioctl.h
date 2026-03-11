@@ -406,4 +406,34 @@ struct obmafs3_ioctl_metadata_distinct_arg
 
 #define OBMAFS3_IOC_DISTINCT_METADATA _IOWR('O', 18, struct obmafs3_ioctl_metadata_distinct_arg)
 
+/* ================================================================== */
+/*  Metadata GROUP BY ioctl                                            */
+/* ================================================================== */
+
+#define METADATA_GROUPBY_MAX_RESULTS 8
+
+/** A single value + count pair for GROUP BY results. */
+struct obmafs3_ioctl_groupby_entry
+{
+    char     value[METADATA_VALUE_MAX]; /**< Distinct value */
+    uint32_t count;                     /**< Number of files with this value */
+    uint32_t _pad;                      /**< Alignment padding */
+};
+
+/**
+ * GROUP BY: return distinct values for a key with per-value file counts.
+ * Paginated: set offset to 0 for the first page.
+ */
+struct obmafs3_ioctl_metadata_groupby_arg
+{
+    char     key[METADATA_KEY_MAX];                                      /**< Input: metadata key */
+    uint32_t offset;                                                     /**< Input: starting offset */
+    uint32_t count;                                                      /**< Output: entries returned this page */
+    uint32_t total;                                                      /**< Output: total distinct values */
+    uint32_t _pad;                                                       /**< Alignment padding */
+    struct obmafs3_ioctl_groupby_entry entries[METADATA_GROUPBY_MAX_RESULTS]; /**< Output: up to 8 entries */
+};
+
+#define OBMAFS3_IOC_GROUPBY_METADATA _IOWR('O', 19, struct obmafs3_ioctl_metadata_groupby_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

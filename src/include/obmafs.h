@@ -422,6 +422,9 @@ int obmafs3_metadata_query_resolve_page(struct obmafs3_ctx *ctx, const uint64_t 
 
 int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***values, uint32_t *count);
 void obmafs3_metadata_distinct_free(char **values, uint32_t count);
+int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
+                             char ***out_values, uint32_t **out_counts, uint32_t *out_n);
+void obmafs3_metadata_groupby_free(char **values, uint32_t *counts, uint32_t n);
 
 /* --- Block refcount operations --- */
 int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_count);

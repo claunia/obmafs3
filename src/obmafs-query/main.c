@@ -1989,6 +1989,130 @@ static int execute_distinct(int fd, const char *key, const char *format, const c
 }
 
 /* ------------------------------------------------------------------ */
+/*  GROUP BY with count                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Execute a GROUP BY query for @p key via ioctl.
+ * Returns each distinct value with its file count.
+ */
+static int execute_groupby(int fd, const char *key, const char *format, const char *to_file)
+{
+    uint32_t  cap    = 64;
+    uint32_t  n      = 0;
+    char    **vals   = malloc(cap * sizeof(char *));
+    uint32_t *cnts   = malloc(cap * sizeof(uint32_t));
+    if(!vals || !cnts)
+    {
+        free(vals); free(cnts);
+        fprintf(stderr, "Error: out of memory\n");
+        return 1;
+    }
+
+    uint32_t offset = 0;
+    uint32_t total  = 0;
+    while(1)
+    {
+        struct obmafs3_ioctl_metadata_groupby_arg ga;
+        memset(&ga, 0, sizeof(ga));
+        strncpy(ga.key, key, METADATA_KEY_MAX - 1);
+        ga.offset = offset;
+
+        if(ioctl(fd, OBMAFS3_IOC_GROUPBY_METADATA, &ga) != 0)
+        {
+            fprintf(stderr, "Error: ioctl GROUPBY_METADATA failed: %s\n", strerror(errno));
+            for(uint32_t i = 0; i < n; i++) free(vals[i]);
+            free(vals); free(cnts);
+            return 1;
+        }
+
+        total = ga.total;
+        if(ga.count == 0) break;
+
+        for(uint32_t i = 0; i < ga.count; i++)
+        {
+            if(n >= cap)
+            {
+                cap *= 2;
+                char     **tv = realloc(vals, cap * sizeof(char *));
+                uint32_t  *tc = realloc(cnts, cap * sizeof(uint32_t));
+                if(!tv || !tc)
+                {
+                    for(uint32_t j = 0; j < n; j++) free(vals[j]);
+                    free(vals); free(cnts);
+                    fprintf(stderr, "Error: out of memory\n");
+                    return 1;
+                }
+                vals = tv;
+                cnts = tc;
+            }
+            vals[n] = strndup(ga.entries[i].value, METADATA_VALUE_MAX);
+            cnts[n] = ga.entries[i].count;
+            n++;
+        }
+
+        offset += ga.count;
+        if(offset >= total) break;
+    }
+
+    /* Output */
+    const char *fmt = format ? format : "txt";
+    FILE       *fp  = stdout;
+    if(to_file)
+    {
+        fp = fopen(to_file, "w");
+        if(!fp)
+        {
+            fprintf(stderr, "Error: cannot open '%s': %s\n", to_file, strerror(errno));
+            for(uint32_t i = 0; i < n; i++) free(vals[i]);
+            free(vals); free(cnts);
+            return 1;
+        }
+    }
+
+    if(strcasecmp(fmt, "json") == 0)
+    {
+        fprintf(fp, "{\n  \"key\": \"");
+        json_escape(fp, key);
+        fprintf(fp, "\",\n  \"groups\": %u,\n  \"results\": [", n);
+        for(uint32_t i = 0; i < n; i++)
+        {
+            fprintf(fp, "%s\n    {\"value\": \"", i ? "," : "");
+            json_escape(fp, vals[i]);
+            fprintf(fp, "\", \"count\": %u}", cnts[i]);
+        }
+        fprintf(fp, "\n  ]\n}\n");
+    }
+    else
+    {
+        /* Compute max value width for alignment */
+        size_t max_vlen = 0;
+        for(uint32_t i = 0; i < n; i++)
+        {
+            size_t vlen = strlen(vals[i]);
+            if(vlen > max_vlen) max_vlen = vlen;
+        }
+        for(uint32_t i = 0; i < n; i++)
+            fprintf(fp, "  %-*s  %u\n", (int)max_vlen, vals[i], cnts[i]);
+    }
+
+    if(to_file)
+    {
+        fclose(fp);
+        printf("Exported %u group(s) to %s\n", n, to_file);
+    }
+    else if(strcasecmp(fmt, "txt") == 0)
+    {
+        printf("\n%u group(s) for '%s'\n", n, key);
+    }
+
+    for(uint32_t i = 0; i < n; i++) free(vals[i]);
+    free(vals);
+    free(cnts);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Help text                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -1999,6 +2123,7 @@ static void print_help(void)
            "Commands:\n"
            "  help               Show this help message\n"
            "  distinct <key>     List all distinct values for a key\n"
+           "  groupby <key>      Show distinct values with file counts\n"
            "  explain <query>    Show query plan with per-filter match counts\n"
            "  resort <key>       Re-sort cached results (e.g. resort N:year)\n"
            "  reverse            Toggle sort order and re-display\n"
@@ -2086,6 +2211,7 @@ static void usage(const char *prog)
             "  -l, --limit <N>        Return at most N results\n"
             "  -S, --stream           Stream results as they arrive (txt/jsonl only)\n"
             "  -d, --distinct <key>   List all distinct values for a metadata key\n"
+            "  -g, --groupby <key>    Show distinct values with file counts\n"
             "  -f, --format <fmt>     Output format: txt, json, table, or csv\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
@@ -2254,6 +2380,19 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             continue;
         }
 
+        /* groupby <key> — show distinct values with counts */
+        if(strncasecmp(cmd, "groupby ", 8) == 0 || strncasecmp(cmd, "groupby\t", 8) == 0)
+        {
+            const char *gkey = cmd + 8;
+            while(*gkey == ' ' || *gkey == '\t') gkey++;
+            if(*gkey == '\0')
+                fprintf(stderr, "Error: expected a key name after 'groupby'\n");
+            else
+                execute_groupby(query_fd, gkey, NULL, NULL);
+            free(line);
+            continue;
+        }
+
         /* explain <query> — show query plan with per-filter match counts */
         if(strncasecmp(cmd, "explain ", 8) == 0 || strncasecmp(cmd, "explain\t", 8) == 0)
         {
@@ -2389,6 +2528,7 @@ int main(int argc, char *argv[])
     const char *output_str   = NULL;
     const char *sort_str     = NULL;
     const char *distinct_str = NULL;
+    const char *groupby_str  = NULL;
     int         show_meta    = 0;
     int         reverse      = 0;
     int         count_only   = 0;
@@ -2405,6 +2545,7 @@ int main(int argc, char *argv[])
         {"reverse",  no_argument,       NULL, 'r'},
         {"count",    no_argument,       NULL, 'c'},
         {"distinct", required_argument, NULL, 'd'},
+        {"groupby",  required_argument, NULL, 'g'},
         {"limit",    required_argument, NULL, 'l'},
         {"keys",     required_argument, NULL, 'k'},
         {"stream",   no_argument,       NULL, 'S'},
@@ -2413,7 +2554,7 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:l:k:Sh", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:g:l:k:Sh", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -2425,6 +2566,7 @@ int main(int argc, char *argv[])
             case 'r': reverse      = 1;      break;
             case 'c': count_only   = 1;      break;
             case 'd': distinct_str = optarg; break;
+            case 'g': groupby_str  = optarg; break;
             case 'l': limit_n      = (uint32_t)strtoul(optarg, NULL, 10); break;
             case 'k': keys_str     = optarg; show_meta = 1; break;
             case 'S': streaming    = 1;      break;
@@ -2457,6 +2599,11 @@ int main(int argc, char *argv[])
     {
         /* Distinct values mode */
         rc = execute_distinct(query_fd, distinct_str, format_str, output_str);
+    }
+    else if(groupby_str)
+    {
+        /* GROUP BY mode */
+        rc = execute_groupby(query_fd, groupby_str, format_str, output_str);
     }
     else if(query_str)
     {

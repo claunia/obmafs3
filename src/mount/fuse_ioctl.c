@@ -1171,6 +1171,32 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             return 0;
         }
 
+        case OBMAFS3_IOC_GROUPBY_METADATA:
+        {
+            /* Filesystem-level GROUP BY query */
+            struct obmafs3_ioctl_metadata_groupby_arg *ga =
+                (struct obmafs3_ioctl_metadata_groupby_arg *)data;
+
+            char     **vals;
+            uint32_t  *cnts;
+            uint32_t   total;
+            int rc = obmafs3_metadata_groupby(g_ctx, ga->key, &vals, &cnts, &total);
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+            uint32_t start = ga->offset;
+            uint32_t n     = 0;
+            memset(ga->entries, 0, sizeof(ga->entries));
+            for(uint32_t i = start; i < total && n < METADATA_GROUPBY_MAX_RESULTS; i++, n++)
+            {
+                strncpy(ga->entries[n].value, vals[i], METADATA_VALUE_MAX - 1);
+                ga->entries[n].count = cnts[i];
+            }
+            ga->count = n;
+            ga->total = total;
+            obmafs3_metadata_groupby_free(vals, cnts, total);
+            return 0;
+        }
+
         default:
             FUSE_RETURN(-ENOTTY, "");
     }

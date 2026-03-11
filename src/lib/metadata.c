@@ -2940,3 +2940,135 @@ void obmafs3_metadata_distinct_free(char **values, uint32_t count)
     for(uint32_t i = 0; i < count; i++) free(values[i]);
     free(values);
 }
+
+/* ------------------------------------------------------------------ */
+/*  GROUP BY with count                                                */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
+                             char ***out_values, uint32_t **out_counts, uint32_t *out_n)
+{
+    *out_values = NULL;
+    *out_counts = NULL;
+    *out_n      = 0;
+
+    if(ctx->sb.metadata_idx_lba == 0) return OBMAFS3_OK;
+
+    uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
+    if(lba == 0) return OBMAFS3_OK;
+
+    size_t   nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    /* Navigate to the leaf containing (key, "", 0) */
+    static const char empty_val[METADATA_VALUE_MAX] = {0};
+    while(1)
+    {
+        int rc = meta_node_read(ctx, lba, buf);
+        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+        if(hdr.level == 0) break;
+
+        uint16_t slot = midx_index_find(buf, hdr.node_keys, key, empty_val, 0);
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain, counting unique inode_ids per value */
+    uint32_t   cap    = 64;
+    uint32_t   n      = 0;
+    char     **values = malloc(cap * sizeof(char *));
+    uint32_t  *counts = malloc(cap * sizeof(uint32_t));
+    if(!values || !counts) { free(buf); free(values); free(counts); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
+
+    char     prev_value[METADATA_VALUE_MAX];
+    uint64_t prev_inode = 0;
+    int      have_prev  = 0;
+
+    while(1)
+    {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for(uint16_t i = 0; i < hdr.node_keys; i++)
+        {
+            struct metadata_idx_record rec;
+            memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
+
+            int kcmp = strncmp(rec.key, key, METADATA_KEY_MAX);
+            if(kcmp < 0) continue;
+            if(kcmp > 0) goto groupby_done;
+
+            if(have_prev && strncmp(rec.value, prev_value, METADATA_VALUE_MAX) == 0)
+            {
+                /* Same value — count only if different inode (tree sorted by inode within value) */
+                if(rec.inode_id != prev_inode)
+                {
+                    counts[n - 1]++;
+                    prev_inode = rec.inode_id;
+                }
+                continue;
+            }
+
+            /* New value */
+            if(n >= cap)
+            {
+                cap *= 2;
+                char     **tv = realloc(values, cap * sizeof(char *));
+                uint32_t  *tc = realloc(counts, cap * sizeof(uint32_t));
+                if(!tv || !tc)
+                {
+                    for(uint32_t j = 0; j < n; j++) free(values[j]);
+                    free(values); free(counts); free(buf);
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                }
+                values = tv;
+                counts = tc;
+            }
+            values[n] = strndup(rec.value, METADATA_VALUE_MAX);
+            if(!values[n])
+            {
+                for(uint32_t j = 0; j < n; j++) free(values[j]);
+                free(values); free(counts); free(buf);
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+            }
+            counts[n] = 1;
+            memcpy(prev_value, rec.value, METADATA_VALUE_MAX);
+            prev_inode = rec.inode_id;
+            have_prev  = 1;
+            n++;
+        }
+
+        if(hdr.right_link == 0) break;
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if(rc != OBMAFS3_OK)
+        {
+            for(uint32_t j = 0; j < n; j++) free(values[j]);
+            free(values); free(counts); free(buf);
+            return rc;
+        }
+    }
+
+groupby_done:
+    free(buf);
+    *out_values = values;
+    *out_counts = counts;
+    *out_n      = n;
+    return OBMAFS3_OK;
+}
+
+void obmafs3_metadata_groupby_free(char **values, uint32_t *counts, uint32_t n)
+{
+    if(values)
+    {
+        for(uint32_t i = 0; i < n; i++) free(values[i]);
+        free(values);
+    }
+    free(counts);
+}
