@@ -672,6 +672,7 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
     {
         qa->offset = offset;
         qa->count  = 0;
+        qa->total  = 0;
 
         if(ioctl(fd, OBMAFS3_IOC_QUERY_METADATA, qa) != 0)
         {
@@ -690,8 +691,8 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
 
         offset += qa->count;
 
-        /* If fewer than max results returned, we've reached the end */
-        if(qa->count < METADATA_QUERY_MAX_RESULTS) break;
+        /* Stop when we've collected all results */
+        if(offset >= qa->total) break;
     }
 
     printf("\n%u result(s)\n", rs.count);

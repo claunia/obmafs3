@@ -411,7 +411,8 @@ struct obmafs3_query_filter
 #define OBMAFS3_QUERY_MAX_FILTERS 4
 
 int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
-                                    uint8_t filter_count, uint8_t combine, char ***paths, uint32_t *count);
+                                    uint8_t filter_count, uint8_t combine, uint32_t offset, uint32_t limit,
+                                    char ***paths, uint32_t *count, uint32_t *total);
 int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char *path_buf, size_t path_buf_size);
 
 /* --- Block refcount operations --- */

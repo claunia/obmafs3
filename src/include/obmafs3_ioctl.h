@@ -217,7 +217,9 @@ struct obmafs3_ioctl_metadata_query_arg
     uint8_t                           _pad[6];                            /**< Alignment padding */
     struct obmafs3_ioctl_query_filter filters[OBMAFS3_QUERY_MAX_FILTERS]; /**< Filter conditions */
     uint32_t                          offset;                             /**< Input: starting offset */
-    uint32_t                          count;                              /**< Output: paths returned */
+    uint32_t                          count;                              /**< Output: paths returned this page */
+    uint32_t                          total;                              /**< Output: total matching results */
+    uint32_t                          _pad2;                              /**< Alignment padding */
     char paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX];      /**< Output: up to 8 paths */
 };
 

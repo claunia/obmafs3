@@ -870,17 +870,19 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             }
 
             char   **paths;
-            uint32_t total;
-            int rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count, qa->combine, &paths, &total);
+            uint32_t page_count;
+            uint32_t total_count;
+            int      rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count, qa->combine,
+                                                          qa->offset, METADATA_QUERY_MAX_RESULTS, &paths, &page_count,
+                                                          &total_count);
             if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
-            uint32_t start = qa->offset;
-            uint32_t n     = 0;
             memset(qa->paths, 0, sizeof(qa->paths));
-            for(uint32_t i = start; i < total && n < METADATA_QUERY_MAX_RESULTS; i++, n++)
-                strncpy(qa->paths[n], paths[i], METADATA_QUERY_PATH_MAX - 1);
-            qa->count = n;
-            obmafs3_metadata_query_free(paths, total);
+            for(uint32_t i = 0; i < page_count && i < METADATA_QUERY_MAX_RESULTS; i++)
+                strncpy(qa->paths[i], paths[i], METADATA_QUERY_PATH_MAX - 1);
+            qa->count = page_count;
+            qa->total = total_count;
+            obmafs3_metadata_query_free(paths, page_count);
             return 0;
         }
 
