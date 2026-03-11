@@ -38,7 +38,7 @@
  *
  * Options:
  *   -q, --query <query>    Run a single query and exit (batch mode)
- *   -f, --format <fmt>     Output format: txt (default), json, or table
+ *   -f, --format <fmt>     Output format: txt (default), json, table, or csv
  *   -o, --output <path>    Write results to file instead of stdout
  *   -h, --help             Show help
  *
@@ -1270,6 +1270,88 @@ static int export_table(const struct result_set *rs, const char *filepath)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  CSV output                                                         */
+/* ------------------------------------------------------------------ */
+
+/** Write a CSV-escaped field to @p fp.  Quotes the field if it contains
+ *  a comma, double-quote, or newline. */
+static void csv_field(FILE *fp, const char *s)
+{
+    int need_quote = 0;
+    for(const char *p = s; *p; p++)
+    {
+        if(*p == ',' || *p == '"' || *p == '\n' || *p == '\r')
+        {
+            need_quote = 1;
+            break;
+        }
+    }
+    if(need_quote)
+    {
+        fputc('"', fp);
+        for(const char *p = s; *p; p++)
+        {
+            if(*p == '"') fputc('"', fp); /* double the quote */
+            fputc(*p, fp);
+        }
+        fputc('"', fp);
+    }
+    else
+    {
+        fputs(s, fp);
+    }
+}
+
+/**
+ * Write a result set as CSV to @p fp.
+ * Columns: PATH, then each metadata key found across all results.
+ */
+static void write_csv(FILE *fp, const struct result_set *rs)
+{
+    char    **col_keys;
+    uint32_t  ncols = collect_column_keys(rs, &col_keys);
+
+    /* Header row */
+    csv_field(fp, "PATH");
+    for(uint32_t c = 0; c < ncols; c++)
+    {
+        fputc(',', fp);
+        csv_field(fp, col_keys[c]);
+    }
+    fputc('\n', fp);
+
+    /* Data rows */
+    for(uint32_t i = 0; i < rs->count; i++)
+    {
+        csv_field(fp, rs->paths[i]);
+        for(uint32_t c = 0; c < ncols; c++)
+        {
+            fputc(',', fp);
+            const char *val = rs->metadata ? ml_find(&rs->metadata[i], col_keys[c]) : "";
+            csv_field(fp, val);
+        }
+        fputc('\n', fp);
+    }
+
+    for(uint32_t i = 0; i < ncols; i++) free(col_keys[i]);
+    free(col_keys);
+}
+
+static int export_csv(const struct result_set *rs, const char *filepath)
+{
+    FILE *fp = fopen(filepath, "w");
+    if(!fp)
+    {
+        fprintf(stderr, "Error: cannot open '%s': %s\n", filepath, strerror(errno));
+        return -1;
+    }
+    write_csv(fp, rs);
+    fclose(fp);
+    printf("Exported %u result(s) to %s\n", rs->count, filepath);
+    return 0;
+}
+
 /**
  * Prompt the user to export results.  Accepts:
  *   txt <path>    — export as plain text
@@ -1280,7 +1362,7 @@ static void offer_export(const struct result_set *rs)
 {
     char line[4096];
 
-    printf("Export? [txt <path> / json <path> / table <path> / enter to skip]: ");
+    printf("Export? [txt <path> / json <path> / table <path> / csv <path> / enter to skip]: ");
     fflush(stdout);
 
     if(!fgets(line, sizeof(line), stdin)) return;
@@ -1319,8 +1401,10 @@ static void offer_export(const struct result_set *rs)
         export_json(rs, filepath);
     else if(strcasecmp(fmt, "table") == 0)
         export_table(rs, filepath);
+    else if(strcasecmp(fmt, "csv") == 0)
+        export_csv(rs, filepath);
     else
-        fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', or 'table')\n", fmt);
+        fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', 'table', or 'csv')\n", fmt);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1468,7 +1552,7 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
 
     /* Sorting by a metadata key requires metadata to be fetched.
      * Table format also requires metadata. */
-    int is_table  = (strcasecmp(fmt, "table") == 0);
+    int is_table  = (strcasecmp(fmt, "table") == 0 || strcasecmp(fmt, "csv") == 0);
     int need_meta = show_metadata || is_table || (sort_key && strcmp(sort_key, "path") != 0);
     if(need_meta && rs.count > 0)
         rs_fetch_metadata(mountpoint, &rs);
@@ -1483,11 +1567,13 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
             rc = export_json(&rs, output);
         else if(strcasecmp(fmt, "table") == 0)
             rc = export_table(&rs, output);
+        else if(strcasecmp(fmt, "csv") == 0)
+            rc = export_csv(&rs, output);
         else if(strcasecmp(fmt, "txt") == 0)
             rc = export_txt(&rs, output);
         else
         {
-            fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', or 'table')\n", fmt);
+            fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', 'table', or 'csv')\n", fmt);
             rs_free(&rs);
             return 1;
         }
@@ -1522,9 +1608,13 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
     {
         write_table(stdout, &rs);
     }
+    else if(strcasecmp(fmt, "csv") == 0)
+    {
+        write_csv(stdout, &rs);
+    }
     else
     {
-        fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', or 'table')\n", fmt);
+        fprintf(stderr, "Error: unknown format '%s' (use 'txt', 'json', 'table', or 'csv')\n", fmt);
         rs_free(&rs);
         return 1;
     }
@@ -1746,7 +1836,7 @@ static void usage(const char *prog)
             "  -q, --query <query>    Run a single query and exit\n"
             "  -c, --count            Count matching results only (no paths)\n"
             "  -d, --distinct <key>   List all distinct values for a metadata key\n"
-            "  -f, --format <fmt>     Output format: txt (default), json, or table\n"
+            "  -f, --format <fmt>     Output format: txt, json, table, or csv\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
             "  -s, --sort <key>       Sort results by metadata key or 'path'\n"
