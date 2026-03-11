@@ -97,7 +97,8 @@ struct obmafs3_thread_bufs
 #define OBMAFS3_ROCOMPAT_SECTOR_TAGS (1ULL << 0)  ///< Sector tags feature (hash-dedup per-sector side data)
 #define OBMAFS3_ROCOMPAT_NINTENDO    (1ULL << 1)  ///< Nintendo GameCube/Wii disc image support
 #define OBMAFS3_ROCOMPAT_PS3         (1ULL << 2)  ///< PS3 disc image support
-#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO | OBMAFS3_ROCOMPAT_PS3)  ///< Mask of known read-only compatible feature flags
+#define OBMAFS3_ROCOMPAT_NUMERIC_IDX (1ULL << 3)  ///< Numeric metadata index B+Tree
+#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO | OBMAFS3_ROCOMPAT_PS3 | OBMAFS3_ROCOMPAT_NUMERIC_IDX)  ///< Mask of known read-only compatible feature flags
 #define OBMAFS3_INCOMPAT_LZMA         (1ULL << 0)  ///< LZMA compressed blocks present
 #define OBMAFS3_INCOMPAT_FLAGS_KNOWN  OBMAFS3_INCOMPAT_LZMA  ///< Mask of known incompatible feature flags
 
@@ -119,6 +120,7 @@ struct obmafs3_ctx
     struct btree_header   sector_tag_data_hdr;      ///< Cached sector tag data tree header
     struct btree_header   sector_tag_ref_hdr;       ///< Cached sector tag ref tree header
     struct btree_header   junk_map_hdr;             ///< Cached junk map tree header
+    struct btree_header   metadata_numeric_idx_hdr;  ///< Cached numeric metadata index tree header
     uint8_t              *bitmap;                  ///< In-memory allocation bitmap
     uint64_t              bitmap_size;             ///< Size of allocation bitmap in bytes
     uint64_t              next_free_lba;           ///< Allocation hint (persisted in bitmap header)
@@ -435,6 +437,13 @@ struct obmafs3_metadata_stats_result
 };
 
 int obmafs3_metadata_stats(struct obmafs3_ctx *ctx, const char *key, struct obmafs3_metadata_stats_result *out);
+
+/* --- Numeric metadata index B+Tree operations --- */
+int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id);
+int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id);
+int obmafs3_numidx_collect_range(struct obmafs3_ctx *ctx, const char *key, int64_t low, int64_t high,
+                                 uint64_t **out_ids, uint32_t *out_count);
+int obmafs3_numidx_build(struct obmafs3_ctx *ctx);
 
 /* --- Block refcount operations --- */
 int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_count);

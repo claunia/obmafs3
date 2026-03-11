@@ -246,6 +246,33 @@ struct __attribute__((packed)) metadata_idx_index_entry
     uint64_t child_lba;                  ///< LBA of the child node
 };
 
+/* ---- Numeric metadata index B+Tree ---- */
+
+/**
+ * Numeric metadata index record stored in leaf nodes.
+ * Sorted by (key, numeric_value, inode_id) composite key.
+ * numeric_value is an int64_t parsed from the string metadata value.
+ * Enables efficient range queries on numeric metadata fields.
+ */
+struct __attribute__((packed)) metadata_numeric_idx_record
+{
+    char     key[METADATA_KEY_MAX];      ///< Metadata key
+    int64_t  value;                      ///< Numeric value (parsed from string)
+    uint64_t inode_id;                   ///< Disk image inode
+};
+
+/**
+ * Index entry for numeric metadata index B+Tree internal nodes.
+ * Uses composite key (key, numeric_value, inode_id).
+ */
+struct __attribute__((packed)) metadata_numeric_idx_index_entry
+{
+    char     key[METADATA_KEY_MAX];      ///< Smallest key reachable through child
+    int64_t  value;                      ///< Smallest numeric value reachable through child
+    uint64_t inode_id;                   ///< Smallest inode_id reachable through child
+    uint64_t child_lba;                  ///< LBA of the child node
+};
+
 /* ---- Compact Disc image B+Trees ---- */
 
 #define CD_PREFIX_DATA_SIZE     16

@@ -51,6 +51,7 @@
 
 #include <ctype.h>
 #include <fnmatch.h>
+#include <limits.h>
 #include <regex.h>
 #include <strings.h>
 
@@ -1591,6 +1592,15 @@ int obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id, const char 
     {
         /* Remove old reverse-index entry */
         midx_tree_delete(ctx, old_rec.key, old_rec.value, inode_id);
+
+        /* Remove old numeric index entry if value was numeric */
+        if(ctx->sb.metadata_numeric_idx_lba != 0)
+        {
+            char  *end;
+            int64_t old_num = strtoll(old_rec.value, &end, 10);
+            if(*end == '\0' && old_rec.value[0] != '\0')
+                obmafs3_numidx_delete(ctx, old_rec.key, old_num, inode_id);
+        }
     }
     else if(rc != OBMAFS3_ERR_NOTFOUND) { return rc; }
 
@@ -1611,7 +1621,19 @@ int obmafs3_metadata_put(struct obmafs3_ctx *ctx, uint64_t inode_id, const char 
     strncpy(idx_rec.value, value, METADATA_VALUE_MAX - 1);
     idx_rec.inode_id = inode_id;
 
-    return midx_tree_put(ctx, &idx_rec);
+    rc = midx_tree_put(ctx, &idx_rec);
+    if(rc != OBMAFS3_OK) return rc;
+
+    /* Insert into numeric index if the value is a valid integer */
+    if(ctx->sb.metadata_numeric_idx_lba != 0)
+    {
+        char  *end;
+        int64_t num = strtoll(value, &end, 10);
+        if(*end == '\0' && value[0] != '\0')
+            obmafs3_numidx_put(ctx, key, num, inode_id);
+    }
+
+    return OBMAFS3_OK;
 }
 
 /**
@@ -1641,6 +1663,15 @@ int obmafs3_metadata_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const ch
 
     /* Delete from reverse-index tree */
     if(ctx->sb.metadata_idx_lba != 0) midx_tree_delete(ctx, rec.key, rec.value, inode_id);
+
+    /* Delete from numeric index if the value was numeric */
+    if(ctx->sb.metadata_numeric_idx_lba != 0)
+    {
+        char  *end;
+        int64_t num = strtoll(rec.value, &end, 10);
+        if(*end == '\0' && rec.value[0] != '\0')
+            obmafs3_numidx_delete(ctx, rec.key, num, inode_id);
+    }
 
     return OBMAFS3_OK;
 }
@@ -2549,6 +2580,80 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
 
     /* Wildcard key: "*" matches any key */
     int wildcard = (flt->key[0] == '*' && flt->key[1] == '\0');
+
+    /* For non-wildcard numeric operators, try the numeric index tree
+     * for an efficient range scan instead of the full string tree scan. */
+    if(!wildcard && ctx->sb.metadata_numeric_idx_lba != 0 &&
+       ctx->metadata_numeric_idx_hdr.root_node_lba != 0)
+    {
+        int64_t low = INT64_MIN, high = INT64_MAX;
+        int     use_numidx = 0;
+
+        switch(flt->op)
+        {
+            case kQueryOpNumEqual:
+                low = high = strtoll(flt->value, NULL, 10);
+                use_numidx = 1;
+                break;
+            case kQueryOpNumGreater:
+            {
+                int64_t v = strtoll(flt->value, NULL, 10);
+                low  = (v < INT64_MAX) ? v + 1 : INT64_MAX;
+                use_numidx = 1;
+                break;
+            }
+            case kQueryOpNumLess:
+            {
+                int64_t v = strtoll(flt->value, NULL, 10);
+                high = (v > INT64_MIN) ? v - 1 : INT64_MIN;
+                use_numidx = 1;
+                break;
+            }
+            case kQueryOpNumGreaterEq:
+                low = strtoll(flt->value, NULL, 10);
+                use_numidx = 1;
+                break;
+            case kQueryOpNumLessEq:
+                high = strtoll(flt->value, NULL, 10);
+                use_numidx = 1;
+                break;
+            case kQueryOpNumNotEqual:
+                /* Can't do a single range — fall through to string scan */
+                break;
+            case kQueryOpNumBetween:
+            {
+                const char *comma = strchr(flt->value, ',');
+                if(comma)
+                {
+                    low  = strtoll(flt->value, NULL, 10);
+                    high = strtoll(comma + 1, NULL, 10);
+                    use_numidx = 1;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+
+        if(use_numidx)
+        {
+            uint64_t *ids;
+            uint32_t  id_count;
+            int rc = obmafs3_numidx_collect_range(ctx, flt->key, low, high, &ids, &id_count);
+            if(rc != OBMAFS3_OK) return rc;
+
+            for(uint32_t i = 0; i < id_count; i++)
+            {
+                if(idset_add(out, ids[i]))
+                {
+                    free(ids);
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                }
+            }
+            free(ids);
+            return OBMAFS3_OK;
+        }
+    }
 
     size_t   nsz = meta_node_size(ctx);
     uint8_t *buf = calloc(1, nsz);

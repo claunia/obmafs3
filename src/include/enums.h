@@ -63,7 +63,8 @@ enum obmafs3_btree_type
     kBtreeTypeRefcount      = 10,
     kBtreeTypeSectorTagData = 11,
     kBtreeTypeSectorTagRef  = 12,
-    kBtreeTypeJunkMap       = 13
+    kBtreeTypeJunkMap       = 13,
+    kBtreeTypeMetadataNumericIndex = 14  ///< Numeric metadata reverse-index
 };
 
 /// Identifies the record format stored in a B+Tree.
@@ -82,7 +83,8 @@ enum obmafs3_btree_data_type
     kBtreeDataTypeRefcountEntry      = 10,
     kBtreeDataTypeSectorTagDataEntry  = 11,
     kBtreeDataTypeSectorTagRefEntry   = 12,
-    kBtreeDataTypeJunkMapEntry        = 13
+    kBtreeDataTypeJunkMapEntry        = 13,
+    kBtreeDataTypeMetadataNumericIndexEntry = 14  ///< Numeric metadata index entry
 };
 
 /// Inode file type stored in inode_record::file_type.

@@ -148,6 +148,13 @@ int main(int argc, char *argv[])
             fuse_opt_add_arg(&args, "-o");
             fuse_opt_add_arg(&args, "ro");
         }
+        else
+        {
+            /* Build numeric metadata index if not already present */
+            rc = obmafs3_numidx_build(g_ctx);
+            if(rc != OBMAFS3_OK)
+                fprintf(stderr, "Warning: failed to build numeric metadata index (rc=%d)\n", rc);
+        }
 
         /* Apply mount options */
         if(opts.cache_limit)

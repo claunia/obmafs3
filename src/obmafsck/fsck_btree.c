@@ -564,6 +564,21 @@ int ordering_key_cmp(const uint8_t *a, const uint8_t *b, int type, int is_leaf)
                 return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
             }
 
+        case ORD_METADATA_NUMERIC_IDX:
+        {
+            /* metadata_numeric_idx_record/index_entry: key[256], int64_t value(8), inode_id(8) [, child_lba(8)] */
+            int r = strncmp((const char *)a, (const char *)b, METADATA_KEY_MAX);
+            if(r != 0) return r;
+            int64_t va, vb;
+            memcpy(&va, a + METADATA_KEY_MAX, 8);
+            memcpy(&vb, b + METADATA_KEY_MAX, 8);
+            if(va != vb) return (va < vb) ? -1 : 1;
+            uint64_t id_a, id_b;
+            memcpy(&id_a, a + METADATA_KEY_MAX + 8, 8);
+            memcpy(&id_b, b + METADATA_KEY_MAX + 8, 8);
+            return (id_a < id_b) ? -1 : (id_a > id_b) ? 1 : 0;
+        }
+
         default:
             return 0;
     }

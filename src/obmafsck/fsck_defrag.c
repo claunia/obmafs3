@@ -498,6 +498,13 @@ void defrag_all_trees(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
                     __builtin_offsetof(struct metadata_idx_index_entry, child_lba), METADATA_NODE_BLOCKS, auto_yes,
                     auto_no);
 
+    /* Numeric metadata index (8 blocks per node) */
+    if(ctx->sb.metadata_numeric_idx_lba != 0)
+        defrag_tree(ctx, "numeric metadata index", ctx->sb.metadata_numeric_idx_lba,
+                    &ctx->metadata_numeric_idx_hdr, sizeof(struct metadata_numeric_idx_index_entry),
+                    __builtin_offsetof(struct metadata_numeric_idx_index_entry, child_lba), METADATA_NODE_BLOCKS,
+                    auto_yes, auto_no);
+
     /* Dedup sub-trees */
     if(ctx->sb.dedup_lba != 0)
     {

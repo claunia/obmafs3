@@ -1046,6 +1046,29 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         }
     }
 
+    /* Numeric metadata index tree header and nodes (if present) */
+    PROGRESS("numeric metadata index tree");
+    if(ctx->sb.metadata_numeric_idx_lba != 0)
+    {
+        MARK(ctx->sb.metadata_numeric_idx_lba);
+        if(ctx->metadata_numeric_idx_hdr.root_node_lba != 0)
+        {
+            uint64_t *nodes = NULL;
+            uint64_t  count = 0;
+            int rc = walk_meta_btree_nodes(ctx, ctx->metadata_numeric_idx_hdr.root_node_lba,
+                                           sizeof(struct metadata_numeric_idx_index_entry),
+                                           __builtin_offsetof(struct metadata_numeric_idx_index_entry, child_lba),
+                                           &nodes, &count);
+            if(rc == OBMAFS3_OK)
+            {
+                for(uint64_t i = 0; i < count; i++)
+                    for(int b = 0; b < METADATA_NODE_BLOCKS; b++)
+                        MARK(nodes[i] + (uint64_t)b);
+                free(nodes);
+            }
+        }
+    }
+
     /* Bitmap blocks */
     PROGRESS("bitmap blocks");
     for(uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++) MARK(ctx->sb.bitmap_lba + i);
@@ -1300,6 +1323,10 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
 
         /* Junk map tree */
         if(ctx->sb.junk_map_lba != 0) MARK_FREE_CHAIN(&ctx->junk_map_hdr, 1);
+
+        /* Numeric metadata index tree (multi-block nodes) */
+        if(ctx->sb.metadata_numeric_idx_lba != 0)
+            MARK_FREE_CHAIN(&ctx->metadata_numeric_idx_hdr, METADATA_NODE_BLOCKS);
 
         /* Dedup trees (each has its own header and free chain) */
         if(ctx->sb.dedup_lba != 0)

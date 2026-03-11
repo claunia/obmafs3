@@ -96,6 +96,7 @@ extern int             g_phase_num;
 #define ORD_MEDIA_TAG    3 /**< key = (inode_id, tag_type) */
 #define ORD_METADATA     4 /**< key = (inode_id, key[256]) */
 #define ORD_METADATA_IDX 5 /**< key = (key[256], value[1025], inode_id) */
+#define ORD_METADATA_NUMERIC_IDX 6 /**< key = (key[256], int64_value, inode_id) */
 
 /* ------------------------------------------------------------------ */
 /*  fsck_util.c — colour, timing, phase, result, options helpers       */
