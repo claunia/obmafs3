@@ -208,7 +208,11 @@ enum obmafs3_query_op
 
     /* Range matching (value = "low,high", inclusive) */
     kQueryOpBetween     = 25,
-    kQueryOpNumBetween  = 26
+    kQueryOpNumBetween  = 26,
+
+    /* Glob/wildcard matching (fnmatch) */
+    kQueryOpGlob        = 27,
+    kQueryOpIGlob       = 28
 };
 
 enum obmafs3_query_combine

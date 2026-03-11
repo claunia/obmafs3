@@ -149,7 +149,11 @@ enum obmafs3_query_op
 
     /* Range matching (value = "low,high", inclusive) */
     kQueryOpBetween     = 25, ///< low <= strcmp <= high (lexicographic)
-    kQueryOpNumBetween  = 26  ///< low <= atoll <= high (numeric)
+    kQueryOpNumBetween  = 26, ///< low <= atoll <= high (numeric)
+
+    /* Glob/wildcard matching (fnmatch) */
+    kQueryOpGlob        = 27, ///< fnmatch pattern (case-sensitive)
+    kQueryOpIGlob       = 28  ///< fnmatch pattern (case-insensitive)
 };
 
 /// How to combine multiple query filters.

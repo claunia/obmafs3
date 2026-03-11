@@ -54,6 +54,7 @@
  *   <key> ENDSWITH "<value>"        Suffix match
  *   <key> IN "<val1>,<val2>,..."     Match any in comma-separated list
  *   <key> BETWEEN "<low>" "<high>"  Inclusive range (lexicographic)
+ *   <key> GLOB "<pattern>"          Wildcard match (*, ?, [abc])
  *   <key> EXISTS                    Key exists (any value)
  *
  *   Case-insensitive:
@@ -63,6 +64,7 @@
  *   <key> ISTARTSWITH "<value>"     Prefix (ignoring case)
  *   <key> IENDSWITH "<value>"       Suffix (ignoring case)
  *   <key> IIN "<val1>,<val2>,..."    IN match (ignoring case)
+ *   <key> IGLOB "<pattern>"         Wildcard match (ignoring case)
  *
  *   Numeric (values parsed as integers):
  *   <key> N= "<value>"              Numeric equal
@@ -421,6 +423,16 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
     {
         *op         = kQueryOpNumBetween;
         *need_value = 2;
+        return after;
+    }
+    if(strcasecmp(kw, "GLOB") == 0)
+    {
+        *op = kQueryOpGlob;
+        return after;
+    }
+    if(strcasecmp(kw, "IGLOB") == 0)
+    {
+        *op = kQueryOpIGlob;
         return after;
     }
     if(strcasecmp(kw, "REGEX") == 0)
@@ -1513,6 +1525,7 @@ static void print_help(void)
            "  <key> ENDSWITH \"<value>\"           Suffix match\n"
            "  <key> IN \"<val1>,<val2>,...\"       Match any in list\n"
            "  <key> BETWEEN \"<low>\" \"<high>\"    Inclusive range (lexicographic)\n"
+           "  <key> GLOB \"<pattern>\"             Wildcard match (*, ?, [abc])\n"
            "  <key> EXISTS                       Key exists (any value)\n"
            "\n"
            "Case-insensitive operators:\n"
@@ -1522,6 +1535,7 @@ static void print_help(void)
            "  <key> ISTARTSWITH \"<value>\"        Prefix (case-insensitive)\n"
            "  <key> IENDSWITH \"<value>\"          Suffix (case-insensitive)\n"
            "  <key> IIN \"<val1>,<val2>,...\"      IN match (case-insensitive)\n"
+           "  <key> IGLOB \"<pattern>\"            Wildcard (case-insensitive)\n"
            "\n"
            "Numeric operators (values parsed as integers):\n"
            "  <key> N= \"<value>\"                 Numeric equal\n"

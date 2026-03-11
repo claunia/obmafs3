@@ -44,10 +44,13 @@
  * Both trees use multi-block nodes (METADATA_NODE_BLOCKS blocks
  * each = 32768 bytes with default 4096-byte block size).
  */
+#define _GNU_SOURCE /* for FNM_CASEFOLD */
+
 #include "btree_internal.h"
 #include "debug.h"
 
 #include <ctype.h>
+#include <fnmatch.h>
 #include <regex.h>
 #include <strings.h>
 
@@ -2564,6 +2567,12 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
             int64_t hi  = strtoll(comma + 1, NULL, 10);
             return rv >= low && rv <= hi;
         }
+
+        /* Glob/wildcard matching */
+        case kQueryOpGlob:
+            return fnmatch(flt_value, rec_value, 0) == 0;
+        case kQueryOpIGlob:
+            return fnmatch(flt_value, rec_value, FNM_CASEFOLD) == 0;
 
         default:
             return 0;
