@@ -2546,6 +2546,25 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
             return 0;
         }
 
+        /* Range matching: value field contains "low,high" */
+        case kQueryOpBetween:
+        {
+            const char *comma = strchr(flt_value, ',');
+            if(!comma) return 0;
+            size_t low_len = (size_t)(comma - flt_value);
+            return strncmp(rec_value, flt_value, low_len) >= 0 &&
+                   strcmp(rec_value, comma + 1) <= 0;
+        }
+        case kQueryOpNumBetween:
+        {
+            const char *comma = strchr(flt_value, ',');
+            if(!comma) return 0;
+            int64_t rv  = strtoll(rec_value, NULL, 10);
+            int64_t low = strtoll(flt_value, NULL, 10);
+            int64_t hi  = strtoll(comma + 1, NULL, 10);
+            return rv >= low && rv <= hi;
+        }
+
         default:
             return 0;
     }

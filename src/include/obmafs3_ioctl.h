@@ -204,7 +204,11 @@ enum obmafs3_query_op
 
     /* Set membership (comma-separated value list) */
     kQueryOpIn          = 23,
-    kQueryOpIIn         = 24
+    kQueryOpIIn         = 24,
+
+    /* Range matching (value = "low,high", inclusive) */
+    kQueryOpBetween     = 25,
+    kQueryOpNumBetween  = 26
 };
 
 enum obmafs3_query_combine

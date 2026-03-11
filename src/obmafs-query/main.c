@@ -53,6 +53,7 @@
  *   <key> STARTSWITH "<value>"      Prefix match
  *   <key> ENDSWITH "<value>"        Suffix match
  *   <key> IN "<val1>,<val2>,..."     Match any in comma-separated list
+ *   <key> BETWEEN "<low>" "<high>"  Inclusive range (lexicographic)
  *   <key> EXISTS                    Key exists (any value)
  *
  *   Case-insensitive:
@@ -70,6 +71,7 @@
  *   <key> N< "<value>"              Numeric less than
  *   <key> N>= "<value>"             Numeric greater or equal
  *   <key> N<= "<value>"             Numeric less or equal
+ *   <key> NBETWEEN "<low>" "<high>" Inclusive numeric range
  *
  *   Regex (POSIX extended regular expressions):
  *   <key> REGEX "<pattern>"         Regex match (case-sensitive)
@@ -409,6 +411,18 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
         *op = kQueryOpIIn;
         return after;
     }
+    if(strcasecmp(kw, "BETWEEN") == 0)
+    {
+        *op         = kQueryOpBetween;
+        *need_value = 2;
+        return after;
+    }
+    if(strcasecmp(kw, "NBETWEEN") == 0)
+    {
+        *op         = kQueryOpNumBetween;
+        *need_value = 2;
+        return after;
+    }
     if(strcasecmp(kw, "REGEX") == 0)
     {
         *op = kQueryOpRegex;
@@ -473,6 +487,26 @@ static const char *parse_one_filter(const char *p, struct obmafs3_ioctl_query_fi
     {
         fprintf(stderr, "Error: expected a value after operator\n");
         return NULL;
+    }
+
+    /* BETWEEN/NBETWEEN: parse second value and append with comma separator */
+    if(need_value == 2)
+    {
+        p = skip_ws(p);
+        char val2[METADATA_VALUE_MAX];
+        if(*p == '"') { p = parse_quoted(p, val2, sizeof(val2)); }
+        else           { p = parse_token(p, val2, sizeof(val2)); }
+        if(!p)
+        {
+            fprintf(stderr, "Error: BETWEEN requires two values\n");
+            return NULL;
+        }
+        size_t v1len = strlen(flt->value);
+        if(v1len + 1 + strlen(val2) < sizeof(flt->value))
+        {
+            flt->value[v1len] = ',';
+            memcpy(flt->value + v1len + 1, val2, strlen(val2) + 1);
+        }
     }
 
     return p;
@@ -1478,6 +1512,7 @@ static void print_help(void)
            "  <key> STARTSWITH \"<value>\"         Prefix match\n"
            "  <key> ENDSWITH \"<value>\"           Suffix match\n"
            "  <key> IN \"<val1>,<val2>,...\"       Match any in list\n"
+           "  <key> BETWEEN \"<low>\" \"<high>\"    Inclusive range (lexicographic)\n"
            "  <key> EXISTS                       Key exists (any value)\n"
            "\n"
            "Case-insensitive operators:\n"
@@ -1495,6 +1530,7 @@ static void print_help(void)
            "  <key> N< \"<value>\"                 Numeric less than\n"
            "  <key> N>= \"<value>\"                Numeric greater or equal\n"
            "  <key> N<= \"<value>\"                Numeric less or equal\n"
+           "  <key> NBETWEEN \"<low>\" \"<high>\"   Inclusive numeric range\n"
            "\n"
            "Regex operators (POSIX extended regular expressions):\n"
            "  <key> REGEX \"<pattern>\"            Regex match (case-sensitive)\n"

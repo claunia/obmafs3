@@ -145,7 +145,11 @@ enum obmafs3_query_op
 
     /* Set membership (comma-separated value list) */
     kQueryOpIn          = 23, ///< value in comma-separated list (case-sensitive)
-    kQueryOpIIn         = 24  ///< value in comma-separated list (case-insensitive)
+    kQueryOpIIn         = 24, ///< value in comma-separated list (case-insensitive)
+
+    /* Range matching (value = "low,high", inclusive) */
+    kQueryOpBetween     = 25, ///< low <= strcmp <= high (lexicographic)
+    kQueryOpNumBetween  = 26  ///< low <= atoll <= high (numeric)
 };
 
 /// How to combine multiple query filters.
