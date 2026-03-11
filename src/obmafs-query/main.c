@@ -1205,6 +1205,11 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
 {
     uint32_t offset = 0;
 
+    /* First call: cursor_id starts at 0 (new query).
+     * Subsequent calls reuse the cursor_id returned by the server,
+     * avoiding redundant B+Tree scans and set algebra. */
+    qa->cursor_id = 0;
+
     while(1)
     {
         qa->offset = offset;
@@ -1226,6 +1231,8 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
 
         /* Stop when we've collected all results */
         if(offset >= qa->total) break;
+
+        /* cursor_id is now set by the server; subsequent calls skip the query */
     }
     return 0;
 }
@@ -1241,9 +1248,10 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
  */
 static uint32_t execute_query_count(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
 {
-    qa->offset = UINT32_MAX;
-    qa->count  = 0;
-    qa->total  = 0;
+    qa->offset    = UINT32_MAX;
+    qa->count     = 0;
+    qa->total     = 0;
+    qa->cursor_id = 0;
 
     if(ioctl(fd, OBMAFS3_IOC_QUERY_METADATA, qa) != 0)
     {

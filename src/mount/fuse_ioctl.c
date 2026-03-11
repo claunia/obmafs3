@@ -45,6 +45,63 @@
 #include <limits.h>
 
 /* ------------------------------------------------------------------ */
+/*  Query cursor cache                                                 */
+/* ------------------------------------------------------------------ */
+
+#define MAX_QUERY_CURSORS 4
+
+struct query_cursor
+{
+    uint32_t  id;        /**< Cursor ID (0 = unused) */
+    uint64_t *ids;       /**< Sorted inode ID array */
+    uint32_t  count;     /**< Number of IDs */
+    uint64_t  last_use;  /**< Monotonic use counter for LRU eviction */
+};
+
+static struct query_cursor g_cursors[MAX_QUERY_CURSORS];
+static uint32_t            g_next_cursor_id = 1;
+static uint64_t            g_cursor_use_seq = 0;
+
+/** Find a cursor by ID.  Returns NULL if not found. */
+static struct query_cursor *cursor_find(uint32_t id)
+{
+    for(int i = 0; i < MAX_QUERY_CURSORS; i++)
+        if(g_cursors[i].id == id) return &g_cursors[i];
+    return NULL;
+}
+
+/** Allocate a cursor slot, evicting the LRU entry if full. */
+static struct query_cursor *cursor_alloc(void)
+{
+    /* Find an empty slot */
+    for(int i = 0; i < MAX_QUERY_CURSORS; i++)
+    {
+        if(g_cursors[i].id == 0) return &g_cursors[i];
+    }
+
+    /* Evict LRU */
+    struct query_cursor *lru = &g_cursors[0];
+    for(int i = 1; i < MAX_QUERY_CURSORS; i++)
+        if(g_cursors[i].last_use < lru->last_use) lru = &g_cursors[i];
+
+    free(lru->ids);
+    lru->ids   = NULL;
+    lru->id    = 0;
+    lru->count = 0;
+    return lru;
+}
+
+/** Release a cursor, freeing its cached data. */
+static void cursor_release(struct query_cursor *c)
+{
+    free(c->ids);
+    c->ids      = NULL;
+    c->id       = 0;
+    c->count    = 0;
+    c->last_use = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  CD image helpers                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -854,40 +911,81 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
 
         case OBMAFS3_IOC_QUERY_METADATA:
         {
-            /* Filesystem-level multi-filter query; works on any open image file */
+            /* Filesystem-level multi-filter query with cursor support */
             struct obmafs3_ioctl_metadata_query_arg *qa = (struct obmafs3_ioctl_metadata_query_arg *)data;
 
-            if(qa->filter_count == 0 || qa->filter_count > OBMAFS3_QUERY_MAX_FILTERS) FUSE_RETURN(-EINVAL, "");
-            if(qa->combine != kQueryCombineAnd && qa->combine != kQueryCombineOr) FUSE_RETURN(-EINVAL, "");
+            struct query_cursor *cursor = NULL;
 
-            /* Convert ioctl filters to library filters (strip padding) */
-            struct obmafs3_query_filter lib_filters[OBMAFS3_QUERY_MAX_FILTERS];
-            for(uint8_t f = 0; f < qa->filter_count; f++)
+            if(qa->cursor_id != 0)
             {
-                memcpy(lib_filters[f].key, qa->filters[f].key, METADATA_KEY_MAX);
-                memcpy(lib_filters[f].value, qa->filters[f].value, METADATA_VALUE_MAX);
-                lib_filters[f].op     = qa->filters[f].op;
-                lib_filters[f].negate = qa->filters[f].negate ? 1 : 0;
-                lib_filters[f].group  = qa->filters[f].group  ? 1 : 0;
+                /* Follow-up page: look up existing cursor */
+                cursor = cursor_find(qa->cursor_id);
+                if(!cursor) FUSE_RETURN(-EINVAL, "invalid cursor_id");
+                cursor->last_use = ++g_cursor_use_seq;
+            }
+            else
+            {
+                /* New query: validate and execute */
+                if(qa->filter_count == 0 || qa->filter_count > OBMAFS3_QUERY_MAX_FILTERS) FUSE_RETURN(-EINVAL, "");
+                if(qa->combine != kQueryCombineAnd && qa->combine != kQueryCombineOr) FUSE_RETURN(-EINVAL, "");
+
+                /* Convert ioctl filters to library filters (strip padding) */
+                struct obmafs3_query_filter lib_filters[OBMAFS3_QUERY_MAX_FILTERS];
+                for(uint8_t f = 0; f < qa->filter_count; f++)
+                {
+                    memcpy(lib_filters[f].key, qa->filters[f].key, METADATA_KEY_MAX);
+                    memcpy(lib_filters[f].value, qa->filters[f].value, METADATA_VALUE_MAX);
+                    lib_filters[f].op     = qa->filters[f].op;
+                    lib_filters[f].negate = qa->filters[f].negate ? 1 : 0;
+                    lib_filters[f].group  = qa->filters[f].group  ? 1 : 0;
+                }
+
+                /* Collect matching inode IDs */
+                uint64_t *ids;
+                uint32_t  id_count;
+                int rc = obmafs3_metadata_query_collect_ids(g_ctx, lib_filters, qa->filter_count,
+                                                            qa->combine, qa->combine1, qa->group_combine,
+                                                            &ids, &id_count);
+                if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+                /* Cache in a cursor slot */
+                cursor           = cursor_alloc();
+                cursor->ids      = ids;
+                cursor->count    = id_count;
+                cursor->id       = g_next_cursor_id++;
+                if(cursor->id == 0) cursor->id = g_next_cursor_id++; /* skip 0 */
+                cursor->last_use = ++g_cursor_use_seq;
             }
 
+            qa->total     = cursor->count;
+            qa->cursor_id = cursor->id;
+
+            /* Count-only mode: skip path resolution */
+            if(qa->offset == UINT32_MAX)
+            {
+                qa->count = 0;
+                memset(qa->paths, 0, sizeof(qa->paths));
+                return 0;
+            }
+
+            /* Resolve the requested page of paths */
             char   **paths;
             uint32_t page_count;
-            uint32_t total_count;
-            /* offset == UINT32_MAX is count-only mode: skip path resolution */
-            uint32_t req_limit = (qa->offset == UINT32_MAX) ? 0 : METADATA_QUERY_MAX_RESULTS;
-            int      rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count,
-                                                          qa->combine, qa->combine1, qa->group_combine,
-                                                          qa->offset, req_limit, &paths, &page_count,
-                                                          &total_count);
-            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+            int rc2 = obmafs3_metadata_query_resolve_page(g_ctx, cursor->ids, cursor->count,
+                                                          qa->offset, METADATA_QUERY_MAX_RESULTS,
+                                                          &paths, &page_count);
+            if(rc2 != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 
             memset(qa->paths, 0, sizeof(qa->paths));
             for(uint32_t i = 0; i < page_count && i < METADATA_QUERY_MAX_RESULTS; i++)
                 strncpy(qa->paths[i], paths[i], METADATA_QUERY_PATH_MAX - 1);
             qa->count = page_count;
-            qa->total = total_count;
             obmafs3_metadata_query_free(paths, page_count);
+
+            /* If this was the last page, release the cursor */
+            if(qa->offset + qa->count >= cursor->count)
+                cursor_release(cursor);
+
             return 0;
         }
 

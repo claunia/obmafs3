@@ -2706,42 +2706,15 @@ collect_done:
 }
 
 /**
- * Query which files match a set of metadata filter conditions.
- *
- * Each filter specifies a key, a comparison operator, and a value.
- * Filters may be negated (NOT) and assigned to one of two groups.
- * Group 0 filters are combined with @p combine0, group 1 filters
- * with @p combine1, and the two group results with @p group_combine.
- * If all filters are in group 0 (the default), @p combine1 and
- * @p group_combine are ignored, providing backward compatibility.
- *
- * Negated filters: the set of matching inodes is subtracted from the
- * universe of all inodes that have any metadata entry.
- *
- * Only the results in the range [@p offset, @p offset + @p limit) are
- * resolved to paths.
- *
- * @param ctx            Filesystem context.
- * @param filters        Array of filter conditions.
- * @param filter_count   Number of filters (1..OBMAFS3_QUERY_MAX_FILTERS).
- * @param combine0       How to combine group 0 filters (AND/OR).
- * @param combine1       How to combine group 1 filters (AND/OR).
- * @param group_combine  How to combine group results (AND/OR).
- * @param offset         Number of matching inodes to skip.
- * @param limit          Maximum paths to resolve (0 = all).
- * @param paths          Output array of path strings.
- * @param count          Output number of paths returned this page.
- * @param total          Output total number of matching inodes.
- * @return @c OBMAFS3_OK on success, or an error code on failure.
+ * Internal: collect matching inode IDs for a set of filters, apply
+ * negation, group separation, and set algebra.  Returns a sorted,
+ * deduplicated inode_id_set.  Caller must idset_free the result.
  */
-int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
-                                    uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
-                                    uint32_t offset, uint32_t limit,
-                                    char ***paths, uint32_t *count, uint32_t *total)
+static int query_collect_ids(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
+                             uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
+                             struct inode_id_set *result)
 {
-    *paths = NULL;
-    *count = 0;
-    *total = 0;
+    memset(result, 0, sizeof(*result));
 
     if(filter_count == 0 || filter_count > OBMAFS3_QUERY_MAX_FILTERS) DBG_RETURN(OBMAFS3_ERR_INVAL, "bad filter count");
 
@@ -2843,26 +2816,54 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
     }
 
     /* Step 5: Combine group results */
-    struct inode_id_set result;
     if(g0n > 0 && g1n > 0)
     {
         int rc;
         if(group_combine == kQueryCombineAnd)
-            rc = idset_intersect(&g0_result, &g1_result, &result);
+            rc = idset_intersect(&g0_result, &g1_result, result);
         else
-            rc = idset_union(&g0_result, &g1_result, &result);
+            rc = idset_union(&g0_result, &g1_result, result);
         idset_free(&g0_result);
         idset_free(&g1_result);
         if(rc != 0) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
     else if(g0n > 0)
     {
-        result = g0_result;
+        *result = g0_result;
     }
     else
     {
-        result = g1_result;
+        *result = g1_result;
     }
+
+    return OBMAFS3_OK;
+}
+
+/**
+ * Query which files match a set of metadata filter conditions.
+ *
+ * Each filter specifies a key, a comparison operator, and a value.
+ * Filters may be negated (NOT) and assigned to one of two groups.
+ * Group 0 filters are combined with @p combine0, group 1 filters
+ * with @p combine1, and the two group results with @p group_combine.
+ *
+ * Only the results in the range [@p offset, @p offset + @p limit) are
+ * resolved to paths.
+ *
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
+                                    uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
+                                    uint32_t offset, uint32_t limit,
+                                    char ***paths, uint32_t *count, uint32_t *total)
+{
+    *paths = NULL;
+    *count = 0;
+    *total = 0;
+
+    struct inode_id_set result;
+    int rc = query_collect_ids(ctx, filters, filter_count, combine0, combine1, group_combine, &result);
+    if(rc != OBMAFS3_OK) return rc;
 
     /* Resolve only the inode IDs in [offset, offset+limit) to paths.
      * Special case: offset == UINT32_MAX is the count-only sentinel —
@@ -2915,6 +2916,72 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
 
     path_cache_free(&pc);
     idset_free(&result);
+    *paths = res;
+    *count = n;
+    return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cursor-based query: collect IDs + resolve pages                    */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_metadata_query_collect_ids(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
+                                       uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
+                                       uint64_t **out_ids, uint32_t *out_count)
+{
+    *out_ids   = NULL;
+    *out_count = 0;
+
+    struct inode_id_set result;
+    int rc = query_collect_ids(ctx, filters, filter_count, combine0, combine1, group_combine, &result);
+    if(rc != OBMAFS3_OK) return rc;
+
+    /* Transfer ownership of the ID array to the caller */
+    *out_ids   = result.ids;
+    *out_count = result.count;
+    /* Don't call idset_free — caller owns the array now */
+    return OBMAFS3_OK;
+}
+
+int obmafs3_metadata_query_resolve_page(struct obmafs3_ctx *ctx, const uint64_t *ids, uint32_t id_count,
+                                        uint32_t offset, uint32_t limit, char ***paths, uint32_t *count)
+{
+    *paths = NULL;
+    *count = 0;
+
+    if(offset >= id_count) return OBMAFS3_OK;
+
+    uint32_t end      = (limit > 0 && offset + limit < id_count) ? offset + limit : id_count;
+    uint32_t page_max = end - offset;
+    uint32_t n        = 0;
+    char   **res      = malloc(page_max * sizeof(char *));
+    if(!res) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    struct path_cache pc;
+    if(path_cache_init(&pc))
+    {
+        free(res);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    for(uint32_t i = offset; i < end; i++)
+    {
+        char path[4096];
+        int  prc = resolve_inode_path_cached(ctx, ids[i], path, sizeof(path), &pc);
+        if(prc != OBMAFS3_OK) continue;
+
+        res[n] = strdup(path);
+        if(!res[n])
+        {
+            for(uint32_t j = 0; j < n; j++) free(res[j]);
+            free(res);
+            path_cache_free(&pc);
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        }
+        n++;
+    }
+
+    path_cache_free(&pc);
     *paths = res;
     *count = n;
     return OBMAFS3_OK;

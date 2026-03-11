@@ -257,7 +257,7 @@ struct obmafs3_ioctl_metadata_query_arg
     uint32_t                          offset;                             /**< Input: starting offset */
     uint32_t                          count;                              /**< Output: paths returned this page */
     uint32_t                          total;                              /**< Output: total matching results */
-    uint32_t                          _pad2;                              /**< Alignment padding */
+    uint32_t                          cursor_id;                          /**< In/Out: 0=new query, >0=reuse cached result */
     char paths[METADATA_QUERY_MAX_RESULTS][METADATA_QUERY_PATH_MAX];      /**< Output: up to 8 paths */
 };
 
