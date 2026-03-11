@@ -874,9 +874,11 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             char   **paths;
             uint32_t page_count;
             uint32_t total_count;
+            /* offset == UINT32_MAX is count-only mode: skip path resolution */
+            uint32_t req_limit = (qa->offset == UINT32_MAX) ? 0 : METADATA_QUERY_MAX_RESULTS;
             int      rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count,
                                                           qa->combine, qa->combine1, qa->group_combine,
-                                                          qa->offset, METADATA_QUERY_MAX_RESULTS, &paths, &page_count,
+                                                          qa->offset, req_limit, &paths, &page_count,
                                                           &total_count);
             if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
 

@@ -2798,12 +2798,13 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
         result = g1_result;
     }
 
-    /* Resolve only the inode IDs in [offset, offset+limit) to paths */
+    /* Resolve only the inode IDs in [offset, offset+limit) to paths.
+     * Special case: offset == UINT32_MAX is the count-only sentinel —
+     * return total without any path resolution. */
     *total = result.count;
 
-    if(offset >= result.count)
+    if(offset == UINT32_MAX || offset >= result.count)
     {
-        /* Offset past the end — return empty page */
         idset_free(&result);
         *paths = NULL;
         *count = 0;

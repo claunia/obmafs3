@@ -1161,6 +1161,30 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
 }
 
 /**
+ * Execute a count-only query: sets offset to UINT32_MAX so the
+ * kernel/library skips path resolution entirely.  Returns the
+ * total number of matching inodes.
+ *
+ * @param fd  File descriptor on the OBMAFS3 mount.
+ * @param qa  Parsed query argument.
+ * @return Total count, or (uint32_t)-1 on error.
+ */
+static uint32_t execute_query_count(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
+{
+    qa->offset = UINT32_MAX;
+    qa->count  = 0;
+    qa->total  = 0;
+
+    if(ioctl(fd, OBMAFS3_IOC_QUERY_METADATA, qa) != 0)
+    {
+        fprintf(stderr, "Error: ioctl QUERY_METADATA failed: %s\n", strerror(errno));
+        return (uint32_t)-1;
+    }
+
+    return qa->total;
+}
+
+/**
  * Execute a parsed query interactively: print results, show count,
  * offer export.  If @p show_metadata is set, fetches and displays
  * metadata for each result.  If @p sort_key is non-NULL, sorts results.
@@ -1370,6 +1394,7 @@ static void usage(const char *prog)
             "\n"
             "Options:\n"
             "  -q, --query <query>    Run a single query and exit\n"
+            "  -c, --count            Count matching results only (no paths)\n"
             "  -f, --format <fmt>     Output format: txt (default) or json\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
@@ -1381,8 +1406,8 @@ static void usage(const char *prog)
             "Examples:\n"
             "  %s <mountpoint>                              Interactive mode\n"
             "  %s -q 'artist = \"Iron Maiden\"' /mnt/archive  Batch query\n"
+            "  %s -q 'genre = \"Rock\"' -c /mnt/archive       Count only\n"
             "  %s -q 'genre = \"Rock\"' -s N:year /mnt/archive Sort by year\n"
-            "  %s -q 'artist EXISTS' -s path -r /mnt/archive Sort by path desc\n"
             "  %s -q 'year N> \"1985\"' -f json -m /mnt/archive JSON + metadata\n",
             prog, prog, prog, prog, prog, prog);
 }
@@ -1448,6 +1473,7 @@ int main(int argc, char *argv[])
     const char *sort_str   = NULL;
     int         show_meta  = 0;
     int         reverse    = 0;
+    int         count_only = 0;
 
     static struct option long_opts[] = {
         {"query",    required_argument, NULL, 'q'},
@@ -1456,12 +1482,13 @@ int main(int argc, char *argv[])
         {"metadata", no_argument,       NULL, 'm'},
         {"sort",     required_argument, NULL, 's'},
         {"reverse",  no_argument,       NULL, 'r'},
+        {"count",    no_argument,       NULL, 'c'},
         {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rh", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rch", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -1471,6 +1498,7 @@ int main(int argc, char *argv[])
             case 'm': show_meta  = 1;      break;
             case 's': sort_str   = optarg; break;
             case 'r': reverse    = 1;      break;
+            case 'c': count_only = 1;      break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -1505,13 +1533,27 @@ int main(int argc, char *argv[])
             close(query_fd);
             return 1;
         }
-        rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta, sort_str, reverse);
+
+        if(count_only)
+        {
+            uint32_t total = execute_query_count(query_fd, &qa);
+            if(total == (uint32_t)-1)
+                rc = 1;
+            else
+                printf("%u\n", total);
+        }
+        else
+        {
+            rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta, sort_str, reverse);
+        }
     }
     else
     {
         /* Interactive REPL mode */
         if(format_str || output_str)
             fprintf(stderr, "Warning: --format and --output are ignored in interactive mode\n");
+        if(count_only)
+            fprintf(stderr, "Warning: --count is ignored in interactive mode (use batch mode with -q)\n");
         repl(mountpoint, query_fd, show_meta, sort_str, reverse);
     }
 
