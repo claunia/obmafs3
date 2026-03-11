@@ -178,7 +178,21 @@ enum obmafs3_query_op
     kQueryOpLessEq     = 5,
     kQueryOpContains   = 6,
     kQueryOpStartsWith = 7,
-    kQueryOpExists     = 8
+    kQueryOpExists     = 8,
+
+    /* Case-insensitive variants */
+    kQueryOpIEqual      = 9,
+    kQueryOpINotEqual   = 10,
+    kQueryOpIContains   = 11,
+    kQueryOpIStartsWith = 12,
+
+    /* Numeric comparisons (values parsed as int64_t) */
+    kQueryOpNumEqual    = 13,
+    kQueryOpNumNotEqual = 14,
+    kQueryOpNumGreater  = 15,
+    kQueryOpNumLess     = 16,
+    kQueryOpNumGreaterEq = 17,
+    kQueryOpNumLessEq   = 18
 };
 
 enum obmafs3_query_combine

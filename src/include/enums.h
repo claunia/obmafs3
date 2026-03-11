@@ -119,7 +119,21 @@ enum obmafs3_query_op
     kQueryOpLessEq     = 5,  ///< strcmp <= 0
     kQueryOpContains   = 6,  ///< strstr != NULL
     kQueryOpStartsWith = 7,  ///< strncmp prefix == 0
-    kQueryOpExists     = 8   ///< key exists, value ignored
+    kQueryOpExists     = 8,  ///< key exists, value ignored
+
+    /* Case-insensitive variants */
+    kQueryOpIEqual      = 9,  ///< strcasecmp == 0
+    kQueryOpINotEqual   = 10, ///< strcasecmp != 0
+    kQueryOpIContains   = 11, ///< case-insensitive substring
+    kQueryOpIStartsWith = 12, ///< case-insensitive prefix
+
+    /* Numeric comparisons (values parsed as int64_t) */
+    kQueryOpNumEqual    = 13, ///< atoll == atoll
+    kQueryOpNumNotEqual = 14, ///< atoll != atoll
+    kQueryOpNumGreater  = 15, ///< atoll > atoll
+    kQueryOpNumLess     = 16, ///< atoll < atoll
+    kQueryOpNumGreaterEq = 17, ///< atoll >= atoll
+    kQueryOpNumLessEq   = 18  ///< atoll <= atoll
 };
 
 /// How to combine multiple query filters.

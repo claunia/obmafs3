@@ -47,8 +47,22 @@
  *   <key> STARTSWITH "<value>"      Prefix match
  *   <key> EXISTS                    Key exists (any value)
  *
+ *   Case-insensitive:
+ *   <key> I= "<value>"              Equal (ignoring case)
+ *   <key> I!= "<value>"             Not equal (ignoring case)
+ *   <key> ICONTAINS "<value>"       Substring (ignoring case)
+ *   <key> ISTARTSWITH "<value>"     Prefix (ignoring case)
+ *
+ *   Numeric (values parsed as integers):
+ *   <key> N= "<value>"              Numeric equal
+ *   <key> N!= "<value>"             Numeric not equal
+ *   <key> N> "<value>"              Numeric greater than
+ *   <key> N< "<value>"              Numeric less than
+ *   <key> N>= "<value>"             Numeric greater or equal
+ *   <key> N<= "<value>"             Numeric less or equal
+ *
  *   Multiple conditions joined with AND or OR:
- *     artist = "Iron Maiden" AND year > "1985"
+ *     artist I= "iron maiden" AND year N> "1985"
  */
 
 #include <ctype.h>
@@ -57,6 +71,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
@@ -250,6 +265,8 @@ static const char *parse_quoted(const char *p, char *out, size_t outsz)
 /**
  * Parse the operator after the key.  Accepts:
  *   =  !=  >  <  >=  <=  CONTAINS  STARTSWITH  EXISTS
+ *   I=  I!=  ICONTAINS  ISTARTSWITH         (case-insensitive)
+ *   N=  N!=  N>  N<  N>=  N<=               (numeric)
  *
  * @param p     Input pointer (after key + whitespace).
  * @param op    Output operator value.
@@ -259,6 +276,24 @@ static const char *parse_quoted(const char *p, char *out, size_t outsz)
 static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
 {
     *need_value = 1;
+
+    /* Numeric operators: N=  N!=  N>=  N<=  N>  N< */
+    if((p[0] == 'N' || p[0] == 'n') && (p[1] == '=' || p[1] == '!' || p[1] == '>' || p[1] == '<'))
+    {
+        if(p[1] == '!' && p[2] == '=') { *op = kQueryOpNumNotEqual;  return p + 3; }
+        if(p[1] == '>' && p[2] == '=') { *op = kQueryOpNumGreaterEq; return p + 3; }
+        if(p[1] == '<' && p[2] == '=') { *op = kQueryOpNumLessEq;    return p + 3; }
+        if(p[1] == '=')                { *op = kQueryOpNumEqual;      return p + 2; }
+        if(p[1] == '>')                { *op = kQueryOpNumGreater;    return p + 2; }
+        if(p[1] == '<')                { *op = kQueryOpNumLess;       return p + 2; }
+    }
+
+    /* Case-insensitive operators: I=  I!= */
+    if((p[0] == 'I' || p[0] == 'i') && (p[1] == '=' || p[1] == '!'))
+    {
+        if(p[1] == '!' && p[2] == '=') { *op = kQueryOpINotEqual; return p + 3; }
+        if(p[1] == '=')                { *op = kQueryOpIEqual;     return p + 2; }
+    }
 
     /* Two-character operators first */
     if(p[0] == '!' && p[1] == '=')
@@ -317,6 +352,16 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
     {
         *op         = kQueryOpExists;
         *need_value = 0;
+        return after;
+    }
+    if(strcasecmp(kw, "ICONTAINS") == 0)
+    {
+        *op = kQueryOpIContains;
+        return after;
+    }
+    if(strcasecmp(kw, "ISTARTSWITH") == 0)
+    {
+        *op = kQueryOpIStartsWith;
         return after;
     }
 
@@ -725,13 +770,28 @@ static void print_help(void)
            "  <key> STARTSWITH \"<value>\"         Prefix match\n"
            "  <key> EXISTS                       Key exists (any value)\n"
            "\n"
+           "Case-insensitive operators:\n"
+           "  <key> I= \"<value>\"                 Equal (case-insensitive)\n"
+           "  <key> I!= \"<value>\"                Not equal (case-insensitive)\n"
+           "  <key> ICONTAINS \"<value>\"          Substring (case-insensitive)\n"
+           "  <key> ISTARTSWITH \"<value>\"        Prefix (case-insensitive)\n"
+           "\n"
+           "Numeric operators (values parsed as integers):\n"
+           "  <key> N= \"<value>\"                 Numeric equal\n"
+           "  <key> N!= \"<value>\"                Numeric not equal\n"
+           "  <key> N> \"<value>\"                 Numeric greater than\n"
+           "  <key> N< \"<value>\"                 Numeric less than\n"
+           "  <key> N>= \"<value>\"                Numeric greater or equal\n"
+           "  <key> N<= \"<value>\"                Numeric less or equal\n"
+           "\n"
            "  Use * as the key to match across all keys:\n"
            "    * CONTAINS \"maiden\"               Any key's value contains\n"
+           "    * ICONTAINS \"maiden\"              Any key (case-insensitive)\n"
            "    * = \"Rock\"                        Any key's value equals\n"
            "    * STARTSWITH \"Iron\"               Any key's value starts with\n"
            "\n"
            "  Multiple conditions joined with AND or OR (cannot mix):\n"
-           "    artist = \"Iron Maiden\" AND year > \"1985\"\n"
+           "    artist I= \"iron maiden\" AND year N> \"1985\"\n"
            "    genre = \"Rock\" OR genre = \"Metal\"\n"
            "\n"
            "  Values may be quoted (\"...\") or unquoted single words.\n"

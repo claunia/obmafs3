@@ -47,6 +47,9 @@
 #include "btree_internal.h"
 #include "debug.h"
 
+#include <ctype.h>
+#include <strings.h>
+
 #define METADATA_BTREE_MAX_DEPTH 16
 
 /** Compute node buffer size for metadata trees. */
@@ -2307,6 +2310,28 @@ static int idset_union(const struct inode_id_set *a, const struct inode_id_set *
 }
 
 /**
+ * Portable case-insensitive substring search.
+ * Returns a pointer to the first occurrence of @p needle in @p haystack,
+ * ignoring case, or NULL if not found.
+ */
+static const char *ci_strstr(const char *haystack, const char *needle)
+{
+    if(!needle[0]) return haystack;
+    for(; *haystack; haystack++)
+    {
+        const char *h = haystack;
+        const char *n = needle;
+        while(*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n))
+        {
+            h++;
+            n++;
+        }
+        if(!*n) return haystack;
+    }
+    return NULL;
+}
+
+/**
  * Test whether a single reverse-index record matches a filter operator.
  *
  * @param rec_value  The value from the metadata_idx_record.
@@ -2347,6 +2372,60 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
 
         case kQueryOpExists:
             return 1; /* key exists — always matches */
+
+        /* Case-insensitive variants */
+        case kQueryOpIEqual:
+            return strncasecmp(rec_value, flt_value, METADATA_VALUE_MAX) == 0;
+
+        case kQueryOpINotEqual:
+            return strncasecmp(rec_value, flt_value, METADATA_VALUE_MAX) != 0;
+
+        case kQueryOpIContains:
+            return ci_strstr(rec_value, flt_value) != NULL;
+
+        case kQueryOpIStartsWith:
+        {
+            size_t plen = strnlen(flt_value, METADATA_VALUE_MAX);
+            return strncasecmp(rec_value, flt_value, plen) == 0;
+        }
+
+        /* Numeric comparisons */
+        case kQueryOpNumEqual:
+        {
+            int64_t rv = strtoll(rec_value, NULL, 10);
+            int64_t fv = strtoll(flt_value, NULL, 10);
+            return rv == fv;
+        }
+        case kQueryOpNumNotEqual:
+        {
+            int64_t rv = strtoll(rec_value, NULL, 10);
+            int64_t fv = strtoll(flt_value, NULL, 10);
+            return rv != fv;
+        }
+        case kQueryOpNumGreater:
+        {
+            int64_t rv = strtoll(rec_value, NULL, 10);
+            int64_t fv = strtoll(flt_value, NULL, 10);
+            return rv > fv;
+        }
+        case kQueryOpNumLess:
+        {
+            int64_t rv = strtoll(rec_value, NULL, 10);
+            int64_t fv = strtoll(flt_value, NULL, 10);
+            return rv < fv;
+        }
+        case kQueryOpNumGreaterEq:
+        {
+            int64_t rv = strtoll(rec_value, NULL, 10);
+            int64_t fv = strtoll(flt_value, NULL, 10);
+            return rv >= fv;
+        }
+        case kQueryOpNumLessEq:
+        {
+            int64_t rv = strtoll(rec_value, NULL, 10);
+            int64_t fv = strtoll(flt_value, NULL, 10);
+            return rv <= fv;
+        }
 
         default:
             return 0;
