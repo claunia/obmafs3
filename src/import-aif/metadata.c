@@ -35,6 +35,7 @@
 #include "ui.h"
 
 #include <iconv.h>
+#include <unistd.h>
 
 /**
  * Import media tags from an AIF file via ioctl.
@@ -1294,6 +1295,216 @@ const char *aaru_media_type_to_string(MediaType type)
 }
 
 /**
+ * Converts Aaru media type to platform.
+ *
+ * @param type  Aaru Media type.
+ */
+const char *aaru_media_type_to_platform(MediaType type)
+{
+    switch(type)
+    {
+        case CDI:
+        case CDIREADY:
+            return "Philips CD-i";
+        case FMTOWNS:
+            return "Fujitsu FM Towns";
+
+        case MegaLD:
+            return "Pioneer LaserActive";
+
+        // Sony game media, types 110 to 129
+        case PlayStationMemoryCard:
+        case PS1CD:
+            return "Sony PlayStation";
+        case PlayStationMemoryCard2:
+        case PS2CD:
+        case PS2DVD:
+            return "Sony PlayStation 2";
+        case PS3DVD:
+        case PS3BD:
+            return "Sony PlayStation 3";
+        case PS4BD:
+            return "Sony PlayStation 4";
+        case UMD:
+            return "Sony PlayStation Portable";
+        case PlayStationVitaGameCard:
+            return "Sony PlayStation Vita";
+
+        // Microsoft game media, types 130 to 149
+        case XGD:
+            return "Microsoft Xbox";
+        case XGD2:
+            return "Microsoft Xbox 360";
+        case XGD3:
+            return "Microsoft Xbox 360";
+        case XGD4:
+            return "Microsoft Xbox One";
+
+        // Sega game media, types 150 to 169
+        case MEGACD:
+            return "Sega Mega CD";
+        case SATURNCD:
+            return "Sega Saturn";
+        case GDROM:
+        case GDR:
+        case MilCD:
+            return "Sega Dreamcast";
+        case SegaCard:
+            return "Sega Master System";
+
+        // Other game media, types 170 to 179
+        case HuCard:
+            return "NEC PC Engine";
+        case SuperCDROM2:
+            return "NEC PC Engine CD";
+        case JaguarCD:
+            return "Atari Jaguar CD";
+        case ThreeDO:
+            return "3DO";
+        case PCFX:
+            return "NEC PC-FX";
+        case NeoGeoCD:
+            return "SNK Neo Geo CD";
+        case CDTV:
+            return "Commodore CDTV";
+        case CD32:
+            return "Amiga CD32";
+        case Nuon:
+            return "Nuon";
+        case Playdia:
+            return "Bandai Playdia";
+
+        // Apple floppies, types 180 to 189
+        case Apple32SS:
+        case Apple32DS:
+        case Apple33SS:
+        case Apple33DS:
+            return "Apple II";
+        case AppleSonySS:
+        case AppleSonyDS:
+            return "Apple Macintosh";
+        case AppleFileWare:
+            return "Apple Lisa";
+
+        // PC floppies, types 190 to 209
+        case DOS_525_SS_DD_8:
+        case DOS_525_SS_DD_9:
+        case DOS_525_DS_DD_8:
+        case DOS_525_DS_DD_9:
+        case DOS_525_HD:
+        case DOS_35_SS_DD_8:
+        case DOS_35_SS_DD_9:
+        case DOS_35_DS_DD_8:
+        case DOS_35_DS_DD_9:
+        case DOS_35_HD:
+        case DOS_35_ED:
+        case DMF:
+        case DMF_82:
+        case XDF_525:
+        case XDF_35:
+            return "IBM PC";
+
+        // Acorn floppies, types 230 to 239
+        case ACORN_525_SS_SD_40:
+        case ACORN_525_SS_SD_80:
+        case ACORN_525_SS_DD_40:
+        case ACORN_525_SS_DD_80:
+        case ACORN_525_DS_DD:
+            return "Acorn BBC";
+        case ACORN_35_DS_DD:
+        case ACORN_35_DS_HD:
+            return "Acorn Archimedes";
+
+        // Atari floppies, types 240 to 249
+        case ATARI_525_SD:
+        case ATARI_525_ED:
+        case ATARI_525_DD:
+            return "Atari 8-bit";
+        case ATARI_35_SS_DD:
+        case ATARI_35_DS_DD:
+        case ATARI_35_SS_DD_11:
+        case ATARI_35_DS_DD_11:
+            return "Atari ST";
+
+        // Commodore floppies, types 250 to 259
+        case CBM_AMIGA_35_DD:
+        case CBM_AMIGA_35_HD:
+            return "Amiga";
+        case CBM_1540:
+            return "Commodore 64";
+
+        // NEC/SHARP floppies, types 260 to 269
+        case NEC_35_HD_15:
+            return "NEC PC-98";
+
+        // Non-standard PC formats, types 290 to 308
+        case FDFORMAT_525_DD:
+        case FDFORMAT_525_HD:
+        case FDFORMAT_35_DD:
+        case FDFORMAT_35_HD:
+            return "IBM PC";
+
+        // Apricot, type 309
+        case Apricot_35:
+            return "Apricot PC";
+
+        // Nintendo, types 450 to 469
+        case FamicomGamePak:
+            return "Nintendo Famicom";
+        case GameBoyAdvanceGamePak:
+            return "Nintendo Game Boy";
+        case GameBoyGamePak:
+            return "Nintendo Game Boy";
+        case GOD:
+            return "Nintendo GameCube";
+        case N64DD:
+            return "Nintendo 64DD";
+        case N64GamePak:
+            return "Nintendo 64";
+        case NESGamePak:
+            return "Nintendo NES";
+        case Nintendo3DSGameCard:
+            return "Nintendo 3DS";
+        case NintendoDiskCard:
+            return "Nintendo Famicom Disk System";
+        case NintendoDSGameCard:
+            return "Nintendo DS";
+        case NintendoDSiGameCard:
+            return "Nintendo DSi";
+        case SNESGamePak:
+        case SNESGamePakUS:
+            return "Nintendo SNES";
+        case WOD:
+            return "Nintendo Wii";
+        case WUOD:
+            return "Nintendo Wii U";
+        case SwitchGameCard:
+            return "Nintendo Switch";
+
+        case ZXMicrodrive:
+            return "ZX Spectrum";
+
+        case Pippin:
+            return "Bandai Pippin";
+
+        // VideoNow, types 740 to 749
+        case VideoNow:
+            return "VideoNow";
+        case VideoNowColor:
+            return "VideoNow Color";
+        case VideoNowXp:
+            return "VideoNow XP";
+
+        case AtariLynxCard:
+            return "Atari Lynx";
+        case AtariJaguarCartridge:
+            return "Atari Jaguar";
+        default:
+            return NULL;
+    }
+}
+
+/**
  * Import metadata strings from the AIF ImageInfo via ioctl.
  *
  * @param aaruf_ctx  libaaruformat context.
@@ -1344,6 +1555,19 @@ void import_metadata(void *aaruf_ctx, const ImageInfo *info, int fd)
         snprintf(meta.value, METADATA_VALUE_MAX, "%s", aaru_media_type_to_string(info->MediaType));
         if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
             ui_warn("Failed to set metadata 'MediaType'");
+    }
+
+    /* Store platform if known */
+    {
+        const char* platform = aaru_media_type_to_platform(info->MediaType);
+        if(platform != NULL)
+        {
+            memset(&meta, 0, sizeof(meta));
+            strncpy(meta.key, "Platform", METADATA_KEY_MAX - 1);
+            snprintf(meta.value, METADATA_VALUE_MAX, "%s", platform);
+            if(ioctl(fd, OBMAFS3_IOC_SET_METADATA, &meta) != 0)
+                ui_warn("Failed to set metadata 'Platform'");
+        }
     }
 
     /* Store CHS geometry if available */
