@@ -97,6 +97,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <readline/history.h>
 #include <readline/readline.h>
@@ -2113,6 +2114,57 @@ static int execute_groupby(int fd, const char *key, const char *format, const ch
 }
 
 /* ------------------------------------------------------------------ */
+/*  Numeric statistics                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Execute a stats query for @p key via ioctl.
+ * Shows min, max, avg, sum, count.
+ */
+static int execute_stats(int fd, const char *key, const char *format)
+{
+    struct obmafs3_ioctl_metadata_stats_arg sa;
+    memset(&sa, 0, sizeof(sa));
+    strncpy(sa.key, key, METADATA_KEY_MAX - 1);
+
+    if(ioctl(fd, OBMAFS3_IOC_STATS_METADATA, &sa) != 0)
+    {
+        fprintf(stderr, "Error: ioctl STATS_METADATA failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    const char *fmt = format ? format : "txt";
+
+    if(strcasecmp(fmt, "json") == 0)
+    {
+        printf("{\n  \"key\": \"");
+        json_escape(stdout, key);
+        printf("\",\n  \"count\": %u,\n", sa.count);
+        printf("  \"min\": %" PRId64 ",\n", sa.min);
+        printf("  \"max\": %" PRId64 ",\n", sa.max);
+        printf("  \"sum\": %" PRId64 ",\n", sa.sum);
+        if(sa.count > 0)
+            printf("  \"avg\": %.2f\n", (double)sa.sum / (double)sa.count);
+        else
+            printf("  \"avg\": null\n");
+        printf("}\n");
+    }
+    else
+    {
+        printf("\nStatistics for '%s':\n", key);
+        printf("  Count: %u\n", sa.count);
+        printf("  Min:   %" PRId64 "\n", sa.min);
+        printf("  Max:   %" PRId64 "\n", sa.max);
+        printf("  Sum:   %" PRId64 "\n", sa.sum);
+        if(sa.count > 0)
+            printf("  Avg:   %.2f\n", (double)sa.sum / (double)sa.count);
+        printf("\n");
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Help text                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -2124,6 +2176,7 @@ static void print_help(void)
            "  help               Show this help message\n"
            "  distinct <key>     List all distinct values for a key\n"
            "  groupby <key>      Show distinct values with file counts\n"
+           "  stats <key>        Show min/max/avg/sum for a numeric key\n"
            "  explain <query>    Show query plan with per-filter match counts\n"
            "  resort <key>       Re-sort cached results (e.g. resort N:year)\n"
            "  reverse            Toggle sort order and re-display\n"
@@ -2212,6 +2265,7 @@ static void usage(const char *prog)
             "  -S, --stream           Stream results as they arrive (txt/jsonl only)\n"
             "  -d, --distinct <key>   List all distinct values for a metadata key\n"
             "  -g, --groupby <key>    Show distinct values with file counts\n"
+            "  -t, --stats <key>      Show min/max/avg/sum for a numeric key\n"
             "  -f, --format <fmt>     Output format: txt, json, table, or csv\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
@@ -2393,6 +2447,19 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             continue;
         }
 
+        /* stats <key> — show numeric statistics */
+        if(strncasecmp(cmd, "stats ", 6) == 0 || strncasecmp(cmd, "stats\t", 6) == 0)
+        {
+            const char *skey = cmd + 6;
+            while(*skey == ' ' || *skey == '\t') skey++;
+            if(*skey == '\0')
+                fprintf(stderr, "Error: expected a key name after 'stats'\n");
+            else
+                execute_stats(query_fd, skey, NULL);
+            free(line);
+            continue;
+        }
+
         /* explain <query> — show query plan with per-filter match counts */
         if(strncasecmp(cmd, "explain ", 8) == 0 || strncasecmp(cmd, "explain\t", 8) == 0)
         {
@@ -2529,6 +2596,7 @@ int main(int argc, char *argv[])
     const char *sort_str     = NULL;
     const char *distinct_str = NULL;
     const char *groupby_str  = NULL;
+    const char *stats_str    = NULL;
     int         show_meta    = 0;
     int         reverse      = 0;
     int         count_only   = 0;
@@ -2546,6 +2614,7 @@ int main(int argc, char *argv[])
         {"count",    no_argument,       NULL, 'c'},
         {"distinct", required_argument, NULL, 'd'},
         {"groupby",  required_argument, NULL, 'g'},
+        {"stats",    required_argument, NULL, 't'},
         {"limit",    required_argument, NULL, 'l'},
         {"keys",     required_argument, NULL, 'k'},
         {"stream",   no_argument,       NULL, 'S'},
@@ -2554,7 +2623,7 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:g:l:k:Sh", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:g:t:l:k:Sh", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -2567,6 +2636,7 @@ int main(int argc, char *argv[])
             case 'c': count_only   = 1;      break;
             case 'd': distinct_str = optarg; break;
             case 'g': groupby_str  = optarg; break;
+            case 't': stats_str    = optarg; break;
             case 'l': limit_n      = (uint32_t)strtoul(optarg, NULL, 10); break;
             case 'k': keys_str     = optarg; show_meta = 1; break;
             case 'S': streaming    = 1;      break;
@@ -2604,6 +2674,11 @@ int main(int argc, char *argv[])
     {
         /* GROUP BY mode */
         rc = execute_groupby(query_fd, groupby_str, format_str, output_str);
+    }
+    else if(stats_str)
+    {
+        /* Stats mode */
+        rc = execute_stats(query_fd, stats_str, format_str);
     }
     else if(query_str)
     {

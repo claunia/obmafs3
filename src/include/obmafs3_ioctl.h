@@ -436,4 +436,24 @@ struct obmafs3_ioctl_metadata_groupby_arg
 
 #define OBMAFS3_IOC_GROUPBY_METADATA _IOWR('O', 19, struct obmafs3_ioctl_metadata_groupby_arg)
 
+/* ================================================================== */
+/*  Metadata stats ioctl                                               */
+/* ================================================================== */
+
+/**
+ * Compute numeric statistics (min, max, sum, count) for a metadata key.
+ * Average can be derived as sum/count by the caller.
+ */
+struct obmafs3_ioctl_metadata_stats_arg
+{
+    char     key[METADATA_KEY_MAX]; /**< Input: metadata key */
+    uint32_t count;                 /**< Output: number of values */
+    uint32_t _pad;                  /**< Alignment padding */
+    int64_t  min;                   /**< Output: minimum value */
+    int64_t  max;                   /**< Output: maximum value */
+    int64_t  sum;                   /**< Output: sum of values */
+};
+
+#define OBMAFS3_IOC_STATS_METADATA _IOWR('O', 20, struct obmafs3_ioctl_metadata_stats_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

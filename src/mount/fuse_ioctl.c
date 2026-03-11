@@ -1197,6 +1197,22 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             return 0;
         }
 
+        case OBMAFS3_IOC_STATS_METADATA:
+        {
+            struct obmafs3_ioctl_metadata_stats_arg *sa =
+                (struct obmafs3_ioctl_metadata_stats_arg *)data;
+
+            struct obmafs3_metadata_stats_result sr;
+            int rc = obmafs3_metadata_stats(g_ctx, sa->key, &sr);
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+            sa->count = sr.count;
+            sa->min   = sr.min;
+            sa->max   = sr.max;
+            sa->sum   = sr.sum;
+            return 0;
+        }
+
         default:
             FUSE_RETURN(-ENOTTY, "");
     }

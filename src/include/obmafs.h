@@ -426,6 +426,16 @@ int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
                              char ***out_values, uint32_t **out_counts, uint32_t *out_n);
 void obmafs3_metadata_groupby_free(char **values, uint32_t *counts, uint32_t n);
 
+struct obmafs3_metadata_stats_result
+{
+    uint32_t count;  /**< Number of values aggregated */
+    int64_t  min;    /**< Minimum numeric value */
+    int64_t  max;    /**< Maximum numeric value */
+    int64_t  sum;    /**< Sum of all numeric values */
+};
+
+int obmafs3_metadata_stats(struct obmafs3_ctx *ctx, const char *key, struct obmafs3_metadata_stats_result *out);
+
 /* --- Block refcount operations --- */
 int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_count);
 int obmafs3_refcount_set(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t ref_count);

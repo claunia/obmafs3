@@ -3072,3 +3072,92 @@ void obmafs3_metadata_groupby_free(char **values, uint32_t *counts, uint32_t n)
     }
     free(counts);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Numeric statistics for a metadata key                              */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_metadata_stats(struct obmafs3_ctx *ctx, const char *key, struct obmafs3_metadata_stats_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if(ctx->sb.metadata_idx_lba == 0) return OBMAFS3_OK;
+
+    uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
+    if(lba == 0) return OBMAFS3_OK;
+
+    size_t   nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    /* Navigate to the leaf containing (key, "", 0) */
+    static const char empty_val[METADATA_VALUE_MAX] = {0};
+    while(1)
+    {
+        int rc = meta_node_read(ctx, lba, buf);
+        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC) { free(buf); DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic"); }
+        if(hdr.level == 0) break;
+
+        uint16_t slot = midx_index_find(buf, hdr.node_keys, key, empty_val, 0);
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain, computing numeric stats over unique inodes */
+    int64_t  sum       = 0;
+    int64_t  min_val   = INT64_MAX;
+    int64_t  max_val   = INT64_MIN;
+    uint32_t count     = 0;
+    uint64_t prev_inode = 0;
+    char     prev_value[METADATA_VALUE_MAX];
+    int      have_prev = 0;
+
+    while(1)
+    {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for(uint16_t i = 0; i < hdr.node_keys; i++)
+        {
+            struct metadata_idx_record rec;
+            memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
+
+            int kcmp = strncmp(rec.key, key, METADATA_KEY_MAX);
+            if(kcmp < 0) continue;
+            if(kcmp > 0) goto stats_done;
+
+            /* Skip duplicate (same inode + same value) */
+            if(have_prev && rec.inode_id == prev_inode &&
+               strncmp(rec.value, prev_value, METADATA_VALUE_MAX) == 0)
+                continue;
+
+            int64_t v = strtoll(rec.value, NULL, 10);
+            sum += v;
+            if(v < min_val) min_val = v;
+            if(v > max_val) max_val = v;
+            count++;
+
+            prev_inode = rec.inode_id;
+            memcpy(prev_value, rec.value, METADATA_VALUE_MAX);
+            have_prev = 1;
+        }
+
+        if(hdr.right_link == 0) break;
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if(rc != OBMAFS3_OK) { free(buf); return rc; }
+    }
+
+stats_done:
+    free(buf);
+    out->count = count;
+    out->sum   = sum;
+    out->min   = (count > 0) ? min_val : 0;
+    out->max   = (count > 0) ? max_val : 0;
+    return OBMAFS3_OK;
+}
