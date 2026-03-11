@@ -83,7 +83,10 @@ static void reconstruct_junk_sector(struct obmafs3_ctx *ctx, uint64_t iid, uint6
         uint32_t sc[NGC_LFG_SEED_SIZE];
         memcpy(sc, jrec.seed, sizeof(sc));
         ngc_lfg_set_seed(&lfg, sc);
-        uint64_t adv = sector_off - jrec.offset;
+        /* The seed's position 0 corresponds to the start of the 0x8000-aligned
+         * block, not jrec.offset (which is the start of the junk region).
+         * Compute advance from the block start. */
+        uint64_t adv = sector_off - (jrec.offset & ~(uint64_t)0x7FFF);
         if(adv > 0) {
             uint8_t d[4096];
             while(adv > 0) { size_t s = adv > sizeof(d) ? sizeof(d) : (size_t)adv; ngc_lfg_get_bytes(&lfg, d, s); adv -= s; }
