@@ -1493,6 +1493,163 @@ static uint32_t execute_query_count(int fd, struct obmafs3_ioctl_metadata_query_
     return qa->total;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Query explain                                                      */
+/* ------------------------------------------------------------------ */
+
+static const char *op_name(uint8_t op)
+{
+    switch(op)
+    {
+        case kQueryOpEqual:       return "=";
+        case kQueryOpNotEqual:    return "!=";
+        case kQueryOpGreater:     return ">";
+        case kQueryOpLess:        return "<";
+        case kQueryOpGreaterEq:   return ">=";
+        case kQueryOpLessEq:      return "<=";
+        case kQueryOpContains:    return "CONTAINS";
+        case kQueryOpStartsWith:  return "STARTSWITH";
+        case kQueryOpEndsWith:    return "ENDSWITH";
+        case kQueryOpExists:      return "EXISTS";
+        case kQueryOpIEqual:      return "I=";
+        case kQueryOpINotEqual:   return "I!=";
+        case kQueryOpIContains:   return "ICONTAINS";
+        case kQueryOpIStartsWith: return "ISTARTSWITH";
+        case kQueryOpIEndsWith:   return "IENDSWITH";
+        case kQueryOpNumEqual:    return "N=";
+        case kQueryOpNumNotEqual: return "N!=";
+        case kQueryOpNumGreater:  return "N>";
+        case kQueryOpNumLess:     return "N<";
+        case kQueryOpNumGreaterEq: return "N>=";
+        case kQueryOpNumLessEq:   return "N<=";
+        case kQueryOpRegex:       return "REGEX";
+        case kQueryOpIRegex:      return "IREGEX";
+        case kQueryOpIn:          return "IN";
+        case kQueryOpIIn:         return "IIN";
+        case kQueryOpBetween:     return "BETWEEN";
+        case kQueryOpNumBetween:  return "NBETWEEN";
+        case kQueryOpGlob:        return "GLOB";
+        case kQueryOpIGlob:       return "IGLOB";
+        default:                  return "?";
+    }
+}
+
+static const char *combine_name(uint8_t c) { return c == kQueryCombineAnd ? "AND" : "OR"; }
+
+/**
+ * Run an explain on a parsed query: show per-filter match counts,
+ * per-group totals, and the final combined result count.
+ */
+static void execute_explain(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
+{
+    printf("\nQuery plan:\n");
+
+    /* Per-filter counts: issue each filter as a standalone count-only query */
+    uint32_t per_filter[OBMAFS3_QUERY_MAX_FILTERS];
+    for(uint8_t f = 0; f < qa->filter_count; f++)
+    {
+        struct obmafs3_ioctl_metadata_query_arg solo;
+        memset(&solo, 0, sizeof(solo));
+        solo.filter_count = 1;
+        solo.combine      = kQueryCombineAnd;
+        solo.filters[0]   = qa->filters[f];
+        /* Clear negate for the raw count — we show both raw and negated */
+        solo.filters[0].negate = 0;
+        solo.filters[0].group  = 0;
+
+        uint32_t raw = execute_query_count(fd, &solo);
+
+        const char *key_str = qa->filters[f].key;
+        const char *op_str  = op_name(qa->filters[f].op);
+        const char *val_str = qa->filters[f].value;
+
+        if(qa->filters[f].op == kQueryOpExists)
+            printf("  Filter %u: %s %s", f + 1, key_str, op_str);
+        else
+            printf("  Filter %u: %s %s \"%s\"", f + 1, key_str, op_str, val_str);
+
+        if(qa->filters[f].negate)
+        {
+            /* Also get the negated count */
+            solo.filters[0].negate = 1;
+            uint32_t neg = execute_query_count(fd, &solo);
+            printf(" → %u matches (NOT → %u)", raw, neg);
+        }
+        else
+        {
+            printf(" → %u matches", raw);
+        }
+
+        if(qa->filter_count > 1)
+            printf("  [group %u]", qa->filters[f].group);
+        printf("\n");
+
+        per_filter[f] = raw;
+    }
+
+    /* Per-group counts (if multiple filters) */
+    if(qa->filter_count > 1)
+    {
+        /* Check if we have filters in group 0 and/or group 1 */
+        int g0n = 0, g1n = 0;
+        for(uint8_t f = 0; f < qa->filter_count; f++)
+        {
+            if(qa->filters[f].group == 0) g0n++;
+            else                          g1n++;
+        }
+
+        if(g0n > 0 && g0n < qa->filter_count)
+        {
+            /* Run group 0 only */
+            struct obmafs3_ioctl_metadata_query_arg g0q;
+            memcpy(&g0q, qa, sizeof(g0q));
+            g0q.filter_count = 0;
+            for(uint8_t f = 0; f < qa->filter_count; f++)
+            {
+                if(qa->filters[f].group == 0)
+                {
+                    g0q.filters[g0q.filter_count] = qa->filters[f];
+                    g0q.filters[g0q.filter_count].group = 0;
+                    g0q.filter_count++;
+                }
+            }
+            g0q.combine = qa->combine;
+            uint32_t g0c = execute_query_count(fd, &g0q);
+            printf("  Group 0 (%s): %u results\n", combine_name(qa->combine), g0c);
+        }
+
+        if(g1n > 0 && g1n < qa->filter_count)
+        {
+            /* Run group 1 only */
+            struct obmafs3_ioctl_metadata_query_arg g1q;
+            memcpy(&g1q, qa, sizeof(g1q));
+            g1q.filter_count = 0;
+            for(uint8_t f = 0; f < qa->filter_count; f++)
+            {
+                if(qa->filters[f].group == 1)
+                {
+                    g1q.filters[g1q.filter_count] = qa->filters[f];
+                    g1q.filters[g1q.filter_count].group = 0;
+                    g1q.filter_count++;
+                }
+            }
+            g1q.combine = qa->combine1;
+            uint32_t g1c = execute_query_count(fd, &g1q);
+            printf("  Group 1 (%s): %u results\n", combine_name(qa->combine1), g1c);
+        }
+
+        if(g0n > 0 && g1n > 0)
+            printf("  Groups combined: %s\n", combine_name(qa->group_combine));
+        else if(qa->filter_count > 1)
+            printf("  Combined: %s\n", combine_name(qa->combine));
+    }
+
+    /* Final combined count */
+    uint32_t total = execute_query_count(fd, qa);
+    printf("  ─────────────────────────────\n");
+    printf("  Final result: %u matches\n\n", total);
+}
+
 /**
  * Execute a query in batch mode: collect results and write to the
  * given output file (or stdout) in the specified format.
@@ -1723,6 +1880,7 @@ static void print_help(void)
            "Commands:\n"
            "  help               Show this help message\n"
            "  distinct <key>     List all distinct values for a key\n"
+           "  explain <query>    Show query plan with per-filter match counts\n"
            "  resort <key>       Re-sort cached results (e.g. resort N:year)\n"
            "  reverse            Toggle sort order and re-display\n"
            "  quit               Exit the query tool\n"
@@ -1972,6 +2130,25 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
                 fprintf(stderr, "Error: expected a key name after 'distinct'\n");
             else
                 execute_distinct(query_fd, dkey, NULL, NULL);
+            free(line);
+            continue;
+        }
+
+        /* explain <query> — show query plan with per-filter match counts */
+        if(strncasecmp(cmd, "explain ", 8) == 0 || strncasecmp(cmd, "explain\t", 8) == 0)
+        {
+            const char *qstr = cmd + 8;
+            while(*qstr == ' ' || *qstr == '\t') qstr++;
+            if(*qstr == '\0')
+            {
+                fprintf(stderr, "Error: expected a query after 'explain'\n");
+            }
+            else
+            {
+                struct obmafs3_ioctl_metadata_query_arg eqa;
+                if(parse_query(qstr, &eqa) == 0)
+                    execute_explain(query_fd, &eqa);
+            }
             free(line);
             continue;
         }
