@@ -125,6 +125,9 @@
 /* Temp file used to obtain a FUSE file handle for ioctls */
 #define QUERY_SENTINEL ".obmafs3_query_tmp"
 
+/* Forward declarations */
+static int key_in_filter(const char *key, const char *key_filter);
+
 /* ------------------------------------------------------------------ */
 /*  Mount-point validation                                             */
 /* ------------------------------------------------------------------ */
@@ -1546,7 +1549,8 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
 static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
                                const char *format, const char *output,
                                const char *mountpoint, int show_metadata,
-                               const char *sort_key, int reverse, uint32_t max_results)
+                               const char *sort_key, int reverse, uint32_t max_results,
+                               const char *key_filter)
 {
     struct result_set rs;
     rs_init(&rs);
@@ -1609,7 +1613,8 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
             if(rs.metadata && rs.metadata[i].count > 0)
             {
                 for(uint32_t j = 0; j < rs.metadata[i].count; j++)
-                    printf("  %s = %s\n", rs.metadata[i].pairs[j].key, rs.metadata[i].pairs[j].value);
+                    if(key_in_filter(rs.metadata[i].pairs[j].key, key_filter))
+                        printf("  %s = %s\n", rs.metadata[i].pairs[j].key, rs.metadata[i].pairs[j].value);
             }
         }
     }
@@ -1849,6 +1854,7 @@ static void usage(const char *prog)
             "  -f, --format <fmt>     Output format: txt, json, table, or csv\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
+            "  -k, --keys <k1,k2,...>  Show only these metadata keys (implies -m)\n"
             "  -s, --sort <key>       Sort results by metadata key or 'path'\n"
             "                         Prefix with N: for numeric sort (e.g. N:year)\n"
             "  -r, --reverse          Reverse sort order (descending)\n"
@@ -1893,9 +1899,32 @@ static void repl_cache_free(struct repl_cache *c)
 }
 
 /**
- * Display a result set to stdout, optionally with metadata.
+ * Check if a metadata key should be displayed.
+ * @param key         The key to check.
+ * @param key_filter  Comma-separated list of keys to show, or NULL to show all.
+ * @return Non-zero if the key should be displayed.
  */
-static void display_results(const struct result_set *rs, int show_metadata)
+static int key_in_filter(const char *key, const char *key_filter)
+{
+    if(!key_filter) return 1; /* no filter = show all */
+    const char *p = key_filter;
+    size_t klen = strlen(key);
+    while(*p)
+    {
+        const char *comma = p;
+        while(*comma && *comma != ',') comma++;
+        size_t ilen = (size_t)(comma - p);
+        if(ilen == klen && strncmp(p, key, ilen) == 0) return 1;
+        p = *comma ? comma + 1 : comma;
+    }
+    return 0;
+}
+
+/**
+ * Display a result set to stdout, optionally with metadata.
+ * @param key_filter  Comma-separated keys to show, or NULL for all.
+ */
+static void display_results(const struct result_set *rs, int show_metadata, const char *key_filter)
 {
     for(uint32_t i = 0; i < rs->count; i++)
     {
@@ -1903,7 +1932,8 @@ static void display_results(const struct result_set *rs, int show_metadata)
         if(show_metadata && rs->metadata && rs->metadata[i].count > 0)
         {
             for(uint32_t j = 0; j < rs->metadata[i].count; j++)
-                printf("    %s = %s\n", rs->metadata[i].pairs[j].key, rs->metadata[i].pairs[j].value);
+                if(key_in_filter(rs->metadata[i].pairs[j].key, key_filter))
+                    printf("    %s = %s\n", rs->metadata[i].pairs[j].key, rs->metadata[i].pairs[j].value);
         }
     }
     printf("\n%u result(s)\n", rs->count);
@@ -1927,7 +1957,7 @@ static void history_path(char *buf, size_t bufsz)
 }
 
 static void repl(const char *mountpoint, int query_fd, int show_metadata,
-                 const char *sort_key, int reverse)
+                 const char *sort_key, int reverse, const char *key_filter)
 {
     struct repl_cache cache;
     repl_cache_init(&cache);
@@ -2015,7 +2045,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             strncpy(current_sort, skey, sizeof(current_sort) - 1);
             current_sort[sizeof(current_sort) - 1] = '\0';
             if(cache.rs.count > 1) rs_sort(&cache.rs, current_sort, current_reverse);
-            display_results(&cache.rs, show_metadata);
+            display_results(&cache.rs, show_metadata, key_filter);
             if(cache.rs.count > 0) offer_export(&cache.rs);
             free(line);
             continue;
@@ -2033,7 +2063,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             if(current_sort[0] != '\0' && cache.rs.count > 1)
                 rs_sort(&cache.rs, current_sort, current_reverse);
             printf("Sort order: %s\n", current_reverse ? "descending" : "ascending");
-            display_results(&cache.rs, show_metadata);
+            display_results(&cache.rs, show_metadata, key_filter);
             if(cache.rs.count > 0) offer_export(&cache.rs);
             free(line);
             continue;
@@ -2050,7 +2080,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             printf("  (cached)\n");
             if(current_sort[0] != '\0' && cache.rs.count > 1)
                 rs_sort(&cache.rs, current_sort, current_reverse);
-            display_results(&cache.rs, show_metadata);
+            display_results(&cache.rs, show_metadata, key_filter);
             if(cache.rs.count > 0) offer_export(&cache.rs);
             free(line);
             continue;
@@ -2083,7 +2113,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
         cache.query[sizeof(cache.query) - 1] = '\0';
 
         /* Display */
-        display_results(&cache.rs, show_metadata);
+        display_results(&cache.rs, show_metadata, key_filter);
         if(cache.rs.count > 0) offer_export(&cache.rs);
         free(line);
     }
@@ -2109,6 +2139,7 @@ int main(int argc, char *argv[])
     int         reverse      = 0;
     int         count_only   = 0;
     uint32_t    limit_n      = 0;
+    const char *keys_str     = NULL;
 
     static struct option long_opts[] = {
         {"query",    required_argument, NULL, 'q'},
@@ -2120,12 +2151,13 @@ int main(int argc, char *argv[])
         {"count",    no_argument,       NULL, 'c'},
         {"distinct", required_argument, NULL, 'd'},
         {"limit",    required_argument, NULL, 'l'},
+        {"keys",     required_argument, NULL, 'k'},
         {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:l:h", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:l:k:h", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -2138,6 +2170,7 @@ int main(int argc, char *argv[])
             case 'c': count_only   = 1;      break;
             case 'd': distinct_str = optarg; break;
             case 'l': limit_n      = (uint32_t)strtoul(optarg, NULL, 10); break;
+            case 'k': keys_str     = optarg; show_meta = 1; break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -2189,7 +2222,7 @@ int main(int argc, char *argv[])
         else
         {
             rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta, sort_str, reverse,
-                                     limit_n);
+                                     limit_n, keys_str);
         }
     }
     else
@@ -2199,7 +2232,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Warning: --format and --output are ignored in interactive mode\n");
         if(count_only)
             fprintf(stderr, "Warning: --count is ignored in interactive mode (use batch mode with -q)\n");
-        repl(mountpoint, query_fd, show_meta, sort_str, reverse);
+        repl(mountpoint, query_fd, show_meta, sort_str, reverse, keys_str);
     }
 
     close(query_fd);
