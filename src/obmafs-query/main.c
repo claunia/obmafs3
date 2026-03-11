@@ -1494,49 +1494,6 @@ static uint32_t execute_query_count(int fd, struct obmafs3_ioctl_metadata_query_
 }
 
 /**
- * Execute a parsed query interactively: print results, show count,
- * offer export.  If @p show_metadata is set, fetches and displays
- * metadata for each result.  If @p sort_key is non-NULL, sorts results.
- */
-static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
-                          const char *mountpoint, int show_metadata,
-                          const char *sort_key, int reverse)
-{
-    struct result_set rs;
-    rs_init(&rs);
-
-    if(execute_query_collect(fd, qa, &rs, 0) != 0)
-    {
-        rs_free(&rs);
-        return;
-    }
-
-    /* Sorting by a metadata key requires metadata to be fetched */
-    int need_meta = show_metadata || (sort_key && strcmp(sort_key, "path") != 0);
-    if(need_meta && rs.count > 0)
-        rs_fetch_metadata(mountpoint, &rs);
-
-    if(sort_key && rs.count > 1)
-        rs_sort(&rs, sort_key, reverse);
-
-    for(uint32_t i = 0; i < rs.count; i++)
-    {
-        printf("  %s\n", rs.paths[i]);
-        if(show_metadata && rs.metadata && rs.metadata[i].count > 0)
-        {
-            for(uint32_t j = 0; j < rs.metadata[i].count; j++)
-                printf("    %s = %s\n", rs.metadata[i].pairs[j].key, rs.metadata[i].pairs[j].value);
-        }
-    }
-
-    printf("\n%u result(s)\n", rs.count);
-
-    if(rs.count > 0) offer_export(&rs);
-
-    rs_free(&rs);
-}
-
-/**
  * Execute a query in batch mode: collect results and write to the
  * given output file (or stdout) in the specified format.
  *

@@ -396,7 +396,6 @@ int  obmafs3_metadata_delete(struct obmafs3_ctx *ctx, uint64_t inode_id, const c
 int  obmafs3_metadata_delete_all(struct obmafs3_ctx *ctx, uint64_t inode_id);
 int  obmafs3_metadata_list(struct obmafs3_ctx *ctx, uint64_t inode_id, char ***keys, uint32_t *count);
 void obmafs3_metadata_list_free(char **keys, uint32_t count);
-int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char *value, char ***paths, uint32_t *count);
 void obmafs3_metadata_query_free(char **paths, uint32_t count);
 
 /** A single metadata query filter condition.
@@ -413,10 +412,6 @@ struct obmafs3_query_filter
 
 #define OBMAFS3_QUERY_MAX_FILTERS 4
 
-int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
-                                    uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
-                                    uint32_t offset, uint32_t limit,
-                                    char ***paths, uint32_t *count, uint32_t *total);
 int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char *path_buf, size_t path_buf_size);
 
 int obmafs3_metadata_query_collect_ids(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
