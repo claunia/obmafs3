@@ -34,7 +34,13 @@
  * Communicates with a live OBMAFS3 FUSE mount entirely through ioctls.
  * Does not link against libobmafs.
  *
- * Usage: obmafs-query <mountpoint>
+ * Usage: obmafs-query [options] <mountpoint>
+ *
+ * Options:
+ *   -q, --query <query>    Run a single query and exit (batch mode)
+ *   -f, --format <fmt>     Output format: txt (default) or json
+ *   -o, --output <path>    Write results to file instead of stdout
+ *   -h, --help             Show help
  *
  * Query syntax:
  *   <key> = "<value>"               Exact match
@@ -81,6 +87,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -838,17 +845,15 @@ static void offer_export(const struct result_set *rs)
 
 /**
  * Execute a parsed query via the OBMAFS3_IOC_QUERY_METADATA ioctl.
- * Paginates automatically, prints all matching paths, and offers
- * to export the results as .txt or .json.
+ * Paginates automatically and collects all matching paths into @p rs.
  *
  * @param fd  File descriptor on the OBMAFS3 mount (sentinel file).
  * @param qa  Parsed query argument (filters/combine/filter_count set).
+ * @param rs  Output result set (must be rs_init'd by caller).
+ * @return 0 on success, -1 on ioctl error.
  */
-static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
+static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg *qa, struct result_set *rs)
 {
-    struct result_set rs;
-    rs_init(&rs);
-
     uint32_t offset = 0;
 
     while(1)
@@ -860,29 +865,114 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
         if(ioctl(fd, OBMAFS3_IOC_QUERY_METADATA, qa) != 0)
         {
             fprintf(stderr, "Error: ioctl QUERY_METADATA failed: %s\n", strerror(errno));
-            rs_free(&rs);
-            return;
+            return -1;
         }
 
         if(qa->count == 0) break;
 
         for(uint32_t i = 0; i < qa->count; i++)
-        {
-            printf("  %s\n", qa->paths[i]);
-            rs_add(&rs, qa->paths[i]);
-        }
+            rs_add(rs, qa->paths[i]);
 
         offset += qa->count;
 
         /* Stop when we've collected all results */
         if(offset >= qa->total) break;
     }
+    return 0;
+}
+
+/**
+ * Execute a parsed query interactively: print results, show count,
+ * offer export.
+ */
+static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa)
+{
+    struct result_set rs;
+    rs_init(&rs);
+
+    if(execute_query_collect(fd, qa, &rs) != 0)
+    {
+        rs_free(&rs);
+        return;
+    }
+
+    for(uint32_t i = 0; i < rs.count; i++)
+        printf("  %s\n", rs.paths[i]);
 
     printf("\n%u result(s)\n", rs.count);
 
     if(rs.count > 0) offer_export(&rs);
 
     rs_free(&rs);
+}
+
+/**
+ * Execute a query in batch mode: collect results and write to the
+ * given output file (or stdout) in the specified format.
+ *
+ * @param fd      File descriptor on the OBMAFS3 mount.
+ * @param qa      Parsed query argument.
+ * @param format  "txt" or "json" (NULL defaults to "txt").
+ * @param output  Output file path (NULL = stdout).
+ * @return 0 on success, non-zero on error.
+ */
+static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
+                               const char *format, const char *output)
+{
+    struct result_set rs;
+    rs_init(&rs);
+
+    if(execute_query_collect(fd, qa, &rs) != 0)
+    {
+        rs_free(&rs);
+        return 1;
+    }
+
+    const char *fmt = format ? format : "txt";
+
+    if(output)
+    {
+        int rc;
+        if(strcasecmp(fmt, "json") == 0)
+            rc = export_json(&rs, output);
+        else if(strcasecmp(fmt, "txt") == 0)
+            rc = export_txt(&rs, output);
+        else
+        {
+            fprintf(stderr, "Error: unknown format '%s' (use 'txt' or 'json')\n", fmt);
+            rs_free(&rs);
+            return 1;
+        }
+        rs_free(&rs);
+        return rc == 0 ? 0 : 1;
+    }
+
+    /* No output file — write to stdout */
+    if(strcasecmp(fmt, "json") == 0)
+    {
+        printf("{\n  \"count\": %u,\n  \"results\": [", rs.count);
+        for(uint32_t i = 0; i < rs.count; i++)
+        {
+            printf("%s\n    \"", i ? "," : "");
+            json_escape(stdout, rs.paths[i]);
+            putchar('"');
+        }
+        printf("\n  ]\n}\n");
+    }
+    else if(strcasecmp(fmt, "txt") == 0)
+    {
+        for(uint32_t i = 0; i < rs.count; i++)
+            printf("%s\n", rs.paths[i]);
+    }
+    else
+    {
+        fprintf(stderr, "Error: unknown format '%s' (use 'txt' or 'json')\n", fmt);
+        rs_free(&rs);
+        return 1;
+    }
+
+    rs_free(&rs);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -960,7 +1050,26 @@ static void print_help(void)
 /*  Usage                                                              */
 /* ------------------------------------------------------------------ */
 
-static void usage(const char *prog) { fprintf(stderr, "Usage: %s <mountpoint>\n", prog); }
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [options] <mountpoint>\n"
+            "\n"
+            "Options:\n"
+            "  -q, --query <query>    Run a single query and exit\n"
+            "  -f, --format <fmt>     Output format: txt (default) or json\n"
+            "  -o, --output <path>    Write results to file instead of stdout\n"
+            "  -h, --help             Show this help message\n"
+            "\n"
+            "Interactive mode (default):\n"
+            "  %s <mountpoint>\n"
+            "\n"
+            "Batch mode:\n"
+            "  %s -q 'artist = \"Iron Maiden\"' /mnt/archive\n"
+            "  %s -q 'year N> \"1985\"' -f json /mnt/archive\n"
+            "  %s -q 'genre = \"Rock\"' -f txt -o results.txt /mnt/archive\n",
+            prog, prog, prog, prog, prog);
+}
 
 /* ------------------------------------------------------------------ */
 /*  Read-eval-print loop                                               */
@@ -1016,21 +1125,70 @@ static void repl(const char *mountpoint, int query_fd)
 
 int main(int argc, char *argv[])
 {
-    if(argc != 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)
+    const char *query_str  = NULL;
+    const char *format_str = NULL;
+    const char *output_str = NULL;
+
+    static struct option long_opts[] = {
+        {"query",  required_argument, NULL, 'q'},
+        {"format", required_argument, NULL, 'f'},
+        {"output", required_argument, NULL, 'o'},
+        {"help",   no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+
+    int opt;
+    while((opt = getopt_long(argc, argv, "q:f:o:h", long_opts, NULL)) != -1)
     {
-        usage(argv[0]);
-        return argc != 2 ? 1 : 0;
+        switch(opt)
+        {
+            case 'q': query_str  = optarg; break;
+            case 'f': format_str = optarg; break;
+            case 'o': output_str = optarg; break;
+            case 'h':
+                usage(argv[0]);
+                return 0;
+            default:
+                usage(argv[0]);
+                return 1;
+        }
     }
 
-    const char *mountpoint = argv[1];
+    if(optind >= argc)
+    {
+        fprintf(stderr, "Error: missing mountpoint argument\n");
+        usage(argv[0]);
+        return 1;
+    }
+
+    const char *mountpoint = argv[optind];
 
     if(validate_mountpoint(mountpoint) != 0) return 1;
 
     int query_fd = open_sentinel(mountpoint);
     if(query_fd < 0) return 1;
 
-    repl(mountpoint, query_fd);
+    int rc = 0;
+
+    if(query_str)
+    {
+        /* Batch mode: execute a single query and exit */
+        struct obmafs3_ioctl_metadata_query_arg qa;
+        if(parse_query(query_str, &qa) != 0)
+        {
+            close(query_fd);
+            return 1;
+        }
+        rc = execute_query_batch(query_fd, &qa, format_str, output_str);
+    }
+    else
+    {
+        /* Interactive REPL mode */
+        if(format_str || output_str)
+            fprintf(stderr, "Warning: --format and --output are ignored in interactive mode\n");
+        repl(mountpoint, query_fd);
+    }
 
     close(query_fd);
-    return 0;
+    return rc;
 }
