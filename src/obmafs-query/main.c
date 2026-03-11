@@ -97,6 +97,8 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <stdio.h>
+#include <readline/history.h>
+#include <readline/readline.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -1903,10 +1905,22 @@ static void display_results(const struct result_set *rs, int show_metadata)
 /*  Read-eval-print loop                                               */
 /* ------------------------------------------------------------------ */
 
+/* History file in user's home directory */
+#define HISTORY_FILE ".obmafs_query_history"
+#define HISTORY_MAX  500
+
+static void history_path(char *buf, size_t bufsz)
+{
+    const char *home = getenv("HOME");
+    if(home)
+        snprintf(buf, bufsz, "%s/%s", home, HISTORY_FILE);
+    else
+        buf[0] = '\0';
+}
+
 static void repl(const char *mountpoint, int query_fd, int show_metadata,
                  const char *sort_key, int reverse)
 {
-    char line[4096];
     struct repl_cache cache;
     repl_cache_init(&cache);
 
@@ -1915,37 +1929,42 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
     int   current_reverse   = reverse;
     if(sort_key) strncpy(current_sort, sort_key, sizeof(current_sort) - 1);
 
+    /* Load persistent history */
+    char histfile[4096];
+    history_path(histfile, sizeof(histfile));
+    using_history();
+    stifle_history(HISTORY_MAX);
+    if(histfile[0]) read_history(histfile);
+
     printf("obmafs-query: connected to %s\n", mountpoint);
     printf("Type 'help' for available commands, 'quit' to exit.\n\n");
 
     while(1)
     {
-        printf(PROMPT);
-        fflush(stdout);
-
-        if(!fgets(line, sizeof(line), stdin))
+        char *line = readline(PROMPT);
+        if(!line)
         {
-            /* EOF (Ctrl-D) — treat as quit */
+            /* EOF (Ctrl-D) */
             printf("\n");
             break;
         }
-
-        /* Strip trailing newline / carriage return */
-        size_t len = strlen(line);
-        while(len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
 
         /* Skip leading whitespace */
         const char *cmd = line;
         while(*cmd == ' ' || *cmd == '\t') cmd++;
 
         /* Skip empty lines */
-        if(*cmd == '\0') continue;
+        if(*cmd == '\0') { free(line); continue; }
 
-        if(strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "exit") == 0) break;
+        /* Add non-empty lines to history */
+        add_history(cmd);
+
+        if(strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "exit") == 0) { free(line); break; }
 
         if(strcasecmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0)
         {
             print_help();
+            free(line);
             continue;
         }
 
@@ -1958,6 +1977,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
                 fprintf(stderr, "Error: expected a key name after 'distinct'\n");
             else
                 execute_distinct(query_fd, dkey, NULL, NULL);
+            free(line);
             continue;
         }
 
@@ -1989,6 +2009,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             if(cache.rs.count > 1) rs_sort(&cache.rs, current_sort, current_reverse);
             display_results(&cache.rs, show_metadata);
             if(cache.rs.count > 0) offer_export(&cache.rs);
+            free(line);
             continue;
         }
 
@@ -2006,12 +2027,13 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             printf("Sort order: %s\n", current_reverse ? "descending" : "ascending");
             display_results(&cache.rs, show_metadata);
             if(cache.rs.count > 0) offer_export(&cache.rs);
+            free(line);
             continue;
         }
 
         /* Parse query */
         struct obmafs3_ioctl_metadata_query_arg qa;
-        if(parse_query(cmd, &qa) != 0) continue;
+        if(parse_query(cmd, &qa) != 0) { free(line); continue; }
 
         /* Check if this query matches the cache */
         if(cache.query[0] != '\0' && strcmp(cmd, cache.query) == 0)
@@ -2022,6 +2044,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
                 rs_sort(&cache.rs, current_sort, current_reverse);
             display_results(&cache.rs, show_metadata);
             if(cache.rs.count > 0) offer_export(&cache.rs);
+            free(line);
             continue;
         }
 
@@ -2031,6 +2054,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
         if(execute_query_collect(query_fd, &qa, &cache.rs) != 0)
         {
             repl_cache_free(&cache);
+            free(line);
             continue;
         }
 
@@ -2053,7 +2077,11 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
         /* Display */
         display_results(&cache.rs, show_metadata);
         if(cache.rs.count > 0) offer_export(&cache.rs);
+        free(line);
     }
+
+    /* Save history before exit */
+    if(histfile[0]) write_history(histfile);
 
     repl_cache_free(&cache);
 }
