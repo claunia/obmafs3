@@ -65,8 +65,17 @@
  *   <key> REGEX "<pattern>"         Regex match (case-sensitive)
  *   <key> IREGEX "<pattern>"        Regex match (case-insensitive)
  *
+ *   Negation (NOT prefix):
+ *   NOT <key> = "<value>"            Invert a single filter
+ *   NOT <key> EXISTS                 Files without this key
+ *
  *   Multiple conditions joined with AND or OR:
  *     artist I= "iron maiden" AND year N> "1985"
+ *     NOT genre = "Pop" AND year N> "1985"
+ *
+ *   Parentheses for mixed AND/OR (one group allowed):
+ *     (genre = "Rock" OR genre = "Metal") AND year N> "1985"
+ *     artist = "Iron Maiden" OR (year N>= "1980" AND year N<= "1990")
  */
 
 #include <ctype.h>
@@ -212,7 +221,8 @@ static const char *skip_ws(const char *p)
 static const char *parse_token(const char *p, char *out, size_t outsz)
 {
     size_t i = 0;
-    while(*p && *p != ' ' && *p != '\t' && *p != '"' && *p != '=' && *p != '!' && *p != '<' && *p != '>' && *p != '*')
+    while(*p && *p != ' ' && *p != '\t' && *p != '"' && *p != '=' && *p != '!' && *p != '<' && *p != '>' && *p != '*' &&
+          *p != '(' && *p != ')')
     {
         if(i < outsz - 1) out[i++] = *p;
         p++;
@@ -441,23 +451,31 @@ static const char *parse_one_filter(const char *p, struct obmafs3_ioctl_query_fi
  * Parse a full query line into an ioctl metadata query argument.
  *
  * Grammar:
- *   query     := filter (combiner filter)*
- *   combiner  := AND | OR
- *   filter    := key operator [value]
+ *   query  := piece (combiner piece)*
+ *   piece  := [NOT] filter | '(' [NOT] filter (combiner [NOT] filter)* ')'
+ *   filter := key operator [value]
  *
- * All combiners in a single query must be the same kind (all AND or all OR).
+ * Filters outside parentheses are group 0 (combined with @c combine).
+ * Filters inside parentheses are group 1 (combined with @c combine1).
+ * The combiner between a parenthesized and a non-parenthesized piece
+ * sets @c group_combine.  Only one parenthesized group is allowed.
  *
  * @param input  The query string.
- * @param qa     Output ioctl argument (filters, combine, filter_count filled).
+ * @param qa     Output ioctl argument.
  * @return 0 on success, -1 on error (message printed to stderr).
  */
 static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_arg *qa)
 {
     memset(qa, 0, sizeof(*qa));
 
-    const char *p           = input;
-    uint8_t     nf          = 0;
-    int         combine_set = 0;
+    const char *p            = input;
+    uint8_t     nf           = 0;
+    int         in_parens    = 0;
+    int         have_parens  = 0;
+    int         combine0_set = 0;
+    int         combine1_set = 0;
+    int         gcombine_set = 0;
+    int         prev_close   = 0;
 
     while(1)
     {
@@ -467,14 +485,80 @@ static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_ar
             return -1;
         }
 
+        p = skip_ws(p);
+        if(!*p)
+        {
+            if(nf == 0)
+            {
+                fprintf(stderr, "Error: expected a filter condition\n");
+                return -1;
+            }
+            break;
+        }
+
+        /* Opening parenthesis → start group 1 */
+        if(*p == '(')
+        {
+            if(in_parens)
+            {
+                fprintf(stderr, "Error: nested parentheses are not supported\n");
+                return -1;
+            }
+            if(have_parens)
+            {
+                fprintf(stderr, "Error: only one parenthesized group is allowed\n");
+                return -1;
+            }
+            in_parens   = 1;
+            have_parens = 1;
+            p++;
+            p = skip_ws(p);
+        }
+
+        /* NOT prefix */
+        int negate = 0;
+        {
+            char        kw[8];
+            const char *after = parse_token(p, kw, sizeof(kw));
+            if(after && strcasecmp(kw, "NOT") == 0)
+            {
+                const char *peek = skip_ws(after);
+                /* Only treat as NOT prefix if not followed by an operator char */
+                if(*peek && *peek != '=' && *peek != '!' && *peek != '>' && *peek != '<' && *peek != ')')
+                {
+                    negate = 1;
+                    p      = peek;
+                }
+            }
+        }
+
+        /* Parse filter (memsets flt to 0, so set negate/group after) */
         p = parse_one_filter(p, &qa->filters[nf]);
         if(!p) return -1;
+        qa->filters[nf].negate = negate ? 1 : 0;
+        qa->filters[nf].group  = in_parens ? 1 : 0;
         nf++;
 
         p = skip_ws(p);
+
+        /* Closing parenthesis */
+        prev_close = 0;
+        if(*p == ')')
+        {
+            if(!in_parens)
+            {
+                fprintf(stderr, "Error: unexpected ')'\n");
+                return -1;
+            }
+            in_parens  = 0;
+            prev_close = 1;
+            p++;
+            p = skip_ws(p);
+        }
+
         if(!*p) break; /* end of input */
 
-        /* Expect AND or OR */
+        /* Parse combiner: AND | OR */
         char        kw[8];
         const char *after = parse_token(p, kw, sizeof(kw));
         if(!after)
@@ -494,16 +578,56 @@ static int parse_query(const char *input, struct obmafs3_ioctl_metadata_query_ar
             return -1;
         }
 
-        if(combine_set && qa->combine != this_combine)
+        /* Peek ahead to see if the next piece starts with '(' */
+        const char *peek         = skip_ws(after);
+        int         next_is_open = (*peek == '(');
+
+        /* Classify the combiner */
+        if(prev_close || next_is_open)
         {
-            fprintf(stderr, "Error: cannot mix AND and OR in a single query\n");
-            return -1;
+            /* Between groups → group_combine */
+            if(gcombine_set && qa->group_combine != this_combine)
+            {
+                fprintf(stderr, "Error: cannot mix AND and OR between groups\n");
+                return -1;
+            }
+            qa->group_combine = this_combine;
+            gcombine_set      = 1;
         }
-        qa->combine = this_combine;
-        combine_set = 1;
+        else if(in_parens)
+        {
+            /* Inside parentheses → combine1 (group 1) */
+            if(combine1_set && qa->combine1 != this_combine)
+            {
+                fprintf(stderr, "Error: cannot mix AND and OR inside parentheses\n");
+                return -1;
+            }
+            qa->combine1 = this_combine;
+            combine1_set = 1;
+        }
+        else
+        {
+            /* Between non-parenthesized pieces → combine (group 0) */
+            if(combine0_set && qa->combine != this_combine)
+            {
+                fprintf(stderr, "Error: cannot mix AND and OR outside parentheses\n");
+                return -1;
+            }
+            qa->combine = this_combine;
+            combine0_set = 1;
+        }
 
         p = after;
     }
+
+    if(in_parens)
+    {
+        fprintf(stderr, "Error: unclosed parenthesis\n");
+        return -1;
+    }
+
+    /* Default: if combine0 not explicitly set but group_combine is, inherit it */
+    if(!combine0_set && gcombine_set) qa->combine = qa->group_combine;
 
     qa->filter_count = nf;
     return 0;
@@ -802,15 +926,23 @@ static void print_help(void)
            "  <key> REGEX \"<pattern>\"            Regex match (case-sensitive)\n"
            "  <key> IREGEX \"<pattern>\"           Regex match (case-insensitive)\n"
            "\n"
+           "Negation:\n"
+           "  NOT <key> = \"<value>\"               Invert a single filter\n"
+           "  NOT <key> EXISTS                    Files without this key\n"
+           "\n"
            "  Use * as the key to match across all keys:\n"
            "    * CONTAINS \"maiden\"               Any key's value contains\n"
            "    * ICONTAINS \"maiden\"              Any key (case-insensitive)\n"
            "    * = \"Rock\"                        Any key's value equals\n"
            "    * STARTSWITH \"Iron\"               Any key's value starts with\n"
            "\n"
-           "  Multiple conditions joined with AND or OR (cannot mix):\n"
+           "  Multiple conditions joined with AND or OR:\n"
            "    artist I= \"iron maiden\" AND year N> \"1985\"\n"
-           "    genre = \"Rock\" OR genre = \"Metal\"\n"
+           "    NOT genre = \"Pop\" AND year N> \"2000\"\n"
+           "\n"
+           "  Parentheses for mixed AND/OR (one group allowed):\n"
+           "    (genre = \"Rock\" OR genre = \"Metal\") AND year N> \"1985\"\n"
+           "    artist = \"Iron Maiden\" OR (year N>= \"1980\" AND year N<= \"1990\")\n"
            "\n"
            "  Values may be quoted (\"...\") or unquoted single words.\n"
            "  Use \\\" for literal quotes inside quoted strings.\n"

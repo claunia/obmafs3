@@ -216,7 +216,9 @@ struct obmafs3_ioctl_query_filter
     char    key[METADATA_KEY_MAX];     /**< Metadata key to match */
     char    value[METADATA_VALUE_MAX]; /**< Value operand (ignored for kQueryOpExists) */
     uint8_t op;                        /**< enum obmafs3_query_op */
-    uint8_t _pad[7];                   /**< Alignment padding */
+    uint8_t negate;                    /**< 1 = invert this filter's match (NOT) */
+    uint8_t group;                     /**< 0 = group A, 1 = group B */
+    uint8_t _pad[5];                   /**< Alignment padding */
 };
 
 /**
@@ -230,9 +232,11 @@ struct obmafs3_ioctl_query_filter
  */
 struct obmafs3_ioctl_metadata_query_arg
 {
-    uint8_t                           combine;                            /**< enum obmafs3_query_combine */
+    uint8_t                           combine;                            /**< Group 0 intra-group combiner */
     uint8_t                           filter_count;                       /**< 1..OBMAFS3_QUERY_MAX_FILTERS */
-    uint8_t                           _pad[6];                            /**< Alignment padding */
+    uint8_t                           combine1;                           /**< Group 1 intra-group combiner */
+    uint8_t                           group_combine;                      /**< Inter-group combiner */
+    uint8_t                           _pad[4];                            /**< Alignment padding */
     struct obmafs3_ioctl_query_filter filters[OBMAFS3_QUERY_MAX_FILTERS]; /**< Filter conditions */
     uint32_t                          offset;                             /**< Input: starting offset */
     uint32_t                          count;                              /**< Output: paths returned this page */

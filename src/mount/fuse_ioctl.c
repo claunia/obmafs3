@@ -866,13 +866,16 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             {
                 memcpy(lib_filters[f].key, qa->filters[f].key, METADATA_KEY_MAX);
                 memcpy(lib_filters[f].value, qa->filters[f].value, METADATA_VALUE_MAX);
-                lib_filters[f].op = qa->filters[f].op;
+                lib_filters[f].op     = qa->filters[f].op;
+                lib_filters[f].negate = qa->filters[f].negate ? 1 : 0;
+                lib_filters[f].group  = qa->filters[f].group  ? 1 : 0;
             }
 
             char   **paths;
             uint32_t page_count;
             uint32_t total_count;
-            int      rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count, qa->combine,
+            int      rc = obmafs3_metadata_query_filtered(g_ctx, lib_filters, qa->filter_count,
+                                                          qa->combine, qa->combine1, qa->group_combine,
                                                           qa->offset, METADATA_QUERY_MAX_RESULTS, &paths, &page_count,
                                                           &total_count);
             if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");

@@ -407,12 +407,15 @@ struct obmafs3_query_filter
     char    key[METADATA_KEY_MAX];     /**< Metadata key to match ("*" = any key) */
     char    value[METADATA_VALUE_MAX]; /**< Value operand (ignored for kQueryOpExists) */
     uint8_t op;                        /**< enum obmafs3_query_op */
+    uint8_t negate;                    /**< 1 = invert this filter's match (NOT) */
+    uint8_t group;                     /**< 0 = group A, 1 = group B */
 };
 
 #define OBMAFS3_QUERY_MAX_FILTERS 4
 
 int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
-                                    uint8_t filter_count, uint8_t combine, uint32_t offset, uint32_t limit,
+                                    uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
+                                    uint32_t offset, uint32_t limit,
                                     char ***paths, uint32_t *count, uint32_t *total);
 int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char *path_buf, size_t path_buf_size);
 

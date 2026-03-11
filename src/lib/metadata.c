@@ -2310,6 +2310,73 @@ static int idset_union(const struct inode_id_set *a, const struct inode_id_set *
     return 0;
 }
 
+/** Difference of sorted/deduped sets: elements in a but not in b → out. */
+static int idset_difference(const struct inode_id_set *a, const struct inode_id_set *b, struct inode_id_set *out)
+{
+    if(idset_init(out, a->count)) return -1;
+    uint32_t i = 0, j = 0;
+    while(i < a->count)
+    {
+        if(j >= b->count || a->ids[i] < b->ids[j])
+        {
+            if(idset_add(out, a->ids[i]))
+            {
+                idset_free(out);
+                return -1;
+            }
+            i++;
+        }
+        else if(a->ids[i] == b->ids[j])
+        {
+            i++;
+            j++;
+        }
+        else
+        {
+            j++;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Combine an array of inode_id_sets using the given combiner.
+ * Takes ownership of the sets at the given indices (frees them).
+ * Produces a single combined set in @p out.
+ */
+static int idset_combine(struct inode_id_set *sets, const int *indices, int count, uint8_t combine,
+                         struct inode_id_set *out)
+{
+    if(count == 0)
+    {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+
+    /* Transfer ownership of first set */
+    *out = sets[indices[0]];
+    sets[indices[0]].ids = NULL;
+    sets[indices[0]].count = 0;
+    sets[indices[0]].cap = 0;
+
+    for(int i = 1; i < count; i++)
+    {
+        struct inode_id_set combined;
+        int                 rc;
+        if(combine == kQueryCombineAnd)
+            rc = idset_intersect(out, &sets[indices[i]], &combined);
+        else
+            rc = idset_union(out, &sets[indices[i]], &combined);
+
+        idset_free(out);
+        idset_free(&sets[indices[i]]);
+
+        if(rc != 0) return -1;
+        *out = combined;
+    }
+    return 0;
+}
+
 /**
  * Portable case-insensitive substring search.
  * Returns a pointer to the first occurrence of @p needle in @p haystack,
@@ -2576,29 +2643,34 @@ collect_done:
  * Query which files match a set of metadata filter conditions.
  *
  * Each filter specifies a key, a comparison operator, and a value.
- * Filters are combined with AND (all must match) or OR (any must match).
+ * Filters may be negated (NOT) and assigned to one of two groups.
+ * Group 0 filters are combined with @p combine0, group 1 filters
+ * with @p combine1, and the two group results with @p group_combine.
+ * If all filters are in group 0 (the default), @p combine1 and
+ * @p group_combine are ignored, providing backward compatibility.
+ *
+ * Negated filters: the set of matching inodes is subtracted from the
+ * universe of all inodes that have any metadata entry.
+ *
  * Only the results in the range [@p offset, @p offset + @p limit) are
- * resolved to paths, avoiding expensive catalog lookups for results
- * that the caller will discard.  The total number of matching inodes
- * (before pagination) is written to @p total so the caller can
- * display progress or detect end-of-results.
+ * resolved to paths.
  *
- * The caller must free the returned array with @c obmafs3_metadata_query_free.
- *
- * @param ctx          Filesystem context.
- * @param filters      Array of filter conditions.
- * @param filter_count Number of filters (1..OBMAFS3_QUERY_MAX_FILTERS).
- * @param combine      kQueryCombineAnd or kQueryCombineOr.
- * @param offset       Number of matching inodes to skip.
- * @param limit        Maximum number of paths to resolve and return.
- *                     Pass 0 to resolve all results (no limit).
- * @param paths        Output array of path strings.
- * @param count        Output number of paths returned this page.
- * @param total        Output total number of matching inodes.
+ * @param ctx            Filesystem context.
+ * @param filters        Array of filter conditions.
+ * @param filter_count   Number of filters (1..OBMAFS3_QUERY_MAX_FILTERS).
+ * @param combine0       How to combine group 0 filters (AND/OR).
+ * @param combine1       How to combine group 1 filters (AND/OR).
+ * @param group_combine  How to combine group results (AND/OR).
+ * @param offset         Number of matching inodes to skip.
+ * @param limit          Maximum paths to resolve (0 = all).
+ * @param paths          Output array of path strings.
+ * @param count          Output number of paths returned this page.
+ * @param total          Output total number of matching inodes.
  * @return @c OBMAFS3_OK on success, or an error code on failure.
  */
 int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs3_query_filter *filters,
-                                    uint8_t filter_count, uint8_t combine, uint32_t offset, uint32_t limit,
+                                    uint8_t filter_count, uint8_t combine0, uint8_t combine1, uint8_t group_combine,
+                                    uint32_t offset, uint32_t limit,
                                     char ***paths, uint32_t *count, uint32_t *total)
 {
     *paths = NULL;
@@ -2607,7 +2679,7 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
 
     if(filter_count == 0 || filter_count > OBMAFS3_QUERY_MAX_FILTERS) DBG_RETURN(OBMAFS3_ERR_INVAL, "bad filter count");
 
-    /* Collect matching inode IDs for each filter */
+    /* Step 1: Collect matching inode IDs for each filter */
     struct inode_id_set sets[OBMAFS3_QUERY_MAX_FILTERS];
     memset(sets, 0, sizeof(sets));
 
@@ -2628,39 +2700,102 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
         idset_sort_dedup(&sets[f]);
     }
 
-    /* Combine the per-filter ID sets */
-    struct inode_id_set result;
-    if(filter_count == 1)
-    {
-        result = sets[0];
-        /* Ownership transferred — don't free sets[0] below */
-    }
-    else
-    {
-        result = sets[0];
-        for(uint8_t f = 1; f < filter_count; f++)
-        {
-            struct inode_id_set combined;
-            int                 rc;
-            if(combine == kQueryCombineAnd)
-                rc = idset_intersect(&result, &sets[f], &combined);
-            else
-                rc = idset_union(&result, &sets[f], &combined);
+    /* Step 2: Handle negation — complement against all metadata inodes */
+    int                 has_negation = 0;
+    struct inode_id_set all_inodes;
+    memset(&all_inodes, 0, sizeof(all_inodes));
 
-            if(rc != 0)
+    for(uint8_t f = 0; f < filter_count; f++)
+    {
+        if(!filters[f].negate) continue;
+
+        /* Lazily collect the universe of all inodes with metadata */
+        if(!has_negation)
+        {
+            struct obmafs3_query_filter all_flt;
+            memset(&all_flt, 0, sizeof(all_flt));
+            all_flt.key[0] = '*';
+            all_flt.op     = kQueryOpExists;
+
+            if(idset_init(&all_inodes, 16))
             {
-                idset_free(&result);
-                for(uint8_t j = f; j < filter_count; j++) idset_free(&sets[j]);
+                for(uint8_t j = 0; j < filter_count; j++) idset_free(&sets[j]);
                 DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
 
-            /* Free the previous result and the consumed set */
-            if(f > 1 || filter_count > 1) idset_free(&result);
-            idset_free(&sets[f]);
-            result = combined;
+            int rc = midx_collect_matching(ctx, &all_flt, &all_inodes);
+            if(rc != OBMAFS3_OK)
+            {
+                idset_free(&all_inodes);
+                for(uint8_t j = 0; j < filter_count; j++) idset_free(&sets[j]);
+                return rc;
+            }
+            idset_sort_dedup(&all_inodes);
+            has_negation = 1;
         }
-        /* sets[0] was consumed as the initial result — free it if filter_count > 1 */
-        if(filter_count > 1) idset_free(&sets[0]);
+
+        struct inode_id_set negated;
+        if(idset_difference(&all_inodes, &sets[f], &negated) != 0)
+        {
+            idset_free(&all_inodes);
+            for(uint8_t j = 0; j < filter_count; j++) idset_free(&sets[j]);
+            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+        }
+        idset_free(&sets[f]);
+        sets[f] = negated;
+    }
+
+    if(has_negation) idset_free(&all_inodes);
+
+    /* Step 3: Separate filters into groups */
+    int g0_idx[OBMAFS3_QUERY_MAX_FILTERS], g0n = 0;
+    int g1_idx[OBMAFS3_QUERY_MAX_FILTERS], g1n = 0;
+    for(uint8_t f = 0; f < filter_count; f++)
+    {
+        if(filters[f].group == 0)
+            g0_idx[g0n++] = (int)f;
+        else
+            g1_idx[g1n++] = (int)f;
+    }
+
+    /* Step 4: Combine within each group */
+    struct inode_id_set g0_result, g1_result;
+    memset(&g0_result, 0, sizeof(g0_result));
+    memset(&g1_result, 0, sizeof(g1_result));
+
+    if(idset_combine(sets, g0_idx, g0n, combine0, &g0_result) != 0)
+    {
+        for(uint8_t j = 0; j < filter_count; j++) idset_free(&sets[j]);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    if(idset_combine(sets, g1_idx, g1n, combine1, &g1_result) != 0)
+    {
+        idset_free(&g0_result);
+        for(uint8_t j = 0; j < filter_count; j++) idset_free(&sets[j]);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    /* Step 5: Combine group results */
+    struct inode_id_set result;
+    if(g0n > 0 && g1n > 0)
+    {
+        int rc;
+        if(group_combine == kQueryCombineAnd)
+            rc = idset_intersect(&g0_result, &g1_result, &result);
+        else
+            rc = idset_union(&g0_result, &g1_result, &result);
+        idset_free(&g0_result);
+        idset_free(&g1_result);
+        if(rc != 0) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+    else if(g0n > 0)
+    {
+        result = g0_result;
+    }
+    else
+    {
+        result = g1_result;
     }
 
     /* Resolve only the inode IDs in [offset, offset+limit) to paths */
