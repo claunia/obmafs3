@@ -1808,6 +1808,211 @@ void obmafs3_metadata_list_free(char **keys, uint32_t count)
     free(keys);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Path resolution cache                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A simple open-addressing hash table that caches inode_id → path
+ * mappings during a query batch.  This avoids repeated full catalog
+ * scans for shared parent directories when resolving sibling inodes.
+ */
+
+#define PATH_CACHE_INITIAL_CAP 64 /* must be power of 2 */
+
+struct path_cache_entry
+{
+    uint64_t inode_id; /* 0 = empty slot */
+    char    *path;     /* heap-allocated, owned by the cache */
+};
+
+struct path_cache
+{
+    struct path_cache_entry *entries;
+    uint32_t                 cap;   /* always power of 2 */
+    uint32_t                 count;
+};
+
+static int path_cache_init(struct path_cache *pc)
+{
+    pc->cap     = PATH_CACHE_INITIAL_CAP;
+    pc->count   = 0;
+    pc->entries = calloc(pc->cap, sizeof(struct path_cache_entry));
+    return pc->entries ? 0 : -1;
+}
+
+static void path_cache_free(struct path_cache *pc)
+{
+    if(!pc->entries) return;
+    for(uint32_t i = 0; i < pc->cap; i++)
+        free(pc->entries[i].path);
+    free(pc->entries);
+    pc->entries = NULL;
+    pc->count   = 0;
+    pc->cap     = 0;
+}
+
+static uint32_t pc_slot(uint64_t id, uint32_t cap) { return (uint32_t)(id * 0x9E3779B97F4A7C15ULL >> 32) & (cap - 1); }
+
+static const char *path_cache_lookup(const struct path_cache *pc, uint64_t inode_id)
+{
+    uint32_t mask = pc->cap - 1;
+    uint32_t idx  = pc_slot(inode_id, pc->cap);
+    for(uint32_t i = 0; i < pc->cap; i++)
+    {
+        uint32_t slot = (idx + i) & mask;
+        if(pc->entries[slot].inode_id == 0) return NULL;
+        if(pc->entries[slot].inode_id == inode_id) return pc->entries[slot].path;
+    }
+    return NULL;
+}
+
+static int path_cache_grow(struct path_cache *pc)
+{
+    uint32_t                 new_cap = pc->cap * 2;
+    struct path_cache_entry *new_ent = calloc(new_cap, sizeof(struct path_cache_entry));
+    if(!new_ent) return -1;
+
+    uint32_t mask = new_cap - 1;
+    for(uint32_t i = 0; i < pc->cap; i++)
+    {
+        if(pc->entries[i].inode_id == 0) continue;
+        uint32_t idx = pc_slot(pc->entries[i].inode_id, new_cap);
+        while(new_ent[idx].inode_id != 0) idx = (idx + 1) & mask;
+        new_ent[idx] = pc->entries[i];
+    }
+    free(pc->entries);
+    pc->entries = new_ent;
+    pc->cap     = new_cap;
+    return 0;
+}
+
+static int path_cache_insert(struct path_cache *pc, uint64_t inode_id, const char *path)
+{
+    /* Grow at 70% load */
+    if(pc->count * 10 >= pc->cap * 7)
+    {
+        if(path_cache_grow(pc)) return -1;
+    }
+
+    uint32_t mask = pc->cap - 1;
+    uint32_t idx  = pc_slot(inode_id, pc->cap);
+    while(pc->entries[idx].inode_id != 0)
+    {
+        if(pc->entries[idx].inode_id == inode_id) return 0; /* already cached */
+        idx = (idx + 1) & mask;
+    }
+    pc->entries[idx].inode_id = inode_id;
+    pc->entries[idx].path     = strdup(path);
+    if(!pc->entries[idx].path) return -1;
+    pc->count++;
+    return 0;
+}
+
+/**
+ * Resolve an inode ID to its full path, using a cache to avoid
+ * repeated catalog scans for shared parent directories.
+ *
+ * On first call for a given inode, walks bottom-up via catalog_find_by_inode
+ * but stops as soon as a cached ancestor is found.  All intermediate
+ * directories (and the target inode itself) are inserted into the cache.
+ */
+static int resolve_inode_path_cached(struct obmafs3_ctx *ctx, uint64_t inode_id, char *path_buf, size_t path_buf_size,
+                                     struct path_cache *pc)
+{
+    if(path_buf_size == 0) return OBMAFS3_ERR_NOMEM;
+
+    if(inode_id == OBMAFS3_ROOT_INODE_ID)
+    {
+        path_buf[0] = '/';
+        path_buf[1] = '\0';
+        return OBMAFS3_OK;
+    }
+
+    /* Check cache first */
+    const char *cached = path_cache_lookup(pc, inode_id);
+    if(cached)
+    {
+        if(strlen(cached) + 1 > path_buf_size) return OBMAFS3_ERR_NOMEM;
+        memcpy(path_buf, cached, strlen(cached) + 1);
+        return OBMAFS3_OK;
+    }
+
+    /* Walk bottom-up, stopping at a cached ancestor or root */
+    const int MAX_DEPTH = 256;
+
+    struct
+    {
+        uint64_t inode_id;
+        char     name[256];
+    } *stack = malloc((size_t)MAX_DEPTH * sizeof(*stack));
+    if(!stack) return OBMAFS3_ERR_NOMEM;
+
+    int      depth = 0;
+    uint64_t cur   = inode_id;
+
+    const char *prefix      = NULL;
+    size_t      prefix_len  = 0;
+
+    while(cur != OBMAFS3_ROOT_INODE_ID && depth < MAX_DEPTH)
+    {
+        /* Check if this ancestor is cached */
+        cached = path_cache_lookup(pc, cur);
+        if(cached)
+        {
+            prefix     = cached;
+            prefix_len = strlen(cached);
+            break;
+        }
+
+        struct catalog_record cat;
+        int                   rc = obmafs3_catalog_find_by_inode(ctx, cur, &cat);
+        if(rc != OBMAFS3_OK)
+        {
+            free(stack);
+            return rc;
+        }
+        stack[depth].inode_id = cur;
+        memcpy(stack[depth].name, cat.name, 256);
+        depth++;
+        cur = cat.parent_id;
+    }
+
+    /* Build path: prefix (cached ancestor or "/") + stack components top-down */
+    size_t pos = 0;
+    if(prefix)
+    {
+        if(prefix_len + 1 > path_buf_size)
+        {
+            free(stack);
+            return OBMAFS3_ERR_NOMEM;
+        }
+        memcpy(path_buf, prefix, prefix_len);
+        pos = prefix_len;
+    }
+
+    for(int i = depth - 1; i >= 0; i--)
+    {
+        size_t nlen = strlen(stack[i].name);
+        if(pos + 1 + nlen + 1 > path_buf_size)
+        {
+            free(stack);
+            return OBMAFS3_ERR_NOMEM;
+        }
+        path_buf[pos++] = '/';
+        memcpy(path_buf + pos, stack[i].name, nlen);
+        pos += nlen;
+
+        /* Cache this intermediate path for the corresponding inode */
+        path_buf[pos] = '\0';
+        path_cache_insert(pc, stack[i].inode_id, path_buf);
+    }
+
+    path_buf[pos] = '\0';
+    free(stack);
+    return OBMAFS3_OK;
+}
+
 /**
  * Query which files have a specific metadata key/value pair.
  *
@@ -1831,6 +2036,9 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
 
     uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_OK;
+
+    struct path_cache pc;
+    if(path_cache_init(&pc)) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
     size_t   nsz = meta_node_size(ctx);
     uint8_t *buf = calloc(1, nsz);
@@ -1894,7 +2102,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
 
             /* key and value match — resolve inode to path */
             char path[4096];
-            int  prc = obmafs3_resolve_inode_path(ctx, rec.inode_id, path, sizeof(path));
+            int  prc = resolve_inode_path_cached(ctx, rec.inode_id, path, sizeof(path), &pc);
             if(prc != OBMAFS3_OK) continue; /* skip unresolvable inodes */
 
             if(n >= cap)
@@ -1906,6 +2114,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
                     for(uint32_t j = 0; j < n; j++) free(result[j]);
                     free(result);
                     free(buf);
+                    path_cache_free(&pc);
                     DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                 }
                 result = tmp;
@@ -1916,6 +2125,7 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
                 for(uint32_t j = 0; j < n; j++) free(result[j]);
                 free(result);
                 free(buf);
+                path_cache_free(&pc);
                 DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
             }
             n++;
@@ -1929,12 +2139,14 @@ int obmafs3_metadata_query(struct obmafs3_ctx *ctx, const char *key, const char 
             for(uint32_t j = 0; j < n; j++) free(result[j]);
             free(result);
             free(buf);
+            path_cache_free(&pc);
             return rc;
         }
     }
 
 query_done:
     free(buf);
+    path_cache_free(&pc);
     *paths = result;
     *count = n;
     return OBMAFS3_OK;
@@ -2380,10 +2592,18 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
+    struct path_cache pc;
+    if(path_cache_init(&pc))
+    {
+        free(res);
+        idset_free(&result);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
     for(uint32_t i = offset; i < end; i++)
     {
         char path[4096];
-        int  prc = obmafs3_resolve_inode_path(ctx, result.ids[i], path, sizeof(path));
+        int  prc = resolve_inode_path_cached(ctx, result.ids[i], path, sizeof(path), &pc);
         if(prc != OBMAFS3_OK) continue; /* skip unresolvable inodes */
 
         res[n] = strdup(path);
@@ -2392,11 +2612,13 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
             for(uint32_t j = 0; j < n; j++) free(res[j]);
             free(res);
             idset_free(&result);
+            path_cache_free(&pc);
             DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
         }
         n++;
     }
 
+    path_cache_free(&pc);
     idset_free(&result);
     *paths = res;
     *count = n;

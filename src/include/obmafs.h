@@ -224,6 +224,7 @@ int obmafs3_btree_header_write(struct obmafs3_ctx *ctx, uint64_t lba, struct btr
 
 /* --- Catalog operations --- */
 int obmafs3_catalog_lookup(struct obmafs3_ctx *ctx, uint64_t parent_id, const char *name, struct catalog_record *entry);
+int obmafs3_catalog_find_by_inode(struct obmafs3_ctx *ctx, uint64_t inode_id, struct catalog_record *out);
 int obmafs3_catalog_list(struct obmafs3_ctx *ctx, uint64_t parent_id, struct catalog_record **entries, uint32_t *count);
 void obmafs3_catalog_list_free(struct catalog_record *entries);
 

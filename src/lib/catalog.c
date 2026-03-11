@@ -316,7 +316,7 @@ void obmafs3_catalog_list_free(struct catalog_record *entries) { free(entries); 
  * The catalog is sorted by (parent_id, name) so we must do a full scan.
  * Returns OBMAFS3_OK and fills *out on success, OBMAFS3_ERR_NOTFOUND otherwise.
  */
-static int catalog_find_by_inode(struct obmafs3_ctx *ctx, uint64_t target_inode, struct catalog_record *out)
+static int catalog_find_by_inode_internal(struct obmafs3_ctx *ctx, uint64_t target_inode, struct catalog_record *out)
 {
     uint64_t lba = ctx->catalog_hdr.root_node_lba;
     if(lba == 0) return OBMAFS3_ERR_NOTFOUND;
@@ -418,7 +418,7 @@ int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char 
     while(cur != OBMAFS3_ROOT_INODE_ID && depth < MAX_DEPTH)
     {
         struct catalog_record cat;
-        int                   rc = catalog_find_by_inode(ctx, cur, &cat);
+        int                   rc = catalog_find_by_inode_internal(ctx, cur, &cat);
         if(rc != OBMAFS3_OK)
         {
             free(components);
@@ -447,6 +447,11 @@ int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char 
 
     free(components);
     return OBMAFS3_OK;
+}
+
+int obmafs3_catalog_find_by_inode(struct obmafs3_ctx *ctx, uint64_t inode_id, struct catalog_record *out)
+{
+    return catalog_find_by_inode_internal(ctx, inode_id, out);
 }
 
 /* ------------------------------------------------------------------ */
