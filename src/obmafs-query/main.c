@@ -822,6 +822,112 @@ static void rs_fetch_metadata(const char *mountpoint, struct result_set *rs)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Result sorting                                                     */
+/* ------------------------------------------------------------------ */
+
+/** Context passed to the qsort comparator via a file-scope global. */
+static struct
+{
+    const struct result_set *rs;
+    const char              *sort_key;
+    int                      numeric;
+    int                      reverse;
+} g_sort_ctx;
+
+/**
+ * Find the value of @p key in a meta_list.
+ * Returns "" if not found (sorts empty values first in ascending order).
+ */
+static const char *ml_find(const struct meta_list *ml, const char *key)
+{
+    if(!ml) return "";
+    for(uint32_t i = 0; i < ml->count; i++)
+        if(strncmp(ml->pairs[i].key, key, METADATA_KEY_MAX) == 0)
+            return ml->pairs[i].value;
+    return "";
+}
+
+static int rs_sort_cmp(const void *a, const void *b)
+{
+    uint32_t ia = *(const uint32_t *)a;
+    uint32_t ib = *(const uint32_t *)b;
+    int      cmp;
+
+    if(strcmp(g_sort_ctx.sort_key, "path") == 0)
+    {
+        cmp = strcmp(g_sort_ctx.rs->paths[ia], g_sort_ctx.rs->paths[ib]);
+    }
+    else if(g_sort_ctx.numeric)
+    {
+        int64_t va = strtoll(ml_find(&g_sort_ctx.rs->metadata[ia], g_sort_ctx.sort_key), NULL, 10);
+        int64_t vb = strtoll(ml_find(&g_sort_ctx.rs->metadata[ib], g_sort_ctx.sort_key), NULL, 10);
+        cmp        = (va > vb) - (va < vb);
+    }
+    else
+    {
+        const char *va = ml_find(&g_sort_ctx.rs->metadata[ia], g_sort_ctx.sort_key);
+        const char *vb = ml_find(&g_sort_ctx.rs->metadata[ib], g_sort_ctx.sort_key);
+        cmp            = strncmp(va, vb, METADATA_VALUE_MAX);
+    }
+
+    return g_sort_ctx.reverse ? -cmp : cmp;
+}
+
+/**
+ * Sort a result set by a metadata key or by path.
+ *
+ * @param rs        Result set (must have metadata fetched unless
+ *                  sort_key is "path").
+ * @param sort_key  Metadata key to sort by, or "path" for path order.
+ *                  Prefix with "N:" for numeric sort (e.g. "N:year").
+ * @param reverse   Non-zero for descending order.
+ */
+static void rs_sort(struct result_set *rs, const char *sort_key, int reverse)
+{
+    if(rs->count <= 1) return;
+
+    int         numeric  = 0;
+    const char *real_key = sort_key;
+    if(strncasecmp(sort_key, "N:", 2) == 0)
+    {
+        numeric  = 1;
+        real_key = sort_key + 2;
+    }
+
+    /* Build an index array, sort it, then reorder paths+metadata in-place */
+    uint32_t *idx = malloc(rs->count * sizeof(uint32_t));
+    if(!idx) return;
+    for(uint32_t i = 0; i < rs->count; i++) idx[i] = i;
+
+    g_sort_ctx.rs       = rs;
+    g_sort_ctx.sort_key = real_key;
+    g_sort_ctx.numeric  = numeric;
+    g_sort_ctx.reverse  = reverse;
+
+    qsort(idx, rs->count, sizeof(uint32_t), rs_sort_cmp);
+
+    /* Reorder paths and metadata according to sorted index */
+    char            **new_paths = malloc(rs->count * sizeof(char *));
+    struct meta_list *new_meta  = rs->metadata ? malloc(rs->count * sizeof(struct meta_list)) : NULL;
+    if(!new_paths) { free(idx); return; }
+
+    for(uint32_t i = 0; i < rs->count; i++)
+    {
+        new_paths[i] = rs->paths[idx[i]];
+        if(new_meta) new_meta[i] = rs->metadata[idx[i]];
+    }
+
+    free(rs->paths);
+    rs->paths = new_paths;
+    if(new_meta)
+    {
+        free(rs->metadata);
+        rs->metadata = new_meta;
+    }
+    free(idx);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Export helpers                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1057,10 +1163,11 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
 /**
  * Execute a parsed query interactively: print results, show count,
  * offer export.  If @p show_metadata is set, fetches and displays
- * metadata for each result.
+ * metadata for each result.  If @p sort_key is non-NULL, sorts results.
  */
 static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
-                          const char *mountpoint, int show_metadata)
+                          const char *mountpoint, int show_metadata,
+                          const char *sort_key, int reverse)
 {
     struct result_set rs;
     rs_init(&rs);
@@ -1071,13 +1178,18 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
         return;
     }
 
-    if(show_metadata && rs.count > 0)
+    /* Sorting by a metadata key requires metadata to be fetched */
+    int need_meta = show_metadata || (sort_key && strcmp(sort_key, "path") != 0);
+    if(need_meta && rs.count > 0)
         rs_fetch_metadata(mountpoint, &rs);
+
+    if(sort_key && rs.count > 1)
+        rs_sort(&rs, sort_key, reverse);
 
     for(uint32_t i = 0; i < rs.count; i++)
     {
         printf("  %s\n", rs.paths[i]);
-        if(rs.metadata && rs.metadata[i].count > 0)
+        if(show_metadata && rs.metadata && rs.metadata[i].count > 0)
         {
             for(uint32_t j = 0; j < rs.metadata[i].count; j++)
                 printf("    %s = %s\n", rs.metadata[i].pairs[j].key, rs.metadata[i].pairs[j].value);
@@ -1103,7 +1215,8 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
  */
 static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
                                const char *format, const char *output,
-                               const char *mountpoint, int show_metadata)
+                               const char *mountpoint, int show_metadata,
+                               const char *sort_key, int reverse)
 {
     struct result_set rs;
     rs_init(&rs);
@@ -1114,8 +1227,13 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
         return 1;
     }
 
-    if(show_metadata && rs.count > 0)
+    /* Sorting by a metadata key requires metadata to be fetched */
+    int need_meta = show_metadata || (sort_key && strcmp(sort_key, "path") != 0);
+    if(need_meta && rs.count > 0)
         rs_fetch_metadata(mountpoint, &rs);
+
+    if(sort_key && rs.count > 1)
+        rs_sort(&rs, sort_key, reverse);
 
     const char *fmt = format ? format : "txt";
 
@@ -1255,16 +1373,17 @@ static void usage(const char *prog)
             "  -f, --format <fmt>     Output format: txt (default) or json\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
+            "  -s, --sort <key>       Sort results by metadata key or 'path'\n"
+            "                         Prefix with N: for numeric sort (e.g. N:year)\n"
+            "  -r, --reverse          Reverse sort order (descending)\n"
             "  -h, --help             Show this help message\n"
             "\n"
-            "Interactive mode (default):\n"
-            "  %s <mountpoint>\n"
-            "  %s -m <mountpoint>                         (with metadata)\n"
-            "\n"
-            "Batch mode:\n"
-            "  %s -q 'artist = \"Iron Maiden\"' /mnt/archive\n"
-            "  %s -q 'year N> \"1985\"' -f json -m /mnt/archive\n"
-            "  %s -q 'genre = \"Rock\"' -f txt -o results.txt /mnt/archive\n",
+            "Examples:\n"
+            "  %s <mountpoint>                              Interactive mode\n"
+            "  %s -q 'artist = \"Iron Maiden\"' /mnt/archive  Batch query\n"
+            "  %s -q 'genre = \"Rock\"' -s N:year /mnt/archive Sort by year\n"
+            "  %s -q 'artist EXISTS' -s path -r /mnt/archive Sort by path desc\n"
+            "  %s -q 'year N> \"1985\"' -f json -m /mnt/archive JSON + metadata\n",
             prog, prog, prog, prog, prog, prog);
 }
 
@@ -1272,7 +1391,8 @@ static void usage(const char *prog)
 /*  Read-eval-print loop                                               */
 /* ------------------------------------------------------------------ */
 
-static void repl(const char *mountpoint, int query_fd, int show_metadata)
+static void repl(const char *mountpoint, int query_fd, int show_metadata,
+                 const char *sort_key, int reverse)
 {
     char line[4096];
 
@@ -1312,7 +1432,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata)
 
         /* Parse and execute as a query */
         struct obmafs3_ioctl_metadata_query_arg qa;
-        if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa, mountpoint, show_metadata);
+        if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa, mountpoint, show_metadata, sort_key, reverse);
     }
 }
 
@@ -1325,19 +1445,23 @@ int main(int argc, char *argv[])
     const char *query_str  = NULL;
     const char *format_str = NULL;
     const char *output_str = NULL;
+    const char *sort_str   = NULL;
     int         show_meta  = 0;
+    int         reverse    = 0;
 
     static struct option long_opts[] = {
         {"query",    required_argument, NULL, 'q'},
         {"format",   required_argument, NULL, 'f'},
         {"output",   required_argument, NULL, 'o'},
         {"metadata", no_argument,       NULL, 'm'},
+        {"sort",     required_argument, NULL, 's'},
+        {"reverse",  no_argument,       NULL, 'r'},
         {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:mh", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rh", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -1345,6 +1469,8 @@ int main(int argc, char *argv[])
             case 'f': format_str = optarg; break;
             case 'o': output_str = optarg; break;
             case 'm': show_meta  = 1;      break;
+            case 's': sort_str   = optarg; break;
+            case 'r': reverse    = 1;      break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -1379,14 +1505,14 @@ int main(int argc, char *argv[])
             close(query_fd);
             return 1;
         }
-        rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta);
+        rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta, sort_str, reverse);
     }
     else
     {
         /* Interactive REPL mode */
         if(format_str || output_str)
             fprintf(stderr, "Warning: --format and --output are ignored in interactive mode\n");
-        repl(mountpoint, query_fd, show_meta);
+        repl(mountpoint, query_fd, show_meta, sort_str, reverse);
     }
 
     close(query_fd);
