@@ -2346,8 +2346,12 @@ static int idset_difference(const struct inode_id_set *a, const struct inode_id_
  * Combine an array of inode_id_sets using the given combiner.
  * Takes ownership of the sets at the given indices (frees them).
  * Produces a single combined set in @p out.
+ *
+ * For AND queries, sorts indices by set size ascending (most selective
+ * first) so the running intersection shrinks fastest.  Bails out
+ * early if the intersection becomes empty.
  */
-static int idset_combine(struct inode_id_set *sets, const int *indices, int count, uint8_t combine,
+static int idset_combine(struct inode_id_set *sets, int *indices, int count, uint8_t combine,
                          struct inode_id_set *out)
 {
     if(count == 0)
@@ -2356,14 +2360,38 @@ static int idset_combine(struct inode_id_set *sets, const int *indices, int coun
         return 0;
     }
 
+    /* For AND: sort indices by ascending set size so the smallest
+     * (most selective) filter is intersected first.  This minimises
+     * intermediate result sizes and enables early termination. */
+    if(combine == kQueryCombineAnd && count > 1)
+    {
+        for(int i = 0; i < count - 1; i++)
+            for(int j = i + 1; j < count; j++)
+                if(sets[indices[j]].count < sets[indices[i]].count)
+                {
+                    int tmp    = indices[i];
+                    indices[i] = indices[j];
+                    indices[j] = tmp;
+                }
+    }
+
     /* Transfer ownership of first set */
     *out = sets[indices[0]];
-    sets[indices[0]].ids = NULL;
+    sets[indices[0]].ids   = NULL;
     sets[indices[0]].count = 0;
-    sets[indices[0]].cap = 0;
+    sets[indices[0]].cap   = 0;
 
     for(int i = 1; i < count; i++)
     {
+        /* AND early termination: if the running result is empty,
+         * the intersection with any further set is still empty. */
+        if(combine == kQueryCombineAnd && out->count == 0)
+        {
+            /* Free remaining unconsumed sets */
+            for(int j = i; j < count; j++) idset_free(&sets[indices[j]]);
+            return 0;
+        }
+
         struct inode_id_set combined;
         int                 rc;
         if(combine == kQueryCombineAnd)
