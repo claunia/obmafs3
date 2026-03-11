@@ -2299,7 +2299,7 @@ static const char *ci_strstr(const char *haystack, const char *needle)
  * @param op         The comparison operator.
  * @return Non-zero if the record matches.
  */
-static int filter_value_matches(const char *rec_value, const char *flt_value, uint8_t op)
+static int filter_single_value_matches(const char *rec_value, const char *flt_value, uint8_t op)
 {
     switch(op)
     {
@@ -2469,6 +2469,65 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
 }
 
 /**
+ * Test whether a record value matches a filter, with multi-value support.
+ *
+ * Metadata values may contain multiple sub-values separated by '\n'.
+ * For positive operators (equal, contains, etc.), the record matches if
+ * ANY sub-value satisfies the operator.  For negative operators (not-equal),
+ * the record matches only if ALL sub-values satisfy the operator.
+ *
+ * The "Comments" key is exempt: its value is treated as a single string
+ * even if it contains newlines, since comments naturally contain them.
+ *
+ * @param rec_key    The metadata key name.
+ * @param rec_value  The full value from the record (may contain '\n').
+ * @param flt_value  The filter value to compare against.
+ * @param op         The comparison operator.
+ * @return Non-zero if the record matches.
+ */
+static int filter_value_matches(const char *rec_key, const char *rec_value, const char *flt_value, uint8_t op)
+{
+    /* Comments key: always treat as a single value (newlines are content) */
+    if(strncmp(rec_key, "Comments", METADATA_KEY_MAX) == 0)
+        return filter_single_value_matches(rec_value, flt_value, op);
+
+    /* No newline in value: fast path */
+    if(!strchr(rec_value, '\n'))
+        return filter_single_value_matches(rec_value, flt_value, op);
+
+    /* Negative operators: ALL sub-values must match */
+    int is_negative = (op == kQueryOpNotEqual || op == kQueryOpINotEqual);
+
+    const char *p = rec_value;
+    while(*p)
+    {
+        const char *nl = strchr(p, '\n');
+        size_t slen = nl ? (size_t)(nl - p) : strlen(p);
+
+        /* Extract sub-value into a temporary NUL-terminated buffer */
+        char sub[METADATA_VALUE_MAX];
+        if(slen >= METADATA_VALUE_MAX) slen = METADATA_VALUE_MAX - 1;
+        memcpy(sub, p, slen);
+        sub[slen] = '\0';
+
+        int match = filter_single_value_matches(sub, flt_value, op);
+
+        if(is_negative)
+        {
+            if(!match) return 0; /* one sub-value failed → whole record fails */
+        }
+        else
+        {
+            if(match) return 1;  /* one sub-value matched → whole record matches */
+        }
+
+        p = nl ? nl + 1 : p + slen;
+    }
+
+    return is_negative ? 1 : 0;
+}
+
+/**
  * Collect all inode IDs from the reverse-index tree whose key matches
  * @p filter_key and whose value satisfies @p op against @p filter_value.
  *
@@ -2570,7 +2629,7 @@ static int midx_collect_matching(struct obmafs3_ctx *ctx, const struct obmafs3_q
             }
 
             /* Key matches (or wildcard) — apply the operator against the value */
-            if(filter_value_matches(rec.value, flt->value, flt->op))
+            if(filter_value_matches(rec.key, rec.value, flt->value, flt->op))
             {
                 if(idset_add(out, rec.inode_id))
                 {
@@ -2798,6 +2857,8 @@ int obmafs3_metadata_query_resolve_page(struct obmafs3_ctx *ctx, const uint64_t 
 /*  Distinct values for a metadata key                                 */
 /* ------------------------------------------------------------------ */
 
+static int str_ptr_cmp(const void *a, const void *b) { return strcmp(*(const char **)a, *(const char **)b); }
+
 /**
  * Collect all distinct values for a given metadata key.
  *
@@ -2856,7 +2917,10 @@ int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***
         lba = ie.child_lba;
     }
 
-    /* Scan leaf chain collecting distinct values */
+    /* Scan leaf chain collecting distinct values.
+     * For multi-value metadata (values containing \\n), each sub-value
+     * is added separately — except for the "Comments" key which is
+     * treated as a single value. */
     uint32_t  cap    = 64;
     uint32_t  n      = 0;
     char    **result = malloc(cap * sizeof(char *));
@@ -2866,9 +2930,11 @@ int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***
         DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
     }
 
-    char prev_value[METADATA_VALUE_MAX];
-    memset(prev_value, 0, sizeof(prev_value));
-    int have_prev = 0;
+    int is_comments = (strncmp(key, "Comments", METADATA_KEY_MAX) == 0);
+
+    /* We can't rely on "skip if same as previous" for dedup when
+     * splitting multi-values. Instead, collect all sub-values and
+     * sort+dedup at the end. */
 
     while(1)
     {
@@ -2882,38 +2948,43 @@ int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***
             memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
 
             int kcmp = strncmp(rec.key, key, METADATA_KEY_MAX);
-            if(kcmp < 0) continue;          /* haven't reached the key yet */
-            if(kcmp > 0) goto distinct_done; /* past the key — done */
+            if(kcmp < 0) continue;
+            if(kcmp > 0) goto distinct_done;
 
-            /* Skip if same value as previous (tree is sorted by value) */
-            if(have_prev && strncmp(rec.value, prev_value, METADATA_VALUE_MAX) == 0)
-                continue;
-
-            /* New distinct value */
-            if(n >= cap)
+            /* Add value(s) */
+            const char *val = rec.value;
+            while(1)
             {
-                cap *= 2;
-                char **tmp = realloc(result, cap * sizeof(char *));
-                if(!tmp)
+                const char *nl = is_comments ? NULL : strchr(val, '\n');
+                size_t slen = nl ? (size_t)(nl - val) : strlen(val);
+
+                if(slen > 0)
                 {
-                    for(uint32_t j = 0; j < n; j++) free(result[j]);
-                    free(result);
-                    free(buf);
-                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                    if(n >= cap)
+                    {
+                        cap *= 2;
+                        char **tmp = realloc(result, cap * sizeof(char *));
+                        if(!tmp)
+                        {
+                            for(uint32_t j = 0; j < n; j++) free(result[j]);
+                            free(result); free(buf);
+                            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                        }
+                        result = tmp;
+                    }
+                    result[n] = strndup(val, slen);
+                    if(!result[n])
+                    {
+                        for(uint32_t j = 0; j < n; j++) free(result[j]);
+                        free(result); free(buf);
+                        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                    }
+                    n++;
                 }
-                result = tmp;
+
+                if(!nl) break;
+                val = nl + 1;
             }
-            result[n] = strndup(rec.value, METADATA_VALUE_MAX);
-            if(!result[n])
-            {
-                for(uint32_t j = 0; j < n; j++) free(result[j]);
-                free(result);
-                free(buf);
-                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
-            }
-            memcpy(prev_value, rec.value, METADATA_VALUE_MAX);
-            have_prev = 1;
-            n++;
         }
 
         if(hdr.right_link == 0) break;
@@ -2921,14 +2992,28 @@ int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***
         if(rc != OBMAFS3_OK)
         {
             for(uint32_t j = 0; j < n; j++) free(result[j]);
-            free(result);
-            free(buf);
+            free(result); free(buf);
             return rc;
         }
     }
 
 distinct_done:
     free(buf);
+
+    /* Sort and deduplicate the collected values */
+    if(n > 1)
+    {
+        qsort(result, n, sizeof(char *), str_ptr_cmp);
+        uint32_t w = 1;
+        for(uint32_t r = 1; r < n; r++)
+        {
+            if(strcmp(result[r], result[w - 1]) == 0)
+                free(result[r]);
+            else
+                result[w++] = result[r];
+        }
+        n = w;
+    }
     *values = result;
     *count  = n;
     return OBMAFS3_OK;
@@ -2944,6 +3029,16 @@ void obmafs3_metadata_distinct_free(char **values, uint32_t count)
 /* ------------------------------------------------------------------ */
 /*  GROUP BY with count                                                */
 /* ------------------------------------------------------------------ */
+
+struct groupby_pair { char *value; uint64_t inode_id; };
+
+static int groupby_pair_cmp(const void *a, const void *b)
+{
+    const struct groupby_pair *pa = a, *pb = b;
+    int vc = strcmp(pa->value, pb->value);
+    if(vc != 0) return vc;
+    return (pa->inode_id > pb->inode_id) - (pa->inode_id < pb->inode_id);
+}
 
 int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
                              char ***out_values, uint32_t **out_counts, uint32_t *out_n)
@@ -2979,16 +3074,15 @@ int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
         lba = ie.child_lba;
     }
 
-    /* Scan leaf chain, counting unique inode_ids per value */
-    uint32_t   cap    = 64;
-    uint32_t   n      = 0;
-    char     **values = malloc(cap * sizeof(char *));
-    uint32_t  *counts = malloc(cap * sizeof(uint32_t));
-    if(!values || !counts) { free(buf); free(values); free(counts); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
+    /* Scan leaf chain. For multi-value support, collect all (sub-value)
+     * entries, then sort and aggregate counts post-scan. */
+    int is_comments = (strncmp(key, "Comments", METADATA_KEY_MAX) == 0);
 
-    char     prev_value[METADATA_VALUE_MAX];
-    uint64_t prev_inode = 0;
-    int      have_prev  = 0;
+    /* Temporary: collect (value_str, inode_id) pairs for post-processing */
+    uint32_t               pair_cap = 64;
+    uint32_t               pair_n   = 0;
+    struct groupby_pair   *pairs    = malloc(pair_cap * sizeof(struct groupby_pair));
+    if(!pairs) { free(buf); DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory"); }
 
     while(1)
     {
@@ -3005,17 +3099,84 @@ int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
             if(kcmp < 0) continue;
             if(kcmp > 0) goto groupby_done;
 
-            if(have_prev && strncmp(rec.value, prev_value, METADATA_VALUE_MAX) == 0)
+            /* For each sub-value (or the whole value for Comments) */
+            const char *val = rec.value;
+            while(1)
             {
-                /* Same value — count only if different inode (tree sorted by inode within value) */
-                if(rec.inode_id != prev_inode)
-                {
-                    counts[n - 1]++;
-                    prev_inode = rec.inode_id;
-                }
-                continue;
-            }
+                const char *nl = is_comments ? NULL : strchr(val, '\n');
+                size_t slen = nl ? (size_t)(nl - val) : strlen(val);
 
+                if(slen > 0)
+                {
+                    if(pair_n >= pair_cap)
+                    {
+                        pair_cap *= 2;
+                        struct groupby_pair *tmp = realloc(pairs, pair_cap * sizeof(struct groupby_pair));
+                        if(!tmp)
+                        {
+                            for(uint32_t j = 0; j < pair_n; j++) free(pairs[j].value);
+                            free(pairs); free(buf);
+                            DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                        }
+                        pairs = tmp;
+                    }
+                    pairs[pair_n].value    = strndup(val, slen);
+                    pairs[pair_n].inode_id = rec.inode_id;
+                    if(!pairs[pair_n].value)
+                    {
+                        for(uint32_t j = 0; j < pair_n; j++) free(pairs[j].value);
+                        free(pairs); free(buf);
+                        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                    }
+                    pair_n++;
+                }
+
+                if(!nl) break;
+                val = nl + 1;
+            }
+        }
+
+        if(hdr.right_link == 0) break;
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if(rc != OBMAFS3_OK)
+        {
+            for(uint32_t j = 0; j < pair_n; j++) free(pairs[j].value);
+            free(pairs); free(buf);
+            return rc;
+        }
+    }
+
+groupby_done:
+    free(buf);
+
+    /* Sort pairs by (value, inode_id), then aggregate */
+    if(pair_n > 1)
+    {
+        qsort(pairs, pair_n, sizeof(struct groupby_pair), groupby_pair_cmp);
+    }
+
+    /* Count distinct inodes per value */
+    uint32_t   cap    = 64;
+    uint32_t   n      = 0;
+    char     **values = malloc(cap * sizeof(char *));
+    uint32_t  *counts = malloc(cap * sizeof(uint32_t));
+    if(!values || !counts)
+    {
+        for(uint32_t j = 0; j < pair_n; j++) free(pairs[j].value);
+        free(pairs); free(values); free(counts);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    for(uint32_t i = 0; i < pair_n; i++)
+    {
+        if(n > 0 && strcmp(pairs[i].value, values[n - 1]) == 0)
+        {
+            /* Same value — count if different inode than previous pair */
+            if(i == 0 || pairs[i].inode_id != pairs[i - 1].inode_id)
+                counts[n - 1]++;
+        }
+        else
+        {
             /* New value */
             if(n >= cap)
             {
@@ -3025,38 +3186,22 @@ int obmafs3_metadata_groupby(struct obmafs3_ctx *ctx, const char *key,
                 if(!tv || !tc)
                 {
                     for(uint32_t j = 0; j < n; j++) free(values[j]);
-                    free(values); free(counts); free(buf);
+                    free(values); free(counts);
+                    for(uint32_t j = i; j < pair_n; j++) free(pairs[j].value);
+                    free(pairs);
                     DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
                 }
                 values = tv;
                 counts = tc;
             }
-            values[n] = strndup(rec.value, METADATA_VALUE_MAX);
-            if(!values[n])
-            {
-                for(uint32_t j = 0; j < n; j++) free(values[j]);
-                free(values); free(counts); free(buf);
-                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
-            }
+            values[n] = strdup(pairs[i].value);
             counts[n] = 1;
-            memcpy(prev_value, rec.value, METADATA_VALUE_MAX);
-            prev_inode = rec.inode_id;
-            have_prev  = 1;
             n++;
-        }
-
-        if(hdr.right_link == 0) break;
-        int rc = meta_node_read(ctx, hdr.right_link, buf);
-        if(rc != OBMAFS3_OK)
-        {
-            for(uint32_t j = 0; j < n; j++) free(values[j]);
-            free(values); free(counts); free(buf);
-            return rc;
         }
     }
 
-groupby_done:
-    free(buf);
+    for(uint32_t j = 0; j < pair_n; j++) free(pairs[j].value);
+    free(pairs);
     *out_values = values;
     *out_counts = counts;
     *out_n      = n;
@@ -3108,14 +3253,14 @@ int obmafs3_metadata_stats(struct obmafs3_ctx *ctx, const char *key, struct obma
         lba = ie.child_lba;
     }
 
-    /* Scan leaf chain, computing numeric stats over unique inodes */
+    /* Scan leaf chain, computing numeric stats.
+     * Multi-value metadata: each \\n-separated sub-value is aggregated
+     * independently (except Comments, which is treated as one value). */
+    int is_comments = (strncmp(key, "Comments", METADATA_KEY_MAX) == 0);
     int64_t  sum       = 0;
     int64_t  min_val   = INT64_MAX;
     int64_t  max_val   = INT64_MIN;
     uint32_t count     = 0;
-    uint64_t prev_inode = 0;
-    char     prev_value[METADATA_VALUE_MAX];
-    int      have_prev = 0;
 
     while(1)
     {
@@ -3132,20 +3277,30 @@ int obmafs3_metadata_stats(struct obmafs3_ctx *ctx, const char *key, struct obma
             if(kcmp < 0) continue;
             if(kcmp > 0) goto stats_done;
 
-            /* Skip duplicate (same inode + same value) */
-            if(have_prev && rec.inode_id == prev_inode &&
-               strncmp(rec.value, prev_value, METADATA_VALUE_MAX) == 0)
-                continue;
+            /* Aggregate each sub-value */
+            const char *val = rec.value;
+            while(1)
+            {
+                const char *nl = is_comments ? NULL : strchr(val, '\n');
+                size_t slen = nl ? (size_t)(nl - val) : strlen(val);
 
-            int64_t v = strtoll(rec.value, NULL, 10);
-            sum += v;
-            if(v < min_val) min_val = v;
-            if(v > max_val) max_val = v;
-            count++;
+                if(slen > 0)
+                {
+                    char sub[METADATA_VALUE_MAX];
+                    if(slen >= METADATA_VALUE_MAX) slen = METADATA_VALUE_MAX - 1;
+                    memcpy(sub, val, slen);
+                    sub[slen] = '\0';
 
-            prev_inode = rec.inode_id;
-            memcpy(prev_value, rec.value, METADATA_VALUE_MAX);
-            have_prev = 1;
+                    int64_t v = strtoll(sub, NULL, 10);
+                    sum += v;
+                    if(v < min_val) min_val = v;
+                    if(v > max_val) max_val = v;
+                    count++;
+                }
+
+                if(!nl) break;
+                val = nl + 1;
+            }
         }
 
         if(hdr.right_link == 0) break;
