@@ -196,7 +196,11 @@ enum obmafs3_query_op
 
     /* Regular expression matching (POSIX extended regex) */
     kQueryOpRegex       = 19,
-    kQueryOpIRegex      = 20
+    kQueryOpIRegex      = 20,
+
+    /* Suffix matching */
+    kQueryOpEndsWith    = 21,
+    kQueryOpIEndsWith   = 22
 };
 
 enum obmafs3_query_combine

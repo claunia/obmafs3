@@ -2508,6 +2508,22 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
             return match;
         }
 
+        /* Suffix matching */
+        case kQueryOpEndsWith:
+        {
+            size_t rlen = strnlen(rec_value, METADATA_VALUE_MAX);
+            size_t flen = strnlen(flt_value, METADATA_VALUE_MAX);
+            if(flen > rlen) return 0;
+            return strncmp(rec_value + rlen - flen, flt_value, flen) == 0;
+        }
+        case kQueryOpIEndsWith:
+        {
+            size_t rlen = strnlen(rec_value, METADATA_VALUE_MAX);
+            size_t flen = strnlen(flt_value, METADATA_VALUE_MAX);
+            if(flen > rlen) return 0;
+            return strncasecmp(rec_value + rlen - flen, flt_value, flen) == 0;
+        }
+
         default:
             return 0;
     }

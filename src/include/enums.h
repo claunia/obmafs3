@@ -137,7 +137,11 @@ enum obmafs3_query_op
 
     /* Regular expression matching (POSIX extended regex) */
     kQueryOpRegex       = 19, ///< regexec match (case-sensitive)
-    kQueryOpIRegex      = 20  ///< regexec match (case-insensitive)
+    kQueryOpIRegex      = 20, ///< regexec match (case-insensitive)
+
+    /* Suffix matching */
+    kQueryOpEndsWith    = 21, ///< suffix match (case-sensitive)
+    kQueryOpIEndsWith   = 22  ///< suffix match (case-insensitive)
 };
 
 /// How to combine multiple query filters.
