@@ -40,6 +40,7 @@
  *   -q, --query <query>    Run a single query and exit (batch mode)
  *   -f, --format <fmt>     Output format: txt (default), json, table, or csv
  *   -o, --output <path>    Write results to file instead of stdout
+ *   -l, --limit <N>        Return at most N results
  *   -h, --help             Show help
  *
  * Query syntax:
@@ -1417,12 +1418,14 @@ static void offer_export(const struct result_set *rs)
  * Execute a parsed query via the OBMAFS3_IOC_QUERY_METADATA ioctl.
  * Paginates automatically and collects all matching paths into @p rs.
  *
- * @param fd  File descriptor on the OBMAFS3 mount (sentinel file).
- * @param qa  Parsed query argument (filters/combine/filter_count set).
- * @param rs  Output result set (must be rs_init'd by caller).
+ * @param fd           File descriptor on the OBMAFS3 mount (sentinel file).
+ * @param qa           Parsed query argument (filters/combine/filter_count set).
+ * @param rs           Output result set (must be rs_init'd by caller).
+ * @param max_results  Maximum results to collect, or 0 for unlimited.
  * @return 0 on success, -1 on ioctl error.
  */
-static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg *qa, struct result_set *rs)
+static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg *qa, struct result_set *rs,
+                                 uint32_t max_results)
 {
     uint32_t offset = 0;
 
@@ -1446,7 +1449,10 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
         if(qa->count == 0) break;
 
         for(uint32_t i = 0; i < qa->count; i++)
+        {
             rs_add(rs, qa->paths[i]);
+            if(max_results > 0 && rs->count >= max_results) goto collect_done;
+        }
 
         offset += qa->count;
 
@@ -1455,6 +1461,7 @@ static int execute_query_collect(int fd, struct obmafs3_ioctl_metadata_query_arg
 
         /* cursor_id is now set by the server; subsequent calls skip the query */
     }
+collect_done:
     return 0;
 }
 
@@ -1495,7 +1502,7 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
     struct result_set rs;
     rs_init(&rs);
 
-    if(execute_query_collect(fd, qa, &rs) != 0)
+    if(execute_query_collect(fd, qa, &rs, 0) != 0)
     {
         rs_free(&rs);
         return;
@@ -1539,12 +1546,12 @@ static void execute_query(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
 static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *qa,
                                const char *format, const char *output,
                                const char *mountpoint, int show_metadata,
-                               const char *sort_key, int reverse)
+                               const char *sort_key, int reverse, uint32_t max_results)
 {
     struct result_set rs;
     rs_init(&rs);
 
-    if(execute_query_collect(fd, qa, &rs) != 0)
+    if(execute_query_collect(fd, qa, &rs, max_results) != 0)
     {
         rs_free(&rs);
         return 1;
@@ -1837,6 +1844,7 @@ static void usage(const char *prog)
             "Options:\n"
             "  -q, --query <query>    Run a single query and exit\n"
             "  -c, --count            Count matching results only (no paths)\n"
+            "  -l, --limit <N>        Return at most N results\n"
             "  -d, --distinct <key>   List all distinct values for a metadata key\n"
             "  -f, --format <fmt>     Output format: txt, json, table, or csv\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
@@ -2051,7 +2059,7 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
         /* New query — clear cache and execute */
         repl_cache_free(&cache);
 
-        if(execute_query_collect(query_fd, &qa, &cache.rs) != 0)
+        if(execute_query_collect(query_fd, &qa, &cache.rs, 0) != 0)
         {
             repl_cache_free(&cache);
             free(line);
@@ -2100,6 +2108,7 @@ int main(int argc, char *argv[])
     int         show_meta    = 0;
     int         reverse      = 0;
     int         count_only   = 0;
+    uint32_t    limit_n      = 0;
 
     static struct option long_opts[] = {
         {"query",    required_argument, NULL, 'q'},
@@ -2110,12 +2119,13 @@ int main(int argc, char *argv[])
         {"reverse",  no_argument,       NULL, 'r'},
         {"count",    no_argument,       NULL, 'c'},
         {"distinct", required_argument, NULL, 'd'},
+        {"limit",    required_argument, NULL, 'l'},
         {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:h", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:l:h", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
@@ -2127,6 +2137,7 @@ int main(int argc, char *argv[])
             case 'r': reverse      = 1;      break;
             case 'c': count_only   = 1;      break;
             case 'd': distinct_str = optarg; break;
+            case 'l': limit_n      = (uint32_t)strtoul(optarg, NULL, 10); break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -2177,7 +2188,8 @@ int main(int argc, char *argv[])
         }
         else
         {
-            rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta, sort_str, reverse);
+            rc = execute_query_batch(query_fd, &qa, format_str, output_str, mountpoint, show_meta, sort_str, reverse,
+                                     limit_n);
         }
     }
     else
