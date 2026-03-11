@@ -61,6 +61,10 @@
  *   <key> N>= "<value>"             Numeric greater or equal
  *   <key> N<= "<value>"             Numeric less or equal
  *
+ *   Regex (POSIX extended regular expressions):
+ *   <key> REGEX "<pattern>"         Regex match (case-sensitive)
+ *   <key> IREGEX "<pattern>"        Regex match (case-insensitive)
+ *
  *   Multiple conditions joined with AND or OR:
  *     artist I= "iron maiden" AND year N> "1985"
  */
@@ -362,6 +366,16 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
     if(strcasecmp(kw, "ISTARTSWITH") == 0)
     {
         *op = kQueryOpIStartsWith;
+        return after;
+    }
+    if(strcasecmp(kw, "REGEX") == 0)
+    {
+        *op = kQueryOpRegex;
+        return after;
+    }
+    if(strcasecmp(kw, "IREGEX") == 0)
+    {
+        *op = kQueryOpIRegex;
         return after;
     }
 
@@ -783,6 +797,10 @@ static void print_help(void)
            "  <key> N< \"<value>\"                 Numeric less than\n"
            "  <key> N>= \"<value>\"                Numeric greater or equal\n"
            "  <key> N<= \"<value>\"                Numeric less or equal\n"
+           "\n"
+           "Regex operators (POSIX extended regular expressions):\n"
+           "  <key> REGEX \"<pattern>\"            Regex match (case-sensitive)\n"
+           "  <key> IREGEX \"<pattern>\"           Regex match (case-insensitive)\n"
            "\n"
            "  Use * as the key to match across all keys:\n"
            "    * CONTAINS \"maiden\"               Any key's value contains\n"

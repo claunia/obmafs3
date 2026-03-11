@@ -133,7 +133,11 @@ enum obmafs3_query_op
     kQueryOpNumGreater  = 15, ///< atoll > atoll
     kQueryOpNumLess     = 16, ///< atoll < atoll
     kQueryOpNumGreaterEq = 17, ///< atoll >= atoll
-    kQueryOpNumLessEq   = 18  ///< atoll <= atoll
+    kQueryOpNumLessEq   = 18, ///< atoll <= atoll
+
+    /* Regular expression matching (POSIX extended regex) */
+    kQueryOpRegex       = 19, ///< regexec match (case-sensitive)
+    kQueryOpIRegex      = 20  ///< regexec match (case-insensitive)
 };
 
 /// How to combine multiple query filters.

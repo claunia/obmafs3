@@ -192,7 +192,11 @@ enum obmafs3_query_op
     kQueryOpNumGreater  = 15,
     kQueryOpNumLess     = 16,
     kQueryOpNumGreaterEq = 17,
-    kQueryOpNumLessEq   = 18
+    kQueryOpNumLessEq   = 18,
+
+    /* Regular expression matching (POSIX extended regex) */
+    kQueryOpRegex       = 19,
+    kQueryOpIRegex      = 20
 };
 
 enum obmafs3_query_combine

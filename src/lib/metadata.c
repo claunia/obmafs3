@@ -48,6 +48,7 @@
 #include "debug.h"
 
 #include <ctype.h>
+#include <regex.h>
 #include <strings.h>
 
 #define METADATA_BTREE_MAX_DEPTH 16
@@ -2425,6 +2426,19 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
             int64_t rv = strtoll(rec_value, NULL, 10);
             int64_t fv = strtoll(flt_value, NULL, 10);
             return rv <= fv;
+        }
+
+        /* Regular expression matching */
+        case kQueryOpRegex:
+        case kQueryOpIRegex:
+        {
+            int    cflags = REG_EXTENDED | REG_NOSUB;
+            if(op == kQueryOpIRegex) cflags |= REG_ICASE;
+            regex_t re;
+            if(regcomp(&re, flt_value, cflags) != 0) return 0;
+            int match = regexec(&re, rec_value, 0, NULL, 0) == 0;
+            regfree(&re);
+            return match;
         }
 
         default:
