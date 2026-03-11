@@ -396,6 +396,14 @@ int main(int argc, char *argv[])
                     sb.metadata_numeric_idx_lba, rc);
     }
 
+    /* Load user-defined index registry (uses lenient open since fsck context may have corrupt data) */
+    if(sb.user_index_registry_lba != 0)
+    {
+        rc = obmafs3_user_index_load(ctx);
+        if(rc != OBMAFS3_OK)
+            fprintf(stderr, "Warning: cannot load user-defined index registry (error %d)\n", rc);
+    }
+
     int errors = 0;
 
     /* ---- Dedup-stats-only fast path: skip all integrity checks ---- */
@@ -1661,6 +1669,96 @@ int main(int argc, char *argv[])
             {
                 result_bad("Node checksums:", "could not walk tree");
                 errors++;
+            }
+        }
+    }
+
+    /* ---- User-defined secondary indexes ---- */
+    if(ctx->user_index_count > 0)
+    {
+        for(uint32_t ui = 0; ui < ctx->user_index_count; ui++)
+        {
+            struct user_index_ctx *uidx = &ctx->user_indexes[ui];
+            printf("\n  %sUser index: %s (%s)%s\n", CLR_BOLD, uidx->key,
+                   uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC ? "numeric" : "string", CLR_RESET);
+
+            if(uidx->header_lba == 0) { result_bad("Header LBA:", "0"); errors++; continue; }
+
+            if(uidx->hdr.magic == OBMAFS3_BTREE_HDR_MAGIC)
+                result_ok("Magic:", "0x%016" PRIx64, uidx->hdr.magic);
+            else
+            {
+                result_bad("Magic:", "0x%016" PRIx64, uidx->hdr.magic);
+                errors++;
+            }
+            {
+                int cs_ok = 0;
+                obmafs3_btree_header_read_lenient(ctx, uidx->header_lba, &uidx->hdr, &cs_ok);
+                if(cs_ok) result_ok("Header checksum:", "");
+                else { result_bad("Header checksum:", "mismatch"); errors++; }
+            }
+
+            if(uidx->hdr.root_node_lba != 0)
+            {
+                size_t ie_sz  = uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC
+                                    ? sizeof(struct metadata_numeric_idx_index_entry)
+                                    : sizeof(struct metadata_idx_index_entry);
+                size_t cl_off = uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC
+                                    ? __builtin_offsetof(struct metadata_numeric_idx_index_entry, child_lba)
+                                    : __builtin_offsetof(struct metadata_idx_index_entry, child_lba);
+                int    ord_type = uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC
+                                      ? ORD_METADATA_NUMERIC_IDX
+                                      : ORD_METADATA_IDX;
+                size_t rec_sz = uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC
+                                    ? sizeof(struct metadata_numeric_idx_record)
+                                    : sizeof(struct metadata_idx_record);
+
+                uint64_t *nodes      = NULL;
+                uint64_t  node_count = 0;
+                int       wrc        = walk_meta_btree_nodes(ctx, uidx->hdr.root_node_lba, ie_sz, cl_off, &nodes, &node_count);
+                if(wrc == OBMAFS3_OK)
+                {
+                    uint64_t bad = 0, cs_fix = 0;
+                    verify_meta_node_checksums(ctx, nodes, node_count, uidx->key, auto_yes, auto_no, &bad, &cs_fix);
+                    uint64_t ord = 0, ord_fix = 0;
+                    verify_meta_ordering(ctx, nodes, node_count, ord_type, rec_sz, ie_sz, uidx->key, auto_yes, auto_no, &ord, &ord_fix);
+                    free(nodes);
+                    if(bad > 0)
+                    {
+                        if(cs_fix > 0) result_fixed("Node checksums:", "%" PRIu64 " bad, %" PRIu64 " fixed", bad, cs_fix);
+                        else           result_bad("Node checksums:", "%" PRIu64 " bad", bad);
+                        errors += (int)(bad - cs_fix);
+                    }
+                    else result_ok("Node checksums:", "");
+
+                    if(ord > 0)
+                    {
+                        if(ord_fix > 0) result_fixed("Key ordering:", "%" PRIu64 " bad, %" PRIu64 " fixed", ord, ord_fix);
+                        else            result_bad("Key ordering:", "%" PRIu64 " bad", ord);
+                        errors += (int)(ord - ord_fix);
+                    }
+                    else result_ok("Key ordering:", "");
+
+                    verify_fix_total_nodes(ctx, &uidx->hdr, uidx->header_lba, node_count, uidx->key, "  ", auto_yes, auto_no, &errors);
+                    verify_fix_free_nodes(ctx, &uidx->hdr, uidx->header_lba, uidx->key, "  ", auto_yes, auto_no, &errors);
+                    {
+                        uint64_t sib_bad = 0, sib_fix = 0;
+                        verify_fix_sibling_links(ctx, uidx->hdr.root_node_lba, ie_sz, cl_off, METADATA_NODE_BLOCKS,
+                                                 uidx->key, auto_yes, auto_no, &sib_bad, &sib_fix);
+                        if(sib_bad > 0)
+                        {
+                            if(sib_fix > 0) result_fixed("Sibling links:", "%" PRIu64 " bad, %" PRIu64 " fixed", sib_bad, sib_fix);
+                            else            result_bad("Sibling links:", "%" PRIu64 " bad", sib_bad);
+                            errors += (int)(sib_bad - sib_fix);
+                        }
+                        else result_ok("Sibling links:", "");
+                    }
+                }
+                else
+                {
+                    result_bad("Node checksums:", "could not walk tree");
+                    errors++;
+                }
             }
         }
     }

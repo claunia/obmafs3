@@ -693,6 +693,26 @@ int defrag_analysis_run(struct analysis_state *state)
                  sizeof(struct junk_map_index_entry),
                  offsetof(struct junk_map_index_entry, child_lba));
 
+    /* Numeric metadata index tree */
+    analyse_tree(state, ctx->sb.metadata_numeric_idx_lba, "NumMetaIdx",
+                 sizeof(struct metadata_numeric_idx_index_entry),
+                 offsetof(struct metadata_numeric_idx_index_entry, child_lba));
+
+    /* User-defined per-key indexes */
+    for(uint32_t ui = 0; ui < ctx->user_index_count; ui++)
+    {
+        struct user_index_ctx *uidx = &ctx->user_indexes[ui];
+        if(uidx->header_lba == 0) continue;
+        if(uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC)
+            analyse_tree(state, uidx->header_lba, uidx->key,
+                         sizeof(struct metadata_numeric_idx_index_entry),
+                         offsetof(struct metadata_numeric_idx_index_entry, child_lba));
+        else
+            analyse_tree(state, uidx->header_lba, uidx->key,
+                         sizeof(struct metadata_idx_index_entry),
+                         offsetof(struct metadata_idx_index_entry, child_lba));
+    }
+
     /* ---- Phase 2: Walk dedup tree list and dedup data blocks ---- */
     atomic_store(&state->phase, ANALYSIS_PHASE_DEDUP);
 

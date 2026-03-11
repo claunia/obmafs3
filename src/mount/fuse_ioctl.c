@@ -1213,6 +1213,44 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             return 0;
         }
 
+        case OBMAFS3_IOC_CREATE_INDEX:
+        {
+            const struct obmafs3_ioctl_create_index_arg *cia =
+                (const struct obmafs3_ioctl_create_index_arg *)data;
+            if(!cia || cia->key[0] == '\0') FUSE_RETURN(-EINVAL, "");
+            int rc = obmafs3_user_index_create(g_ctx, cia->key, cia->value_type);
+            if(rc == OBMAFS3_ERR_INVAL) FUSE_RETURN(-EEXIST, "");
+            return rc == OBMAFS3_OK ? 0 : -EIO;
+        }
+
+        case OBMAFS3_IOC_DROP_INDEX:
+        {
+            const struct obmafs3_ioctl_drop_index_arg *dia =
+                (const struct obmafs3_ioctl_drop_index_arg *)data;
+            if(!dia || dia->key[0] == '\0') FUSE_RETURN(-EINVAL, "");
+            int rc = obmafs3_user_index_drop(g_ctx, dia->key);
+            if(rc == OBMAFS3_ERR_NOTFOUND) FUSE_RETURN(-ENODATA, "");
+            return rc == OBMAFS3_OK ? 0 : -EIO;
+        }
+
+        case OBMAFS3_IOC_LIST_INDEXES:
+        {
+            struct obmafs3_ioctl_list_indexes_arg *lia =
+                (struct obmafs3_ioctl_list_indexes_arg *)data;
+            uint32_t total = g_ctx->user_index_count;
+            uint32_t start = lia->offset;
+            uint32_t n     = 0;
+            memset(lia->entries, 0, sizeof(lia->entries));
+            for(uint32_t i = start; i < total && n < INDEX_LIST_MAX_RESULTS; i++, n++)
+            {
+                strncpy(lia->entries[n].key, g_ctx->user_indexes[i].key, METADATA_KEY_MAX - 1);
+                lia->entries[n].value_type = g_ctx->user_indexes[i].value_type;
+            }
+            lia->count = n;
+            lia->total = total;
+            return 0;
+        }
+
         default:
             FUSE_RETURN(-ENOTTY, "");
     }

@@ -86,7 +86,8 @@ struct __attribute__((packed)) obmafs3_sb
     uint64_t sector_tag_ref_lba;   ///< LBA of the Sector Tag Ref B+Tree header (0 = none)
     uint64_t junk_map_lba;         ///< LBA of the Junk Map B+Tree header (0 = none)
     uint64_t metadata_numeric_idx_lba; ///< LBA of the Numeric Metadata Index B+Tree header (0 = none)
-    uint8_t  reserved[3490];       ///< Zero-filled, reserved for future expansion
+    uint64_t user_index_registry_lba;   ///< LBA of first user-defined index registry block (0 = none)
+    uint8_t  reserved[3482];       ///< Zero-filled, reserved for future expansion
     uint8_t  checksum2[32];        ///< Checksum of extension area (bytes 526..4095 with this field zeroed)
 };
 

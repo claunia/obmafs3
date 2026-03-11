@@ -2179,6 +2179,9 @@ static void print_help(void)
            "  distinct <key>     List all distinct values for a key\n"
            "  groupby <key>      Show distinct values with file counts\n"
            "  stats <key>        Show min/max/avg/sum for a numeric key\n"
+           "  create index <key> [numeric|string]  Create a secondary index\n"
+           "  drop index <key>   Drop a secondary index\n"
+           "  show indexes       List all secondary indexes\n"
            "  explain <query>    Show query plan with per-filter match counts\n"
            "  resort <key>       Re-sort cached results (e.g. resort N:year)\n"
            "  reverse            Toggle sort order and re-display\n"
@@ -2458,6 +2461,91 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
                 fprintf(stderr, "Error: expected a key name after 'stats'\n");
             else
                 execute_stats(query_fd, skey, NULL);
+            free(line);
+            continue;
+        }
+
+        /* create index <key> [numeric|string] */
+        if(strncasecmp(cmd, "create index ", 13) == 0)
+        {
+            const char *rest = cmd + 13;
+            while(*rest == ' ' || *rest == '\t') rest++;
+            char idx_key[METADATA_KEY_MAX];
+            memset(idx_key, 0, sizeof(idx_key));
+            const char *sp = rest;
+            size_t klen = 0;
+            while(*sp && *sp != ' ' && *sp != '\t' && klen < METADATA_KEY_MAX - 1) { idx_key[klen++] = *sp++; }
+            if(klen == 0) { fprintf(stderr, "Error: expected a key name\n"); free(line); continue; }
+
+            /* Parse optional type (default: numeric) */
+            uint8_t vtype = USER_INDEX_VALUE_TYPE_NUMERIC;
+            while(*sp == ' ' || *sp == '\t') sp++;
+            if(*sp)
+            {
+                if(strncasecmp(sp, "string", 6) == 0) vtype = USER_INDEX_VALUE_TYPE_STRING;
+                else if(strncasecmp(sp, "numeric", 7) == 0) vtype = USER_INDEX_VALUE_TYPE_NUMERIC;
+                else { fprintf(stderr, "Error: unknown type '%s' (use 'numeric' or 'string')\n", sp); free(line); continue; }
+            }
+
+            struct obmafs3_ioctl_create_index_arg cia;
+            memset(&cia, 0, sizeof(cia));
+            strncpy(cia.key, idx_key, METADATA_KEY_MAX - 1);
+            cia.value_type = vtype;
+
+            if(ioctl(query_fd, OBMAFS3_IOC_CREATE_INDEX, &cia) != 0)
+                fprintf(stderr, "Error: create index failed: %s\n", strerror(errno));
+            else
+                printf("Index created for '%s' (%s)\n", idx_key, vtype ? "numeric" : "string");
+            free(line);
+            continue;
+        }
+
+        /* drop index <key> */
+        if(strncasecmp(cmd, "drop index ", 11) == 0)
+        {
+            const char *dkey = cmd + 11;
+            while(*dkey == ' ' || *dkey == '\t') dkey++;
+            if(*dkey == '\0') { fprintf(stderr, "Error: expected a key name\n"); free(line); continue; }
+
+            struct obmafs3_ioctl_drop_index_arg dia;
+            memset(&dia, 0, sizeof(dia));
+            strncpy(dia.key, dkey, METADATA_KEY_MAX - 1);
+
+            if(ioctl(query_fd, OBMAFS3_IOC_DROP_INDEX, &dia) != 0)
+                fprintf(stderr, "Error: drop index failed: %s\n", strerror(errno));
+            else
+                printf("Index dropped for '%s'\n", dkey);
+            free(line);
+            continue;
+        }
+
+        /* show indexes */
+        if(strcasecmp(cmd, "show indexes") == 0)
+        {
+            uint32_t offset = 0;
+            uint32_t total  = 0;
+            int      first  = 1;
+            while(1)
+            {
+                struct obmafs3_ioctl_list_indexes_arg lia;
+                memset(&lia, 0, sizeof(lia));
+                lia.offset = offset;
+                if(ioctl(query_fd, OBMAFS3_IOC_LIST_INDEXES, &lia) != 0)
+                {
+                    fprintf(stderr, "Error: list indexes failed: %s\n", strerror(errno));
+                    break;
+                }
+                total = lia.total;
+                if(lia.count == 0) break;
+                if(first) { printf("%-30s  %s\n%-30s  %s\n", "KEY", "TYPE", "---", "----"); first = 0; }
+                for(uint32_t i = 0; i < lia.count; i++)
+                    printf("%-30s  %s\n", lia.entries[i].key,
+                           lia.entries[i].value_type == USER_INDEX_VALUE_TYPE_NUMERIC ? "numeric" : "string");
+                offset += lia.count;
+                if(offset >= total) break;
+            }
+            if(first) printf("No user-defined indexes\n");
+            else      printf("\n%u index(es)\n", total);
             free(line);
             continue;
         }

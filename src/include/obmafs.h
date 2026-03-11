@@ -98,7 +98,8 @@ struct obmafs3_thread_bufs
 #define OBMAFS3_ROCOMPAT_NINTENDO    (1ULL << 1)  ///< Nintendo GameCube/Wii disc image support
 #define OBMAFS3_ROCOMPAT_PS3         (1ULL << 2)  ///< PS3 disc image support
 #define OBMAFS3_ROCOMPAT_NUMERIC_IDX (1ULL << 3)  ///< Numeric metadata index B+Tree
-#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO | OBMAFS3_ROCOMPAT_PS3 | OBMAFS3_ROCOMPAT_NUMERIC_IDX)  ///< Mask of known read-only compatible feature flags
+#define OBMAFS3_ROCOMPAT_USER_INDEXES (1ULL << 4) ///< User-defined secondary indexes
+#define OBMAFS3_ROCOMPAT_FLAGS_KNOWN (OBMAFS3_ROCOMPAT_SECTOR_TAGS | OBMAFS3_ROCOMPAT_NINTENDO | OBMAFS3_ROCOMPAT_PS3 | OBMAFS3_ROCOMPAT_NUMERIC_IDX | OBMAFS3_ROCOMPAT_USER_INDEXES)  ///< Mask of known read-only compatible feature flags
 #define OBMAFS3_INCOMPAT_LZMA         (1ULL << 0)  ///< LZMA compressed blocks present
 #define OBMAFS3_INCOMPAT_FLAGS_KNOWN  OBMAFS3_INCOMPAT_LZMA  ///< Mask of known incompatible feature flags
 
@@ -121,6 +122,17 @@ struct obmafs3_ctx
     struct btree_header   sector_tag_ref_hdr;       ///< Cached sector tag ref tree header
     struct btree_header   junk_map_hdr;             ///< Cached junk map tree header
     struct btree_header   metadata_numeric_idx_hdr;  ///< Cached numeric metadata index tree header
+
+    /* User-defined secondary indexes */
+    struct user_index_ctx
+    {
+        char             key[METADATA_KEY_MAX];  ///< Metadata key this index covers
+        uint8_t          value_type;             ///< 0=string, 1=numeric
+        uint64_t         header_lba;             ///< LBA of the per-key B+Tree header
+        struct btree_header hdr;                 ///< Cached B+Tree header
+    }                    *user_indexes;           ///< Heap array of user-defined indexes
+    uint32_t              user_index_count;       ///< Number of user-defined indexes
+
     uint8_t              *bitmap;                  ///< In-memory allocation bitmap
     uint64_t              bitmap_size;             ///< Size of allocation bitmap in bytes
     uint64_t              next_free_lba;           ///< Allocation hint (persisted in bitmap header)
@@ -439,11 +451,25 @@ struct obmafs3_metadata_stats_result
 int obmafs3_metadata_stats(struct obmafs3_ctx *ctx, const char *key, struct obmafs3_metadata_stats_result *out);
 
 /* --- Numeric metadata index B+Tree operations --- */
+int obmafs3_numidx_put_ex(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
+                          const char *key, int64_t value, uint64_t inode_id);
+int obmafs3_numidx_delete_ex(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
+                             const char *key, int64_t value, uint64_t inode_id);
+int obmafs3_numidx_collect_range_ex(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba,
+                                    const char *key, int64_t low, int64_t high,
+                                    uint64_t **out_ids, uint32_t *out_count);
 int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id);
 int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id);
 int obmafs3_numidx_collect_range(struct obmafs3_ctx *ctx, const char *key, int64_t low, int64_t high,
                                  uint64_t **out_ids, uint32_t *out_count);
 int obmafs3_numidx_build(struct obmafs3_ctx *ctx);
+
+/* --- User-defined secondary indexes --- */
+int  obmafs3_user_index_load(struct obmafs3_ctx *ctx);
+void obmafs3_user_index_free(struct obmafs3_ctx *ctx);
+int  obmafs3_user_index_create(struct obmafs3_ctx *ctx, const char *key, uint8_t value_type);
+int  obmafs3_user_index_drop(struct obmafs3_ctx *ctx, const char *key);
+struct user_index_ctx *obmafs3_user_index_find(struct obmafs3_ctx *ctx, const char *key);
 
 /* --- Block refcount operations --- */
 int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_count);

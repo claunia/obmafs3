@@ -62,14 +62,14 @@ static int numidx_node_write(struct obmafs3_ctx *ctx, uint64_t lba, const uint8_
     return obmafs3_block_write(ctx, lba, buf, numidx_node_size(ctx));
 }
 
-static int numidx_alloc_node(struct obmafs3_ctx *ctx, uint64_t *lba)
+static int numidx_alloc_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t *lba)
 {
-    return obmafs3_btree_alloc_node(ctx, &ctx->metadata_numeric_idx_hdr, ctx->sb.metadata_numeric_idx_lba, lba);
+    return obmafs3_btree_alloc_node(ctx, hdr, hdr_lba, lba);
 }
 
-static void numidx_free_node(struct obmafs3_ctx *ctx, uint64_t lba)
+static void numidx_free_node(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, uint64_t lba)
 {
-    obmafs3_btree_free_node(ctx, &ctx->metadata_numeric_idx_hdr, ctx->sb.metadata_numeric_idx_lba, lba);
+    obmafs3_btree_free_node(ctx, hdr, hdr_lba, lba);
 }
 
 static uint16_t numidx_leaf_max_keys(const struct obmafs3_ctx *ctx)
@@ -151,38 +151,38 @@ static uint16_t numidx_index_find(const uint8_t *buf, uint16_t node_keys,
 /*  Header write helper                                                */
 /* ------------------------------------------------------------------ */
 
-static int numidx_hdr_write(struct obmafs3_ctx *ctx)
+static int numidx_hdr_write(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba)
 {
-    return obmafs3_btree_header_write(ctx, ctx->sb.metadata_numeric_idx_lba, &ctx->metadata_numeric_idx_hdr);
+    return obmafs3_btree_header_write(ctx, hdr_lba, hdr);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Insert with split                                                  */
 /* ------------------------------------------------------------------ */
 
-int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id)
+int obmafs3_numidx_put_ex(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, const char *key, int64_t value, uint64_t inode_id)
 {
     size_t   nsz      = numidx_node_size(ctx);
-    uint64_t root_lba = ctx->metadata_numeric_idx_hdr.root_node_lba;
+    uint64_t root_lba = hdr->root_node_lba;
     int      rc;
 
     /* Empty tree: create first leaf */
     if(root_lba == 0)
     {
         uint64_t new_lba;
-        rc = numidx_alloc_node(ctx, &new_lba);
+        rc = numidx_alloc_node(ctx, hdr, hdr_lba, &new_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         uint8_t *buf = calloc(1, nsz);
         if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
 
-        struct btree_node_header hdr;
-        memset(&hdr, 0, sizeof(hdr));
-        hdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
-        hdr.record_type = kBtreeDataTypeMetadataNumericIndexEntry;
-        hdr.level       = 0;
-        hdr.node_keys   = 1;
-        hdr.keys_length = (uint16_t)sizeof(struct metadata_numeric_idx_record);
+        struct btree_node_header nhdr;
+        memset(&nhdr, 0, sizeof(nhdr));
+        nhdr.magic       = OBMAFS3_BTREE_NODE_MAGIC;
+        nhdr.record_type = kBtreeDataTypeMetadataNumericIndexEntry;
+        nhdr.level       = 0;
+        nhdr.node_keys   = 1;
+        nhdr.keys_length = (uint16_t)sizeof(struct metadata_numeric_idx_record);
 
         struct metadata_numeric_idx_record rec;
         memset(&rec, 0, sizeof(rec));
@@ -190,17 +190,17 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
         rec.value    = value;
         rec.inode_id = inode_id;
 
-        memcpy(buf, &hdr, sizeof(hdr));
-        memcpy(buf + sizeof(hdr), &rec, sizeof(rec));
+        memcpy(buf, &nhdr, sizeof(nhdr));
+        memcpy(buf + sizeof(nhdr), &rec, sizeof(rec));
         compute_node_checksum(buf);
 
         rc = numidx_node_write(ctx, new_lba, buf);
         free(buf);
         if(rc != OBMAFS3_OK) return rc;
 
-        ctx->metadata_numeric_idx_hdr.root_node_lba = new_lba;
-        ctx->metadata_numeric_idx_hdr.total_nodes   = 1;
-        return numidx_hdr_write(ctx);
+        hdr->root_node_lba = new_lba;
+        hdr->total_nodes   = 1;
+        return numidx_hdr_write(ctx, hdr, hdr_lba);
     }
 
     uint8_t *buf = calloc(1, nsz);
@@ -295,7 +295,7 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
 
     uint64_t old_right = leaf_hdr.right_link;
     uint64_t new_leaf_lba;
-    rc = numidx_alloc_node(ctx, &new_leaf_lba);
+    rc = numidx_alloc_node(ctx, hdr, hdr_lba, &new_leaf_lba);
     if(rc != OBMAFS3_OK) { free(all); free(buf); return rc; }
 
     leaf_hdr.node_keys   = left_count;
@@ -340,7 +340,7 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
 
     uint64_t left_lba = lba;
     free(all);
-    ctx->metadata_numeric_idx_hdr.total_nodes++;
+    hdr->total_nodes++;
 
     /* Update old right neighbor's left_link */
     if(old_right != 0)
@@ -394,7 +394,7 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
             rc = numidx_node_write(ctx, parent_lba, buf);
             free(buf);
             if(rc != OBMAFS3_OK) return rc;
-            return numidx_hdr_write(ctx);
+            return numidx_hdr_write(ctx, hdr, hdr_lba);
         }
 
         /* Parent full — split index node */
@@ -415,7 +415,7 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
 
         uint64_t idx_old_right = phdr.right_link;
         uint64_t new_idx_lba;
-        rc = numidx_alloc_node(ctx, &new_idx_lba);
+        rc = numidx_alloc_node(ctx, hdr, hdr_lba, &new_idx_lba);
         if(rc != OBMAFS3_OK) { free(aie); free(buf); return rc; }
 
         memset(id, 0, nsz - sizeof(struct btree_node_header));
@@ -458,7 +458,7 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
 
         left_lba = parent_lba;
         free(aie);
-        ctx->metadata_numeric_idx_hdr.total_nodes++;
+        hdr->total_nodes++;
 
         if(idx_old_right != 0)
         {
@@ -477,7 +477,7 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
 
     /* Create new root */
     uint64_t new_root_lba;
-    rc = numidx_alloc_node(ctx, &new_root_lba);
+    rc = numidx_alloc_node(ctx, hdr, hdr_lba, &new_root_lba);
     if(rc != OBMAFS3_OK) { free(buf); return rc; }
 
     rc = numidx_node_read(ctx, left_lba, buf);
@@ -506,19 +506,19 @@ int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, 
     free(buf);
     if(rc != OBMAFS3_OK) return rc;
 
-    ctx->metadata_numeric_idx_hdr.root_node_lba = new_root_lba;
-    ctx->metadata_numeric_idx_hdr.total_nodes++;
-    return numidx_hdr_write(ctx);
+    hdr->root_node_lba = new_root_lba;
+    hdr->total_nodes++;
+    return numidx_hdr_write(ctx, hdr, hdr_lba);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Delete                                                             */
 /* ------------------------------------------------------------------ */
 
-int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id)
+int obmafs3_numidx_delete_ex(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, const char *key, int64_t value, uint64_t inode_id)
 {
     size_t   nsz      = numidx_node_size(ctx);
-    uint64_t root_lba = ctx->metadata_numeric_idx_hdr.root_node_lba;
+    uint64_t root_lba = hdr->root_node_lba;
     int      rc;
 
     if(root_lba == 0) return OBMAFS3_ERR_NOTFOUND;
@@ -564,10 +564,10 @@ int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t valu
     {
         if(depth == 0)
         {
-            ctx->metadata_numeric_idx_hdr.root_node_lba = 0;
-            ctx->metadata_numeric_idx_hdr.total_nodes--;
-            rc = numidx_hdr_write(ctx);
-            numidx_free_node(ctx, lba);
+            hdr->root_node_lba = 0;
+            hdr->total_nodes--;
+            rc = numidx_hdr_write(ctx, hdr, hdr_lba);
+            numidx_free_node(ctx, hdr, hdr_lba, lba);
         }
         else
         {
@@ -623,21 +623,21 @@ int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t valu
 
             if(phdr.node_keys == 0 && depth == 1)
             {
-                ctx->metadata_numeric_idx_hdr.root_node_lba = 0;
-                ctx->metadata_numeric_idx_hdr.total_nodes -= 2;
-                rc = numidx_hdr_write(ctx);
-                numidx_free_node(ctx, lba);
-                numidx_free_node(ctx, plba);
+                hdr->root_node_lba = 0;
+                hdr->total_nodes -= 2;
+                rc = numidx_hdr_write(ctx, hdr, hdr_lba);
+                numidx_free_node(ctx, hdr, hdr_lba, lba);
+                numidx_free_node(ctx, hdr, hdr_lba, plba);
             }
             else if(phdr.node_keys == 1 && depth == 1)
             {
                 struct metadata_numeric_idx_index_entry remaining;
                 memcpy(&remaining, pdata, sizeof(remaining));
-                ctx->metadata_numeric_idx_hdr.root_node_lba = remaining.child_lba;
-                ctx->metadata_numeric_idx_hdr.total_nodes -= 2;
-                rc = numidx_hdr_write(ctx);
-                numidx_free_node(ctx, lba);
-                numidx_free_node(ctx, plba);
+                hdr->root_node_lba = remaining.child_lba;
+                hdr->total_nodes -= 2;
+                rc = numidx_hdr_write(ctx, hdr, hdr_lba);
+                numidx_free_node(ctx, hdr, hdr_lba, lba);
+                numidx_free_node(ctx, hdr, hdr_lba, plba);
             }
             else
             {
@@ -646,10 +646,10 @@ int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t valu
                 rc = numidx_node_write(ctx, plba, pbuf);
                 if(rc == OBMAFS3_OK)
                 {
-                    ctx->metadata_numeric_idx_hdr.total_nodes--;
-                    rc = numidx_hdr_write(ctx);
+                    hdr->total_nodes--;
+                    rc = numidx_hdr_write(ctx, hdr, hdr_lba);
                 }
-                numidx_free_node(ctx, lba);
+                numidx_free_node(ctx, hdr, hdr_lba, lba);
             }
             free(pbuf);
         }
@@ -686,15 +686,15 @@ int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t valu
  * Navigates to the first leaf where (key, low, 0) would appear,
  * then scans right until the key changes or value > high.
  */
-int obmafs3_numidx_collect_range(struct obmafs3_ctx *ctx, const char *key,
+int obmafs3_numidx_collect_range_ex(struct obmafs3_ctx *ctx, struct btree_header *hdr, uint64_t hdr_lba, const char *key,
                                  int64_t low, int64_t high,
                                  uint64_t **out_ids, uint32_t *out_count)
 {
     *out_ids   = NULL;
     *out_count = 0;
 
-    if(ctx->sb.metadata_numeric_idx_lba == 0) return OBMAFS3_OK;
-    uint64_t root_lba = ctx->metadata_numeric_idx_hdr.root_node_lba;
+    if(hdr_lba == 0) return OBMAFS3_OK;
+    uint64_t root_lba = hdr->root_node_lba;
     if(root_lba == 0) return OBMAFS3_OK;
 
     size_t   nsz = numidx_node_size(ctx);
@@ -795,8 +795,8 @@ int obmafs3_numidx_build(struct obmafs3_ctx *ctx)
      * allocate one block for it now. */
     if(ctx->sb.metadata_numeric_idx_lba == 0)
     {
-        uint64_t hdr_lba;
-        int rc = obmafs3_alloc_block(ctx, &hdr_lba);
+        uint64_t new_hdr_lba;
+        int rc = obmafs3_alloc_block(ctx, &new_hdr_lba);
         if(rc != OBMAFS3_OK) return rc;
 
         struct btree_header hdr;
@@ -807,10 +807,10 @@ int obmafs3_numidx_build(struct obmafs3_ctx *ctx)
         hdr.tree_type = kBtreeTypeMetadataNumericIndex;
         obmafs3_checksum_block(&hdr, sizeof(hdr), hdr.checksum);
 
-        rc = obmafs3_block_write(ctx, hdr_lba, &hdr, sizeof(hdr));
+        rc = obmafs3_block_write(ctx, new_hdr_lba, &hdr, sizeof(hdr));
         if(rc != OBMAFS3_OK) return rc;
 
-        ctx->sb.metadata_numeric_idx_lba = hdr_lba;
+        ctx->sb.metadata_numeric_idx_lba = new_hdr_lba;
         ctx->metadata_numeric_idx_hdr    = hdr;
     }
 
@@ -875,4 +875,27 @@ int obmafs3_numidx_build(struct obmafs3_ctx *ctx)
     }
 
     return OBMAFS3_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Convenience wrappers for the global numeric index                  */
+/* ------------------------------------------------------------------ */
+
+int obmafs3_numidx_put(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id)
+{
+    return obmafs3_numidx_put_ex(ctx, &ctx->metadata_numeric_idx_hdr, ctx->sb.metadata_numeric_idx_lba,
+                                 key, value, inode_id);
+}
+
+int obmafs3_numidx_delete(struct obmafs3_ctx *ctx, const char *key, int64_t value, uint64_t inode_id)
+{
+    return obmafs3_numidx_delete_ex(ctx, &ctx->metadata_numeric_idx_hdr, ctx->sb.metadata_numeric_idx_lba,
+                                    key, value, inode_id);
+}
+
+int obmafs3_numidx_collect_range(struct obmafs3_ctx *ctx, const char *key, int64_t low, int64_t high,
+                                 uint64_t **out_ids, uint32_t *out_count)
+{
+    return obmafs3_numidx_collect_range_ex(ctx, &ctx->metadata_numeric_idx_hdr, ctx->sb.metadata_numeric_idx_lba,
+                                           key, low, high, out_ids, out_count);
 }

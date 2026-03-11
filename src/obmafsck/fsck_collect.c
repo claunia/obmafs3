@@ -1069,6 +1069,56 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         }
     }
 
+    /* User-defined index registry blocks and per-key tree nodes */
+    PROGRESS("user-defined indexes");
+    if(ctx->sb.user_index_registry_lba != 0)
+    {
+        /* Walk registry linked list, marking each block */
+        uint64_t reg_lba = ctx->sb.user_index_registry_lba;
+        uint8_t *rbuf    = calloc(1, (size_t)ctx->sb.block_size);
+        if(rbuf)
+        {
+            while(reg_lba != 0)
+            {
+                MARK(reg_lba);
+                int rc = obmafs3_block_read(ctx, reg_lba, rbuf, (size_t)ctx->sb.block_size);
+                if(rc != OBMAFS3_OK) break;
+                struct user_index_registry_block rblk;
+                memcpy(&rblk, rbuf, sizeof(rblk));
+                reg_lba = rblk.next_lba;
+            }
+            free(rbuf);
+        }
+
+        /* Mark per-key tree header blocks and tree nodes */
+        for(uint32_t ui = 0; ui < ctx->user_index_count; ui++)
+        {
+            struct user_index_ctx *uidx = &ctx->user_indexes[ui];
+            if(uidx->header_lba == 0) continue;
+            MARK(uidx->header_lba);
+            if(uidx->hdr.root_node_lba != 0)
+            {
+                uint64_t *nodes = NULL;
+                uint64_t  count = 0;
+                int rc = walk_meta_btree_nodes(ctx, uidx->hdr.root_node_lba,
+                                               uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC
+                                                   ? sizeof(struct metadata_numeric_idx_index_entry)
+                                                   : sizeof(struct metadata_idx_index_entry),
+                                               uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC
+                                                   ? __builtin_offsetof(struct metadata_numeric_idx_index_entry, child_lba)
+                                                   : __builtin_offsetof(struct metadata_idx_index_entry, child_lba),
+                                               &nodes, &count);
+                if(rc == OBMAFS3_OK)
+                {
+                    for(uint64_t i = 0; i < count; i++)
+                        for(int b = 0; b < METADATA_NODE_BLOCKS; b++)
+                            MARK(nodes[i] + (uint64_t)b);
+                    free(nodes);
+                }
+            }
+        }
+    }
+
     /* Bitmap blocks */
     PROGRESS("bitmap blocks");
     for(uint64_t i = 0; i < ctx->sb.bitmap_blocks; i++) MARK(ctx->sb.bitmap_lba + i);
@@ -1327,6 +1377,11 @@ uint8_t *build_expected_bitmap(struct obmafs3_ctx *ctx, uint64_t total_blocks, u
         /* Numeric metadata index tree (multi-block nodes) */
         if(ctx->sb.metadata_numeric_idx_lba != 0)
             MARK_FREE_CHAIN(&ctx->metadata_numeric_idx_hdr, METADATA_NODE_BLOCKS);
+
+        /* User-defined per-key trees (multi-block nodes) */
+        for(uint32_t ui = 0; ui < ctx->user_index_count; ui++)
+            if(ctx->user_indexes[ui].header_lba != 0)
+                MARK_FREE_CHAIN(&ctx->user_indexes[ui].hdr, METADATA_NODE_BLOCKS);
 
         /* Dedup trees (each has its own header and free chain) */
         if(ctx->sb.dedup_lba != 0)

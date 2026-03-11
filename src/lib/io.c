@@ -611,6 +611,18 @@ int obmafs3_open_flags(const char *path, int flags, struct obmafs3_ctx **ctx)
                 return rc;
             }
         }
+
+        /* Load user-defined secondary indexes */
+        if(c->sb.user_index_registry_lba != 0)
+        {
+            rc = obmafs3_user_index_load(c);
+            if(rc != OBMAFS3_OK)
+            {
+                close(fd);
+                free(c);
+                return rc;
+            }
+        }
     }
 
     /* Load allocation bitmap (skip when asked, e.g. for fsck) */
@@ -729,6 +741,7 @@ void obmafs3_close(struct obmafs3_ctx *ctx)
     pthread_rwlock_destroy(&ctx->tree_lock);
 
     free(ctx->rc_leaf_buf);
+    obmafs3_user_index_free(ctx);
     if(ctx->bitmap) free(ctx->bitmap);
     if(ctx->fd >= 0) close(ctx->fd);
     free(ctx);

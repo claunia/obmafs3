@@ -7,6 +7,7 @@ add_library(obmafs STATIC
     cd_btree.c
     metadata.c
     metadata_numeric.c
+    user_index.c
     bitmap.c
     block.c
     checksum.c

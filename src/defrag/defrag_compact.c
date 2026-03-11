@@ -2765,6 +2765,23 @@ static int compact_trees(struct compact_state *state)
     ADD_TREE("Refcount",     ctx->sb.refcount_lba,      struct btree_index_entry,        child_lba, 1);
     ADD_TREE("JunkMap",      ctx->sb.junk_map_lba,      struct junk_map_index_entry,     child_lba, 1);
 
+    /* Numeric metadata index */
+    ADD_TREE("NumMetaIdx",   ctx->sb.metadata_numeric_idx_lba,
+             struct metadata_numeric_idx_index_entry, child_lba, METADATA_NODE_BLOCKS);
+
+    /* User-defined per-key indexes */
+    for(uint32_t ui = 0; ui < ctx->user_index_count; ui++)
+    {
+        struct user_index_ctx *uidx = &ctx->user_indexes[ui];
+        if(uidx->header_lba == 0) continue;
+        if(uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC)
+            ADD_TREE(uidx->key, uidx->header_lba,
+                     struct metadata_numeric_idx_index_entry, child_lba, METADATA_NODE_BLOCKS);
+        else
+            ADD_TREE(uidx->key, uidx->header_lba,
+                     struct metadata_idx_index_entry, child_lba, METADATA_NODE_BLOCKS);
+    }
+
     /* Add dedup trees from the tree list */
     if(ctx->sb.dedup_lba != 0)
     {

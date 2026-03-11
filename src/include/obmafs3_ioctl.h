@@ -456,4 +456,49 @@ struct obmafs3_ioctl_metadata_stats_arg
 
 #define OBMAFS3_IOC_STATS_METADATA _IOWR('O', 20, struct obmafs3_ioctl_metadata_stats_arg)
 
+/* ================================================================== */
+/*  User-defined index management ioctls                               */
+/* ================================================================== */
+
+struct obmafs3_ioctl_create_index_arg
+{
+    char    key[METADATA_KEY_MAX]; /**< Metadata key to index */
+    uint8_t value_type;            /**< 0 = string, 1 = numeric */
+    uint8_t _pad[7];
+};
+
+#ifndef USER_INDEX_VALUE_TYPE_STRING
+#define USER_INDEX_VALUE_TYPE_STRING  0
+#define USER_INDEX_VALUE_TYPE_NUMERIC 1
+#endif
+
+#define OBMAFS3_IOC_CREATE_INDEX _IOW('O', 21, struct obmafs3_ioctl_create_index_arg)
+
+struct obmafs3_ioctl_drop_index_arg
+{
+    char key[METADATA_KEY_MAX]; /**< Metadata key to drop index for */
+};
+
+#define OBMAFS3_IOC_DROP_INDEX _IOW('O', 22, struct obmafs3_ioctl_drop_index_arg)
+
+#define INDEX_LIST_MAX_RESULTS 8
+
+struct obmafs3_ioctl_list_indexes_entry
+{
+    char    key[METADATA_KEY_MAX]; /**< Key name */
+    uint8_t value_type;            /**< 0 = string, 1 = numeric */
+    uint8_t _pad[7];
+};
+
+struct obmafs3_ioctl_list_indexes_arg
+{
+    uint32_t offset;                                                 /**< Input: starting offset */
+    uint32_t count;                                                  /**< Output: entries returned */
+    uint32_t total;                                                  /**< Output: total indexes */
+    uint32_t _pad;
+    struct obmafs3_ioctl_list_indexes_entry entries[INDEX_LIST_MAX_RESULTS];
+};
+
+#define OBMAFS3_IOC_LIST_INDEXES _IOWR('O', 23, struct obmafs3_ioctl_list_indexes_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

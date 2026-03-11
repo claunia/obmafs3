@@ -199,6 +199,37 @@ struct __attribute__((packed)) media_tag_index_entry
 #define METADATA_VALUE_MAX   1025 /* 1024 chars + NUL */
 #define METADATA_NODE_BLOCKS 8    /* Blocks per metadata tree node */
 
+/* ---- User-defined index registry (on-disk linked list) ---- */
+
+#define USER_INDEX_VALUE_TYPE_STRING  0
+#define USER_INDEX_VALUE_TYPE_NUMERIC 1
+
+/**
+ * A single entry in the user-defined index registry.
+ * Maps a metadata key name to its dedicated secondary B+Tree.
+ */
+struct __attribute__((packed)) user_index_registry_entry
+{
+    char     key[METADATA_KEY_MAX];  ///< Metadata key this index covers
+    uint8_t  value_type;             ///< 0 = string, 1 = numeric
+    uint8_t  _pad[7];               ///< Alignment padding
+    uint64_t index_header_lba;       ///< LBA of the per-key B+Tree header
+};
+
+/**
+ * On-disk linked list block for the user-defined index registry.
+ * Each block contains up to N entries followed by a next pointer.
+ * The maximum entries per block depends on block size:
+ *   (block_size - 16) / sizeof(user_index_registry_entry)
+ */
+struct __attribute__((packed)) user_index_registry_block
+{
+    uint64_t next_lba;     ///< LBA of next registry block (0 = end of chain)
+    uint32_t entry_count;  ///< Number of valid entries in this block
+    uint32_t _pad;         ///< Alignment padding
+    /* Followed by entry_count * user_index_registry_entry */
+};
+
 /**
  * Metadata record stored in the per-image metadata B+Tree leaf nodes.
  * Sorted by (inode_id, key) composite key.

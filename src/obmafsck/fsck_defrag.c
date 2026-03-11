@@ -505,6 +505,25 @@ void defrag_all_trees(struct obmafs3_ctx *ctx, int auto_yes, int auto_no)
                     __builtin_offsetof(struct metadata_numeric_idx_index_entry, child_lba), METADATA_NODE_BLOCKS,
                     auto_yes, auto_no);
 
+    /* User-defined per-key indexes (8 blocks per node) */
+    for(uint32_t ui = 0; ui < ctx->user_index_count; ui++)
+    {
+        struct user_index_ctx *uidx = &ctx->user_indexes[ui];
+        if(uidx->header_lba == 0) continue;
+        char label[300];
+        snprintf(label, sizeof(label), "user index '%s'", uidx->key);
+        if(uidx->value_type == USER_INDEX_VALUE_TYPE_NUMERIC)
+            defrag_tree(ctx, label, uidx->header_lba, &uidx->hdr,
+                        sizeof(struct metadata_numeric_idx_index_entry),
+                        __builtin_offsetof(struct metadata_numeric_idx_index_entry, child_lba),
+                        METADATA_NODE_BLOCKS, auto_yes, auto_no);
+        else
+            defrag_tree(ctx, label, uidx->header_lba, &uidx->hdr,
+                        sizeof(struct metadata_idx_index_entry),
+                        __builtin_offsetof(struct metadata_idx_index_entry, child_lba),
+                        METADATA_NODE_BLOCKS, auto_yes, auto_no);
+    }
+
     /* Dedup sub-trees */
     if(ctx->sb.dedup_lba != 0)
     {
