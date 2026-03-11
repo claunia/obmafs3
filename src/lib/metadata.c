@@ -2524,6 +2524,28 @@ static int filter_value_matches(const char *rec_value, const char *flt_value, ui
             return strncasecmp(rec_value + rlen - flen, flt_value, flen) == 0;
         }
 
+        /* Set membership: value matches any item in a comma-separated list */
+        case kQueryOpIn:
+        case kQueryOpIIn:
+        {
+            int ci = (op == kQueryOpIIn);
+            size_t rlen = strnlen(rec_value, METADATA_VALUE_MAX);
+            const char *p = flt_value;
+            while(*p)
+            {
+                const char *comma = p;
+                while(*comma && *comma != ',') comma++;
+                size_t ilen = (size_t)(comma - p);
+                if(ilen == rlen)
+                {
+                    if(ci ? strncasecmp(rec_value, p, ilen) == 0 : strncmp(rec_value, p, ilen) == 0)
+                        return 1;
+                }
+                p = *comma ? comma + 1 : comma;
+            }
+            return 0;
+        }
+
         default:
             return 0;
     }

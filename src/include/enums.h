@@ -141,7 +141,11 @@ enum obmafs3_query_op
 
     /* Suffix matching */
     kQueryOpEndsWith    = 21, ///< suffix match (case-sensitive)
-    kQueryOpIEndsWith   = 22  ///< suffix match (case-insensitive)
+    kQueryOpIEndsWith   = 22, ///< suffix match (case-insensitive)
+
+    /* Set membership (comma-separated value list) */
+    kQueryOpIn          = 23, ///< value in comma-separated list (case-sensitive)
+    kQueryOpIIn         = 24  ///< value in comma-separated list (case-insensitive)
 };
 
 /// How to combine multiple query filters.

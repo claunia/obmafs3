@@ -52,6 +52,7 @@
  *   <key> CONTAINS "<value>"        Substring match
  *   <key> STARTSWITH "<value>"      Prefix match
  *   <key> ENDSWITH "<value>"        Suffix match
+ *   <key> IN "<val1>,<val2>,..."     Match any in comma-separated list
  *   <key> EXISTS                    Key exists (any value)
  *
  *   Case-insensitive:
@@ -60,6 +61,7 @@
  *   <key> ICONTAINS "<value>"       Substring (ignoring case)
  *   <key> ISTARTSWITH "<value>"     Prefix (ignoring case)
  *   <key> IENDSWITH "<value>"       Suffix (ignoring case)
+ *   <key> IIN "<val1>,<val2>,..."    IN match (ignoring case)
  *
  *   Numeric (values parsed as integers):
  *   <key> N= "<value>"              Numeric equal
@@ -395,6 +397,16 @@ static const char *parse_operator(const char *p, uint8_t *op, int *need_value)
     if(strcasecmp(kw, "IENDSWITH") == 0)
     {
         *op = kQueryOpIEndsWith;
+        return after;
+    }
+    if(strcasecmp(kw, "IN") == 0)
+    {
+        *op = kQueryOpIn;
+        return after;
+    }
+    if(strcasecmp(kw, "IIN") == 0)
+    {
+        *op = kQueryOpIIn;
         return after;
     }
     if(strcasecmp(kw, "REGEX") == 0)
@@ -1465,6 +1477,7 @@ static void print_help(void)
            "  <key> CONTAINS \"<value>\"           Substring match\n"
            "  <key> STARTSWITH \"<value>\"         Prefix match\n"
            "  <key> ENDSWITH \"<value>\"           Suffix match\n"
+           "  <key> IN \"<val1>,<val2>,...\"       Match any in list\n"
            "  <key> EXISTS                       Key exists (any value)\n"
            "\n"
            "Case-insensitive operators:\n"
@@ -1473,6 +1486,7 @@ static void print_help(void)
            "  <key> ICONTAINS \"<value>\"          Substring (case-insensitive)\n"
            "  <key> ISTARTSWITH \"<value>\"        Prefix (case-insensitive)\n"
            "  <key> IENDSWITH \"<value>\"          Suffix (case-insensitive)\n"
+           "  <key> IIN \"<val1>,<val2>,...\"      IN match (case-insensitive)\n"
            "\n"
            "Numeric operators (values parsed as integers):\n"
            "  <key> N= \"<value>\"                 Numeric equal\n"

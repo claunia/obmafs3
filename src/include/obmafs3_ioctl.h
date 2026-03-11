@@ -200,7 +200,11 @@ enum obmafs3_query_op
 
     /* Suffix matching */
     kQueryOpEndsWith    = 21,
-    kQueryOpIEndsWith   = 22
+    kQueryOpIEndsWith   = 22,
+
+    /* Set membership (comma-separated value list) */
+    kQueryOpIn          = 23,
+    kQueryOpIIn         = 24
 };
 
 enum obmafs3_query_combine
