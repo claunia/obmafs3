@@ -1519,6 +1519,8 @@ static void print_help(void)
            "Commands:\n"
            "  help               Show this help message\n"
            "  distinct <key>     List all distinct values for a key\n"
+           "  resort <key>       Re-sort cached results (e.g. resort N:year)\n"
+           "  reverse            Toggle sort order and re-display\n"
            "  quit               Exit the query tool\n"
            "\n"
            "Query syntax:\n"
@@ -1622,10 +1624,63 @@ static void usage(const char *prog)
 /*  Read-eval-print loop                                               */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/*  REPL query cache                                                   */
+/* ------------------------------------------------------------------ */
+
+struct repl_cache
+{
+    char             query[4096];  /**< Last query string (empty = no cache) */
+    struct result_set rs;          /**< Cached result set */
+    int              has_metadata; /**< Whether metadata was fetched */
+};
+
+static void repl_cache_init(struct repl_cache *c)
+{
+    c->query[0]      = '\0';
+    c->has_metadata  = 0;
+    rs_init(&c->rs);
+}
+
+static void repl_cache_free(struct repl_cache *c)
+{
+    rs_free(&c->rs);
+    c->query[0]     = '\0';
+    c->has_metadata = 0;
+}
+
+/**
+ * Display a result set to stdout, optionally with metadata.
+ */
+static void display_results(const struct result_set *rs, int show_metadata)
+{
+    for(uint32_t i = 0; i < rs->count; i++)
+    {
+        printf("  %s\n", rs->paths[i]);
+        if(show_metadata && rs->metadata && rs->metadata[i].count > 0)
+        {
+            for(uint32_t j = 0; j < rs->metadata[i].count; j++)
+                printf("    %s = %s\n", rs->metadata[i].pairs[j].key, rs->metadata[i].pairs[j].value);
+        }
+    }
+    printf("\n%u result(s)\n", rs->count);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Read-eval-print loop                                               */
+/* ------------------------------------------------------------------ */
+
 static void repl(const char *mountpoint, int query_fd, int show_metadata,
                  const char *sort_key, int reverse)
 {
     char line[4096];
+    struct repl_cache cache;
+    repl_cache_init(&cache);
+
+    /* Mutable copies of sort params so REPL commands can change them */
+    char  current_sort[256] = {0};
+    int   current_reverse   = reverse;
+    if(sort_key) strncpy(current_sort, sort_key, sizeof(current_sort) - 1);
 
     printf("obmafs-query: connected to %s\n", mountpoint);
     printf("Type 'help' for available commands, 'quit' to exit.\n\n");
@@ -1673,10 +1728,101 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             continue;
         }
 
-        /* Parse and execute as a query */
+        /* resort <key> — re-display cached results with new sort key */
+        if(strncasecmp(cmd, "resort ", 7) == 0 || strncasecmp(cmd, "resort\t", 7) == 0)
+        {
+            const char *skey = cmd + 7;
+            while(*skey == ' ' || *skey == '\t') skey++;
+            if(*skey == '\0')
+            {
+                fprintf(stderr, "Error: expected a sort key after 'resort'\n");
+                continue;
+            }
+            if(cache.query[0] == '\0')
+            {
+                fprintf(stderr, "No cached query results to re-sort\n");
+                continue;
+            }
+
+            /* Fetch metadata if needed for this sort key and not already fetched */
+            if(!cache.has_metadata && strcmp(skey, "path") != 0 && cache.rs.count > 0)
+            {
+                rs_fetch_metadata(mountpoint, &cache.rs);
+                cache.has_metadata = 1;
+            }
+
+            strncpy(current_sort, skey, sizeof(current_sort) - 1);
+            current_sort[sizeof(current_sort) - 1] = '\0';
+            if(cache.rs.count > 1) rs_sort(&cache.rs, current_sort, current_reverse);
+            display_results(&cache.rs, show_metadata);
+            if(cache.rs.count > 0) offer_export(&cache.rs);
+            continue;
+        }
+
+        /* reverse — toggle sort order and re-display */
+        if(strcasecmp(cmd, "reverse") == 0)
+        {
+            if(cache.query[0] == '\0')
+            {
+                fprintf(stderr, "No cached query results to reverse\n");
+                continue;
+            }
+            current_reverse = !current_reverse;
+            if(current_sort[0] != '\0' && cache.rs.count > 1)
+                rs_sort(&cache.rs, current_sort, current_reverse);
+            printf("Sort order: %s\n", current_reverse ? "descending" : "ascending");
+            display_results(&cache.rs, show_metadata);
+            if(cache.rs.count > 0) offer_export(&cache.rs);
+            continue;
+        }
+
+        /* Parse query */
         struct obmafs3_ioctl_metadata_query_arg qa;
-        if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa, mountpoint, show_metadata, sort_key, reverse);
+        if(parse_query(cmd, &qa) != 0) continue;
+
+        /* Check if this query matches the cache */
+        if(cache.query[0] != '\0' && strcmp(cmd, cache.query) == 0)
+        {
+            /* Same query — re-display cached results */
+            printf("  (cached)\n");
+            if(current_sort[0] != '\0' && cache.rs.count > 1)
+                rs_sort(&cache.rs, current_sort, current_reverse);
+            display_results(&cache.rs, show_metadata);
+            if(cache.rs.count > 0) offer_export(&cache.rs);
+            continue;
+        }
+
+        /* New query — clear cache and execute */
+        repl_cache_free(&cache);
+
+        if(execute_query_collect(query_fd, &qa, &cache.rs) != 0)
+        {
+            repl_cache_free(&cache);
+            continue;
+        }
+
+        /* Fetch metadata if needed */
+        int need_meta = show_metadata || (current_sort[0] != '\0' && strcmp(current_sort, "path") != 0);
+        if(need_meta && cache.rs.count > 0)
+        {
+            rs_fetch_metadata(mountpoint, &cache.rs);
+            cache.has_metadata = 1;
+        }
+
+        /* Sort if configured */
+        if(current_sort[0] != '\0' && cache.rs.count > 1)
+            rs_sort(&cache.rs, current_sort, current_reverse);
+
+        /* Cache the query string */
+        strncpy(cache.query, cmd, sizeof(cache.query) - 1);
+        cache.query[sizeof(cache.query) - 1] = '\0';
+
+        /* Display */
+        display_results(&cache.rs, show_metadata);
+        if(cache.rs.count > 0) offer_export(&cache.rs);
     }
+
+    repl_cache_free(&cache);
 }
 
 /* ------------------------------------------------------------------ */
