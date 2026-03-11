@@ -1051,6 +1051,28 @@ static int obmafs3_fuse_ioctl_impl(const char *path, unsigned int cmd, void *arg
             return rc == OBMAFS3_OK ? 0 : -EIO;
         }
 
+        case OBMAFS3_IOC_DISTINCT_METADATA:
+        {
+            /* Filesystem-level distinct values query */
+            struct obmafs3_ioctl_metadata_distinct_arg *da =
+                (struct obmafs3_ioctl_metadata_distinct_arg *)data;
+
+            char   **vals;
+            uint32_t total;
+            int rc = obmafs3_metadata_distinct(g_ctx, da->key, &vals, &total);
+            if(rc != OBMAFS3_OK) FUSE_RETURN(-EIO, "");
+
+            uint32_t start = da->offset;
+            uint32_t n     = 0;
+            memset(da->values, 0, sizeof(da->values));
+            for(uint32_t i = start; i < total && n < METADATA_DISTINCT_MAX_RESULTS; i++, n++)
+                strncpy(da->values[n], vals[i], METADATA_VALUE_MAX - 1);
+            da->count = n;
+            da->total = total;
+            obmafs3_metadata_distinct_free(vals, total);
+            return 0;
+        }
+
         default:
             FUSE_RETURN(-ENOTTY, "");
     }

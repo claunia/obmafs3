@@ -2853,3 +2853,150 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
     *count = n;
     return OBMAFS3_OK;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Distinct values for a metadata key                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Collect all distinct values for a given metadata key.
+ *
+ * Navigates the reverse-index B+Tree to the first leaf containing
+ * @p key, then scans the leaf chain collecting unique values until
+ * the key changes.  Since the tree is sorted by (key, value, inode_id),
+ * values for the same key are contiguous and already in sorted order,
+ * making deduplication a simple "skip if same as previous" check.
+ *
+ * The caller must free the returned array with
+ * @c obmafs3_metadata_distinct_free.
+ *
+ * @param ctx     Filesystem context.
+ * @param key     Metadata key to enumerate values for.
+ * @param values  Output array of distinct value strings.
+ * @param count   Output number of distinct values.
+ * @return @c OBMAFS3_OK on success, or an error code on failure.
+ */
+int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***values, uint32_t *count)
+{
+    *values = NULL;
+    *count  = 0;
+
+    if(ctx->sb.metadata_idx_lba == 0) return OBMAFS3_OK;
+
+    uint64_t lba = ctx->metadata_idx_hdr.root_node_lba;
+    if(lba == 0) return OBMAFS3_OK;
+
+    size_t   nsz = meta_node_size(ctx);
+    uint8_t *buf = calloc(1, nsz);
+    if(!buf) DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+
+    /* Navigate to the leaf containing (key, "", 0) */
+    static const char empty_val[METADATA_VALUE_MAX] = {0};
+    while(1)
+    {
+        int rc = meta_node_read(ctx, lba, buf);
+        if(rc != OBMAFS3_OK)
+        {
+            free(buf);
+            return rc;
+        }
+
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        if(hdr.magic != OBMAFS3_BTREE_NODE_MAGIC)
+        {
+            free(buf);
+            DBG_RETURN(OBMAFS3_ERR_BADMAGIC, "bad magic");
+        }
+        if(hdr.level == 0) break;
+
+        uint16_t                        slot = midx_index_find(buf, hdr.node_keys, key, empty_val, 0);
+        struct metadata_idx_index_entry ie;
+        memcpy(&ie, buf + sizeof(struct btree_node_header) + (size_t)slot * sizeof(ie), sizeof(ie));
+        lba = ie.child_lba;
+    }
+
+    /* Scan leaf chain collecting distinct values */
+    uint32_t  cap    = 64;
+    uint32_t  n      = 0;
+    char    **result = malloc(cap * sizeof(char *));
+    if(!result)
+    {
+        free(buf);
+        DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+    }
+
+    char prev_value[METADATA_VALUE_MAX];
+    memset(prev_value, 0, sizeof(prev_value));
+    int have_prev = 0;
+
+    while(1)
+    {
+        struct btree_node_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+
+        const uint8_t *data = buf + sizeof(struct btree_node_header);
+        for(uint16_t i = 0; i < hdr.node_keys; i++)
+        {
+            struct metadata_idx_record rec;
+            memcpy(&rec, data + (size_t)i * sizeof(rec), sizeof(rec));
+
+            int kcmp = strncmp(rec.key, key, METADATA_KEY_MAX);
+            if(kcmp < 0) continue;          /* haven't reached the key yet */
+            if(kcmp > 0) goto distinct_done; /* past the key — done */
+
+            /* Skip if same value as previous (tree is sorted by value) */
+            if(have_prev && strncmp(rec.value, prev_value, METADATA_VALUE_MAX) == 0)
+                continue;
+
+            /* New distinct value */
+            if(n >= cap)
+            {
+                cap *= 2;
+                char **tmp = realloc(result, cap * sizeof(char *));
+                if(!tmp)
+                {
+                    for(uint32_t j = 0; j < n; j++) free(result[j]);
+                    free(result);
+                    free(buf);
+                    DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+                }
+                result = tmp;
+            }
+            result[n] = strndup(rec.value, METADATA_VALUE_MAX);
+            if(!result[n])
+            {
+                for(uint32_t j = 0; j < n; j++) free(result[j]);
+                free(result);
+                free(buf);
+                DBG_RETURN(OBMAFS3_ERR_NOMEM, "out of memory");
+            }
+            memcpy(prev_value, rec.value, METADATA_VALUE_MAX);
+            have_prev = 1;
+            n++;
+        }
+
+        if(hdr.right_link == 0) break;
+        int rc = meta_node_read(ctx, hdr.right_link, buf);
+        if(rc != OBMAFS3_OK)
+        {
+            for(uint32_t j = 0; j < n; j++) free(result[j]);
+            free(result);
+            free(buf);
+            return rc;
+        }
+    }
+
+distinct_done:
+    free(buf);
+    *values = result;
+    *count  = n;
+    return OBMAFS3_OK;
+}
+
+void obmafs3_metadata_distinct_free(char **values, uint32_t count)
+{
+    if(!values) return;
+    for(uint32_t i = 0; i < count; i++) free(values[i]);
+    free(values);
+}

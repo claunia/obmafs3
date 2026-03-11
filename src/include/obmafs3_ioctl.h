@@ -365,4 +365,29 @@ struct obmafs3_ioctl_set_ps3_image_arg
 
 #define OBMAFS3_IOC_SET_PS3_IMAGE _IOW('O', 17, struct obmafs3_ioctl_set_ps3_image_arg)
 
+/* ================================================================== */
+/*  Metadata distinct values ioctl                                     */
+/* ================================================================== */
+
+#define METADATA_DISTINCT_MAX_RESULTS 8
+
+/**
+ * Query distinct values for a given metadata key.
+ * Returns a paginated list of unique values.
+ *
+ * Set offset to 0 for the first page, advance by count for subsequent
+ * pages.  Returns count == 0 when no more values remain.
+ */
+struct obmafs3_ioctl_metadata_distinct_arg
+{
+    char     key[METADATA_KEY_MAX];                                           /**< Input: metadata key */
+    uint32_t offset;                                                          /**< Input: starting offset */
+    uint32_t count;                                                           /**< Output: values returned this page */
+    uint32_t total;                                                           /**< Output: total distinct values */
+    uint32_t _pad;                                                            /**< Alignment padding */
+    char     values[METADATA_DISTINCT_MAX_RESULTS][METADATA_VALUE_MAX];       /**< Output: up to 8 values */
+};
+
+#define OBMAFS3_IOC_DISTINCT_METADATA _IOWR('O', 18, struct obmafs3_ioctl_metadata_distinct_arg)
+
 #endif /* OBMAFS3_IOCTL_H */

@@ -1313,6 +1313,124 @@ static int execute_query_batch(int fd, struct obmafs3_ioctl_metadata_query_arg *
 }
 
 /* ------------------------------------------------------------------ */
+/*  Distinct values                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Execute a distinct values query for @p key via ioctl.
+ * Paginates automatically and prints all unique values.
+ *
+ * @param fd      File descriptor on the OBMAFS3 mount.
+ * @param key     Metadata key to enumerate.
+ * @param format  "txt" or "json" (NULL defaults to "txt").
+ * @param to_file Output file path (NULL = stdout).
+ * @return 0 on success, non-zero on failure.
+ */
+static int execute_distinct(int fd, const char *key, const char *format, const char *to_file)
+{
+    /* Collect all distinct values via paginated ioctls */
+    uint32_t  cap  = 64;
+    uint32_t  n    = 0;
+    char    **vals = malloc(cap * sizeof(char *));
+    if(!vals)
+    {
+        fprintf(stderr, "Error: out of memory\n");
+        return 1;
+    }
+
+    uint32_t offset = 0;
+    uint32_t total  = 0;
+    while(1)
+    {
+        struct obmafs3_ioctl_metadata_distinct_arg da;
+        memset(&da, 0, sizeof(da));
+        strncpy(da.key, key, METADATA_KEY_MAX - 1);
+        da.offset = offset;
+
+        if(ioctl(fd, OBMAFS3_IOC_DISTINCT_METADATA, &da) != 0)
+        {
+            fprintf(stderr, "Error: ioctl DISTINCT_METADATA failed: %s\n", strerror(errno));
+            for(uint32_t i = 0; i < n; i++) free(vals[i]);
+            free(vals);
+            return 1;
+        }
+
+        total = da.total;
+        if(da.count == 0) break;
+
+        for(uint32_t i = 0; i < da.count; i++)
+        {
+            if(n >= cap)
+            {
+                cap *= 2;
+                char **tmp = realloc(vals, cap * sizeof(char *));
+                if(!tmp)
+                {
+                    for(uint32_t j = 0; j < n; j++) free(vals[j]);
+                    free(vals);
+                    fprintf(stderr, "Error: out of memory\n");
+                    return 1;
+                }
+                vals = tmp;
+            }
+            vals[n] = strndup(da.values[i], METADATA_VALUE_MAX);
+            n++;
+        }
+
+        offset += da.count;
+        if(offset >= total) break;
+    }
+
+    /* Output */
+    const char *fmt = format ? format : "txt";
+    FILE       *fp  = stdout;
+    if(to_file)
+    {
+        fp = fopen(to_file, "w");
+        if(!fp)
+        {
+            fprintf(stderr, "Error: cannot open '%s': %s\n", to_file, strerror(errno));
+            for(uint32_t i = 0; i < n; i++) free(vals[i]);
+            free(vals);
+            return 1;
+        }
+    }
+
+    if(strcasecmp(fmt, "json") == 0)
+    {
+        fprintf(fp, "{\n  \"key\": \"");
+        json_escape(fp, key);
+        fprintf(fp, "\",\n  \"count\": %u,\n  \"values\": [", n);
+        for(uint32_t i = 0; i < n; i++)
+        {
+            fprintf(fp, "%s\n    \"", i ? "," : "");
+            json_escape(fp, vals[i]);
+            fputc('"', fp);
+        }
+        fprintf(fp, "\n  ]\n}\n");
+    }
+    else
+    {
+        for(uint32_t i = 0; i < n; i++)
+            fprintf(fp, "%s\n", vals[i]);
+    }
+
+    if(to_file)
+    {
+        fclose(fp);
+        printf("Exported %u distinct value(s) to %s\n", n, to_file);
+    }
+    else if(strcasecmp(fmt, "txt") == 0)
+    {
+        printf("\n%u distinct value(s) for '%s'\n", n, key);
+    }
+
+    for(uint32_t i = 0; i < n; i++) free(vals[i]);
+    free(vals);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Help text                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -1322,6 +1440,7 @@ static void print_help(void)
            "\n"
            "Commands:\n"
            "  help               Show this help message\n"
+           "  distinct <key>     List all distinct values for a key\n"
            "  quit               Exit the query tool\n"
            "\n"
            "Query syntax:\n"
@@ -1395,6 +1514,7 @@ static void usage(const char *prog)
             "Options:\n"
             "  -q, --query <query>    Run a single query and exit\n"
             "  -c, --count            Count matching results only (no paths)\n"
+            "  -d, --distinct <key>   List all distinct values for a metadata key\n"
             "  -f, --format <fmt>     Output format: txt (default) or json\n"
             "  -o, --output <path>    Write results to file instead of stdout\n"
             "  -m, --metadata         Include all metadata for each result\n"
@@ -1407,8 +1527,8 @@ static void usage(const char *prog)
             "  %s <mountpoint>                              Interactive mode\n"
             "  %s -q 'artist = \"Iron Maiden\"' /mnt/archive  Batch query\n"
             "  %s -q 'genre = \"Rock\"' -c /mnt/archive       Count only\n"
-            "  %s -q 'genre = \"Rock\"' -s N:year /mnt/archive Sort by year\n"
-            "  %s -q 'year N> \"1985\"' -f json -m /mnt/archive JSON + metadata\n",
+            "  %s -d genre /mnt/archive                      List all genres\n"
+            "  %s -d genre -f json /mnt/archive              Distinct as JSON\n",
             prog, prog, prog, prog, prog, prog);
 }
 
@@ -1455,6 +1575,18 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
             continue;
         }
 
+        /* distinct <key> — list distinct values for a metadata key */
+        if(strncasecmp(cmd, "distinct ", 9) == 0 || strncasecmp(cmd, "distinct\t", 9) == 0)
+        {
+            const char *dkey = cmd + 9;
+            while(*dkey == ' ' || *dkey == '\t') dkey++;
+            if(*dkey == '\0')
+                fprintf(stderr, "Error: expected a key name after 'distinct'\n");
+            else
+                execute_distinct(query_fd, dkey, NULL, NULL);
+            continue;
+        }
+
         /* Parse and execute as a query */
         struct obmafs3_ioctl_metadata_query_arg qa;
         if(parse_query(cmd, &qa) == 0) execute_query(query_fd, &qa, mountpoint, show_metadata, sort_key, reverse);
@@ -1467,13 +1599,14 @@ static void repl(const char *mountpoint, int query_fd, int show_metadata,
 
 int main(int argc, char *argv[])
 {
-    const char *query_str  = NULL;
-    const char *format_str = NULL;
-    const char *output_str = NULL;
-    const char *sort_str   = NULL;
-    int         show_meta  = 0;
-    int         reverse    = 0;
-    int         count_only = 0;
+    const char *query_str    = NULL;
+    const char *format_str   = NULL;
+    const char *output_str   = NULL;
+    const char *sort_str     = NULL;
+    const char *distinct_str = NULL;
+    int         show_meta    = 0;
+    int         reverse      = 0;
+    int         count_only   = 0;
 
     static struct option long_opts[] = {
         {"query",    required_argument, NULL, 'q'},
@@ -1483,22 +1616,24 @@ int main(int argc, char *argv[])
         {"sort",     required_argument, NULL, 's'},
         {"reverse",  no_argument,       NULL, 'r'},
         {"count",    no_argument,       NULL, 'c'},
+        {"distinct", required_argument, NULL, 'd'},
         {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while((opt = getopt_long(argc, argv, "q:f:o:ms:rch", long_opts, NULL)) != -1)
+    while((opt = getopt_long(argc, argv, "q:f:o:ms:rcd:h", long_opts, NULL)) != -1)
     {
         switch(opt)
         {
-            case 'q': query_str  = optarg; break;
-            case 'f': format_str = optarg; break;
-            case 'o': output_str = optarg; break;
-            case 'm': show_meta  = 1;      break;
-            case 's': sort_str   = optarg; break;
-            case 'r': reverse    = 1;      break;
-            case 'c': count_only = 1;      break;
+            case 'q': query_str    = optarg; break;
+            case 'f': format_str   = optarg; break;
+            case 'o': output_str   = optarg; break;
+            case 'm': show_meta    = 1;      break;
+            case 's': sort_str     = optarg; break;
+            case 'r': reverse      = 1;      break;
+            case 'c': count_only   = 1;      break;
+            case 'd': distinct_str = optarg; break;
             case 'h':
                 usage(argv[0]);
                 return 0;
@@ -1524,7 +1659,12 @@ int main(int argc, char *argv[])
 
     int rc = 0;
 
-    if(query_str)
+    if(distinct_str)
+    {
+        /* Distinct values mode */
+        rc = execute_distinct(query_fd, distinct_str, format_str, output_str);
+    }
+    else if(query_str)
     {
         /* Batch mode: execute a single query and exit */
         struct obmafs3_ioctl_metadata_query_arg qa;

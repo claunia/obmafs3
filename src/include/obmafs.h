@@ -418,6 +418,8 @@ int obmafs3_metadata_query_filtered(struct obmafs3_ctx *ctx, const struct obmafs
                                     uint32_t offset, uint32_t limit,
                                     char ***paths, uint32_t *count, uint32_t *total);
 int obmafs3_resolve_inode_path(struct obmafs3_ctx *ctx, uint64_t inode_id, char *path_buf, size_t path_buf_size);
+int obmafs3_metadata_distinct(struct obmafs3_ctx *ctx, const char *key, char ***values, uint32_t *count);
+void obmafs3_metadata_distinct_free(char **values, uint32_t count);
 
 /* --- Block refcount operations --- */
 int obmafs3_refcount_get(struct obmafs3_ctx *ctx, uint64_t lba, uint32_t *ref_count);
