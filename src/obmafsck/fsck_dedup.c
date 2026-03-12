@@ -226,6 +226,9 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
     uint64_t total_sector_map_entries = 0;
     uint64_t total_sector_count       = 0;
 
+    /* Per-tree reference counts: refs_per_tree[t] = total SME refs for tree t */
+    uint64_t *refs_per_tree = calloc((size_t)tree_count, sizeof(uint64_t));
+
     if(ctx->inode_hdr.root_node_lba != 0)
     {
         uint8_t *buf = calloc(1, (size_t)ctx->sb.block_size);
@@ -269,12 +272,33 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
                     {
                         struct inode_record rec;
                         memcpy(&rec, buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(rec), sizeof(rec));
-                        if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeNintendo || rec.file_type == kFileTypePS3Image)
+                        if(rec.file_type == kFileTypeMediaImage || rec.file_type == kFileTypeCompactDiscImage || rec.file_type == kFileTypeNintendo || rec.file_type == kFileTypePS3Image)
                         {
                             total_media_files++;
                             total_media_file_size += rec.file_size;
                             total_sector_map_entries += rec.sector_map_size;
                             total_sector_count += rec.sector_count;
+
+                            /* Determine which dedup tree this file maps to by
+                             * reading the first sector map entry's sector_size.
+                             * Both sector_map_entry and cd_sector_map_entry have
+                             * sector_size at offset 8 (after int64_t sector). */
+                            if(rec.sector_map_size > 0 && refs_per_tree)
+                            {
+                                struct sector_map_entry sme;
+                                if(obmafs3_read_file_data(ctx, &rec, sizeof(struct sector_map_header),
+                                                          &sme, sizeof(sme)) == OBMAFS3_OK && sme.sector_size > 0)
+                                {
+                                    for(uint64_t ti = 0; ti < tree_count; ti++)
+                                    {
+                                        if(tl_entries[ti].sector_size == sme.sector_size)
+                                        {
+                                            refs_per_tree[ti] += rec.sector_map_size;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -550,6 +574,28 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
             printf("    Compression ratio:      %.2f:1 (%.1f%% smaller)\n", comp_ratio, comp_saved);
         }
 
+        if(refs_per_tree && refs_per_tree[t] > 0 && stats[t].dedup_entries > 0)
+        {
+            double dr = (double)refs_per_tree[t] / (double)stats[t].dedup_entries;
+            printf("    Dedup ratio:            %.2f:1"
+                   " (%" PRIu64 " refs -> %" PRIu64 " unique)\n",
+                   dr, refs_per_tree[t], stats[t].dedup_entries);
+            if(refs_per_tree[t] > stats[t].dedup_entries)
+            {
+                uint64_t dup = refs_per_tree[t] - stats[t].dedup_entries;
+                printf("    Duplicate sectors:      %" PRIu64 "\n", dup);
+            }
+            if(stats[t].dedup_entries > refs_per_tree[t])
+            {
+                uint64_t orphaned = stats[t].dedup_entries - refs_per_tree[t];
+                printf("    Unreferenced sectors:   %" PRIu64 " (from deleted files)\n", orphaned);
+            }
+        }
+        else if(stats[t].dedup_entries > 0 && refs_per_tree && refs_per_tree[t] == 0)
+        {
+            printf("    Unreferenced sectors:   %" PRIu64 " (from deleted files)\n", stats[t].dedup_entries);
+        }
+
         grand_dedup_entries += stats[t].dedup_entries;
         grand_unique_blocks += stats[t].unique_blocks;
         grand_unique_sector_bytes += stats[t].dedup_entries * (uint64_t)stats[t].sector_size;
@@ -580,15 +626,33 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
     /* ---- Savings summary ---- */
     printf("\n  Savings summary:\n");
 
-    if(total_sector_map_entries > 0 && grand_dedup_entries > 0)
+    /* Sum per-tree refs for correct aggregate dedup ratio */
+    uint64_t grand_refs = 0;
+    if(refs_per_tree)
+        for(uint64_t t = 0; t < tree_count; t++)
+            grand_refs += refs_per_tree[t];
+
+    if(grand_refs > 0 && grand_dedup_entries > 0)
     {
-        double   dedup_ratio = (double)total_sector_map_entries / (double)grand_dedup_entries;
-        uint64_t dup_sectors = total_sector_map_entries - grand_dedup_entries;
+        /* Dedup ratio uses only referenced entries to avoid counting orphans */
+        uint64_t referenced_entries = grand_dedup_entries;
+        if(grand_dedup_entries > grand_refs)
+            referenced_entries = grand_refs;
+
+        double   dedup_ratio = (double)grand_refs / (double)referenced_entries;
         printf("    Dedup ratio:            %.2f:1"
                " (%" PRIu64 " refs -> %" PRIu64 " unique)\n",
-               dedup_ratio, total_sector_map_entries, grand_dedup_entries);
-        printf("    Duplicate sectors:      %" PRIu64 "\n", dup_sectors);
-
+               dedup_ratio, grand_refs, referenced_entries);
+        if(grand_refs > referenced_entries)
+        {
+            uint64_t dup_sectors = grand_refs - referenced_entries;
+            printf("    Duplicate sectors:      %" PRIu64 "\n", dup_sectors);
+        }
+        if(grand_dedup_entries > grand_refs)
+        {
+            uint64_t orphaned = grand_dedup_entries - grand_refs;
+            printf("    Unreferenced sectors:   %" PRIu64 " (from deleted files)\n", orphaned);
+        }
         if(total_media_file_size > grand_unique_sector_bytes)
         {
             uint64_t bytes_saved_dedup = total_media_file_size - grand_unique_sector_bytes;
@@ -624,6 +688,7 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
         }
     }
 
+    free(refs_per_tree);
     free(stats);
     free(tl_entries);
     return 0;
