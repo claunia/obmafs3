@@ -225,6 +225,7 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
     uint64_t total_media_file_size    = 0;
     uint64_t total_sector_map_entries = 0;
     uint64_t total_sector_count       = 0;
+    uint64_t total_cd_sectors         = 0;
 
     /* Per-tree reference counts: refs_per_tree[t] = total SME refs for tree t */
     uint64_t *refs_per_tree = calloc((size_t)tree_count, sizeof(uint64_t));
@@ -278,6 +279,9 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
                             total_media_file_size += rec.file_size;
                             total_sector_map_entries += rec.sector_map_size;
                             total_sector_count += rec.sector_count;
+
+                            if(rec.file_type == kFileTypeCompactDiscImage)
+                                total_cd_sectors += rec.sector_count;
 
                             /* Determine which dedup tree this file maps to by
                              * reading the first sector map entry's sector_size.
@@ -685,6 +689,84 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
             printf("    Total space saved:      ");
             print_human_size(total_saved);
             printf(" (%.1f%%)\n", (double)total_saved / (double)total_media_file_size * 100.0);
+        }
+    }
+
+    /* ---- CD subchannel dedup stats ---- */
+    if(total_cd_sectors > 0 && ctx->cd_subchannel_hdr.root_node_lba != 0)
+    {
+        uint64_t unique_subchannels = 0;
+        uint8_t *sub_buf            = calloc(1, (size_t)ctx->sb.block_size);
+
+        if(sub_buf)
+        {
+            uint64_t *sub_stack  = malloc(64 * sizeof(uint64_t));
+            uint64_t  sub_sz     = 0, sub_cap = 64;
+
+            if(sub_stack)
+            {
+                sub_stack[sub_sz++] = ctx->cd_subchannel_hdr.root_node_lba;
+
+                while(sub_sz > 0)
+                {
+                    uint64_t lba = sub_stack[--sub_sz];
+                    rc           = obmafs3_block_read(ctx, lba, sub_buf, (size_t)ctx->sb.block_size);
+                    if(rc != OBMAFS3_OK) break;
+
+                    struct btree_node_header nhdr;
+                    memcpy(&nhdr, sub_buf, sizeof(nhdr));
+                    if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+                    if(nhdr.level > 0)
+                    {
+                        for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                        {
+                            struct btree_index_entry ie;
+                            memcpy(&ie,
+                                   sub_buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie),
+                                   sizeof(ie));
+                            if(sub_sz >= sub_cap)
+                            {
+                                sub_cap *= 2;
+                                uint64_t *tmp = realloc(sub_stack, sub_cap * sizeof(*tmp));
+                                if(!tmp) break;
+                                sub_stack = tmp;
+                            }
+                            sub_stack[sub_sz++] = ie.child_lba;
+                        }
+                        continue;
+                    }
+
+                    unique_subchannels += nhdr.node_keys;
+                }
+
+                free(sub_stack);
+            }
+
+            free(sub_buf);
+        }
+
+        printf("\n  %sCD subchannel dedup statistics%s\n", CLR_BOLD, CLR_RESET);
+        printf("    Total CD sectors:       %" PRIu64 "\n", total_cd_sectors);
+        printf("    Unique subchannels:     %" PRIu64 "\n", unique_subchannels);
+
+        if(unique_subchannels > 0)
+        {
+            double sub_ratio = (double)total_cd_sectors / (double)unique_subchannels;
+            printf("    Subchannel dedup ratio: %.2f:1"
+                   " (%" PRIu64 " refs -> %" PRIu64 " unique)\n",
+                   sub_ratio, total_cd_sectors, unique_subchannels);
+
+            if(total_cd_sectors > unique_subchannels)
+            {
+                uint64_t dup = total_cd_sectors - unique_subchannels;
+                printf("    Duplicate subchannels:  %" PRIu64 "\n", dup);
+
+                uint64_t saved = dup * CD_SUBCHANNEL_DATA_SIZE;
+                printf("    Saved by dedup:         ");
+                print_human_size(saved);
+                printf("\n");
+            }
         }
     }
 
