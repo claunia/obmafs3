@@ -415,11 +415,20 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
             return;
         }
 
+        uint64_t inode_nodes_visited = 0;
+        uint64_t inode_total_nodes   = (uint64_t)ctx->inode_hdr.total_nodes;
+
         stack[stk_size++] = root_lba;
 
         while(stk_size > 0)
         {
             uint64_t lba = stack[--stk_size];
+
+            inode_nodes_visited++;
+            if(inode_total_nodes > 10 && (inode_nodes_visited <= 1 || (inode_nodes_visited & 0xFF) == 0 ||
+                                          inode_nodes_visited == inode_total_nodes))
+                print_bar("Refcount: collecting inode extents", inode_nodes_visited, inode_total_nodes);
+
             if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
 
             struct btree_node_header nhdr;
@@ -489,11 +498,20 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
             return;
         }
 
+        uint64_t ovf_nodes_visited = 0;
+        uint64_t ovf_total_nodes   = (uint64_t)ctx->overflow_hdr.total_nodes;
+
         stack[stk_size++] = ctx->overflow_hdr.root_node_lba;
 
         while(stk_size > 0)
         {
             uint64_t lba = stack[--stk_size];
+
+            ovf_nodes_visited++;
+            if(ovf_total_nodes > 10 && (ovf_nodes_visited <= 1 || (ovf_nodes_visited & 0xFF) == 0 ||
+                                        ovf_nodes_visited == ovf_total_nodes))
+                print_bar("Refcount: collecting overflow extents", ovf_nodes_visited, ovf_total_nodes);
+
             if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
 
             struct btree_node_header nhdr;
@@ -557,6 +575,9 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
     {
         uint64_t lba = ctx->refcount_hdr.root_node_lba;
 
+        uint64_t rc_leaves_visited = 0;
+        uint64_t rc_total_nodes    = (uint64_t)ctx->refcount_hdr.total_nodes;
+
         /* Descend to left-most leaf */
         while(lba != 0)
         {
@@ -580,6 +601,10 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
                     if(obmafs3_block_read(ctx, lba, buf, bsz) != OBMAFS3_OK) break;
                     memcpy(&nhdr, buf, sizeof(nhdr));
                     if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+                    rc_leaves_visited++;
+                    if(rc_total_nodes > 10 && (rc_leaves_visited <= 1 || (rc_leaves_visited & 0xFF) == 0))
+                        print_bar("Refcount: reading stored records", rc_leaves_visited, rc_total_nodes);
 
                     const uint8_t *rp = buf + sizeof(struct btree_node_header);
                     for(uint16_t i = 0; i < nhdr.node_keys; i++)
@@ -611,6 +636,8 @@ void verify_refcount_tree(struct obmafs3_ctx *ctx, int auto_yes, int auto_no, ui
             }
         }
     }
+
+    bar_clear();
 
     /* ---- Phase 3: compare expected vs stored ---- */
 
