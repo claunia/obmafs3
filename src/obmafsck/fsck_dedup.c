@@ -227,6 +227,8 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
     uint64_t total_sector_count       = 0;
     uint64_t total_cd_sectors         = 0;
 
+    uint64_t unique_subchannels = 0;
+
     /* Per-tree reference counts: refs_per_tree[t] = total SME refs for tree t */
     uint64_t *refs_per_tree = calloc((size_t)tree_count, sizeof(uint64_t));
 
@@ -524,6 +526,69 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
         free(bases);
     }
 
+    /* ---- Walk CD subchannel tree ---- */
+    if(total_cd_sectors > 0 && ctx->cd_subchannel_hdr.root_node_lba != 0)
+    {
+        uint8_t *sub_buf = calloc(1, (size_t)ctx->sb.block_size);
+
+        if(sub_buf)
+        {
+            uint64_t *sub_stack = malloc(64 * sizeof(uint64_t));
+            uint64_t  sub_sz    = 0, sub_cap = 64;
+
+            if(sub_stack)
+            {
+                uint64_t sub_nodes_visited = 0;
+                uint64_t sub_total_nodes   = (uint64_t)ctx->cd_subchannel_hdr.total_nodes;
+
+                sub_stack[sub_sz++] = ctx->cd_subchannel_hdr.root_node_lba;
+
+                while(sub_sz > 0)
+                {
+                    uint64_t lba = sub_stack[--sub_sz];
+                    rc           = obmafs3_block_read(ctx, lba, sub_buf, (size_t)ctx->sb.block_size);
+                    if(rc != OBMAFS3_OK) break;
+
+                    struct btree_node_header nhdr;
+                    memcpy(&nhdr, sub_buf, sizeof(nhdr));
+                    if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
+
+                    sub_nodes_visited++;
+                    if(sub_total_nodes > 10 &&
+                       (sub_nodes_visited <= 1 || (sub_nodes_visited & 0xFF) == 0 ||
+                        sub_nodes_visited == sub_total_nodes))
+                        print_bar("CD subchannel tree", sub_nodes_visited, sub_total_nodes);
+
+                    if(nhdr.level > 0)
+                    {
+                        for(uint16_t i = 0; i < nhdr.node_keys; i++)
+                        {
+                            struct btree_index_entry ie;
+                            memcpy(&ie,
+                                   sub_buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie),
+                                   sizeof(ie));
+                            if(sub_sz >= sub_cap)
+                            {
+                                sub_cap *= 2;
+                                uint64_t *tmp = realloc(sub_stack, sub_cap * sizeof(*tmp));
+                                if(!tmp) break;
+                                sub_stack = tmp;
+                            }
+                            sub_stack[sub_sz++] = ie.child_lba;
+                        }
+                        continue;
+                    }
+
+                    unique_subchannels += nhdr.node_keys;
+                }
+
+                free(sub_stack);
+            }
+
+            free(sub_buf);
+        }
+    }
+
     /* Clear progress line */
     bar_clear();
 
@@ -627,8 +692,8 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
         printf("\n");
     }
 
-    /* ---- Savings summary ---- */
-    printf("\n  Savings summary:\n");
+    /* ---- Savings pipeline ---- */
+    printf("\n  Savings pipeline:\n");
 
     /* Sum per-tree refs for correct aggregate dedup ratio */
     uint64_t grand_refs = 0;
@@ -636,51 +701,70 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
         for(uint64_t t = 0; t < tree_count; t++)
             grand_refs += refs_per_tree[t];
 
+    /* Stage 1: Logical size */
+    printf("    Logical size:           ");
+    print_human_size(total_media_file_size);
+    printf(" (%" PRIu64 " bytes)\n", total_media_file_size);
+
+    /* Stage 2: After dedup */
     if(grand_refs > 0 && grand_dedup_entries > 0)
     {
-        /* Dedup ratio uses only referenced entries to avoid counting orphans */
         uint64_t referenced_entries = grand_dedup_entries;
         if(grand_dedup_entries > grand_refs)
             referenced_entries = grand_refs;
 
-        double   dedup_ratio = (double)grand_refs / (double)referenced_entries;
-        printf("    Dedup ratio:            %.2f:1"
-               " (%" PRIu64 " refs -> %" PRIu64 " unique)\n",
+        double dedup_ratio = (double)grand_refs / (double)referenced_entries;
+        printf("    After dedup:            ");
+        print_human_size(grand_unique_sector_bytes);
+        printf(" (%.2f:1, %" PRIu64 " refs -> %" PRIu64 " unique)\n",
                dedup_ratio, grand_refs, referenced_entries);
         if(grand_refs > referenced_entries)
         {
             uint64_t dup_sectors = grand_refs - referenced_entries;
-            printf("    Duplicate sectors:      %" PRIu64 "\n", dup_sectors);
+            printf("      Duplicate sectors:    %" PRIu64 "\n", dup_sectors);
         }
         if(grand_dedup_entries > grand_refs)
         {
             uint64_t orphaned = grand_dedup_entries - grand_refs;
-            printf("    Unreferenced sectors:   %" PRIu64 " (from deleted files)\n", orphaned);
+            printf("      Unreferenced sectors: %" PRIu64 " (from deleted files)\n", orphaned);
         }
         if(total_media_file_size > grand_unique_sector_bytes)
         {
             uint64_t bytes_saved_dedup = total_media_file_size - grand_unique_sector_bytes;
-            printf("    Saved by dedup:         ");
+            printf("      Saved:                ");
             print_human_size(bytes_saved_dedup);
-            printf(" (%.1f%%)\n", (double)bytes_saved_dedup / (double)total_media_file_size * 100.0);
+            printf(" (%.1f%% of logical)\n", (double)bytes_saved_dedup / (double)total_media_file_size * 100.0);
         }
     }
 
+    /* Stage 3: After compression */
     if(grand_original > 0 && grand_compressed > 0)
     {
         double comp_ratio = (double)grand_original / (double)grand_compressed;
-        printf("    Compression ratio:      %.2f:1\n", comp_ratio);
-        if(grand_compressed < grand_original)
+        printf("    After compression:      ");
+        print_human_size(grand_compressed);
+        printf(" (%.2f:1)\n", comp_ratio);
+        if(grand_compressed < grand_original && total_media_file_size > 0)
         {
             uint64_t comp_saved = grand_original - grand_compressed;
-            printf("    Saved by compression:   ");
+            printf("      Saved:                ");
             print_human_size(comp_saved);
-            printf(" (%.1f%%)\n", (double)comp_saved / (double)grand_original * 100.0);
+            printf(" (%.1f%% of logical)\n", (double)comp_saved / (double)total_media_file_size * 100.0);
         }
     }
 
+    /* Stage 4: Physical allocation (after block alignment) */
     if(total_media_file_size > 0 && grand_physical > 0)
     {
+        printf("    Physical on disk:       ");
+        print_human_size(grand_physical);
+        if(grand_physical != grand_compressed && grand_compressed > 0)
+        {
+            int64_t alignment_overhead = (int64_t)grand_physical - (int64_t)grand_compressed;
+            printf(" (%+" PRId64 " alignment overhead)", alignment_overhead);
+        }
+        printf("\n");
+
         double overall = (double)total_media_file_size / (double)grand_physical;
         printf("    Overall ratio:          %.2f:1\n", overall);
         if(total_media_file_size > grand_physical)
@@ -688,85 +772,31 @@ int compute_dedup_stats(struct obmafs3_ctx *ctx)
             uint64_t total_saved = total_media_file_size - grand_physical;
             printf("    Total space saved:      ");
             print_human_size(total_saved);
-            printf(" (%.1f%%)\n", (double)total_saved / (double)total_media_file_size * 100.0);
+            printf(" (%.1f%% of logical)\n", (double)total_saved / (double)total_media_file_size * 100.0);
         }
     }
 
     /* ---- CD subchannel dedup stats ---- */
-    if(total_cd_sectors > 0 && ctx->cd_subchannel_hdr.root_node_lba != 0)
+    if(total_cd_sectors > 0 && unique_subchannels > 0)
     {
-        uint64_t unique_subchannels = 0;
-        uint8_t *sub_buf            = calloc(1, (size_t)ctx->sb.block_size);
-
-        if(sub_buf)
-        {
-            uint64_t *sub_stack  = malloc(64 * sizeof(uint64_t));
-            uint64_t  sub_sz     = 0, sub_cap = 64;
-
-            if(sub_stack)
-            {
-                sub_stack[sub_sz++] = ctx->cd_subchannel_hdr.root_node_lba;
-
-                while(sub_sz > 0)
-                {
-                    uint64_t lba = sub_stack[--sub_sz];
-                    rc           = obmafs3_block_read(ctx, lba, sub_buf, (size_t)ctx->sb.block_size);
-                    if(rc != OBMAFS3_OK) break;
-
-                    struct btree_node_header nhdr;
-                    memcpy(&nhdr, sub_buf, sizeof(nhdr));
-                    if(nhdr.magic != OBMAFS3_BTREE_NODE_MAGIC) break;
-
-                    if(nhdr.level > 0)
-                    {
-                        for(uint16_t i = 0; i < nhdr.node_keys; i++)
-                        {
-                            struct btree_index_entry ie;
-                            memcpy(&ie,
-                                   sub_buf + sizeof(struct btree_node_header) + (size_t)i * sizeof(ie),
-                                   sizeof(ie));
-                            if(sub_sz >= sub_cap)
-                            {
-                                sub_cap *= 2;
-                                uint64_t *tmp = realloc(sub_stack, sub_cap * sizeof(*tmp));
-                                if(!tmp) break;
-                                sub_stack = tmp;
-                            }
-                            sub_stack[sub_sz++] = ie.child_lba;
-                        }
-                        continue;
-                    }
-
-                    unique_subchannels += nhdr.node_keys;
-                }
-
-                free(sub_stack);
-            }
-
-            free(sub_buf);
-        }
-
         printf("\n  %sCD subchannel dedup statistics%s\n", CLR_BOLD, CLR_RESET);
         printf("    Total CD sectors:       %" PRIu64 "\n", total_cd_sectors);
         printf("    Unique subchannels:     %" PRIu64 "\n", unique_subchannels);
 
-        if(unique_subchannels > 0)
+        double sub_ratio = (double)total_cd_sectors / (double)unique_subchannels;
+        printf("    Subchannel dedup ratio: %.2f:1"
+               " (%" PRIu64 " refs -> %" PRIu64 " unique)\n",
+               sub_ratio, total_cd_sectors, unique_subchannels);
+
+        if(total_cd_sectors > unique_subchannels)
         {
-            double sub_ratio = (double)total_cd_sectors / (double)unique_subchannels;
-            printf("    Subchannel dedup ratio: %.2f:1"
-                   " (%" PRIu64 " refs -> %" PRIu64 " unique)\n",
-                   sub_ratio, total_cd_sectors, unique_subchannels);
+            uint64_t dup = total_cd_sectors - unique_subchannels;
+            printf("    Duplicate subchannels:  %" PRIu64 "\n", dup);
 
-            if(total_cd_sectors > unique_subchannels)
-            {
-                uint64_t dup = total_cd_sectors - unique_subchannels;
-                printf("    Duplicate subchannels:  %" PRIu64 "\n", dup);
-
-                uint64_t saved = dup * CD_SUBCHANNEL_DATA_SIZE;
-                printf("    Saved by dedup:         ");
-                print_human_size(saved);
-                printf("\n");
-            }
+            uint64_t saved = dup * CD_SUBCHANNEL_DATA_SIZE;
+            printf("    Saved by dedup:         ");
+            print_human_size(saved);
+            printf("\n");
         }
     }
 
