@@ -37,12 +37,18 @@
 #include "obmafs3_ioctl.h"
 #include "tags.h"
 
-/* Prevent type collision: obmafs3 and libaaruformat both define MediaTagType and CdEccContext */
-#define MediaTagType AarufMediaTagType
-#define CdEccContext AarufCdEccContext
+/* Prevent type collision: obmafs3 and libaaruformat both define MediaTagType, CdEccContext, and compression enums */
+#define MediaTagType     AarufMediaTagType
+#define CdEccContext     AarufCdEccContext
+#define kCompressionNone AarufCompressionNone
+#define kCompressionLzma AarufCompressionLzma
+#define kCompressionZstd AarufCompressionZstd
 #include <aaruformat.h>
 #undef MediaTagType
 #undef CdEccContext
+#undef kCompressionNone
+#undef kCompressionLzma
+#undef kCompressionZstd
 
 #include <errno.h>
 #include <fcntl.h>
