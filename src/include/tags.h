@@ -116,7 +116,10 @@ typedef enum
     kPS3D2                 = 79,  ///< PS3 data2 key (16 bytes, from disc)
     kPS3PIC                = 80,  ///< PS3 PIC data (115 bytes, from disc lead-in)
     kPS3EncryptionMap      = 81,  ///< PS3 encryption region map (serialized from sector 0)
-    kMaxMediaTag           = kPS3EncryptionMap
+    kWiiUPartitionKeyMap   = 82,  ///< Nintendo Wii U partition-to-key mapping with regions
+    kWiiPartitionKeyMap    = 83,  ///< Nintendo Wii partition-to-key mapping with regions
+    kNgcwJunkMap           = 84,  ///< Nintendo GameCube/Wii junk region map with LFG seeds
+    kMaxMediaTag           = kNgcwJunkMap
 } Obmafs3MediaTagType;
 
 #endif /* OBMAFS3_TAGS_H */

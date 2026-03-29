@@ -30,6 +30,7 @@
 // Copyright © 2015-2026 Natalia Portillo
 // ****************************************************************************/
 
+#include "aaru.h"
 #include "errors.h"
 #include "import_aif.h"
 #include "ui.h"
@@ -281,8 +282,8 @@ int write_cue_file(void *aaruf_ctx, const ImageInfo *info, const char *output_pa
     {
         uint8_t  mcn_buf[16];
         uint32_t mcn_len = sizeof(mcn_buf);
-        /* CD_MCN = 6 in MediaTagType */
-        if(aaruf_read_media_tag(aaruf_ctx, mcn_buf, CD_MCN, &mcn_len) == 0 && mcn_len > 0)
+        /* kMediaTagCdMcn = 6 in MediaTagType */
+        if(aaruf_read_media_tag(aaruf_ctx, mcn_buf, kMediaTagCdMcn, &mcn_len) == 0 && mcn_len > 0)
         {
             /* MCN is typically 13 bytes, ensure NUL termination */
             if(mcn_len < sizeof(mcn_buf))
