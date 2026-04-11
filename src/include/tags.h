@@ -119,7 +119,9 @@ typedef enum
     kWiiUPartitionKeyMap   = 82,  ///< Nintendo Wii U partition-to-key mapping with regions
     kWiiPartitionKeyMap    = 83,  ///< Nintendo Wii partition-to-key mapping with regions
     kNgcwJunkMap           = 84,  ///< Nintendo GameCube/Wii junk region map with LFG seeds
-    kMaxMediaTag           = kNgcwJunkMap
+    kAacsMediaKey          = 85,  ///< AACS Media Key
+    kAacsVolumeUniqueKey   = 86,  ///< AACS Volume Unique Key
+    kMaxMediaTag           = kAacsVolumeUniqueKey
 } Obmafs3MediaTagType;
 
 #endif /* OBMAFS3_TAGS_H */

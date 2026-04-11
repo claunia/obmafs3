@@ -272,6 +272,8 @@ const char *aaru_media_type_to_string(MediaType type)
             return "BD-R XL";
         case BDREXL:
             return "BD-RE XL";
+        case UHDBD:
+            return "Ultra HD Blu-ray";
 
         // Rare optical formats, types 70 to 79
         case EVD:
@@ -338,6 +340,8 @@ const char *aaru_media_type_to_string(MediaType type)
             return "PlayStation 3 Game Blu-ray";
         case PS4BD:
             return "PlayStation 4 Game Blu-ray";
+        case PS5BD:
+            return "PlayStation 5 Game Blu-ray";
         case UMD:
             return "Universal Media Disc";
         case PlayStationVitaGameCard:

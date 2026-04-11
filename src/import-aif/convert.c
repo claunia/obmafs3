@@ -201,6 +201,10 @@ int aaruf_tag_to_obmafs(int aaruf_tag)
             return kWiiPartitionKeyMap;
         case kMediaTagNgcwJunkMap:
             return kNgcwJunkMap;
+        case kMediaTagAacsMediaKey:
+            return kAacsMediaKey;
+        case kMediaTagAacsVolumeUniqueKey:
+            return kAacsVolumeUniqueKey;
         default:
             return -1;
     }
